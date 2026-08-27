@@ -201,3 +201,40 @@ def test_live_ba_requirement_phrasings_are_must_have(description, skill):
 
     assert result.must_have_skills == [skill]
     assert result.nice_to_have_skills == []
+
+
+def test_unknown_nested_heading_preserves_requirement_section_context():
+    result = extract_skills(
+        "Backend Engineer",
+        "Dein Profil:\nTechnologien:\n- Python\n- Docker",
+    )
+
+    assert result.must_have_skills == ["docker", "python"]
+    assert result.nice_to_have_skills == []
+
+
+def test_unknown_nested_heading_preserves_optional_section_context():
+    result = extract_skills(
+        "Backend Engineer",
+        "Ideal Skills:\nCloud:\n- AWS\n- Docker",
+    )
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["aws", "docker"]
+
+
+def test_unknown_heading_without_parent_does_not_create_requirement_context():
+    result = extract_skills("Backend Engineer", "Technologies:\n- Python")
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == []
+
+
+def test_known_responsibilities_header_still_ends_requirement_section():
+    result = extract_skills(
+        "Backend Engineer",
+        "Dein Profil:\n- Python\nResponsibilities:\n- Docker",
+    )
+
+    assert result.must_have_skills == ["python"]
+    assert result.nice_to_have_skills == []

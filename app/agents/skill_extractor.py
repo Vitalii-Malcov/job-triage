@@ -117,6 +117,7 @@ _OTHER_SECTION_HEADERS = {
     "aufgaben",
     "deine aufgaben",
     "ihre aufgaben",
+    "unsere aufgaben",
     "responsibilities",
     "your responsibilities",
     "wir bieten",
@@ -174,11 +175,12 @@ def _section_header(line: str) -> tuple[str | None, str] | None:
     return None
 
 
-def _is_other_section_header(line: str, had_bullet: bool) -> bool:
-    normalized = _normalized_header(line)
-    return normalized in _OTHER_SECTION_HEADERS or (
-        not had_bullet and line.rstrip().endswith(":") and len(line) <= 80
-    )
+def _is_known_other_section_header(line: str) -> bool:
+    return _normalized_header(line) in _OTHER_SECTION_HEADERS
+
+
+def _is_generic_section_header(line: str, had_bullet: bool) -> bool:
+    return not had_bullet and line.rstrip().endswith(":") and len(line) <= 80
 
 
 def _continues_previous_segment(previous: str, current: str) -> bool:
@@ -214,8 +216,14 @@ def _contextual_segments(description: str) -> list[tuple[str, str | None]]:
             line = remainder
         elif re.match(r"^fachkenntnisse\s*:", line, re.IGNORECASE):
             section_context = "must"
-        elif _is_other_section_header(line, had_bullet):
+        elif _is_known_other_section_header(line):
             section_context = None
+            continue
+        elif _is_generic_section_header(line, had_bullet):
+            # An unknown short heading may be a nested label such as
+            # "Technologien:" inside "Dein Profil". It is structural text,
+            # not a context boundary: skip it while preserving any active
+            # must/nice section. With no parent section, None stays None.
             continue
 
         if (
