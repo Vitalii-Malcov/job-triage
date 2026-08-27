@@ -23,9 +23,17 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("java", r"(?<!\w)java(?!\w)"),
         ("javascript", r"(?<!\w)javascript(?!\w)"),
         ("typescript", r"(?<!\w)typescript(?!\w)"),
+        ("html", r"(?<![\w./?=&#%])html5?(?!\w)"),
+        ("css", r"(?<!\w)(?:css3?|scss)(?!\w)"),
+        ("ajax", r"(?<!\w)ajax(?!\w)"),
+        ("c", r"(?<!\w)c(?![\w+#]|\s+(?:niveau|level)\b)"),
         ("c#", r"(?<!\w)c#(?!\w)"),
         ("c++", r"(?<!\w)c\+\+(?!\w)"),
-        (".net", r"(?<!\w)\.net(?!\w)"),
+        ("go", r"(?<!\w)(?:(?-i:Go)|golang)(?!\w)"),
+        ("rust", r"(?<!\w)rust(?!\w)"),
+        (".net", r"(?<!\w)(?<!vb\s)(?<!asp\s)\.net(?!\w)"),
+        ("vb.net", r"(?<!\w)vb\s*\.\s*net(?!\w)"),
+        ("asp.net", r"(?<!\w)asp\s*\.\s*net(?!\w)"),
         ("php", r"(?<!\w)php(?!\w)"),
         ("ruby", r"(?<!\w)ruby(?!\w)"),
         ("kotlin", r"(?<!\w)kotlin(?!\w)"),
@@ -33,12 +41,31 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("flask", r"(?<!\w)flask(?!\w)"),
         ("django", r"(?<!\w)django(?!\w)"),
         ("fastapi", r"(?<!\w)fast[ -]?api(?!\w)"),
+        ("spring mvc", r"(?<!\w)spring\s+mvc(?!\w)"),
         ("spring", r"(?<!\w)spring(?:\s+(?:boot|framework))(?!\w)"),
         ("node.js", r"(?<!\w)node(?:\.js|js)(?!\w)"),
         ("react", r"(?<!\w)react(?:\.js|js)?(?!\w)"),
         ("angular", r"(?<!\w)angular(?:\.js|js)?(?!\w)"),
         ("vue.js", r"(?<!\w)vue(?:\.js|js)(?!\w)"),
-        ("sql", r"(?<!\w)sql(?!\w)"),
+        ("ngrx", r"(?<!\w)ngrx(?!\w)"),
+        ("shopify", r"(?<!\w)shopify(?!\w)"),
+        ("liquid", r"(?<!\w)liquid(?!\w)"),
+        ("flutter", r"(?<!\w)flutter(?!\w)"),
+        ("dart", r"(?<!\w)dart(?!\w)"),
+        ("wpf", r"(?<!\w)wpf(?!\w)"),
+        ("prism", r"(?<!\w)prism(?!\w)"),
+        ("qt", r"(?<!\w)qt(?!\w)"),
+        ("delphi", r"(?<!\w)delphi(?!\w)"),
+        (
+            "sql",
+            r"(?<!\w)(?<!\bms\s)(?<!\bmicrosoft\s)(?<!\bt-)(?<!\bt\s)"
+            r"(?<!\btransact-)(?<!\btransact\s)sql(?!\w)",
+        ),
+        ("t-sql", r"(?<!\w)(?:t[ -]?sql|transact[ -]?sql)(?!\w)"),
+        (
+            "ms sql server",
+            r"(?<!\w)(?:microsoft\s+sql\s+server|ms\s*sql(?:\s+server)?|mssql)(?!\w)",
+        ),
         ("postgresql", r"(?<!\w)(?:postgresql|postgres)(?!\w)"),
         ("mysql", r"(?<!\w)mysql(?!\w)"),
         ("mariadb", r"(?<!\w)mariadb(?!\w)"),
@@ -47,26 +74,61 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("elasticsearch", r"(?<!\w)elasticsearch(?!\w)"),
         ("solr", r"(?<!\w)solr(?!\w)"),
         ("sqlalchemy", r"(?<!\w)sqlalchemy(?!\w)"),
+        ("pydantic", r"(?<!\w)pydantic(?!\w)"),
+        ("jpa", r"(?<!\w)jpa(?!\w)"),
+        ("jsf", r"(?<!\w)jsf(?!\w)"),
+        ("gwt", r"(?<!\w)gwt(?!\w)"),
         ("git", r"(?<!\w)git(?!\w)"),
         ("svn", r"(?<!\w)svn(?!\w)"),
+        ("jira", r"(?<!\w)jira(?!\w)"),
+        ("confluence", r"(?<!\w)confluence(?!\w)"),
+        ("jsm", r"(?<!\w)jsm(?!\w)"),
+        ("active directory", r"(?<!\w)(?:microsoft\s+)?active\s+directory(?!\w)"),
         ("docker", r"(?<!\w)docker(?!\w)"),
         ("kubernetes", r"(?<!\w)(?:kubernetes|k8s)(?!\w)"),
+        ("windows", r"(?<!\w)windows(?!\w)"),
         ("linux", r"(?<!\w)linux(?!\w)"),
         ("unix", r"(?<!\w)unix(?!\w)"),
         ("rest", r"(?<!\w)rest(?:ful)?(?!\w)"),
         ("graphql", r"(?<!\w)graphql(?!\w)"),
         ("openapi", r"(?<!\w)openapi(?!\w)"),
         ("swagger", r"(?<!\w)swagger(?!\w)"),
+        ("xml", r"(?<!\w)xml(?!\w)"),
         ("oauth", r"(?<!\w)oauth(?:2(?:\.0)?| 2)?(?!\w)"),
         ("aws", r"(?<!\w)aws(?!\w)"),
-        ("azure", r"(?<!\w)(?:microsoft\s+)?azure(?!\w)"),
+        ("azure devops", r"(?<!\w)(?:microsoft\s+)?azure\s+devops(?!\w)"),
+        ("azure", r"(?<!\w)(?:microsoft\s+)?azure(?!\s+devops\b)(?!\w)"),
         ("google cloud", r"(?<!\w)(?:google\s+cloud|gcp)(?!\w)"),
         ("terraform", r"(?<!\w)terraform(?!\w)"),
         ("ansible", r"(?<!\w)ansible(?!\w)"),
         ("jenkins", r"(?<!\w)jenkins(?!\w)"),
+        ("teamcity", r"(?<!\w)teamcity(?!\w)"),
+        ("visual studio", r"(?<!\w)visual\s+studio(?!\s+code\b)(?!\w)"),
         ("github actions", r"(?<!\w)github\s+actions(?!\w)"),
+        ("ci/cd", r"(?<!\w)ci\s*/\s*cd(?!\w)"),
+        ("cmake", r"(?<!\w)cmake(?!\w)"),
+        ("make", r"(?<!\w)(?:gnu\s+make|(?-i:Make))(?!\w)"),
         ("kafka", r"(?<!\w)(?:apache\s+)?kafka(?!\w)"),
         ("rabbitmq", r"(?<!\w)rabbitmq(?!\w)"),
+        ("oracle", r"(?<!\w)oracle(?!\w)"),
+        ("prometheus", r"(?<!\w)prometheus(?!\w)"),
+        ("grafana", r"(?<!\w)grafana(?!\w)"),
+        ("elk", r"(?<!\w)elk(?:\s+stack)?(?!\w)"),
+        ("fluentd", r"(?<!\w)fluentd(?!\w)"),
+        ("splunk", r"(?<!\w)splunk(?!\w)"),
+        ("servicenow", r"(?<!\w)service\s*now(?!\w)"),
+        ("bash", r"(?<!\w)bash(?!\w)"),
+        ("matlab", r"(?<!\w)matlab(?!\w)"),
+        ("selenium", r"(?<!\w)selenium(?!\w)"),
+        ("playwright", r"(?<!\w)playwright(?!\w)"),
+        ("postman", r"(?<!\w)postman(?!\w)"),
+        ("xray", r"(?<!\w)x[ -]?ray(?!\w)"),
+        ("hp alm", r"(?<!\w)hp\s+alm(?!\w)"),
+        ("solution manager", r"(?<!\w)(?:sap\s+)?solution\s+manager(?!\w)"),
+        ("readyapi", r"(?<!\w)ready\s*api(?!\w)"),
+        ("soapui", r"(?<!\w)soap\s*ui(?!\w)"),
+        ("tosca", r"(?<!\w)tosca(?!\w)"),
+        ("groovy", r"(?<!\w)groovy(?:\s+script)?(?!\w)"),
         ("pytest", r"(?<!\w)pytest(?!\w)"),
     )
 )
@@ -75,13 +137,14 @@ KNOWN_TECHNOLOGIES: tuple[str, ...] = tuple(name for name, _ in _TECHNOLOGY_PATT
 
 _NICE_TO_HAVE_MARKERS = re.compile(
     r"\b(?:nice[ -]to[ -]have|good[ -]to[ -]have|preferred|desirable|optional|bonus|"
-    r"wünschenswert|von vorteil|idealerweise|nicht erforderlich|not required)\b",
+    r"wünschenswert|von vorteil|idealerweise|nicht erforderlich|not required|"
+    r"(?:is|are|would\s+be)\s+(?:a\s+)?plus)\b",
     re.IGNORECASE,
 )
 _MUST_HAVE_MARKERS = re.compile(
     r"\b(?:"
     r"(?<!nicht\s)erforderlich|vorausgesetzt|voraussetzung(?:en)?|"
-    r"(?:fach)?kenntnisse\s*(?::|(?:in|mit)\b)|"
+    r"(?:fach)?kenntnisse(?:\s*(?::|(?:in|mit)\b))?|"
     r"erfahrungen\s+mit|berufserfahrung\s+als|"
     r"erfahrung\s+(?:mit|in|im\s+umgang\s+mit)|"
     r"mit\b.{0,160}\bvertraut|strong\s+understanding\s+of|"
@@ -93,7 +156,8 @@ _MUST_HAVE_MARKERS = re.compile(
 )
 _SEGMENT_BOUNDARY = re.compile(r"(?:\r?\n)+|(?<=[.!?;])\s+")
 _POSTFIX_NICE_MARKERS = re.compile(
-    r"\b(?:(?:ist|sind|wäre|wären)\s+)?(?:von vorteil|wünschenswert|preferred|desirable)\b",
+    r"\b(?:(?:ist|sind|wäre|wären)\s+)?(?:von vorteil|wünschenswert|preferred|desirable)|"
+    r"(?:is|are|would\s+be)\s+(?:a\s+)?plus\b",
     re.IGNORECASE,
 )
 _EXPLICIT_REQUIRED_MARKERS = re.compile(
@@ -101,6 +165,12 @@ _EXPLICIT_REQUIRED_MARKERS = re.compile(
     re.IGNORECASE,
 )
 _CONTRAST_MARKERS = re.compile(r"\b(?:aber|hingegen|jedoch|während|but|while|whereas)\b", re.I)
+_PROFILE_REQUIREMENT_MARKERS = re.compile(
+    r"\b(?:grundverständnis\s+(?:von|für)|understanding\s+of)\b",
+    re.IGNORECASE,
+)
+_IDEALLY_MARKER = re.compile(r"\bidealerweise\b", re.IGNORECASE)
+_ABBREVIATIONS = re.compile(r"\b(?:z\.\s?b\.|e\.g\.|d\.\s?h\.)", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]+|>>+)\s*")
 _MUST_SECTION_HEADERS = {
     "das bringst du mit",
@@ -149,6 +219,34 @@ def _classify_mention(
         return "nice"
     if inherited_context == "nice" and not _EXPLICIT_REQUIRED_MARKERS.search(segment):
         return "nice"
+
+    ideally_markers = list(_IDEALLY_MARKER.finditer(segment))
+    if ideally_markers:
+        first_ideally = ideally_markers[0].start()
+        has_required_prefix = inherited_context == "must" or any(
+            marker.start() < first_ideally for marker in must_markers
+        )
+        if has_required_prefix:
+            return "must" if mention.end() <= first_ideally else "nice"
+
+    clause_start = segment.rfind(",", 0, mention.start()) + 1
+    clause_end = segment.find(",", mention.end())
+    if clause_end == -1:
+        clause_end = len(segment)
+    clause_must_markers = [
+        marker for marker in must_markers if clause_start <= marker.start() < clause_end
+    ]
+    clause_nice_markers = [
+        marker for marker in nice_markers if clause_start <= marker.start() < clause_end
+    ]
+    if clause_must_markers and not clause_nice_markers:
+        return "must"
+    if clause_nice_markers and not clause_must_markers:
+        return "nice"
+
+    if inherited_context == "must" and nice_markers and not must_markers:
+        first_nice_marker = min(marker.start() for marker in nice_markers)
+        return "must" if mention.end() <= first_nice_marker else "nice"
     if must_markers and not nice_markers:
         return "must"
     if nice_markers and not must_markers:
@@ -236,12 +334,15 @@ def _contextual_segments(description: str) -> list[tuple[str, str | None]]:
         else:
             lines.append((line, section_context))
 
-    return [
-        (segment, context)
-        for line, context in lines
-        for segment in _SEGMENT_BOUNDARY.split(line)
-        if segment.strip()
-    ]
+    segments = []
+    for line, context in lines:
+        protected = _ABBREVIATIONS.sub(lambda match: match.group().replace(".", "\x00"), line)
+        segments.extend(
+            (segment.replace("\x00", "."), context)
+            for segment in _SEGMENT_BOUNDARY.split(protected)
+            if segment.strip()
+        )
+    return segments
 
 
 def _postfix_nice_scopes_all_mentions(
@@ -263,7 +364,7 @@ def _postfix_nice_scopes_all_mentions(
     postfix = postfix_markers[0]
     if _CONTRAST_MARKERS.search(segment, first_mention, postfix.start()):
         return False
-    return not any(first_mention <= marker.start() < postfix.start() for marker in must_markers)
+    return not _EXPLICIT_REQUIRED_MARKERS.search(segment, first_mention, postfix.start())
 
 
 def extract_skills(title: str | None, description: str | None) -> SkillExtraction:
@@ -279,6 +380,8 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
 
     for segment, inherited_context in _contextual_segments(description or ""):
         must_markers = list(_MUST_HAVE_MARKERS.finditer(segment))
+        if inherited_context == "must":
+            must_markers.extend(_PROFILE_REQUIREMENT_MARKERS.finditer(segment))
         nice_markers = list(_NICE_TO_HAVE_MARKERS.finditer(segment))
         mentions = [
             mention for _, pattern in _TECHNOLOGY_PATTERNS for mention in pattern.finditer(segment)

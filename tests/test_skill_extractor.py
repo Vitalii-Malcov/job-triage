@@ -104,7 +104,7 @@ def test_bmw_postfix_von_vorteil_applies_to_the_whole_database_list():
     )
 
     assert result.must_have_skills == []
-    assert result.nice_to_have_skills == ["postgresql", "sql"]
+    assert result.nice_to_have_skills == ["ms sql server", "oracle", "postgresql"]
 
 
 def test_allergosan_postfix_von_vorteil_applies_to_typescript_and_rest():
@@ -114,7 +114,7 @@ def test_allergosan_postfix_von_vorteil_applies_to_typescript_and_rest():
     )
 
     assert result.must_have_skills == []
-    assert result.nice_to_have_skills == ["rest", "typescript"]
+    assert result.nice_to_have_skills == ["liquid", "rest", "typescript"]
 
 
 def test_nevaris_fachkenntnisse_context_continues_into_following_bullet():
@@ -124,7 +124,7 @@ def test_nevaris_fachkenntnisse_context_continues_into_following_bullet():
         "- Datenbanken (SQL oder ORACLE), Client-Server-Architektur",
     )
 
-    assert result.must_have_skills == [".net", "c#", "c++", "sql"]
+    assert result.must_have_skills == [".net", "c", "c#", "c++", "oracle", "sql"]
     assert result.nice_to_have_skills == []
 
 
@@ -238,3 +238,276 @@ def test_known_responsibilities_header_still_ends_requirement_section():
 
     assert result.must_have_skills == ["python"]
     assert result.nice_to_have_skills == []
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        ("Erfahrung mit Jira ist erforderlich.", ["jira"]),
+        ("Kenntnisse in Microsoft SQL Server sind erforderlich.", ["ms sql server"]),
+        ("Erfahrung mit Windows ist erforderlich.", ["windows"]),
+        ("Erfahrung mit CI/CD ist erforderlich.", ["ci/cd"]),
+        ("Erfahrung mit Rust ist erforderlich.", ["rust"]),
+    ],
+)
+def test_live_audit_technologies_are_recognized_as_requirements(description, expected):
+    result = extract_skills("Softwareentwickler", description)
+
+    assert result.must_have_skills == expected
+    assert result.nice_to_have_skills == []
+
+
+def test_c_requirement_does_not_match_csharp_or_cpp_as_c():
+    result = extract_skills("Softwareentwickler", "Kenntnisse in C, C# und C++ erforderlich.")
+
+    assert result.must_have_skills == ["c", "c#", "c++"]
+    assert (
+        "c"
+        not in extract_skills(
+            "Softwareentwickler", "Kenntnisse in C# und C++ erforderlich."
+        ).must_have_skills
+    )
+
+
+def test_oracle_in_postfix_optional_database_list_is_nice_to_have():
+    result = extract_skills(
+        "Softwareentwickler",
+        "PostgreSQL, Oracle oder MSSQL sind von Vorteil.",
+    )
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["ms sql server", "oracle", "postgresql"]
+
+
+def test_is_a_plus_marks_python_as_optional():
+    result = extract_skills("Softwareentwickler", "Matlab or Python is a plus.")
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["matlab", "python"]
+
+
+def test_idealerweise_only_applies_to_the_following_database_list():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Dein Profil:\nSQL Kenntnisse, idealerweise PostgreSQL/MySQL.",
+    )
+
+    assert result.must_have_skills == ["sql"]
+    assert result.nice_to_have_skills == ["mysql", "postgresql"]
+
+
+def test_agrarcommander_idealerweise_scope_keeps_sql_required():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Qualifikationen:\n"
+        "Du kennst dich mit relationalen Datenbanken und SQL aus - "
+        "idealerweise mit PostgreSQL, MySQL/MariaDB oder MSSQL.",
+    )
+
+    assert result.must_have_skills == ["sql"]
+    assert result.nice_to_have_skills == [
+        "mariadb",
+        "ms sql server",
+        "mysql",
+        "postgresql",
+    ]
+
+
+def test_idealerweise_tail_does_not_make_preceding_tools_optional():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Kenntnisse gängiger Werkzeuge wie Git, Jira, Confluence und idealerweise Jenkins.",
+    )
+
+    assert result.must_have_skills == ["confluence", "git", "jira"]
+    assert result.nice_to_have_skills == ["jenkins"]
+
+
+def test_compound_postfix_optional_scope_includes_angular_and_azure():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Angular-Kenntnisse und Erfahrung mit Azure sind von Vorteil.",
+    )
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["angular", "azure"]
+
+
+def test_explicit_requirement_before_optional_postfix_remains_must_have():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Python ist erforderlich, Docker wäre von Vorteil.",
+    )
+
+    assert result.must_have_skills == ["python"]
+    assert result.nice_to_have_skills == ["docker"]
+
+
+@pytest.mark.parametrize("abbreviation", ["z. B.", "z.B.", "e.g.", "d. h.", "d.h."])
+def test_common_abbreviation_does_not_split_git_from_requirement(abbreviation):
+    result = extract_skills(
+        "Softwareentwickler",
+        f"Kenntnisse in Versionsverwaltung ({abbreviation} Git) sind von Vorteil.",
+    )
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["git"]
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["Grundverständnis von", "Grundverständnis für", "Understanding of"],
+)
+def test_understanding_construction_is_requirement_inside_profile_section(phrase):
+    result = extract_skills(
+        "Softwareentwickler",
+        f"Ihr Profil:\n{phrase} AWS und Azure.",
+    )
+
+    assert result.must_have_skills == ["aws", "azure"]
+    assert result.nice_to_have_skills == []
+
+
+@pytest.mark.parametrize(
+    ("literal", "normalized"),
+    [
+        ("HTML5", "html"),
+        ("CSS3", "css"),
+        ("AJAX", "ajax"),
+        ("VB.NET", "vb.net"),
+        ("VB .NET", "vb.net"),
+        ("ASP.NET", "asp.net"),
+        ("ASP .NET", "asp.net"),
+        ("T-SQL", "t-sql"),
+        ("T SQL", "t-sql"),
+        ("Microsoft Active Directory", "active directory"),
+        ("JSM", "jsm"),
+        ("JPA", "jpa"),
+        ("WPF", "wpf"),
+        ("Qt", "qt"),
+        ("Pydantic", "pydantic"),
+        ("Golang", "go"),
+        ("Bash", "bash"),
+        ("Prometheus", "prometheus"),
+        ("Grafana", "grafana"),
+        ("ELK Stack", "elk"),
+        ("Fluentd", "fluentd"),
+        ("Splunk", "splunk"),
+        ("ServiceNow", "servicenow"),
+        ("XML", "xml"),
+        ("CMake", "cmake"),
+        ("GNU Make", "make"),
+        ("Selenium", "selenium"),
+        ("Playwright", "playwright"),
+        ("Postman", "postman"),
+        ("Xray", "xray"),
+        ("HP ALM", "hp alm"),
+        ("SAP Solution Manager", "solution manager"),
+        ("ReadyAPI", "readyapi"),
+        ("SoapUI", "soapui"),
+        ("Tosca", "tosca"),
+        ("Groovy Script", "groovy"),
+        ("Flutter", "flutter"),
+        ("Dart", "dart"),
+        ("Matlab", "matlab"),
+        ("TeamCity", "teamcity"),
+        ("Azure DevOps", "azure devops"),
+        ("Shopify", "shopify"),
+        ("Liquid", "liquid"),
+        ("NgRx", "ngrx"),
+        ("Visual Studio", "visual studio"),
+        ("Prism", "prism"),
+        ("Delphi", "delphi"),
+        ("Spring MVC", "spring mvc"),
+        ("JSF", "jsf"),
+        ("GWT", "gwt"),
+    ],
+)
+def test_confirmed_live_audit_technology_literal_is_normalized(literal, normalized):
+    result = extract_skills("Softwareentwickler", f"Erfahrung mit {literal} erforderlich.")
+
+    assert result.must_have_skills == [normalized]
+    assert result.nice_to_have_skills == []
+
+
+def test_go_does_not_match_ordinary_lowercase_english_word():
+    result = extract_skills("Softwareentwickler", "You must go through the requirements.")
+
+    assert result.must_have_skills == []
+
+
+def test_make_does_not_match_ordinary_lowercase_english_word():
+    result = extract_skills("Softwareentwickler", "You must make reliable software.")
+
+    assert result.must_have_skills == []
+
+
+def test_existing_c_family_patterns_remain_independent_with_new_dictionary_entries():
+    result = extract_skills("Softwareentwickler", "Kenntnisse in C, C# und C++ erforderlich.")
+
+    assert result.must_have_skills == ["c", "c#", "c++"]
+
+
+def test_azure_devops_is_specific_and_not_duplicated_as_azure():
+    result = extract_skills("Softwareentwickler", "Erfahrung mit Azure DevOps erforderlich.")
+
+    assert result.must_have_skills == ["azure devops"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/index.html",
+        "https://example.com/html/jobs",
+        "https://example.com/jobs?format=html",
+    ],
+)
+def test_html_in_url_is_not_extracted_as_skill(url):
+    result = extract_skills("Softwareentwickler", f"Details are required: {url}")
+
+    assert result.must_have_skills == []
+
+
+def test_scss_and_css_variants_normalize_without_duplicates():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Kenntnisse in CSS, CSS3 und SCSS erforderlich.",
+    )
+
+    assert result.must_have_skills == ["css"]
+
+
+def test_spring_mvc_does_not_also_extract_generic_spring():
+    result = extract_skills("Softwareentwickler", "Erfahrung mit Spring MVC erforderlich.")
+
+    assert result.must_have_skills == ["spring mvc"]
+
+
+def test_spring_boot_keeps_existing_spring_normalization():
+    result = extract_skills("Softwareentwickler", "Erfahrung mit Spring Boot erforderlich.")
+
+    assert result.must_have_skills == ["spring"]
+
+
+def test_spring_mvc_and_spring_boot_remain_independent_literals():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Erfahrung mit Spring MVC und Spring Boot erforderlich.",
+    )
+
+    assert result.must_have_skills == ["spring", "spring mvc"]
+
+
+def test_visual_studio_does_not_match_visual_studio_code():
+    result = extract_skills(
+        "Softwareentwickler",
+        "Erfahrung mit Visual Studio Code erforderlich.",
+    )
+
+    assert result.must_have_skills == []
+
+
+def test_t_sql_disambiguation_does_not_hide_sql_after_word_ending_in_t():
+    result = extract_skills("Softwareentwickler", "Erfahrung mit SQL Server erforderlich.")
+
+    assert result.must_have_skills == ["sql"]
