@@ -1,6 +1,9 @@
 import re
 
+from app.agents.data_confidence import calculate_data_confidence
 from app.models.job import Job, JobScore
+
+MINIMUM_DECISION_CONFIDENCE = 0.45
 
 ALIASES = {
     "fast api": "fastapi",
@@ -50,7 +53,14 @@ class JobScorer:
         raw_score = (must_score * 0.70) + (nice_score * 0.20) + (description_score * 0.10)
         score = round(raw_score * 100)
 
-        if missing_must and must_score < 0.6:
+        data_confidence = calculate_data_confidence(
+            job.description,
+            legacy | must | nice,
+        )
+
+        if data_confidence < MINIMUM_DECISION_CONFIDENCE:
+            recommendation = "NEEDS_ENRICHMENT"
+        elif missing_must and must_score < 0.6:
             recommendation = "SKIP"
         elif score >= 80:
             recommendation = "APPLY"
@@ -69,4 +79,5 @@ class JobScorer:
             missing_must_have=sorted(missing_must),
             matched_nice_to_have=sorted(matched_nice),
             recommendation=recommendation,
+            data_confidence=data_confidence,
         )

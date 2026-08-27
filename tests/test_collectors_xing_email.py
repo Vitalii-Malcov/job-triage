@@ -386,10 +386,15 @@ async def test_same_message_id_is_not_reprocessed_on_second_fetch():
     collector, client = _make_collector(
         [raw],
         is_message_processed=lambda message_id: message_id in processed,
-        mark_message_processed=processed.add,
     )
 
-    first = await collector.fetch()
+    first_batches = await collector.fetch_message_batches()
+    first = [job for batch in first_batches for job in batch.jobs]
+    assert len(first_batches) == 1
+
+    # A persistence-owning caller acknowledges only after all jobs in this
+    # batch succeed. The collector itself deliberately never acknowledges.
+    processed.add(first_batches[0].message_id)
     second = await collector.fetch()
 
     assert len(first) == 1

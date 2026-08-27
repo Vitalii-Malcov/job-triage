@@ -52,6 +52,11 @@ def _fingerprint(job: Job) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def get_job_by_fingerprint(db: Session, job: Job) -> JobRecord | None:
+    """Return the persisted record representing ``job``, if one exists."""
+    return db.scalar(select(JobRecord).where(JobRecord.fingerprint == _fingerprint(job)))
+
+
 def get_or_create_default_profile(db: Session) -> UserProfile:
     profile = db.scalar(select(UserProfile).where(UserProfile.name == "default"))
     if profile:
@@ -69,7 +74,7 @@ def profile_skills(profile: UserProfile) -> set[str]:
 
 def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
     fingerprint = _fingerprint(job)
-    existing = db.scalar(select(JobRecord).where(JobRecord.fingerprint == fingerprint))
+    existing = get_job_by_fingerprint(db, job)
     now = datetime.now(UTC)
     if existing:
         existing.last_seen_at = now

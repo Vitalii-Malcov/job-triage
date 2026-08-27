@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import json
 import logging
 from datetime import datetime
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -27,7 +29,10 @@ logger = logging.getLogger(__name__)
 # checks both field-name generations defensively rather than trusting either
 # source blindly.
 BASE_URL = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v6/jobs"
-JOB_DETAIL_URL_TEMPLATE = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
+DETAIL_URL_TEMPLATE = (
+    "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobdetails/{encoded_refnr}"
+)
+PUBLIC_JOB_URL_TEMPLATE = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
 SOURCE_NAME = "bundesagentur"
 
 # API-documented limit for the `veroeffentlichtseit` (published-since) filter.
@@ -159,7 +164,7 @@ def _map_posting(posting: object) -> Job | None:
     url = (
         posting.get("externeURL")
         or posting.get("externeUrl")
-        or JOB_DETAIL_URL_TEMPLATE.format(refnr=refnr)
+        or PUBLIC_JOB_URL_TEMPLATE.format(refnr=refnr)
     )
 
     try:
@@ -170,6 +175,7 @@ def _map_posting(posting: object) -> Job | None:
             location=location,
             url=url,
             description="",
+            source_reference=str(refnr),
         )
     except ValidationError:
         logger.warning(
@@ -233,6 +239,50 @@ class BundesagenturCollector(JobCollector):
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             return await self._collect_pages(client, headers, params)
 
+    async def fetch_detail(self, referenznummer: str) -> str | None:
+        """Fetch the live detail description, or return None for a permanent 404."""
+        if not is_api_key_configured(self.api_key):
+            raise BundesagenturAuthError("BUNDESAGENTUR_API_KEY is not configured")
+
+        encoded_refnr = quote(
+            base64.b64encode(referenznummer.encode("utf-8")).decode("ascii"),
+            safe="",
+        )
+        url = DETAIL_URL_TEMPLATE.format(encoded_refnr=encoded_refnr)
+        headers = {"X-API-Key": self.api_key}
+
+        if self._injected_client is not None:
+            payload = await self._request_json(
+                self._injected_client,
+                url,
+                headers,
+                params=None,
+                request_name="detail",
+                return_none_on_404=True,
+            )
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                payload = await self._request_json(
+                    client,
+                    url,
+                    headers,
+                    params=None,
+                    request_name="detail",
+                    return_none_on_404=True,
+                )
+
+        if payload is None:
+            return None
+
+        description = payload.get("stellenangebotsBeschreibung")
+        if not isinstance(description, str) or not description.strip():
+            logger.warning(
+                "bundesagentur_detail_missing_description referenznummer=%s",
+                referenznummer,
+            )
+            return None
+        return description
+
     def _build_params(self, since: datetime | None) -> dict[str, str | int]:
         params: dict[str, str | int] = {"size": self.page_size}
         if self.keywords:
@@ -287,15 +337,42 @@ class BundesagenturCollector(JobCollector):
         headers: dict[str, str],
         params: dict[str, str | int],
     ) -> dict:
+        payload = await self._request_json(
+            client,
+            BASE_URL,
+            headers,
+            params=params,
+            request_name="search",
+        )
+        if payload is None:  # pragma: no cover - search does not enable this outcome
+            raise BundesagenturAPIError("Bundesagentur search unexpectedly returned no payload")
+        return payload
+
+    async def _request_json(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, str | int] | None,
+        request_name: str,
+        return_none_on_404: bool = False,
+    ) -> dict | None:
+        """Run one API request through the collector's shared retry policy."""
         last_exc: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await client.get(BASE_URL, headers=headers, params=params)
+                response = await client.get(url, headers=headers, params=params)
                 if response.status_code == 401:
                     raise BundesagenturAuthError(
                         "Bundesagentur Jobsuche API rejected the configured X-API-Key (401)"
                     )
+                if return_none_on_404 and response.status_code == 404:
+                    logger.warning(
+                        "bundesagentur_detail_not_found status=404 body=%s",
+                        response.text[:200],
+                    )
+                    return None
                 response.raise_for_status()
                 payload = response.json()
                 if not isinstance(payload, dict):
@@ -335,7 +412,9 @@ class BundesagenturCollector(JobCollector):
             except (httpx.HTTPError, httpx.TimeoutException) as exc:
                 last_exc = exc
                 logger.warning(
-                    "bundesagentur_fetch_failed attempt=%s max_retries=%s params=%s error=%s",
+                    "bundesagentur_fetch_failed request=%s attempt=%s max_retries=%s "
+                    "params=%s error=%s",
+                    request_name,
                     attempt,
                     self.max_retries,
                     params,
@@ -344,7 +423,11 @@ class BundesagenturCollector(JobCollector):
                 if attempt < self.max_retries:
                     await asyncio.sleep(2 ** (attempt - 1))
 
-        logger.error("bundesagentur_fetch_exhausted_retries params=%s", params)
+        logger.error(
+            "bundesagentur_fetch_exhausted_retries request=%s params=%s",
+            request_name,
+            params,
+        )
         raise BundesagenturAPIError(
             f"Bundesagentur Jobsuche API request failed after {self.max_retries} attempts"
         ) from last_exc

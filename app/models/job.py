@@ -1,8 +1,12 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
 from app.models.application_status import ApplicationStatus
+
+SkillSource = Literal["description_extracted", "description_inferred"]
+Recommendation = Literal["APPLY", "MAYBE", "SKIP", "NEEDS_ENRICHMENT"]
 
 
 class Job(BaseModel):
@@ -12,9 +16,11 @@ class Job(BaseModel):
     location: str = ""
     url: HttpUrl
     description: str = ""
+    source_reference: str | None = None
     skills: list[str] = Field(default_factory=list)
     must_have_skills: list[str] = Field(default_factory=list)
     nice_to_have_skills: list[str] = Field(default_factory=list)
+    skill_source: SkillSource | None = None
 
 
 class JobScore(BaseModel):
@@ -24,7 +30,8 @@ class JobScore(BaseModel):
     matched_must_have: list[str] = Field(default_factory=list)
     missing_must_have: list[str] = Field(default_factory=list)
     matched_nice_to_have: list[str] = Field(default_factory=list)
-    recommendation: str
+    recommendation: Recommendation
+    data_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     is_duplicate: bool = False
 
 

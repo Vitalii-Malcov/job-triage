@@ -1,3 +1,5 @@
+import base64
+
 import httpx
 import pytest
 
@@ -80,6 +82,7 @@ async def test_maps_a_valid_posting_including_generated_detail_url():
     assert job.company == "Example GmbH"
     assert job.location == "Berlin"
     assert "10000-1184867112-S" in str(job.url)
+    assert job.source_reference == "10000-1184867112-S"
     assert collector.skipped_invalid_count == 0
 
 
@@ -430,3 +433,54 @@ async def test_retries_on_429_then_succeeds(monkeypatch):
 
     assert len(jobs) == 1
     assert attempts["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_detail_returns_live_description_field():
+    referenznummer = "10000-1184867112-S"
+    description = "Erfahrung mit Python, Flask und PostgreSQL."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        encoded_refnr = request.url.path.rsplit("/", 1)[-1]
+        assert base64.b64decode(encoded_refnr).decode("utf-8") == referenznummer
+        assert request.headers["x-api-key"] == "test-key"
+        return httpx.Response(200, json={"stellenangebotsBeschreibung": description})
+
+    collector = _make_collector(handler)
+
+    assert await collector.fetch_detail(referenznummer) == description
+
+
+@pytest.mark.asyncio
+async def test_fetch_detail_treats_404_as_permanent_without_retry(caplog):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            404,
+            json={"messages": [{"code": "STELLENANGEBOT_NICHT_GEFUNDEN"}]},
+        )
+
+    collector = _make_collector(handler, max_retries=3)
+
+    assert await collector.fetch_detail("does-not-exist") is None
+    assert len(calls) == 1
+    assert "bundesagentur_detail_not_found" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_detail_reuses_retry_policy_for_5xx(monkeypatch):
+    monkeypatch.setattr("app.collectors.bundesagentur.asyncio.sleep", _no_sleep)
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"stellenangebotsBeschreibung": "Python und Flask"})
+
+    collector = _make_collector(handler, max_retries=3)
+
+    assert await collector.fetch_detail("10000-1-S") == "Python und Flask"
+    assert attempts["count"] == 3

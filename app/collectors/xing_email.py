@@ -45,9 +45,9 @@ Beyond that constraint, this collector:
 - Parses the plaintext body (not HTML — confirmed substantially cleaner and
   more stable across the two observed digest formats) into per-posting
   blocks, separated by one or more consecutive lines of dashes.
-- Tracks which Message-IDs have already been processed via the
-  ProcessedEmailMessage table (app/db/repositories.is_message_processed /
-  mark_message_processed) instead of mutating the mailbox's read state.
+- Skips Message-IDs already acknowledged in the ProcessedEmailMessage table;
+  the persistence-owning caller records acknowledgment only after every job
+  parsed from that message has been saved successfully.
 """
 
 import asyncio
@@ -56,6 +56,7 @@ import imaplib
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.header import decode_header
 from email.message import Message
@@ -136,6 +137,14 @@ class XingConnectionError(CollectorError):
     """Raised when the IMAP server can't be reached, or an IMAP command
     other than login fails (e.g. SELECT/SEARCH).
     """
+
+
+@dataclass(frozen=True)
+class XingEmailBatch:
+    """Jobs parsed from one XING digest message, kept with its Message-ID."""
+
+    message_id: str
+    jobs: tuple[Job, ...]
 
 
 class ImapClient(Protocol):
@@ -276,11 +285,11 @@ class XingEmailCollector(JobCollector):
     """Collector for XING job-digest emails delivered to a mailbox via IMAP.
 
     Only fetches and maps postings into `Job` — it never writes to the jobs
-    database and never scores jobs (see app/api/routes.py for that). It does
-    read from and write to the separate ProcessedEmailMessage table via the
-    injected `is_message_processed`/`mark_message_processed` callables, so
-    it can skip already-parsed emails without mutating the mailbox itself —
-    see the module docstring.
+    database and never scores jobs (see app/api/routes.py for that). It
+    consults the separate ProcessedEmailMessage table via the injected
+    `is_message_processed` callable, so it can skip acknowledged emails
+    without mutating the mailbox itself. The persistence-owning caller marks
+    a message only after all jobs in its XingEmailBatch are saved.
     """
 
     source = SOURCE_NAME
@@ -294,7 +303,6 @@ class XingEmailCollector(JobCollector):
         lookback_days: int = 7,
         imap_client: ImapClient | None = None,
         is_message_processed: Callable[[str], bool] | None = None,
-        mark_message_processed: Callable[[str], None] | None = None,
     ) -> None:
         self.imap_host = imap_host
         self.imap_port = imap_port
@@ -304,21 +312,28 @@ class XingEmailCollector(JobCollector):
         # Injected only by tests, to avoid a real IMAP connection; production
         # code always opens (and closes) its own connection in _fetch_sync.
         self._injected_client = imap_client
-        # Callables rather than a raw db.Session: keeps this collector
-        # decoupled from SQLAlchemy (matching JobCollector's "never writes
-        # to the database" spirit for the *jobs* table) while still letting
-        # the caller (POST /collectors/xing/run) wire it to the real
-        # ProcessedEmailMessage repository functions bound to its request's
-        # Session. Default to "nothing is ever processed" so unit tests that
-        # don't care about dedup don't need to wire anything.
+        # A callable rather than a raw db.Session keeps this collector
+        # decoupled from SQLAlchemy while still allowing it to skip messages
+        # acknowledged by the caller after persistence. The collector never
+        # marks a message itself: only the caller knows whether every parsed
+        # job was persisted successfully.
         self._is_message_processed = is_message_processed or (lambda _message_id: False)
-        self._mark_message_processed = mark_message_processed or (lambda _message_id: None)
         # Set on every fetch() call; read by callers after awaiting fetch()
         # to report how many blocks were skipped (mirrors
         # BundesagenturCollector.skipped_invalid_count).
         self.skipped_invalid_count = 0
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
+        batches = await self.fetch_message_batches(since)
+        return [job for batch in batches for job in batch.jobs]
+
+    async def fetch_message_batches(self, since: datetime | None = None) -> list[XingEmailBatch]:
+        """Fetch jobs grouped by source Message-ID for safe acknowledgment.
+
+        The caller must acknowledge a batch only after every job in it has
+        been persisted. Keeping this XING-specific method separate preserves
+        the generic JobCollector.fetch() -> list[Job] contract.
+        """
         if not is_configured(self.username) or not is_configured(self.app_password):
             raise XingAuthError(
                 "XING_MAILBOX_USERNAME / XING_MAILBOX_APP_PASSWORD is not configured"
@@ -335,14 +350,13 @@ class XingEmailCollector(JobCollector):
         # manually and infrequently (like Bundesagentur's), so native
         # asyncio I/O isn't worth the extra dependency here.
         #
-        # Note: the injected is_message_processed/mark_message_processed
-        # callables (bound to the caller's db.Session — see
-        # app/api/routes.py) get invoked from this worker thread. That's
-        # safe here only because the route handler awaits this call and
-        # does not touch `db` concurrently while it's in flight.
+        # Note: the injected is_message_processed callable (bound to the
+        # caller's db.Session — see app/api/routes.py) gets invoked from this
+        # worker thread. That's safe here only because the route handler
+        # awaits this call and does not touch `db` concurrently while it runs.
         return await asyncio.to_thread(self._fetch_sync, since_date)
 
-    def _fetch_sync(self, since: datetime) -> list[Job]:
+    def _fetch_sync(self, since: datetime) -> list[XingEmailBatch]:
         client = self._injected_client
         owns_connection = client is None
         if client is None:
@@ -359,10 +373,12 @@ class XingEmailCollector(JobCollector):
                 raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
 
             message_numbers = data[0].split() if data and data[0] else []
-            jobs: list[Job] = []
+            batches: list[XingEmailBatch] = []
             for message_number in message_numbers:
-                jobs.extend(self._fetch_and_process_message(client, message_number))
-            return jobs
+                batch = self._fetch_and_process_message(client, message_number)
+                if batch is not None:
+                    batches.append(batch)
+            return batches
         finally:
             if owns_connection:
                 self._disconnect(client)
@@ -391,38 +407,39 @@ class XingEmailCollector(JobCollector):
         except Exception:
             logger.warning("xing_email_imap_logout_failed", exc_info=True)
 
-    def _fetch_and_process_message(self, client: ImapClient, message_number: bytes) -> list[Job]:
+    def _fetch_and_process_message(
+        self, client: ImapClient, message_number: bytes
+    ) -> XingEmailBatch | None:
         typ, msg_data = client.fetch(message_number, "(RFC822)")
         if typ != "OK" or not msg_data or msg_data[0] is None:
             logger.warning("xing_email_message_fetch_failed message_number=%s", message_number)
-            return []
+            return None
 
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
         return self._process_message(msg)
 
-    def _process_message(self, msg: Message) -> list[Job]:
+    def _process_message(self, msg: Message) -> XingEmailBatch | None:
         sender = parseaddr(msg.get("From", ""))[1].casefold()
         if sender != XING_DIGEST_SENDER:
-            return []
+            return None
 
         subject = _decode_subject(msg.get("Subject", ""))
         if not _is_job_digest_subject(subject):
             logger.info("xing_email_skipped_subject subject=%s", subject)
-            return []
+            return None
 
         message_id = (msg.get("Message-ID") or "").strip()
         if not message_id:
             logger.warning("xing_email_skipped_missing_message_id subject=%s", subject)
-            return []
+            return None
         if self._is_message_processed(message_id):
-            return []
+            return None
 
         body = _extract_plaintext_body(msg)
         if not body:
             logger.warning("xing_email_no_plaintext_body message_id=%s", message_id)
-            self._mark_message_processed(message_id)
-            return []
+            return XingEmailBatch(message_id=message_id, jobs=())
 
         jobs: list[Job] = []
         for block in _split_blocks(body):
@@ -435,5 +452,4 @@ class XingEmailCollector(JobCollector):
         if not jobs:
             logger.warning("xing_email_no_valid_job_blocks message_id=%s", message_id)
 
-        self._mark_message_processed(message_id)
-        return jobs
+        return XingEmailBatch(message_id=message_id, jobs=tuple(jobs))
