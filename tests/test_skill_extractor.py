@@ -39,3 +39,57 @@ def test_literal_title_match_is_allowed_without_inferring_adjacent_skills():
 
     assert result.must_have_skills == ["django"]
     assert result.nice_to_have_skills == []
+
+
+def test_explicit_german_requirement_classifies_multiple_technologies_as_must_have():
+    result = extract_skills("Backend Entwickler", "Erfahrung mit Python und Django erforderlich")
+
+    assert result.must_have_skills == ["django", "python"]
+    assert result.nice_to_have_skills == []
+
+
+def test_german_optional_context_classifies_skill_as_nice_to_have():
+    result = extract_skills("Backend Entwickler", "Python wäre wünschenswert")
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == ["python"]
+
+
+def test_company_stack_mentions_are_context_only():
+    result = extract_skills(
+        "Backend Entwickler",
+        "Unser Stack besteht aus Python, PostgreSQL und Docker",
+    )
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == []
+
+
+def test_required_mention_wins_over_optional_mention_of_same_technology():
+    result = extract_skills(
+        "Backend Entwickler",
+        "Python wäre wünschenswert. Erfahrung mit Python ist erforderlich.",
+    )
+
+    assert result.must_have_skills == ["python"]
+    assert result.nice_to_have_skills == []
+
+
+def test_several_technologies_in_one_english_requirement_segment():
+    result = extract_skills(
+        "Backend Engineer",
+        "Experience with Python, PostgreSQL and Docker is required",
+    )
+
+    assert result.must_have_skills == ["docker", "postgresql", "python"]
+    assert result.nice_to_have_skills == []
+
+
+def test_nearest_marker_separates_required_and_optional_mentions_in_one_segment():
+    result = extract_skills(
+        "Backend Engineer",
+        "Python is required, while Docker is optional",
+    )
+
+    assert result.must_have_skills == ["python"]
+    assert result.nice_to_have_skills == ["docker"]

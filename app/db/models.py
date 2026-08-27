@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -19,6 +19,10 @@ class JobRecord(Base):
     url: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     skills_json: Mapped[str] = mapped_column(Text, default="[]")
+    data_confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    skill_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    must_have_skills_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    nice_to_have_skills_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)

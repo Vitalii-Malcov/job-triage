@@ -61,6 +61,10 @@ class JobDetail(BaseModel):
     url: str
     description: str
     skills: list[str]
+    data_confidence: float
+    skill_source: SkillSource | None
+    must_have_skills: list[str]
+    nice_to_have_skills: list[str]
     score: int
     recommendation: str
     status: ApplicationStatus

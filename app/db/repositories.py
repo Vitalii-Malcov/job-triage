@@ -81,6 +81,12 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         existing.score = score.score
         existing.recommendation = score.recommendation
         existing.skills_json = json.dumps(job.skills)
+        existing.data_confidence = score.data_confidence
+        existing.skill_source = job.skill_source
+        existing.must_have_skills_json = json.dumps(job.must_have_skills)
+        existing.nice_to_have_skills_json = json.dumps(job.nice_to_have_skills)
+        if job.description.strip():
+            existing.description = job.description
         db.commit()
         db.refresh(existing)
         return existing, False
@@ -94,6 +100,10 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         url=str(job.url),
         description=job.description,
         skills_json=json.dumps(job.skills),
+        data_confidence=score.data_confidence,
+        skill_source=job.skill_source,
+        must_have_skills_json=json.dumps(job.must_have_skills),
+        nice_to_have_skills_json=json.dumps(job.nice_to_have_skills),
         score=score.score,
         recommendation=score.recommendation,
         status="NEW",

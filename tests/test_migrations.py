@@ -2,7 +2,7 @@ from pathlib import Path
 
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,6 +35,10 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "url",
         "description",
         "skills_json",
+        "data_confidence",
+        "skill_source",
+        "must_have_skills_json",
+        "nice_to_have_skills_json",
         "score",
         "recommendation",
         "status",
@@ -50,6 +54,51 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
 
     job_indexes = inspector.get_indexes("jobs")
     assert any(idx["column_names"] == ["status"] for idx in job_indexes)
+
+
+def test_enrichment_migration_backfills_existing_jobs_with_safe_defaults(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_existing_job.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "9fd80046ea7e")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'existing-fingerprint', 'bundesagentur', 'Existing Job', 'Example GmbH',
+                    'Berlin', 'https://example.com/jobs/existing', 'Existing description',
+                    '["python"]', 75, 'MAYBE', 'NEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    """
+                SELECT data_confidence, skill_source, must_have_skills_json,
+                       nice_to_have_skills_json
+                FROM jobs WHERE fingerprint = 'existing-fingerprint'
+                """
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    assert row["data_confidence"] == 0.0
+    assert row["skill_source"] is None
+    assert row["must_have_skills_json"] == "[]"
+    assert row["nice_to_have_skills_json"] == "[]"
 
 
 def test_downgrade_base_then_upgrade_head_roundtrip(tmp_path: Path) -> None:

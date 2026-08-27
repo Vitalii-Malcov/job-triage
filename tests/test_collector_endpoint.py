@@ -335,6 +335,9 @@ class TestRunBundesagenturCollector:
             "pytest",
             "python",
         ]
+        assert rich_detail["data_confidence"] > 0.0
+        assert rich_detail["skill_source"] == "description_extracted"
+        assert rich_detail["must_have_skills"]
 
     def test_second_run_reuses_persisted_detail_instead_of_refetching(self, client, monkeypatch):
         referenznummer = "10000-cached-S"
@@ -360,6 +363,14 @@ class TestRunBundesagenturCollector:
         assert first.status_code == 200
         assert second.status_code == 200
         assert fake_collector.detail_calls == [referenznummer]
+
+        listed = client.get("/api/v1/jobs", headers=_auth_headers()).json()
+        assert len(listed) == 1
+        detail = client.get(f"/api/v1/jobs/{listed[0]['id']}", headers=_auth_headers()).json()
+        assert detail["description"] == description
+        assert detail["data_confidence"] > 0.0
+        assert detail["skill_source"] == "description_extracted"
+        assert detail["must_have_skills"]
 
 
 class TestBundesagenturCollectorNotifications:

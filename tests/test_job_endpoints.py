@@ -62,6 +62,10 @@ def _seed_job(session_factory, **overrides) -> int:
         "url": "https://example.com/jobs/1",
         "description": "We build APIs.",
         "skills_json": json.dumps(["python", "fastapi"]),
+        "data_confidence": 0.9,
+        "skill_source": "description_extracted",
+        "must_have_skills_json": json.dumps(["python"]),
+        "nice_to_have_skills_json": json.dumps(["fastapi"]),
         "score": 80,
         "recommendation": "APPLY",
         "status": overrides.pop("status", "NEW"),
@@ -155,6 +159,10 @@ class TestGetJob:
         assert body["id"] == job_id
         assert body["fingerprint"] == "fp-detail"
         assert body["skills"] == ["python", "fastapi"]
+        assert body["data_confidence"] == 0.9
+        assert body["skill_source"] == "description_extracted"
+        assert body["must_have_skills"] == ["python"]
+        assert body["nice_to_have_skills"] == ["fastapi"]
 
     def test_get_job_404_for_missing_id(self, client):
         c, _ = client
