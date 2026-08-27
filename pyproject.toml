@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-job-search-control-center"
+version = "0.2.0"
+description = "AI multi-agent job search control center"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116",
+  "uvicorn[standard]>=0.35",
+  "pydantic>=2.11",
+  "pydantic-settings>=2.10",
+  "httpx>=0.28",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4",
+  "pytest-asyncio>=1.1",
+  "ruff>=0.12",
+  "pre-commit>=4.2",
+]
+postgres = [
+  "psycopg[binary]>=3.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Vendored/installed Claude Code skills are third-party reference docs, not
+# project source — don't lint or format their bundled scripts/snippets.
+extend-exclude = [".claude/skills"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# B008: FastAPI's Depends(...) in argument defaults is the documented,
+# intended pattern (see FastAPI docs) — not a real bug here.
+ignore = ["B008"]
