@@ -81,7 +81,10 @@ _NICE_TO_HAVE_MARKERS = re.compile(
 _MUST_HAVE_MARKERS = re.compile(
     r"\b(?:"
     r"(?<!nicht\s)erforderlich|vorausgesetzt|voraussetzung(?:en)?|"
-    r"kenntnisse\s+(?:in|mit)|erfahrung\s+(?:mit|in)|"
+    r"(?:fach)?kenntnisse\s*(?::|(?:in|mit)\b)|"
+    r"erfahrungen\s+mit|berufserfahrung\s+als|"
+    r"erfahrung\s+(?:mit|in|im\s+umgang\s+mit)|"
+    r"mit\b.{0,160}\bvertraut|strong\s+understanding\s+of|"
     r"bringst\b.{0,100}\bmit|beherrsch(?:st|en)|(?:sicherer|versierter)\s+umgang\s+mit|"
     r"must|(?<!not\s)required|requirements?|experience\s+(?:with|in)|"
     r"proficiency\s+(?:in|with)|knowledge\s+of|skilled\s+in"
@@ -89,6 +92,40 @@ _MUST_HAVE_MARKERS = re.compile(
     re.IGNORECASE,
 )
 _SEGMENT_BOUNDARY = re.compile(r"(?:\r?\n)+|(?<=[.!?;])\s+")
+_POSTFIX_NICE_MARKERS = re.compile(
+    r"\b(?:(?:ist|sind|wäre|wären)\s+)?(?:von vorteil|wünschenswert|preferred|desirable)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_REQUIRED_MARKERS = re.compile(
+    r"\b(?:(?<!nicht\s)erforderlich|vorausgesetzt|must|(?<!not\s)required)\b",
+    re.IGNORECASE,
+)
+_CONTRAST_MARKERS = re.compile(r"\b(?:aber|hingegen|jedoch|während|but|while|whereas)\b", re.I)
+_BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]+|>>+)\s*")
+_MUST_SECTION_HEADERS = {
+    "das bringst du mit",
+    "das bringen sie mit",
+    "dein profil",
+    "ihr profil",
+    "your profile",
+    "qualifications",
+    "qualifikationen",
+    "was sollst du mitbringen",
+}
+_NICE_SECTION_HEADERS = {"ideal skills", "nice to have", "wünschenswert"}
+_OTHER_SECTION_HEADERS = {
+    "aufgaben",
+    "deine aufgaben",
+    "ihre aufgaben",
+    "responsibilities",
+    "your responsibilities",
+    "wir bieten",
+    "unser angebot",
+    "what we offer",
+    "benefits",
+    "über uns",
+    "about us",
+}
 
 
 def _distance(left: re.Match[str], right: re.Match[str]) -> int:
@@ -103,17 +140,122 @@ def _classify_mention(
     mention: re.Match[str],
     must_markers: list[re.Match[str]],
     nice_markers: list[re.Match[str]],
+    inherited_context: str | None,
+    segment: str,
+    postfix_nice_scope: bool,
 ) -> str | None:
+    if postfix_nice_scope:
+        return "nice"
+    if inherited_context == "nice" and not _EXPLICIT_REQUIRED_MARKERS.search(segment):
+        return "nice"
     if must_markers and not nice_markers:
         return "must"
     if nice_markers and not must_markers:
         return "nice"
     if not must_markers and not nice_markers:
-        return None
+        return inherited_context
 
     nearest_must = min(_distance(mention, marker) for marker in must_markers)
     nearest_nice = min(_distance(mention, marker) for marker in nice_markers)
     return "must" if nearest_must <= nearest_nice else "nice"
+
+
+def _normalized_header(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip().rstrip(":?!").casefold())
+
+
+def _section_header(line: str) -> tuple[str | None, str] | None:
+    prefix, separator, remainder = line.partition(":")
+    candidate = _normalized_header(prefix if separator else line)
+    if candidate in _MUST_SECTION_HEADERS:
+        return "must", remainder.strip()
+    if candidate in _NICE_SECTION_HEADERS:
+        return "nice", remainder.strip()
+    return None
+
+
+def _is_other_section_header(line: str, had_bullet: bool) -> bool:
+    normalized = _normalized_header(line)
+    return normalized in _OTHER_SECTION_HEADERS or (
+        not had_bullet and line.rstrip().endswith(":") and len(line) <= 80
+    )
+
+
+def _continues_previous_segment(previous: str, current: str) -> bool:
+    previous_normalized = previous.rstrip().casefold()
+    current_normalized = current.lstrip().casefold()
+    continuation_endings = (",", " and", " or", " und", " oder", " sowie")
+    continuation_starts = ("and ", "or ", "und ", "oder ", "sowie ")
+    has_requirement_context = bool(
+        _MUST_HAVE_MARKERS.search(previous) or _NICE_TO_HAVE_MARKERS.search(previous)
+    )
+    return has_requirement_context and (
+        previous_normalized.endswith(continuation_endings)
+        or current_normalized.startswith(continuation_starts)
+        or (current[:1].islower() and not previous.rstrip().endswith((".", "!", "?", ";")))
+    )
+
+
+def _contextual_segments(description: str) -> list[tuple[str, str | None]]:
+    lines: list[tuple[str, str | None]] = []
+    section_context: str | None = None
+
+    for raw_line in description.splitlines():
+        had_bullet = bool(_BULLET_PREFIX.match(raw_line))
+        line = _BULLET_PREFIX.sub("", raw_line).strip()
+        if not line:
+            continue
+
+        header = _section_header(line)
+        if header is not None:
+            section_context, remainder = header
+            if not remainder:
+                continue
+            line = remainder
+        elif re.match(r"^fachkenntnisse\s*:", line, re.IGNORECASE):
+            section_context = "must"
+        elif _is_other_section_header(line, had_bullet):
+            section_context = None
+            continue
+
+        if (
+            lines
+            and lines[-1][1] == section_context
+            and _continues_previous_segment(lines[-1][0], line)
+        ):
+            previous, context = lines[-1]
+            lines[-1] = (f"{previous} {line}", context)
+        else:
+            lines.append((line, section_context))
+
+    return [
+        (segment, context)
+        for line, context in lines
+        for segment in _SEGMENT_BOUNDARY.split(line)
+        if segment.strip()
+    ]
+
+
+def _postfix_nice_scopes_all_mentions(
+    segment: str,
+    mentions: list[re.Match[str]],
+    must_markers: list[re.Match[str]],
+) -> bool:
+    if not mentions:
+        return False
+    first_mention = min(mention.start() for mention in mentions)
+    last_mention = max(mention.end() for mention in mentions)
+    postfix_markers = [
+        marker
+        for marker in _POSTFIX_NICE_MARKERS.finditer(segment)
+        if marker.start() >= last_mention
+    ]
+    if not postfix_markers:
+        return False
+    postfix = postfix_markers[0]
+    if _CONTRAST_MARKERS.search(segment, first_mention, postfix.start()):
+        return False
+    return not any(first_mention <= marker.start() < postfix.start() for marker in must_markers)
 
 
 def extract_skills(title: str | None, description: str | None) -> SkillExtraction:
@@ -127,12 +269,23 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
         if pattern.search(title or ""):
             must_have.add(skill)
 
-    for segment in _SEGMENT_BOUNDARY.split(description or ""):
+    for segment, inherited_context in _contextual_segments(description or ""):
         must_markers = list(_MUST_HAVE_MARKERS.finditer(segment))
         nice_markers = list(_NICE_TO_HAVE_MARKERS.finditer(segment))
+        mentions = [
+            mention for _, pattern in _TECHNOLOGY_PATTERNS for mention in pattern.finditer(segment)
+        ]
+        postfix_nice_scope = _postfix_nice_scopes_all_mentions(segment, mentions, must_markers)
         for skill, pattern in _TECHNOLOGY_PATTERNS:
             for mention in pattern.finditer(segment):
-                classification = _classify_mention(mention, must_markers, nice_markers)
+                classification = _classify_mention(
+                    mention,
+                    must_markers,
+                    nice_markers,
+                    inherited_context,
+                    segment,
+                    postfix_nice_scope,
+                )
                 if classification == "must":
                     must_have.add(skill)
                 elif classification == "nice":
