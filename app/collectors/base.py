@@ -12,6 +12,18 @@ class CollectorError(Exception):
     """
 
 
+class CollectorNotConfiguredError(CollectorError):
+    """Raised by a shared collector-run helper when required config (API key,
+    mailbox credentials, etc.) is missing.
+
+    Kept distinct from other CollectorError subclasses so callers can present
+    "not configured" differently from "the upstream call failed" — e.g. the
+    HTTP API maps this to 503 vs. 502 (see app/api/routes.py), and the
+    Telegram control center (app/services/telegram_bot.py) can show a
+    configuration hint instead of a generic failure message.
+    """
+
+
 def is_configured(value: str) -> bool:
     """True if `value` is a real, usable config value rather than empty/whitespace-only.
 

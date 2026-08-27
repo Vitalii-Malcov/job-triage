@@ -24,7 +24,7 @@ AI-система для сбора, оценки и трекинга вакан
 1. ~~PostgreSQL + Alembic migrations~~ — Alembic подключён (см. "Миграции" выше); PostgreSQL поддержан через `.[postgres]` extra, продовое использование ещё предстоит обкатать.
 2. Job collectors: ~~XING alerts/email~~, ~~Bundesagentur für Arbeit~~, StepStone/Indeed where allowed, career pages — частично: Bundesagentur и XING реализованы (см. "Collectors" ниже), Indeed/StepStone/career pages ещё нет, поэтому пункт целиком не вычеркнут.
 3. ~~Application status endpoints: SAVED/APPLIED/INTERVIEW/REJECTED/OFFER~~ — реализовано, см. "Application status" ниже.
-4. Telegram commands/control center
+4. ~~Telegram commands/control center~~ — реализовано, см. "Telegram control center" ниже.
 5. Company Research Agent
 6. CV/Bewerbung Agent
 7. Gmail Response + Follow-up Agent
@@ -248,6 +248,46 @@ curl -X POST -H "X-API-Key: $API_KEY" \
 пользовательскому почтовому ящику через App Password (не изолированный
 ящик только для job-алертов). Осознанное решение для первой итерации —
 изоляция отдельным ящиком вынесена в техдолг на будущее.
+
+## Telegram control center
+
+Двусторонний бот-контроллер поверх `app/services/telegram_bot.py` — читает и
+меняет те же вакансии, что и HTTP API, через те же репозитории и ту же
+`app/domain/status_transitions.py` логику. Использует long polling
+(`getUpdates`), а не webhook — у проекта нет публичного HTTPS-эндпоинта, а
+поднимать его только ради вебхука несоразмерно личному проекту. Бот
+встроен в тот же процесс FastAPI как asyncio-задача в lifespan
+(`app/main.py`), отдельного процесса/скрипта не требует.
+
+Использует те же переменные окружения, что и одностороннее
+best-effort-уведомление (`app/services/telegram.py`) — `TELEGRAM_BOT_TOKEN`
+и `TELEGRAM_CHAT_ID`, новых не нужно. Если `TELEGRAM_BOT_TOKEN` не задан —
+бот просто не стартует (info-лог), остальной API продолжает работать как
+обычно.
+
+**Безопасность:** бот отвечает только чату с `chat_id`, совпадающим с
+`TELEGRAM_CHAT_ID`. Сообщение от любого другого `chat_id` полностью
+игнорируется — ни ответа, ни любого подтверждения, что бот вообще
+существует — только `logger.warning` на сервере с этим `chat_id` и текстом
+сообщения, для видимости попыток постороннего доступа. В БД такие попытки
+не пишутся.
+
+Команды:
+```text
+/start, /help              — список команд
+/jobs [status]              — список вакансий, опционально фильтр по статусу
+/job <id>                   — детали вакансии
+/status <id> <new_status>   — сменить статус (валидация — та же, что у
+                               PATCH /jobs/{id}/status; недопустимый переход
+                               возвращает тот же текст ошибки, что и HTTP API)
+/run bundesagentur           — запустить сбор Bundesagentur
+/run xing                    — запустить сбор XING
+```
+
+`/run bundesagentur` и `/run xing` вызывают ту же внутреннюю функцию, что и
+`POST /collectors/{name}/run` (`app/api/routes.py`'s `_run_bundesagentur` /
+`_run_xing`) — логика сбора и персистентности вакансий существует в одном
+месте, а не дублируется между HTTP API и ботом.
 
 ## Проверки
 ```bash

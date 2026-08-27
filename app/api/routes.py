@@ -6,7 +6,7 @@ from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import JobScorer
-from app.collectors.base import CollectorError, is_configured
+from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_configured
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.core.config import get_settings
@@ -168,16 +168,19 @@ def patch_job_status(
     return _to_detail(record)
 
 
-@router.post(
-    "/collectors/bundesagentur/run",
-    dependencies=[Depends(require_api_key), Depends(enforce_collector_rate_limit)],
-)
-async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str, int]:
-    settings = get_settings()
+async def _run_bundesagentur(db: Session, settings) -> dict[str, int]:
+    """Fetch + score + persist one Bundesagentur collector run.
+
+    Shared by POST /collectors/bundesagentur/run and the Telegram control
+    center's `/run bundesagentur` command (app/services/telegram_bot.py) so
+    this logic lives in exactly one place. Raises CollectorNotConfiguredError
+    if BUNDESAGENTUR_API_KEY isn't set, or a CollectorError subclass if the
+    upstream fetch ultimately fails — callers translate these into their own
+    presentation (HTTP status code vs. a chat message).
+    """
     if not is_api_key_configured(settings.bundesagentur_api_key):
-        raise HTTPException(
-            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY.",
+        raise CollectorNotConfiguredError(
+            "Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY."
         )
 
     collector = BundesagenturCollector(
@@ -187,14 +190,7 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
         radius_km=settings.bundesagentur_search_radius_km,
     )
 
-    try:
-        jobs = await collector.fetch()
-    except CollectorError as exc:
-        logger.exception("bundesagentur_collector_run_failed")
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail=f"Bundesagentur Jobsuche API request failed: {exc}",
-        ) from exc
+    jobs = await collector.fetch()
 
     profile = get_or_create_default_profile(db)
     created_count = 0
@@ -244,20 +240,38 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
 
 
 @router.post(
-    "/collectors/xing/run",
-    dependencies=[Depends(require_api_key), Depends(enforce_xing_rate_limit)],
+    "/collectors/bundesagentur/run",
+    dependencies=[Depends(require_api_key), Depends(enforce_collector_rate_limit)],
 )
-async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
+async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str, int]:
     settings = get_settings()
+    try:
+        return await _run_bundesagentur(db, settings)
+    except CollectorNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except CollectorError as exc:
+        logger.exception("bundesagentur_collector_run_failed")
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bundesagentur Jobsuche API request failed: {exc}",
+        ) from exc
+
+
+async def _run_xing(db: Session, settings) -> dict[str, int]:
+    """Fetch + score + persist one XING mailbox collector run.
+
+    Shared by POST /collectors/xing/run and the Telegram control center's
+    `/run xing` command (app/services/telegram_bot.py) — see
+    `_run_bundesagentur` above for the same rationale.
+    """
     if not is_configured(settings.xing_mailbox_username) or not is_configured(
         settings.xing_mailbox_app_password
     ):
-        raise HTTPException(
-            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "XING mailbox collector is not configured: set "
-                "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
-            ),
+        raise CollectorNotConfiguredError(
+            "XING mailbox collector is not configured: set "
+            "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
         )
 
     collector = XingEmailCollector(
@@ -273,14 +287,7 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
         mark_message_processed=lambda message_id: mark_message_processed(db, "xing", message_id),
     )
 
-    try:
-        jobs = await collector.fetch()
-    except CollectorError as exc:
-        logger.exception("xing_collector_run_failed")
-        raise HTTPException(
-            status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail=f"XING mailbox collector request failed: {exc}",
-        ) from exc
+    jobs = await collector.fetch()
 
     profile = get_or_create_default_profile(db)
     created_count = 0
@@ -325,3 +332,23 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
         "skipped_invalid": collector.skipped_invalid_count,
         "failed": failed_count,
     }
+
+
+@router.post(
+    "/collectors/xing/run",
+    dependencies=[Depends(require_api_key), Depends(enforce_xing_rate_limit)],
+)
+async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
+    settings = get_settings()
+    try:
+        return await _run_xing(db, settings)
+    except CollectorNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except CollectorError as exc:
+        logger.exception("xing_collector_run_failed")
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"XING mailbox collector request failed: {exc}",
+        ) from exc
