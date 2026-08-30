@@ -551,3 +551,57 @@ class CandidateJobMatchRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
+
+
+class CandidateCVDraftRecord(Base):
+    """An immutable, computed Tailored CV Draft snapshot (Stage 6C) — see
+    app/agents/cv_adapter.py for the deterministic selection/ordering
+    algorithm and app/db/candidate_cv_draft_repository.py for cache
+    identity / concurrency handling.
+
+    **Immutability (section 32).** A draft is never updated in place —
+    when the profile, job, match, or cv_adapter_version changes, a NEW row
+    is created (see the UNIQUE constraint below); old drafts remain
+    exactly as generated, forever showing which profile version/job
+    snapshot/match/adapter algorithm produced them. No UPDATE statement
+    anywhere in this project ever targets this table.
+
+    Deliberately not linked to JobRecord or CandidateJobMatchRecord via a
+    ForeignKey — same rationale as CandidateJobMatchRecord's own
+    docstring: this table's cache identity must survive the referenced
+    match/profile/job moving on to a later state without cascading
+    deletes, which is the opposite of what an FK relationship is for.
+    """
+
+    __tablename__ = "candidate_cv_drafts"
+    __table_args__ = (
+        UniqueConstraint(
+            "match_id",
+            "cv_adapter_version",
+            name="uq_candidate_cv_drafts_cache_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # The one specific persisted CandidateJobMatchRecord.id this draft is
+    # pinned to (Stage 6C section 5) — never "whatever GET .../match
+    # currently returns."
+    match_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Snapshot pins, copied from the pinned match at draft-generation time
+    # (sections 6/7/8/9) — the match itself already pins job content and
+    # profile version, so these are traceability copies, not independent
+    # identity components (the UNIQUE constraint above deliberately keys
+    # only on match_id + cv_adapter_version, per section 33's explicit
+    # "do not duplicate redundant identity components" instruction).
+    candidate_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_algorithm_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    cv_adapter_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
+    draft_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )

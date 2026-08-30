@@ -532,3 +532,96 @@ def test_candidate_job_matches_downgrade_removes_table_then_upgrade_restores_it(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "candidate_job_matches" in inspector.get_table_names()
+
+
+def test_candidate_cv_drafts_migration_creates_table_and_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_candidate_cv_drafts.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "candidate_cv_drafts" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("candidate_cv_drafts")}
+    assert columns == {
+        "id",
+        "job_id",
+        "match_id",
+        "candidate_profile_version",
+        "job_snapshot_fingerprint",
+        "match_algorithm_version",
+        "cv_adapter_version",
+        "status",
+        "draft_json",
+        "created_at",
+    }
+
+    indexes = {tuple(idx["column_names"]) for idx in inspector.get_indexes("candidate_cv_drafts")}
+    assert ("job_id",) in indexes
+    assert ("match_id",) in indexes
+
+    unique_constraints = inspector.get_unique_constraints("candidate_cv_drafts")
+    assert any(
+        set(uc["column_names"]) == {"match_id", "cv_adapter_version"} for uc in unique_constraints
+    )
+
+
+def test_candidate_cv_drafts_cache_identity_rejects_duplicates(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_candidate_cv_drafts_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO candidate_cv_drafts (
+                    job_id, match_id, candidate_profile_version, job_snapshot_fingerprint,
+                    match_algorithm_version, cv_adapter_version, status, draft_json, created_at
+                ) VALUES (
+                    1, 1, 1, 'fp-a', 'v1', 'v1', 'DRAFT', '{}', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO candidate_cv_drafts (
+                        job_id, match_id, candidate_profile_version, job_snapshot_fingerprint,
+                        match_algorithm_version, cv_adapter_version, status, draft_json, created_at
+                    ) VALUES (
+                        1, 1, 1, 'fp-b', 'v1', 'v1', 'DRAFT', '{}', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+
+def test_candidate_cv_drafts_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_candidate_cv_drafts_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "ececa0eab87a")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "candidate_cv_drafts" not in tables
+    # Downgrading one step must not touch the previous (Candidate Job
+    # Match) migration's own tables.
+    assert "candidate_job_matches" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "candidate_cv_drafts" in inspector.get_table_names()

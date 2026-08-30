@@ -123,6 +123,32 @@ def enforce_match_rate_limit(request: Request) -> None:
         bucket.append(now)
 
 
+# Separate bucket for CV draft generation: like matching (section above),
+# this is pure local computation with zero network calls, but a POST still
+# writes a new candidate_cv_drafts row when the cache misses — same
+# rationale and same generous sizing as MATCH_RATE_LIMIT above.
+_cv_draft_requests: dict[str, deque[float]] = defaultdict(deque)
+CV_DRAFT_RATE_LIMIT_REQUESTS = 30
+CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_cv_draft_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _cv_draft_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= CV_DRAFT_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="CV draft rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_company_research_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()

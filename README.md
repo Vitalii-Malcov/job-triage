@@ -28,8 +28,8 @@ AI-система для сбора, оценки и трекинга вакан
 5. ~~Company Research Agent~~ — реализовано, см. "Company Research Agent" ниже.
 6. CV/Bewerbung Agent — по подэтапам, см. "Candidate Profile" ниже:
    - [x] 6A Candidate Profile foundation — структурированная модель фактов о кандидате, см. "Candidate Profile" ниже.
-   - [ ] 6B Job-to-profile matching
-   - [ ] 6C CV adaptation
+   - [x] 6B Job-to-profile matching — детерминированный evidence-first матчинг, см. "Candidate Job Match" ниже.
+   - [x] 6C CV adaptation — детерминированный evidence-first CV-черновик, см. "Tailored CV Draft" ниже.
    - [ ] 6D Bewerbung generation
    - [ ] 6E Draft review / approval
 7. Gmail Response + Follow-up Agent
@@ -776,6 +776,174 @@ curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/jobs/42/match
 от Company Research, где Telegram-команда была нужна с первого дня).
 Добавление `/match <job_id>` в будущем — вызов уже существующей
 `_run_candidate_job_match` из `app/api/routes.py`, без новой бизнес-логики.
+
+## Tailored CV Draft (Stage 6C)
+
+Детерминированный, evidence-first слой адаптации резюме:
+**Candidate Profile + Candidate Job Match → структурированный CV-черновик**
+(`app/agents/cv_adapter.py`). CV содержит только доверенные факты кандидата;
+ни LLM, ни сети, ни рендеринга в DOCX/PDF — только структура документа
+(`TailoredCVDraft`), которую будущий рендерер сможет потребить отдельно.
+
+**6C не переоткрывает матчинг.** Отбор скиллов читается напрямую из
+`match.matched_requirements` (только `SKILL` + `MATCH`), отбор проектов — из
+`match.relevant_projects`. Никакой skill/language/education-матчинг,
+нормализация или скоринг здесь не переизобретаются —
+`app/agents/cv_adapter.py` не импортирует ни `job_scorer.normalize_skill`,
+ни `requirement_extractor`.
+
+**Правило доверия — то же самое, что и в Stage 6A, не продублировано.**
+`to_candidate_profile_response` намеренно не фильтрует по доверию (GET
+`/candidate-profile` должен показывать все факты, доверенные или нет) —
+поэтому именно `cv_adapter.py` фильтрует: каждая вложенная сущность
+(skill/experience/project/education/certification/language) проверяется
+через `is_usable_for_generation(source, confidence)`, а каждое верхнеуровневое
+поле шапки/summary — через `is_top_level_fact_usable_for_generation`.
+Недоверенный факт исключается так, как будто его не существует в профиле.
+
+**Секции "полной истории" против секций "по evidence матча".** SKILLS и
+PROJECTS показывают только то, что реально подтверждено текущим матчем
+(`matched_requirements`/`relevant_projects`) — раздел 16/21 спецификации
+явно говорит "используй только из матча". EXPERIENCE/EDUCATION/
+CERTIFICATIONS/LANGUAGES показывают **полную доверенную историю** кандидата
+(как в обычном резюме), с аннотацией релевантности (`matched_skills`/
+`emphasis`/`matched_requirement`/`match_status`) там, где она доступна из
+матча — раздел 23/25 говорит "включай доверенное X" без оговорки про
+релевантность матчу, в отличие от 16/21. Хронология и фактическое
+содержимое релевантностью никогда не меняются.
+
+**Header.** Только доверенные `first_name`/`last_name`/
+`professional_title`/`location_city`/`location_country` — каждое поле
+проверяется независимо через `is_top_level_fact_usable_for_generation`.
+Кандидатский `professional_title` **никогда** не подменяется заголовком
+вакансии, даже если тот трастовее/престижнее. Контактные поля
+(email/телефон/GitHub/LinkedIn/website) в схеме Candidate Profile
+принципиально не смоделированы — CV их не содержит, вместо этого всегда
+присутствует технический warning `CONTACT_DATA_NOT_MODELED` (не расширяем
+схему Stage 6A ради этого внутри 6C).
+
+**Summary.** Доверенный `professional_summary` включается дословно; без LLM
+и без переписывания в новые фактические утверждения. Недоверенный или
+отсутствующий summary — просто `null`, без придуманного текста.
+
+**Skills.** `REQUIRED`-скиллы сначала, затем `PREFERRED`; `category`/
+`proficiency`/`years_experience` копируются из `CandidateSkill` дословно —
+`UNKNOWN` proficiency никогда не апгрейдится просто потому, что скилл
+совпал с вакансией. `MISSING`/`UNKNOWN`-требования никогда не попадают в
+CV как будто кандидат ими владеет.
+
+**Experience.** Все доверенные `CandidateExperience`, обратный
+хронологический порядок (текущая работа первой, затем по `start_date`
+по убыванию) — релевантность **не переставляет** хронологию, только
+добавляет `matched_skills`/`emphasis=HIGH|STANDARD` как метаданные.
+Технология, указанная только в `skills` или в другом месте профиля,
+никогда не "пришивается" к опыту, где её нет в собственном
+`technologies`.
+
+**Projects.** Только проекты из `match.relevant_projects` — ранжируются по
+числу подтверждённых скиллов (`len(matched_skills)`, убывание), не по
+дате. Технологии/highlights копируются как есть.
+
+**Education/Certifications/Languages.** Полная доверенная история;
+`completed=false` никогда не превращается в завершённую степень;
+`IN_PROGRESS`-сертификат никогда не рендерится как `COMPLETED`; уровень
+языка **никогда** не апгрейдится к требуемому вакансией — кандидат B1
+против требования B2 в CV остаётся B1, а `matched_requirement`/
+`match_status` (например, `"German B2"` / `PARTIAL`) — это только
+внутренняя метаданность, не изменяющая рендерящийся факт.
+
+**Section order / emphasis (раздел 38).** По умолчанию: `HEADER → SUMMARY
+→ SKILLS → EXPERIENCE → PROJECTS → EDUCATION → CERTIFICATIONS →
+LANGUAGES`. Единственное, явное, недвусмысленное правило эмфазиса:
+`projects_emphasis = "HIGH"` (PROJECTS переставляется перед EXPERIENCE)
+только когда у кандидата нет доверенного профессионального опыта вообще,
+но есть хотя бы один релевантный проект — типичный сигнал junior/смены
+специальности, основанный на реальных данных профиля, а не на
+эвристическом угадывании "junior" из текста вакансии.
+
+**Provenance (раздел 28/53, включая M-01 fix).** Каждый элемент CV несёт
+`source_entity` + `source_id`, указывающие на конкретную строку Candidate
+Profile — ни одной "осиротевшей" фактической строки без источника.
+Верхнеуровневые résumé-факты (`header.first_name`/`last_name`/
+`professional_title`/`location_city`/`location_country` и
+`professional_summary`) — не голые строки, а типизированная обёртка
+`CVTopLevelFact` с `value` + `source_entity="candidate_profile"` +
+`source_id=profile.id` (реальный id загруженного профиля, никогда не
+захардкожен, хотя Stage 6A singleton сейчас гарантирует `id=1`) +
+`source_field` (точное имя поля — `"first_name"`, `"professional_title"` и
+т.д., не расплывчатое `"header"`/`"profile"`) + `profile_version`. У
+каждого верхнеуровневого поля — своя собственная обёртка, не одна общая на
+весь header: `first_name`/`professional_title`/`location_city` несут
+независимый Stage 6A `field_trust` и могут быть доверены/недоверены
+совершенно независимо друг от друга. Недоверенное поле — это `null`, без
+объекта провенанса и без значения, никогда fallback-подстановка. Эта
+provenance переживает `compute_cv_draft` → `draft_json`-сериализацию → БД →
+`GET` (и `latest`, и по `draft_id`) без потерь — подтверждено round-trip
+тестами на уровне репозитория и полного HTTP API.
+
+**Snapshot pinning и консистентность (разделы 5–9).** CV-черновик
+привязывается к одному конкретному `match_id`, переданному явно в теле
+запроса — никогда к "последнему матчу". Перед генерацией:
+- `match.job_id` должен совпадать с `job_id` из URL — иначе `422`
+  (`Match {match_id} does not belong to job {job_id}.`) — структурно
+  некорректная комбинация запроса, не пропавший ресурс и не устаревшее
+  состояние;
+- текущая версия Candidate Profile должна совпадать с
+  `match.candidate_profile_version` — иначе `409` с
+  `match_profile_version`/`current_profile_version` (только номера версий,
+  никакого содержимого профиля);
+- текущий `compute_job_snapshot_fingerprint(job)` (переиспользуется из
+  Stage 6B, не переизобретается) должен совпадать с
+  `match.job_snapshot_fingerprint` — иначе `409`, без дампа описания
+  вакансии.
+
+Ни при одном из этих `409`/`422` черновик не создаётся.
+
+**Immutability и кэш-идентичность (разделы 32/33).** `candidate_cv_drafts`
+никогда не обновляется — при смене профиля/вакансии/матча/
+`cv_adapter_version` создаётся новая строка, старые остаются нетронутыми
+снимками. DB-enforced `UNIQUE(match_id, cv_adapter_version)` — этого
+достаточно, так как сам матч уже пинит `job`/`candidate_profile_version`/
+`job_snapshot_fingerprint`/`algorithm_version` (раздел 33 явно требует не
+дублировать избыточные компоненты идентичности). Два одновременных `POST`
+с одинаковой идентичностью не создают дубликат: `IntegrityError`
+перехватывается, побеждает уже закоммиченная строка
+(`app/db/candidate_cv_draft_repository.py`'s `create_draft`, тот же
+паттерн, что `create_match`/`get_or_create_candidate_profile`).
+`force_recompute=true` с неизменными входами детерминированно пересчитывает
+то же самое и упирается в тот же `UNIQUE` — новая строка не создаётся (это
+ожидаемо, не баг).
+
+**HTTP API:**
+```bash
+curl -X POST -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"match_id": 123, "force_recompute": false}' \
+  http://localhost:8000/api/v1/jobs/42/cv-draft
+
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/jobs/42/cv-draft
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/cv-drafts/7
+```
+`POST /jobs/{id}/cv-draft` — считает или переиспользует кэш; `match_id`
+обязателен (422 при отсутствии), `force_recompute` опционален. `GET
+/jobs/{id}/cv-draft` — чистое чтение последнего черновика, **никогда не
+считает**. `GET /cv-drafts/{draft_id}` — точный неизменяемый снимок по его
+собственному id.
+
+**Безопасность:** `app/agents/cv_adapter.py` не делает ни одного
+HTTP/DNS-запроса — чистая функция над уже загруженными данными; Company
+Research в 6C вообще не читается (только `company_research_id` из матча,
+чисто для трассируемости, влияния на контент CV нет). Ничего в Stage 6C не
+может отправить email/CV, открыть XING/LinkedIn, написать рекрутёру или
+сменить статус заявки — human approval остаётся обязательным (approval —
+задача будущего Stage 6E). В логах — только
+`job_id`/`match_id`/`draft_id`/`profile_version`/`adapter_version`/
+`status`, никогда имя кандидата, summary, тексты опыта/проектов, скиллы
+или уровни языков.
+
+**Осознанно не в Stage 6C:** генерация Bewerbung/сопроводительного письма
+(6D), рендеринг DOCX/PDF, LLM-переписывание формулировок, сопоставление
+сертификатов с требованиями вакансии (6B их не матчит), одобрение/
+редактирование черновика человеком (6E).
 
 ## Проверки
 ```bash

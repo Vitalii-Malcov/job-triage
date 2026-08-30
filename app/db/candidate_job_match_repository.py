@@ -80,6 +80,15 @@ def get_latest_match(db: Session, job_id: int) -> CandidateJobMatchRecord | None
     return db.scalar(stmt)
 
 
+def get_match_by_id(db: Session, match_id: int) -> CandidateJobMatchRecord | None:
+    """Pure lookup by primary key — used by Stage 6C's CV draft
+    orchestration to load the one specific match a draft is pinned to
+    (never "the latest match"; see app/api/routes.py's
+    `_run_candidate_cv_draft` and Stage 6C spec section 5).
+    """
+    return db.get(CandidateJobMatchRecord, match_id)
+
+
 def get_cached_match(
     db: Session,
     *,

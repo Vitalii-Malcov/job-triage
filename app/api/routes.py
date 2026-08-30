@@ -7,17 +7,33 @@ from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
 from app.agents.candidate_job_matcher import ALGORITHM_VERSION, JobMatchInput, compute_match
+from app.agents.cv_adapter import (
+    CV_ADAPTER_VERSION,
+    CVDraftJobChangedError,
+    CVDraftMatchJobMismatchError,
+    CVDraftMatchNotFoundError,
+    CVDraftProfileChangedError,
+    compute_cv_draft,
+)
 from app.agents.job_scorer import JobScorer
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_configured
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.core.config import get_settings
+from app.db.candidate_cv_draft_repository import (
+    create_draft,
+    get_cached_draft,
+    get_draft_by_id,
+    get_latest_draft,
+    to_tailored_cv_draft,
+)
 from app.db.candidate_job_match_repository import (
     compute_job_snapshot_fingerprint,
     create_match,
     get_cached_match,
     get_latest_match,
+    get_match_by_id,
     to_candidate_job_match,
 )
 from app.db.candidate_profile_repository import (
@@ -48,12 +64,14 @@ from app.models.company_research import (
     CompanyResearchRunResponse,
     ResearchRequest,
 )
+from app.models.cv_draft import CVDraftRequest, TailoredCVDraft
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.providers.base import ProviderNotConfiguredError
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
+    enforce_cv_draft_rate_limit,
     enforce_match_rate_limit,
     enforce_rate_limit,
     enforce_xing_rate_limit,
@@ -458,6 +476,151 @@ def get_candidate_job_match(job_id: int, db: Session = Depends(get_db)) -> Candi
             detail="No match analysis found for this job. POST /jobs/{id}/match to compute it.",
         )
     return to_candidate_job_match(record)
+
+
+def _run_candidate_cv_draft(
+    db: Session, job_id: int, match_id: int, *, force_recompute: bool
+) -> TailoredCVDraft | None:
+    """Compute (or reuse a cached) Tailored CV Draft pinned to one
+    specific persisted match (Stage 6C). Returns None if the job doesn't
+    exist — callers translate that into their own 404. Raises
+    CVDraftMatchNotFoundError / CVDraftMatchJobMismatchError /
+    CVDraftProfileChangedError / CVDraftJobChangedError for every other
+    validation failure — see those classes' docstrings in
+    app/agents/cv_adapter.py for the exact 404/422/409 semantics this
+    function's callers map them to.
+
+    Deliberately synchronous, like _run_candidate_job_match: compute_match
+    (0 network) has already run in Stage 6B, and compute_cv_draft performs
+    zero I/O of its own (no LLM, no network — section 29/42), so nothing
+    here needs to await.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+
+    match_record = get_match_by_id(db, match_id)
+    if match_record is None:
+        raise CVDraftMatchNotFoundError(match_id)
+    if match_record.job_id != job_id:
+        raise CVDraftMatchJobMismatchError(match_id=match_id, job_id=job_id)
+
+    profile_record = get_or_create_candidate_profile(db)
+    if profile_record.profile_version != match_record.candidate_profile_version:
+        raise CVDraftProfileChangedError(
+            match_profile_version=match_record.candidate_profile_version,
+            current_profile_version=profile_record.profile_version,
+        )
+
+    current_fingerprint = compute_job_snapshot_fingerprint(job)
+    if current_fingerprint != match_record.job_snapshot_fingerprint:
+        raise CVDraftJobChangedError()
+
+    if not force_recompute:
+        existing = get_cached_draft(db, match_id=match_id, cv_adapter_version=CV_ADAPTER_VERSION)
+        if existing is not None:
+            return to_tailored_cv_draft(existing)
+
+    profile = to_candidate_profile_response(profile_record)
+    match = to_candidate_job_match(match_record)
+    data = compute_cv_draft(profile, match)
+    record, _created = create_draft(db, job_id, current_fingerprint, data)
+
+    # Privacy-safe (Stage 6C section 41): technical metadata only, never
+    # candidate name/summary/experience/project/skill/language content.
+    logger.info(
+        "candidate_cv_draft_computed job_id=%s match_id=%s draft_id=%s profile_version=%s "
+        "adapter_version=%s status=%s",
+        job_id,
+        match_id,
+        record.id,
+        profile.profile_version,
+        CV_ADAPTER_VERSION,
+        record.status,
+    )
+    return to_tailored_cv_draft(record)
+
+
+@router.post(
+    "/jobs/{job_id}/cv-draft",
+    response_model=TailoredCVDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_cv_draft_rate_limit)],
+)
+def run_candidate_cv_draft(
+    job_id: int,
+    body: CVDraftRequest,
+    db: Session = Depends(get_db),
+) -> TailoredCVDraft:
+    """Compute or reuse a deterministic Tailored CV Draft pinned to
+    `body.match_id`. `match_id` is required (no "latest match" fallback —
+    section 5). Always 200 for a valid, still-fresh match, even with a
+    sparse/empty Candidate Profile (section 37) — a profile with few
+    trusted facts yields a sparse draft plus explicit warnings, never a
+    failure merely because the profile is sparse.
+    """
+    try:
+        result = _run_candidate_cv_draft(
+            db, job_id, body.match_id, force_recompute=body.force_recompute
+        )
+    except CVDraftMatchNotFoundError as exc:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CVDraftMatchJobMismatchError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except CVDraftProfileChangedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "match_profile_version": exc.match_profile_version,
+                "current_profile_version": exc.current_profile_version,
+            },
+        ) from exc
+    except CVDraftJobChangedError as exc:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    if result is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return result
+
+
+@router.get(
+    "/jobs/{job_id}/cv-draft",
+    response_model=TailoredCVDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_candidate_cv_draft_for_job(job_id: int, db: Session = Depends(get_db)) -> TailoredCVDraft:
+    """Pure cache read — never computes (section 35). Returns the most
+    recently created draft for this job, whatever match/profile
+    version/job content it was generated against.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    record = get_latest_draft(db, job_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="No CV draft found for this job. POST /jobs/{id}/cv-draft to create one.",
+        )
+    return to_tailored_cv_draft(record)
+
+
+@router.get(
+    "/cv-drafts/{draft_id}",
+    response_model=TailoredCVDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_candidate_cv_draft_by_id(draft_id: int, db: Session = Depends(get_db)) -> TailoredCVDraft:
+    """Returns the exact immutable draft snapshot for `draft_id` (section
+    35) — never recomputed, never mutated.
+    """
+    record = get_draft_by_id(db, draft_id)
+    if record is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="CV draft not found")
+    return to_tailored_cv_draft(record)
 
 
 async def _maybe_auto_research(
