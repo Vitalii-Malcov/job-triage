@@ -302,3 +302,130 @@ def test_company_research_downgrade_removes_table_then_upgrade_restores_it(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "company_research" in inspector.get_table_names()
+
+
+def test_candidate_profile_migration_creates_expected_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_candidate_profile.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert {
+        "candidate_profiles",
+        "candidate_skills",
+        "candidate_experiences",
+        "candidate_education",
+        "candidate_certifications",
+        "candidate_projects",
+        "candidate_languages",
+        "candidate_job_preferences",
+    } <= tables
+
+    profile_columns = {col["name"] for col in inspector.get_columns("candidate_profiles")}
+    assert profile_columns == {
+        "id",
+        "profile_version",
+        "first_name",
+        "last_name",
+        "professional_title",
+        "location_city",
+        "location_country",
+        "professional_summary",
+        "career_goal",
+        "target_roles_json",
+        "field_trust_json",
+        "created_at",
+        "updated_at",
+    }
+
+    skill_unique = inspector.get_unique_constraints("candidate_skills")
+    assert any(
+        set(uc["column_names"]) == {"candidate_profile_id", "normalized_name"}
+        for uc in skill_unique
+    )
+
+    language_unique = inspector.get_unique_constraints("candidate_languages")
+    assert any(
+        set(uc["column_names"]) == {"candidate_profile_id", "normalized_language"}
+        for uc in language_unique
+    )
+
+    preferences_unique = inspector.get_unique_constraints("candidate_job_preferences")
+    assert any(uc["column_names"] == ["candidate_profile_id"] for uc in preferences_unique)
+
+    for child_table in (
+        "candidate_skills",
+        "candidate_experiences",
+        "candidate_education",
+        "candidate_certifications",
+        "candidate_projects",
+        "candidate_languages",
+        "candidate_job_preferences",
+    ):
+        foreign_keys = inspector.get_foreign_keys(child_table)
+        assert any(
+            fk["referred_table"] == "candidate_profiles"
+            and fk["constrained_columns"] == ["candidate_profile_id"]
+            for fk in foreign_keys
+        )
+
+
+def test_candidate_profiles_singleton_check_constraint_rejects_second_row(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_candidate_profile_singleton.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO candidate_profiles (
+                    id, profile_version, professional_summary, career_goal,
+                    target_roles_json, field_trust_json, created_at, updated_at
+                ) VALUES (1, 1, '', '', '[]', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """
+            )
+        )
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO candidate_profiles (
+                        id, profile_version, professional_summary, career_goal,
+                        target_roles_json, field_trust_json, created_at, updated_at
+                    ) VALUES (2, 1, '', '', '[]', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """
+                )
+            )
+
+
+def test_candidate_profile_downgrade_removes_tables_then_upgrade_restores_them(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_candidate_profile_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "a1c9e3f7b2d4")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "candidate_profiles" not in tables
+    assert "candidate_skills" not in tables
+    # Downgrading one step must not touch the previous (Company Research)
+    # migration's own tables.
+    assert "company_research" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "candidate_profiles" in inspector.get_table_names()

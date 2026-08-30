@@ -26,7 +26,12 @@ AI-система для сбора, оценки и трекинга вакан
 3. ~~Application status endpoints: SAVED/APPLIED/INTERVIEW/REJECTED/OFFER~~ — реализовано, см. "Application status" ниже.
 4. ~~Telegram commands/control center~~ — реализовано, см. "Telegram control center" ниже.
 5. ~~Company Research Agent~~ — реализовано, см. "Company Research Agent" ниже.
-6. CV/Bewerbung Agent
+6. CV/Bewerbung Agent — по подэтапам, см. "Candidate Profile" ниже:
+   - [x] 6A Candidate Profile foundation — структурированная модель фактов о кандидате, см. "Candidate Profile" ниже.
+   - [ ] 6B Job-to-profile matching
+   - [ ] 6C CV adaptation
+   - [ ] 6D Bewerbung generation
+   - [ ] 6E Draft review / approval
 7. Gmail Response + Follow-up Agent
 
 ## Запуск
@@ -430,6 +435,199 @@ relevant facts; если refresh не удался, но показан стар
 `app/collectors/bundesagentur.py` (внешний job source, не Company
 Research); секреты не нужны для дефолтного provider'а, для будущих
 провайдеров — только через `Settings`/env.
+
+## Candidate Profile (Stage 6A)
+
+Структурированный, evidence-first профиль кандидата — **единственный
+источник истины о фактах кандидата** для будущего CV/Bewerbung-агента
+(Stage 6B+). Формула объединения источников:
+
+```text
+Candidate Profile (факты о кандидате)
+        +
+Job data (факты о вакансии)
+        +
+Company Research (факты о компании)
+        ↓
+CV/Bewerbung drafts
+```
+
+Никогда не наоборот — LLM не придумывает факты о кандидате. Если факт не
+записан в Candidate Profile (или явно одобренном источнике), будущая
+генерация CV должна считать его `UNKNOWN`, а не домысливать.
+
+**Модель данных.** Одна каноническая запись `candidate_profiles`
+(`app/db/models.py`'s `CandidateProfileRecord`) — **singleton,
+DB-enforced**: `id` зафиксирован на `1` через `CHECK (id = 1)`, вторую
+строку невозможно вставить ни при каком race (`IntegrityError` → rollback →
+reload winner, race-safe, см.
+`tests/test_candidate_profile_repository.py::test_concurrent_first_access_deduplicates`).
+Осознанный выбор для локального single-user инструмента — не городить
+multi-profile схему, которая сегодня не нужна, но и не полагаться на голую
+Python-константу `PROFILE_ID = 1` без enforcement на уровне БД.
+
+Вложенные факты — отдельные таблицы с FK `ON DELETE CASCADE`:
+`candidate_skills`, `candidate_experiences`, `candidate_education`,
+`candidate_certifications`, `candidate_projects`, `candidate_languages`.
+`professional_summary`/`career_goal`/`target_roles` — прямо на
+`candidate_profiles` (самоописание кандидата, не предпочтение по вакансии).
+`candidate_job_preferences` — **отдельная таблица** (1:1 с профилем,
+`UNIQUE(candidate_profile_id)`): зарплата/релокация/remote — это то, что
+кандидат *ищет*, не факт резюме о том, кем он является/что делал; будущая
+генерация CV не должна путать эти два вида данных.
+
+**Provenance, не выдуманная confidence.** Каждый вложенный факт несёт два
+поля:
+- `source` — откуда факт взялся: `USER_CONFIRMED`, `USER_PROVIDED_DOCUMENT`,
+  `MANUAL_ENTRY`, `IMPORTED`, `INFERRED`, `UNKNOWN`;
+- `confidence` — текущий уровень доверия: `CONFIRMED`, `UNCONFIRMED`,
+  `INFERRED`, `UNKNOWN`.
+
+Никаких процентов вида "93% confident" — факт о кандидате не
+вероятностный. Единственное правило, которое обязана соблюдать будущая
+генерация CV/Bewerbung (`app/models/candidate_profile.py`'s
+`is_usable_for_generation(source, confidence)`): использовать как
+утверждение можно только факт, у которого **и** `source` — один из
+доверенных (`USER_CONFIRMED`/`USER_PROVIDED_DOCUMENT`/`MANUAL_ENTRY`), **и**
+`confidence == "CONFIRMED"`. Одной `confidence` недостаточно —
+`source=INFERRED, confidence=CONFIRMED` или `source=UNKNOWN,
+confidence=CONFIRMED` обязаны остаться неиспользуемыми: факт, который
+никто напрямую не утверждал, не становится достоверным только из-за флага
+confidence. У Stage 6A нет пайплайна извлечения фактов (нет LLM, нет
+document ingestion — см. "Без LLM" ниже), поэтому каждый факт, введённый
+через API, по умолчанию получает `MANUAL_ENTRY`/`CONFIRMED` — человек
+напрямую утверждает факт о себе через аутентифицированный single-user API.
+`INFERRED`/`UNCONFIRMED` появляются только если вызывающий явно их указал.
+
+**Provenance верхнеуровневых полей.** `first_name`, `last_name`,
+`professional_title`, `location_city`, `location_country`,
+`professional_summary`, `career_goal`, `target_roles` — тоже несут
+provenance, не только вложенные сущности: `candidate_profiles.field_trust_json`
+хранит `{имя_поля: {source, confidence}}` **независимо для каждого поля**
+(единый "профильный" статус на все поля сразу был бы слишком грубым —
+`professional_title` может быть подтверждён вручную, пока
+`professional_summary` ещё импортирован/выведен). Запись появляется только
+когда поле реально было установлено через `PATCH`; поле без записи в
+`field_trust` считается неиспользуемым для генерации, даже если у него
+есть значение. Явно переданный в `PATCH` объект `field_trust` для
+конкретного поля сохраняется как есть, не апгрейдится автоматически до
+`MANUAL_ENTRY`/`CONFIRMED`. Проверка того же поля — тот же
+`is_usable_for_generation`, через
+`app/models/candidate_profile.py`'s `is_top_level_fact_usable_for_generation(profile, field_name)`
+(без дублирования логики доверия).
+
+**Версионирование и concurrency-safety.** `profile_version` увеличивается
+на каждый принятый непустой `PATCH`. `PATCH` **обязан** передавать
+`expected_profile_version` (структурно обязательное поле — `422`, если
+отсутствует) — это concurrency-метаданные, не факт о кандидате, никогда не
+попадают в `field_trust`/содержимое профиля. Актуальная версия сверяется
+и захватывается **атомарно на уровне БД** одним `UPDATE ... WHERE id=1 AND
+profile_version=:expected` **до** любой деструктивной замены вложенных
+коллекций — если он не задел ни одной строки (версия устарела),
+`PATCH` откатывается целиком и возвращает `409 Conflict` ещё до того, как
+что-либо изменилось. Успешный `PATCH` со старой/несовпадающей версией
+никогда не проходит: два конкурентных писателя с одинаковой
+`expected_profile_version` — только один выигрывает, второй получает
+`409`; после `GET`-перечитывания актуальной версии повторный `PATCH`
+проходит. Каждый принятый непустой `PATCH` создаёт следующий snapshot
+version; будущие CV/Bewerbung-черновики будут хранить
+`candidate_profile_version`, чтобы всегда знать, какая именно версия
+профиля их породила.
+
+Пустой `PATCH` (без изменяемых полей, только `expected_profile_version`)
+не мутирует профиль и не увеличивает версию — но `expected_profile_version`
+всё равно сверяется **атомарно с БД** в момент проверки, тем же
+`UPDATE ... WHERE id=1 AND profile_version=:expected` (с `SET
+profile_version = profile_version`, то есть без реального изменения
+строки и без побочного касания `updated_at`), а не сравнением с уже
+загруженным в память объектом — иначе версия могла устареть в промежутке
+между загрузкой и ответом, и конкурентное изменение осталось бы
+незамеченным. Если версия к моменту атомарной проверки уже не совпадает —
+`409 Conflict`, даже для пустого `PATCH`.
+
+**`GET`/`PATCH`, без `PUT`.** `GET /api/v1/candidate-profile` всегда
+`200 OK` — singleton создаётся пустым при первом обращении, состояния
+"ещё не инициализирован → 404" не существует.
+`PATCH /api/v1/candidate-profile` — **partial update**: ключ, отсутствующий
+в теле запроса, не трогается вообще (поэтому
+`{"expected_profile_version": N, "professional_title": "..."}` не стирает
+`skills`/`projects`/`education`/`languages`); ключ, который присутствует,
+применяется полностью — скалярные поля просто перезаписываются, списковые
+поля (`skills`, `experiences`, `education`, `certifications`, `projects`,
+`languages`, `target_roles`) **заменяются целиком** (это by design: раз
+список прислан — он и есть новый список, как в большинстве REST API), а
+`job_preferences`, если присутствует, заменяется целиком как один
+вложенный объект. `PUT` намеренно не реализован — для структуры с таким
+количеством опциональных вложенных коллекций у full-replace нет
+однозначного способа отличить "клиент хочет пустой список" от "клиент
+просто не отправил это поле", а `PATCH`'s `exclude_unset` уже даёт
+однозначный ответ на этот вопрос без дополнительного протокола.
+
+**Валидация.** Пустые имена навыков отклоняются; дубликаты навыков/языков/
+проектов внутри одного `PATCH`-payload'а (после NFKC-нормализации +
+casefold, та же логика identity, что и в Company Research'е) — `422`;
+`end_date < start_date` — `422`; `is_current=true` с заданным `end_date` —
+`422` (противоречие); некорректный CEFR-уровень языка — `422` (замкнутый
+`Literal`); URL-поля (`repository_url`, `demo_url`, `credential_url`)
+должны быть `http(s)://`, иначе `422`. Незаконченное образование
+(`completed=false`, `end_date=null`) — валидное состояние, не отклоняется и
+не превращается автоматически в завершённое.
+
+**HTTP API:**
+```bash
+# Прочитать профиль (создаётся пустым при первом обращении) — обратите
+# внимание на profile_version в ответе, он нужен для следующего PATCH
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/v1/candidate-profile
+
+# Частичное обновление — только присланные поля; expected_profile_version
+# обязателен и должен совпадать с текущей версией профиля
+curl -X PATCH -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "expected_profile_version": 3,
+        "professional_title": "Junior Python Developer",
+        "skills": [{"name": "Python"}]
+      }' \
+  http://localhost:8000/api/v1/candidate-profile
+
+# Явный override provenance для конкретного верхнеуровневого поля — только
+# для полей, которые в этом же PATCH и устанавливаются
+curl -X PATCH -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "expected_profile_version": 4,
+        "professional_summary": "Presumably backend-focused.",
+        "field_trust": {
+          "professional_summary": {"source": "INFERRED", "confidence": "UNCONFIRMED"}
+        }
+      }' \
+  http://localhost:8000/api/v1/candidate-profile
+```
+
+`409 Conflict` — `expected_profile_version` устарела (профиль изменён
+другим запросом с момента последнего `GET`); тело ответа содержит
+`current_profile_version` для повторной попытки, но никогда не содержит
+содержимого профиля. `422` — `expected_profile_version` отсутствует в
+теле, любая валидационная ошибка (см. "Валидация" выше), или
+`field_trust` содержит запись для поля, которое в этом же `PATCH` не
+устанавливается.
+
+**Безопасность:** полный профиль никогда не пишется в логи — при `PATCH`
+логируется только `profile_version` и **список изменённых имён полей**, не
+их значения (`app/db/candidate_profile_repository.py`'s
+`apply_candidate_profile_patch`). Ни одного HTTP-клиента, LLM-вызова или
+исходящего сетевого запроса нигде в Stage 6A нет — проверяется
+статическим тестом
+(`tests/test_candidate_profile_endpoints.py::TestSecurity::test_module_never_imports_an_http_client`),
+как и у Company Research/XING. Никакой submit вакансии, отправки CV/писем,
+контакта с рекрутёром или смены статуса заявки этот слой не делает и не
+может — в его API вообще нет понятия `job_id`/`status`.
+
+**Осознанно не в Stage 6A:** генерация CV, PDF/DOCX-рендеринг, генерация
+Bewerbung/сопроводительного письма, отправка заявки, email, взаимодействие
+с LinkedIn/XING, автономная смена статуса заявки — всё это либо будущие
+подэтапы 6B–6E, либо вне контракта human-approval этого проекта. Ingestion
+резюме из файла/GitHub — возможный будущий Stage 6A.2, не часть текущей
+реализации: ничего не парсит и не угадывает факты кандидата из внешних
+документов.
 
 ## Проверки
 ```bash

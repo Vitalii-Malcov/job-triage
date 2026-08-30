@@ -12,6 +12,12 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.core.config import get_settings
+from app.db.candidate_profile_repository import (
+    CandidateProfileVersionConflictError,
+    apply_candidate_profile_patch,
+    get_or_create_candidate_profile,
+    to_candidate_profile_response,
+)
 from app.db.models import JobRecord, UserProfile
 from app.db.repositories import (
     get_job_by_fingerprint,
@@ -27,6 +33,7 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.candidate_profile import CandidateProfile, CandidateProfilePatchRequest
 from app.models.company_research import (
     CompanyResearchResponse,
     CompanyResearchRunResponse,
@@ -185,6 +192,54 @@ def patch_job_status(
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     return _to_detail(record)
+
+
+@router.get(
+    "/candidate-profile",
+    response_model=CandidateProfile,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_candidate_profile(db: Session = Depends(get_db)) -> CandidateProfile:
+    """Stage 6A: the single canonical Candidate Profile — the factual
+    authority future CV/Bewerbung generation must read candidate-side
+    claims from (see app/db/candidate_profile_repository.py's module
+    docstring). Always 200: the singleton is created empty on first access
+    rather than 404ing before any PATCH has ever been sent.
+    """
+    record = get_or_create_candidate_profile(db)
+    return to_candidate_profile_response(record)
+
+
+@router.patch(
+    "/candidate-profile",
+    response_model=CandidateProfile,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def patch_candidate_profile(
+    body: CandidateProfilePatchRequest, db: Session = Depends(get_db)
+) -> CandidateProfile:
+    """Partial update — see CandidateProfilePatchRequest's docstring for
+    the exact semantics (omitted keys untouched; a present list field
+    replaces that list wholesale). No PUT endpoint is exposed; see the
+    same docstring for why.
+
+    `body.expected_profile_version` is required (structurally enforced —
+    422 if omitted) and must match the profile's current version (CP-M-03)
+    — a stale value raises CandidateProfileVersionConflictError, mapped to
+    409 here. The caller must GET the profile again and retry with the
+    fresh version; the response detail never includes profile content.
+    """
+    try:
+        record = apply_candidate_profile_patch(db, body)
+    except CandidateProfileVersionConflictError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "current_profile_version": exc.current_version,
+            },
+        ) from exc
+    return to_candidate_profile_response(record)
 
 
 async def _run_company_research(
