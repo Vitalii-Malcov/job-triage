@@ -6,12 +6,20 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.agents.candidate_job_matcher import ALGORITHM_VERSION, JobMatchInput, compute_match
 from app.agents.job_scorer import JobScorer
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_configured
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.core.config import get_settings
+from app.db.candidate_job_match_repository import (
+    compute_job_snapshot_fingerprint,
+    create_match,
+    get_cached_match,
+    get_latest_match,
+    to_candidate_job_match,
+)
 from app.db.candidate_profile_repository import (
     CandidateProfileVersionConflictError,
     apply_candidate_profile_patch,
@@ -33,6 +41,7 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.candidate_job_match import CandidateJobMatch, MatchRequest
 from app.models.candidate_profile import CandidateProfile, CandidateProfilePatchRequest
 from app.models.company_research import (
     CompanyResearchResponse,
@@ -45,6 +54,7 @@ from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
+    enforce_match_rate_limit,
     enforce_rate_limit,
     enforce_xing_rate_limit,
 )
@@ -332,6 +342,122 @@ def get_company_research(job_id: int, db: Session = Depends(get_db)) -> CompanyR
             detail="Company research not found for this job. POST /jobs/{id}/research to run it.",
         )
     return result
+
+
+def _run_candidate_job_match(
+    db: Session, job_id: int, *, force_recompute: bool
+) -> CandidateJobMatch | None:
+    """Compute (or reuse a cached) Candidate Profile <-> Job match analysis
+    (Stage 6B). Returns None if the job doesn't exist — callers translate
+    that into their own 404.
+
+    Deliberately synchronous (unlike _run_company_research/_run_bundesagentur
+    above): app.agents.candidate_job_matcher.compute_match performs zero
+    I/O — no network, no LLM (Stage 6B sections 26/27) — so there is
+    nothing here to await. Company Research is read via
+    CompanyResearchService().get_cached (a pure DB read, never
+    get_or_run) — matching must never trigger a company-research provider
+    call, and an ambiguous company identity in that unrelated, optional
+    feature must not block matching (section 19).
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+
+    profile_record = get_or_create_candidate_profile(db)
+    profile = to_candidate_profile_response(profile_record)
+
+    company_research_id: int | None = None
+    try:
+        cached_research = CompanyResearchService().get_cached(db, job)
+    except AmbiguousCompanyIdentityError:
+        cached_research = None
+        logger.warning("candidate_job_match_company_research_ambiguous job_id=%s", job_id)
+    if cached_research is not None:
+        company_research_id = cached_research.id
+
+    fingerprint = compute_job_snapshot_fingerprint(job)
+
+    if not force_recompute:
+        existing = get_cached_match(
+            db,
+            job_id=job_id,
+            candidate_profile_version=profile.profile_version,
+            job_snapshot_fingerprint=fingerprint,
+            algorithm_version=ALGORITHM_VERSION,
+        )
+        if existing is not None:
+            return to_candidate_job_match(existing)
+
+    job_input = JobMatchInput(
+        job_id=job.id,
+        title=job.title,
+        description=job.description,
+        must_have_skills=json.loads(job.must_have_skills_json),
+        nice_to_have_skills=json.loads(job.nice_to_have_skills_json),
+    )
+    data = compute_match(job_input, profile, company_research_id=company_research_id)
+    record, _created = create_match(db, data, fingerprint)
+
+    # Privacy-safe (Stage 6B section 35): technical metadata only, never
+    # candidate names/experience/project/skill content.
+    logger.info(
+        "candidate_job_match_computed job_id=%s profile_version=%s algorithm_version=%s "
+        "match_id=%s overall_score=%s",
+        job_id,
+        profile.profile_version,
+        ALGORITHM_VERSION,
+        record.id,
+        record.overall_score,
+    )
+    return to_candidate_job_match(record)
+
+
+@router.post(
+    "/jobs/{job_id}/match",
+    response_model=CandidateJobMatch,
+    dependencies=[Depends(require_api_key), Depends(enforce_match_rate_limit)],
+)
+def run_candidate_job_match(
+    job_id: int,
+    body: MatchRequest = MatchRequest(),
+    db: Session = Depends(get_db),
+) -> CandidateJobMatch:
+    """Compute or reuse a deterministic Candidate Profile <-> Job match
+    analysis. Always 200 for an existing job, even with a sparse/empty
+    Candidate Profile (section 33) — a profile with no confirmed facts
+    yields low/neutral sub-scores plus an explicit warning, never a
+    failure merely because the profile is sparse.
+    """
+    result = _run_candidate_job_match(db, job_id, force_recompute=body.force_recompute)
+    if result is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return result
+
+
+@router.get(
+    "/jobs/{job_id}/match",
+    response_model=CandidateJobMatch,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_candidate_job_match(job_id: int, db: Session = Depends(get_db)) -> CandidateJobMatch:
+    """Pure cache read — never computes (section 23). Returns the most
+    recently computed analysis for this job, whatever candidate profile
+    version and job content it was computed against; the response's own
+    `candidate_profile_version` tells the caller whether it may be stale
+    relative to the current profile.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    record = get_latest_match(db, job_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="No match analysis found for this job. POST /jobs/{id}/match to compute it.",
+        )
+    return to_candidate_job_match(record)
 
 
 async def _maybe_auto_research(

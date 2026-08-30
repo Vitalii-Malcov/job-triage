@@ -490,3 +490,64 @@ class CandidateJobPreferencesRecord(Base):
     travel: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     profile: Mapped["CandidateProfileRecord"] = relationship(back_populates="job_preferences")
+
+
+class CandidateJobMatchRecord(Base):
+    """A computed, cached Candidate Profile <-> Job match analysis (Stage
+    6B) — see app/agents/candidate_job_matcher.py for the deterministic
+    algorithm and app/db/candidate_job_match_repository.py for cache
+    identity / concurrency handling.
+
+    Deliberately not linked to JobRecord or CandidateProfileRecord via a
+    ForeignKey — same rationale as CompanyResearchRecord's own docstring:
+    this table's cache identity (job_id + candidate_profile_version +
+    job_snapshot_fingerprint + algorithm_version) already needs to survive
+    the *current* CandidateProfileRecord moving on to a later version
+    without invalidating history (section 17: an old match analysis must
+    keep showing which profile version produced it), which is the opposite
+    of what an ON DELETE CASCADE FK relationship is for.
+
+    `analysis_json` holds the full serialized CandidateJobMatchData (every
+    requirement/relevant-entity/claim/warning) — the several duplicated
+    scalar columns below exist purely so cache-identity lookups and score
+    filtering don't require deserializing that blob (spec section 20:
+    "normalized core metadata + JSON structured analysis").
+    """
+
+    __tablename__ = "candidate_job_matches"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "candidate_profile_version",
+            "job_snapshot_fingerprint",
+            "algorithm_version",
+            name="uq_candidate_job_matches_cache_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    candidate_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Content fingerprint of the job fields that feed matching (title,
+    # description, skill lists) — NOT JobRecord.fingerprint (that is a
+    # dedup *identity* key, a different concept; see
+    # app/db/repositories.py's _fingerprint). See
+    # app/db/candidate_job_match_repository.py's
+    # compute_job_snapshot_fingerprint.
+    job_snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Traceability only (Stage 6B section 19) — never a FK, mirroring
+    # CompanyResearchRecord's own "deliberately not linked" precedent;
+    # company research content never feeds scoring in v1.
+    company_research_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    overall_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    coverage_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    required_skill_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    preferred_skill_score: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    analysis_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )

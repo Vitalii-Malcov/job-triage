@@ -429,3 +429,106 @@ def test_candidate_profile_downgrade_removes_tables_then_upgrade_restores_them(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "candidate_profiles" in inspector.get_table_names()
+
+
+def test_candidate_job_matches_migration_creates_table_and_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_candidate_job_matches.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "candidate_job_matches" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("candidate_job_matches")}
+    assert columns == {
+        "id",
+        "job_id",
+        "candidate_profile_version",
+        "job_snapshot_fingerprint",
+        "algorithm_version",
+        "company_research_id",
+        "overall_score",
+        "coverage_score",
+        "required_skill_score",
+        "preferred_skill_score",
+        "analysis_json",
+        "created_at",
+    }
+
+    indexes = {tuple(idx["column_names"]) for idx in inspector.get_indexes("candidate_job_matches")}
+    assert ("job_id",) in indexes
+
+    unique_constraints = inspector.get_unique_constraints("candidate_job_matches")
+    assert any(
+        set(uc["column_names"])
+        == {
+            "job_id",
+            "candidate_profile_version",
+            "job_snapshot_fingerprint",
+            "algorithm_version",
+        }
+        for uc in unique_constraints
+    )
+
+
+def test_candidate_job_matches_cache_identity_rejects_duplicates(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_candidate_job_matches_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO candidate_job_matches (
+                    job_id, candidate_profile_version, job_snapshot_fingerprint,
+                    algorithm_version, company_research_id, overall_score, coverage_score,
+                    required_skill_score, preferred_skill_score, analysis_json, created_at
+                ) VALUES (
+                    1, 1, 'fp-a', 'v1', NULL, 50, 50, 50, 100, '{}', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO candidate_job_matches (
+                        job_id, candidate_profile_version, job_snapshot_fingerprint,
+                        algorithm_version, company_research_id, overall_score, coverage_score,
+                        required_skill_score, preferred_skill_score, analysis_json, created_at
+                    ) VALUES (
+                        1, 1, 'fp-a', 'v1', NULL, 10, 10, 10, 10, '{}', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+
+def test_candidate_job_matches_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_candidate_job_matches_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "fa99eefca6bd")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "candidate_job_matches" not in tables
+    # Downgrading one step must not touch the previous (Candidate Profile)
+    # migration's own tables.
+    assert "candidate_profiles" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "candidate_job_matches" in inspector.get_table_names()

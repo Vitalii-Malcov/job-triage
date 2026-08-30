@@ -94,6 +94,35 @@ def enforce_xing_rate_limit(request: Request) -> None:
         bucket.append(now)
 
 
+# Separate bucket for candidate-job-match runs: unlike the collector/XING/
+# company-research buckets above, matching makes zero outbound network
+# calls (pure local computation over already-persisted data) and is cheap
+# per call — but a POST still writes a new candidate_job_matches row when
+# the cache misses, so it gets its own bucket rather than sharing the
+# generic per-key budget, sized more generously than the network-bound
+# buckets above to reflect that lower cost.
+_match_requests: dict[str, deque[float]] = defaultdict(deque)
+MATCH_RATE_LIMIT_REQUESTS = 30
+MATCH_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_match_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - MATCH_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _match_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= MATCH_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Candidate job match rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_company_research_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()

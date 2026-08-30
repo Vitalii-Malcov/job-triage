@@ -629,6 +629,154 @@ Bewerbung/сопроводительного письма, отправка за
 реализации: ничего не парсит и не угадывает факты кандидата из внешних
 документов.
 
+## Candidate Job Match (Stage 6B)
+
+Детерминированный, evidence-first слой сопоставления: **Candidate Profile +
+Job + Company Research → Candidate Job Match Analysis**. Ни LLM, ни
+embeddings, ни исходящих сетевых запросов — только литеральное сравнение
+уже сохранённых данных (`app/agents/candidate_job_matcher.py`). CV/Bewerbung
+(6C/6D) этот слой не генерирует — только структурированный факт-базис для
+них.
+
+**Входные данные и их источники (три независимых домена, не смешиваются):**
+- Job: `must_have_skills`/`nice_to_have_skills` — уже извлечены на этапе
+  коллекции (`app/agents/skill_extractor.py`), здесь не переизвлекаются.
+  LANGUAGE/EDUCATION-требования извлекаются заново на момент матчинга
+  (`app/agents/requirement_extractor.py`, переиспользует движок
+  сегментации/must-nice-классификации из `skill_extractor.py`, не
+  дублирует его) — распознаются только `German`/`Deutsch`,
+  `English`/`Englisch` + явный CEFR-уровень (A1–C2) или native/muttersprachlich,
+  и коарс-сигнал "требуется завершённое высшее образование". Сертификаты
+  как требования в v1 не извлекаются (нет надёжного литерального паттерна) —
+  задокументированное ограничение, не забытая функциональность.
+- Candidate Profile: только факты, прошедшие правило доверия ниже.
+- Company Research: **только `id` для трассируемости** — контент (technologies,
+  facts) никогда не превращается в требование вакансии и никогда не
+  используется для скоринга (v1 имеет заведомо неполные данные, section 19).
+
+**Правило доверия (переиспользуется из Stage 6A, не дублируется):** факт
+кандидата участвует в матчинге, только если
+`is_usable_for_generation(source, confidence)` истинно (доверенный `source`
+**и** `confidence == CONFIRMED`) — та же функция, что и генерационный gate
+6A. `INFERRED`/`IMPORTED`/`UNKNOWN`-source или не-`CONFIRMED`-confidence
+трактуются как если бы факта не существовало вовсе, никогда как более
+слабое свидетельство.
+
+**MATCH/PARTIAL/MISSING/UNKNOWN:**
+- **SKILL** — сравнение через `app/agents/job_scorer.py`'s `normalize_skill`
+  (тот же casefold + whitespace-collapse + явный alias-словарь, что и у
+  `JobScorer`, например `postgres`↔`postgresql`). `MATCH`, если нормализованные
+  строки совпадают, иначе `MISSING`. **PARTIAL для skills в v1 не
+  реализован** — единственный способ обосновать, например, "MySQL закрывает
+  требование SQL" — это нечёткое отношение того же рода, что explicitly
+  запрещено (`AWS`↔`cloud` никогда не матчится); "Flask" при наличии только
+  "Python" — `MISSING`, не `PARTIAL`.
+- **LANGUAGE** — нет доверенной записи языка вообще → `MISSING`. Есть
+  запись, но `level == UNKNOWN` → `UNKNOWN` (претензия на язык есть, оценить
+  нельзя). Есть запись с известным CEFR/`NATIVE`: `candidate_level >=
+  required_level` (`C2 > C1 > B2 > B1 > A2 > A1`, `NATIVE > C2`) → `MATCH`;
+  ниже требуемого → `PARTIAL` (тот же язык, недостаточный уровень —
+  осмысленное отличие от "нет свидетельств вообще").
+- **EDUCATION** — генерируется только если в тексте вакансии найден сигнал
+  "требуется завершённое образование". `MATCH`, если есть хотя бы одна
+  доверенная `CandidateEducation` с `completed=true`; иначе `MISSING`
+  (включая случай "образование указано, но не завершено" — незавершённое
+  никогда не закрывает требование "завершённое").
+
+**Формула скора (полностью объяснима, никакого непрозрачного AI-процента).**
+Каждое требование даёт `1.0` (`MATCH`), `0.5` (`PARTIAL`) или `0.0`
+(`MISSING`/`UNKNOWN`) очков.
+- `required_skill_score` — среднее по всем `REQUIRED`-требованиям (любого
+  типа) × 100; `50`, если таких требований нет вообще (та же логика, что
+  `JobScorer`'s `must_score = 0.5` — отсутствие извлечённых требований
+  неоднозначно, это не "ничего не требуется").
+- `preferred_skill_score` — то же для `PREFERRED`; `100`, если их нет
+  (тривиально удовлетворено, как `JobScorer`'s `nice_score = 1.0`).
+- `coverage_score` — взвешенная смесь по всем требованиям
+  (`REQUIRED`=3, `PREFERRED`=1, `UNKNOWN`-важность=0.5 — "низкодоверительное
+  влияние"); `50`, если требований нет вообще.
+- `experience_support_score` — насколько `REQUIRED`-skill-покрытие
+  подкреплено `relevant_experiences`/`relevant_projects` (а не голой
+  записью в `skills`): `min(1.0, (experiences+projects) /
+  REQUIRED-skill-requirements) × 100`; `50`, если таких требований нет.
+- `overall_score = round(required_skill_score × 0.6 + preferred_skill_score
+  × 0.2 + experience_support_score × 0.2)`.
+
+Каждый суб-скор ограничен [0, 100] по построению — деления на ноль нет
+нигде, `overall_score` всегда в [0, 100] без дополнительного clamp. Смысл
+скора — **покрытие требований вакансии доверенными фактами кандидата**, не
+"вероятность оффера".
+
+**Safe candidate claims** — структурированные факты (`{"claim_type":
+"SKILL", "claim": "Python", "source_entity": "candidate_skill",
+"source_id": 12, "profile_version": 4}`), не готовый текст — формулировка
+остаётся за Stage 6C. Список включает только факты, реально использованные
+как evidence в этом матче (не дамп всего доверенного профиля).
+
+**Провенанс** — каждый `RequirementMatch` несёт `candidate_evidence`
+(ссылки на `CandidateSkill.id`/`CandidateExperience.id`/
+`CandidateProject.id`/`CandidateEducation.id`/`CandidateLanguage.id`) и
+`job_evidence` (исходный текст требования) — "почему мы так сказали"
+всегда прослеживаемо, чёрных ящиков нет.
+
+**Кэш-идентичность и `algorithm_version`.** Матчинг детерминирован для
+фиксированной тройки `(job_snapshot_fingerprint, candidate_profile_version,
+algorithm_version)` — не путать `job_snapshot_fingerprint` (хэш
+title+description+skill-списков, только для инвалидации кэша матчинга) с
+`JobRecord.fingerprint` (dedup-идентичность вакансии, другое понятие).
+Таблица `candidate_job_matches` хранит DB-enforced
+`UNIQUE(job_id, candidate_profile_version, job_snapshot_fingerprint,
+algorithm_version)` — два одновременных `POST` с одинаковой идентичностью
+не создают дубликат: `IntegrityError` перехватывается, побеждает
+уже закоммиченная строка (`app/db/candidate_job_match_repository.py`'s
+`create_match`, тот же паттерн, что `get_or_create_candidate_profile`).
+Смена версии профиля или содержимого вакансии не перезаписывает старый
+анализ — создаётся новая строка; `candidate_profile_version` внутри ответа
+всегда показывает, против какой версии профиля был посчитан именно этот
+матч (section 17), даже если профиль с тех пор изменился. `algorithm_version
+= "v1"` — бампается при любом изменении логики скоринга/матчинга, чтобы
+результат `v1` никогда не путался с будущим `v2`.
+
+**HTTP API:**
+```bash
+curl -X POST -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"force_recompute": false}' \
+  http://localhost:8000/api/v1/jobs/42/match
+
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/jobs/42/match
+```
+`POST` считает (или переиспользует кэш) детерминированный матч;
+`force_recompute=true` пропускает шаг переиспользования кэша и пересчитывает
+заново — если входные данные не изменились, пересчёт детерминированно даёт
+тот же результат и упирается в тот же UNIQUE constraint, поэтому новая
+строка не создаётся (это ожидаемо, не баг: `force_recompute` не обещает
+новый `id`, только свежий пересчёт). `GET` — чистое чтение кэша, **никогда
+не считает** — возвращает последний посчитанный анализ для вакансии, каким
+бы устаревшим он ни был; `404`, если вакансии нет или анализ ещё не
+посчитан. Пустой/скудный Candidate Profile не приводит к ошибке (section
+33) — просто низкие/нейтральные суб-скоры плюс явные `warnings`.
+
+**Безопасность:** `app/agents/candidate_job_matcher.py` и
+`app/agents/requirement_extractor.py` не делают ни одного HTTP-запроса —
+чистые функции над уже загруженными данными. Company Research читается
+только через `CompanyResearchService().get_cached` (никогда `get_or_run`) —
+матчинг не может спровоцировать provider-вызов. Ничего в Stage 6B не может
+отправить заявку/CV/письмо, написать рекрутёру или сменить статус — этот
+слой только анализирует. В логах — только `job_id`/`profile_version`/
+`match_id`/`algorithm_version`/`overall_score`, никогда содержимое профиля.
+
+**Осознанно не в Stage 6B:** генерация CV/Bewerbung (6C/6D), Telegram
+`/match`-команда (см. ниже), сопоставление сертификатов, fuzzy/семантическое
+сопоставление скиллов, использование контента Company Research для скоринга.
+
+**Telegram `/match` отложена в этой волне.** Section 25 спецификации явно
+разрешает отложить эту команду, если она раздувает объём поставки — она
+отложена, чтобы не дублировать `_run_candidate_job_match` под второй
+вызывающий поверхностью без реальной необходимости прямо сейчас (в отличие
+от Company Research, где Telegram-команда была нужна с первого дня).
+Добавление `/match <job_id>` в будущем — вызов уже существующей
+`_run_candidate_job_match` из `app/api/routes.py`, без новой бизнес-логики.
+
 ## Проверки
 ```bash
 pytest -q
