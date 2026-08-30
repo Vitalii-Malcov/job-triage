@@ -25,7 +25,7 @@ AI-система для сбора, оценки и трекинга вакан
 2. Job collectors: ~~XING alerts/email~~, ~~Bundesagentur für Arbeit~~, StepStone/Indeed where allowed, career pages — частично: Bundesagentur и XING реализованы (см. "Collectors" ниже), Indeed/StepStone/career pages ещё нет, поэтому пункт целиком не вычеркнут.
 3. ~~Application status endpoints: SAVED/APPLIED/INTERVIEW/REJECTED/OFFER~~ — реализовано, см. "Application status" ниже.
 4. ~~Telegram commands/control center~~ — реализовано, см. "Telegram control center" ниже.
-5. Company Research Agent
+5. ~~Company Research Agent~~ — реализовано, см. "Company Research Agent" ниже.
 6. CV/Bewerbung Agent
 7. Gmail Response + Follow-up Agent
 
@@ -282,12 +282,154 @@ best-effort-уведомление (`app/services/telegram.py`) — `TELEGRAM_BO
                                возвращает тот же текст ошибки, что и HTTP API)
 /run bundesagentur           — запустить сбор Bundesagentur
 /run xing                    — запустить сбор XING
+/research <id>                — company research по вакансии (кэш или новый прогон)
 ```
 
 `/run bundesagentur` и `/run xing` вызывают ту же внутреннюю функцию, что и
 `POST /collectors/{name}/run` (`app/api/routes.py`'s `_run_bundesagentur` /
 `_run_xing`) — логика сбора и персистентности вакансий существует в одном
-месте, а не дублируется между HTTP API и ботом.
+месте, а не дублируется между HTTP API и ботом. `/research <id>` аналогично
+переиспользует `_run_company_research` / `CompanyResearchService` — см. ниже.
+
+## Company Research Agent
+
+После того как вакансия сохранена, можно собрать структурированную,
+evidence-first информацию о компании-работодателе — для будущего
+CV/Bewerbung-агента, подготовки к интервью и решения пользователя.
+Read-only: никаких Bewerbung, писем рекрутёрам или изменений статуса
+вакансии от имени агента.
+
+**v1 не делает НИ ОДНОГО исходящего сетевого запроса.** Более ранняя
+версия включала опциональный website-fetch (SSRF-checked GET домашней
+страницы компании). Независимый review (Codex) указал, что схема
+`socket.getaddrinfo() → validate IP → httpx делает свой отдельный DNS
+lookup` оставляет неустранимое DNS rebinding / TOCTOU окно — провалидированный
+IP не гарантированно тот же, к которому реально подключится HTTP-клиент.
+Вместо того чтобы городить pinned-IP TLS transport, website-fetch был
+**полностью удалён** (`app/providers/url_safety.py` больше не существует).
+Company Research v1 = только evidence из уже сохранённых данных вакансии.
+Полноценный сетевой Company Web Research Provider — отдельный будущий этап,
+требующий осознанно выбранной safe egress-архитектуры.
+
+**Модель данных.** Отдельная таблица `company_research`
+(`app/db/models.py`'s `CompanyResearchRecord`) — `jobs` не тронута и не
+превращена в "большую таблицу метаданных о компании". Identity — единое,
+**DB-enforced-unique** поле `identity_key` (`domain:<домен>`, если домен
+известен, иначе `name:<нормализованное имя>`); разрешение (какая запись
+соответствует новому job'у) делается в коде приложения
+(`app/db/repositories.py`'s `get_company_research_by_identity`), но
+уникальность — на уровне БД (`identity_key` UNIQUE), а не только
+SELECT-then-INSERT. Гонки при конкурентном создании (`IntegrityError` →
+rollback → reload canonical) и конкурентном refresh (optimistic `version`
+column, конфликтующий UPDATE отбрасывает свой устаревший результат вместо
+затирания более нового) обработаны явно — см. тесты
+`tests/test_company_research_repository.py`.
+
+**`Job.url` никогда не становится company identity.** URL вакансии — это
+URL объявления (часто на job board/ATS: Lever, Greenhouse, сам источник),
+а не сайт компании-работодателя. Более ранняя версия строила "domain hint"
+из `Job.url` с blacklist'ом нескольких известных ATS-хостов; review
+справедливо указал, что это ненадёжный identity-сигнал (риск объединить две
+разные компании, использующие один и тот же ATS). Убрано полностью, не
+пропатчено более длинным blacklist'ом — v1 использует только
+`normalized_company_name` идентичность.
+
+**Evidence-first, без company-level домыслов.** Данные одной вакансии
+(локация, упомянутые в описании технологии) **не** повышаются до
+company-level фактов (`headquarters`, `technologies`, ...) — локация одной
+вакансии не обязательно штаб-квартира, а упомянутые в одном объявлении
+навыки не обязательно весь техстек компании. Такие company-level поля
+остаются `None`/`[]` с явным `UNKNOWN` evidence; вместо этого сохраняются
+квалифицированные, привязанные к конкретной вакансии `relevant_facts`
+("This vacancy is located in Frankfurt.", не "Company headquarters:
+Frankfurt."). Каждый непустой факт в `evidence` помечен `FACT`
+(подтверждено источником), `INFERENCE` (логический вывод) или `UNKNOWN`
+(явно не определено) — см. `app/models/company_research.py`.
+
+**Provider abstraction.** `app/providers/base.py`'s `CompanyResearchProvider`
+— интерфейс, параллельный `app.collectors.base.JobCollector`. Единственная
+реализация v1 — `JobDataCompanyResearchProvider`
+(`app/providers/job_data_provider.py`): строит FACT/INFERENCE evidence
+только из уже собранных данных вакансии, без единого сетевого запроса, и
+поэтому не может честно вернуть `research_status=COMPLETE` — только
+`PARTIAL` (нет в v1 такого статуса, как "полное" исследование компании по
+одному объявлению) или `FAILED`.
+
+**XING правило соблюдено и здесь:** вакансии с `source="xing"` никогда не
+инициируют ничего сетевого, ни напрямую, ни через какую-либо эвристику —
+см. `app/collectors/xing_email.py` про персональные tracking-редиректы
+(v1 в любом случае не делает сетевых запросов вообще, но проверка осталась
+как defense in depth, см. `tests/test_company_research_network_safety.py`).
+
+**Кэш, TTL, attempt-метаданные.** `COMPANY_RESEARCH_TTL_HOURS` (по
+умолчанию 720 = 30 дней) определяет, когда закэшированный research
+считается свежим. `FAILED`-запись никогда не считается свежей — следующий
+вызов автоматически повторит попытку без ручного `force_refresh`.
+Неудачный refresh **не уничтожает** предыдущий хороший research: если он
+уже есть, его содержимое (`research_status`/`researched_at`/`confidence`/
+`evidence`/...) остаётся нетронутым, меняются только отдельные
+attempt-поля (`last_attempt_at`, `last_attempt_status`,
+`last_error` — короткое, санитизированное сообщение, не трейсбек) — см.
+`app/db/repositories.py`'s `record_failed_attempt`.
+
+**Явный refresh outcome.** `POST` возвращает не голый research-объект, а
+`CompanyResearchRunResponse` — `research`, `refresh_attempted`,
+`refresh_succeeded`, `served_stale`, `error`:
+- cache hit: `refresh_attempted=false`.
+- успешный refresh: `refresh_attempted=true`, `refresh_succeeded=true`.
+- refresh не удался, но есть старый хороший результат: `HTTP 200`,
+  `served_stale=true`, `research` = старые данные, `error` заполнен.
+- первая попытка вообще без предыдущих данных: `HTTP 502`, `research=null` —
+  притворяться успехом нечем.
+
+**HTTP API:**
+```bash
+# Запустить (или переиспользовать кэш)
+curl -X POST -H "X-API-Key: $API_KEY" \
+  http://localhost:8000/api/v1/jobs/{job_id}/research
+# Форсировать обновление
+curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"force_refresh": true}' \
+  http://localhost:8000/api/v1/jobs/{job_id}/research
+# Прочитать закэшированный результат (без сети, 404 если ещё не собран)
+curl -H "X-API-Key: $API_KEY" \
+  http://localhost:8000/api/v1/jobs/{job_id}/research
+```
+`404` — вакансия не найдена (`POST`/`GET`) или research ещё не запускался
+(`GET`). `422` — у job'а нет пригодного имени компании (пусто/только
+пробелы после нормализации). `502` — первая попытка полностью провалилась
+и показать нечего. `503` — provider требует конфигурацию, которой нет
+(сегодня недостижимо для дефолтного provider, задел на будущие provider'ы
+с платным API-ключом). Отдельный, более строгий rate limit (10 запросов /
+10 минут на IP, `enforce_company_research_rate_limit`) на `POST`. `GET` —
+чистое чтение кэша, никогда не вызывает provider.
+
+**Конфигурация (`.env`):**
+```bash
+COMPANY_RESEARCH_TTL_HOURS=720
+COMPANY_RESEARCH_AUTO_ENABLED=false
+COMPANY_RESEARCH_AUTO_MAX_PER_RUN=20
+```
+`COMPANY_RESEARCH_AUTO_ENABLED` (по умолчанию `false`) — при `true` после
+каждого сохранённого `APPLY`-рекомендованного job'а в
+`_run_bundesagentur`/`_run_xing` автоматически (best-effort, не влияет на
+`created`/`updated`/`failed`) запускается research — см.
+`_maybe_auto_research` в `app/api/routes.py`. `COMPANY_RESEARCH_AUTO_MAX_PER_RUN`
+ограничивает, сколько таких автоматических research'ей может запустить один
+прогон коллектора, независимо от того, сколько `APPLY`-вакансий он выдал —
+ручные вызовы (`POST`, Telegram `/research`) этим бюджетом не ограничены.
+
+**Telegram:** `/research <id>` — компания, статус, confidence, короткие
+relevant facts; если refresh не удался, но показан старый результат — явно
+"Refresh failed — showing cached research."; при полном провале без данных —
+контролируемое сообщение об ошибке, не падение. 4096-символьный лимit и
+авторизация — как у остальных команд.
+
+**Безопасность:** никакого произвольного URL-fetch endpoint'а в API нет и
+не было; единственный HTTP-клиент, который вообще существует в проекте —
+`app/collectors/bundesagentur.py` (внешний job source, не Company
+Research); секреты не нужны для дефолтного provider'а, для будущих
+провайдеров — только через `Settings`/env.
 
 ## Проверки
 ```bash

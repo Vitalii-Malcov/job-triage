@@ -10,3 +10,8 @@ htmlcov/
 *.db
 *.db-journal
 *.egg-info/
+
+# Local Claude Code permission/tool settings — machine-specific, not shared
+# project config. .claude/skills/ and other tracked .claude/ project files
+# are intentionally NOT excluded here.
+.claude/settings.local.json

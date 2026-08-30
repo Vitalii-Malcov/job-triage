@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +41,22 @@ class Settings(BaseSettings):
     xing_mailbox_username: str = ""
     xing_mailbox_app_password: str = ""
     xing_lookback_days: int = 7
+
+    # Company Research Agent (POST/GET /jobs/{id}/research, Telegram
+    # /research <id>). v1 makes zero outbound network requests — its only
+    # provider (JobDataCompanyResearchProvider) builds research purely from
+    # a job's own already-persisted data, so there is no API key or
+    # HTTP-fetch configuration to expose here (a website-fetch sub-feature
+    # existed briefly but was removed after a Codex review found its
+    # DNS-resolve-then-fetch SSRF check has an unavoidable DNS-rebinding
+    # window — see app/providers/job_data_provider.py). auto_enabled gates
+    # firing research automatically from a collector run for high-scoring
+    # jobs; off by default to control cost until explicitly opted into.
+    # auto_max_per_run bounds how many such automatic runs one collector
+    # run can trigger, regardless of how many APPLY jobs it produces.
+    company_research_ttl_hours: int = Field(default=720, ge=0)
+    company_research_auto_enabled: bool = False
+    company_research_auto_max_per_run: int = Field(default=20, ge=0)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

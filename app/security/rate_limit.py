@@ -32,6 +32,16 @@ XING_RATE_LIMIT_REQUESTS = 3
 XING_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
+# Separate, stricter bucket for company-research runs: each call can make
+# one outbound HTTP fetch to a third-party company website (when enabled)
+# plus a DB write, similar cost profile to the collector endpoints above.
+# Fixed rather than Settings-driven for the same reason as the collector
+# bucket: triggered manually/infrequently, not tuned per deployment.
+_company_research_requests: dict[str, deque[float]] = defaultdict(deque)
+COMPANY_RESEARCH_RATE_LIMIT_REQUESTS = 10
+COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS = 600
+
+
 def enforce_rate_limit(request: Request) -> None:
     settings = get_settings()
     key = request.client.host if request.client else "unknown"
@@ -80,5 +90,22 @@ def enforce_xing_rate_limit(request: Request) -> None:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="XING collector rate limit exceeded",
+            )
+        bucket.append(now)
+
+
+def enforce_company_research_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _company_research_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= COMPANY_RESEARCH_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Company research rate limit exceeded",
             )
         bucket.append(now)

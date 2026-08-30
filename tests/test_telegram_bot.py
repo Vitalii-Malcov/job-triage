@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,7 +12,14 @@ from app.db.base import Base
 from app.db.repositories import upsert_job
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.company_research import (
+    CompanyResearchResponse,
+    CompanyResearchRunResponse,
+    Evidence,
+)
 from app.models.job import Job, JobScore
+from app.providers.base import ProviderNotConfiguredError
+from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
 
 AUTHORIZED_CHAT_ID = 12345
 
@@ -70,6 +78,7 @@ class TestAuthorization:
             (bot.cmd_job, ["1"]),
             (bot.cmd_status, ["1", "APPLIED"]),
             (bot.cmd_run, ["bundesagentur"]),
+            (bot.cmd_research, ["1"]),
         ],
     )
     async def test_unauthorized_chat_gets_no_reply_but_is_logged(self, handler, args, monkeypatch):
@@ -290,6 +299,234 @@ class TestRunCommand:
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_run(update, _make_context([]))
         update.message.reply_text.assert_called_once_with("Usage: /run bundesagentur|xing")
+
+
+def _sample_research_response(**overrides) -> CompanyResearchResponse:
+    now = datetime.now(UTC)
+    fields = {
+        "id": 1,
+        "company_name": "Acme GmbH",
+        "company_domain": None,
+        "industry": None,
+        "headquarters": None,
+        "company_size": None,
+        "short_summary": "",
+        "products_or_services": [],
+        "technologies": [],
+        "hiring_signals": [],
+        "relevant_facts": ["This vacancy mentions: docker, python."],
+        "positive_signals": [],
+        "risk_signals": [],
+        "source_urls": ["https://example.com/jobs/1"],
+        "evidence": [
+            Evidence(type="FACT", claim="test claim", source_url="https://example.com/jobs/1")
+        ],
+        "confidence": 0.5,
+        "research_status": "PARTIAL",
+        "provider_name": "job_data",
+        "researched_at": now,
+        "last_attempt_at": now,
+        "last_attempt_status": "SUCCESS",
+        "last_error": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    fields.update(overrides)
+    return CompanyResearchResponse(**fields)
+
+
+def _sample_run_response(**overrides) -> CompanyResearchRunResponse:
+    research_overrides = overrides.pop("research_overrides", {})
+    fields = {
+        "research": _sample_research_response(**research_overrides),
+        "refresh_attempted": True,
+        "refresh_succeeded": True,
+        "served_stale": False,
+        "error": None,
+    }
+    fields.update(overrides)
+    return CompanyResearchRunResponse(**fields)
+
+
+class TestResearchCommand:
+    @pytest.mark.asyncio
+    async def test_usage_without_args(self):
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context([]))
+        update.message.reply_text.assert_called_once_with("Usage: /research <job_id>")
+
+    @pytest.mark.asyncio
+    async def test_usage_with_non_numeric_id(self):
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["abc"]))
+        update.message.reply_text.assert_called_once_with(
+            "Usage: /research <job_id> (id must be a number)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_found(self, monkeypatch):
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=None))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["999"]))
+
+        update.message.reply_text.assert_called_once_with("Job #999 not found.")
+
+    @pytest.mark.asyncio
+    async def test_success_shows_compact_summary(self, monkeypatch):
+        run = _sample_run_response()
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Acme GmbH" in text
+        assert "PARTIAL" in text
+
+    @pytest.mark.asyncio
+    async def test_served_stale_says_refresh_failed(self, monkeypatch):
+        run = _sample_run_response(
+            refresh_succeeded=False,
+            served_stale=True,
+            error="transient failure",
+        )
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Refresh failed" in text
+        assert "transient failure" in text
+        assert "Acme GmbH" in text
+
+    @pytest.mark.asyncio
+    async def test_superseded_refresh_shows_neither_failed_nor_succeeded(self, monkeypatch):
+        run = _sample_run_response(
+            refresh_succeeded=False,
+            refresh_superseded=True,
+            served_stale=False,
+            error="Refresh result was superseded by a newer concurrent refresh.",
+        )
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Another refresh completed first" in text
+        assert "Refresh failed" not in text
+        assert "Acme GmbH" in text
+
+    @pytest.mark.asyncio
+    async def test_repeated_total_failure_never_says_showing_cached_research(self, monkeypatch):
+        """RR-M-02: a second consecutive total failure (research=None,
+        served_stale=False — see CompanyResearchService._is_usable_research)
+        must keep showing the controlled total-failure message, never the
+        served_stale wording, since no usable cache ever existed.
+        """
+        run = CompanyResearchRunResponse(
+            research=None,
+            refresh_attempted=True,
+            refresh_succeeded=False,
+            refresh_superseded=False,
+            served_stale=False,
+            error="provider exploded",
+        )
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "failed" in text.lower()
+        assert "showing cached research" not in text
+
+    @pytest.mark.asyncio
+    async def test_total_failure_shows_controlled_error_not_a_crash(self, monkeypatch):
+        run = CompanyResearchRunResponse(
+            research=None,
+            refresh_attempted=True,
+            refresh_succeeded=False,
+            refresh_superseded=False,
+            served_stale=False,
+            error="provider exploded",
+        )
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "failed" in text.lower()
+        assert "provider exploded" in text
+
+    @pytest.mark.asyncio
+    async def test_provider_not_configured(self, monkeypatch):
+        monkeypatch.setattr(
+            bot,
+            "_run_company_research",
+            AsyncMock(side_effect=ProviderNotConfiguredError("needs an API key")),
+        )
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        update.message.reply_text.assert_called_once_with("needs an API key")
+
+    @pytest.mark.asyncio
+    async def test_invalid_company_identity(self, monkeypatch):
+        monkeypatch.setattr(
+            bot,
+            "_run_company_research",
+            AsyncMock(side_effect=InvalidCompanyIdentityError("Job 1 has no usable company name.")),
+        )
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        update.message.reply_text.assert_called_once_with("Job 1 has no usable company name.")
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_company_identity(self, monkeypatch):
+        """FR-M-01: never show research for an arbitrarily-picked company
+        when the name is ambiguous across multiple known domains."""
+        monkeypatch.setattr(
+            bot,
+            "_run_company_research",
+            AsyncMock(
+                side_effect=AmbiguousCompanyIdentityError(
+                    "Company identity is ambiguous: multiple known companies share this "
+                    "normalized name."
+                )
+            ),
+        )
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "ambiguous" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_long_reply_stays_under_telegram_limit(self, monkeypatch):
+        run = _sample_run_response(
+            research_overrides={
+                "technologies": [f"tech-{i}" * 10 for i in range(50)],
+                "relevant_facts": [f"fact-{i} " * 20 for i in range(50)],
+                "positive_signals": [f"signal-{i} " * 20 for i in range(50)],
+                "risk_signals": [f"risk-{i} " * 20 for i in range(50)],
+                "short_summary": "S" * 1000,
+            }
+        )
+        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_research(update, _make_context(["1"]))
+
+        text = update.message.reply_text.call_args[0][0]
+        assert len(text) <= 4096
 
 
 class TestJobsMessageLimit:

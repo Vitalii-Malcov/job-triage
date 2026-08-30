@@ -36,13 +36,16 @@ import logging
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from app.api.routes import _run_bundesagentur, _run_xing
+from app.api.routes import _run_bundesagentur, _run_company_research, _run_xing
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.core.config import Settings, get_settings
 from app.db.repositories import get_job_by_id, list_jobs, update_job_status
 from app.db.session import SessionLocal
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.company_research import CompanyResearchRunResponse
+from app.providers.base import ProviderNotConfiguredError
+from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,8 @@ JOBS_LIST_LIMIT = 20
 JOBS_TITLE_MAX_LEN = 120
 JOBS_COMPANY_MAX_LEN = 80
 JOBS_REPLY_SOFT_LIMIT = 4000
+RESEARCH_REPLY_SOFT_LIMIT = 3800
+RESEARCH_LIST_ITEM_LIMIT = 5
 
 HELP_TEXT = (
     "Available commands:\n"
@@ -64,6 +69,7 @@ HELP_TEXT = (
     "/status <id> <new_status> - update a job's status\n"
     "/run bundesagentur - run the Bundesagentur collector\n"
     "/run xing - run the XING mailbox collector\n"
+    "/research <id> - research the hiring company for a job (cached, may refresh)\n"
 )
 
 _VALID_STATUSES = ", ".join(status.value for status in ApplicationStatus)
@@ -241,6 +247,95 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"Job #{record.id} status updated to {record.status}.")
 
 
+def _format_list(items: list[str], limit: int = RESEARCH_LIST_ITEM_LIMIT) -> str:
+    if not items:
+        return "none"
+    shown = items[:limit]
+    suffix = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    return ", ".join(shown) + suffix
+
+
+def _build_research_reply(run: CompanyResearchRunResponse) -> str:
+    """Render a CompanyResearchRunResponse into one message, enforcing
+    Telegram's 4096-char cap the same way _build_jobs_reply does for /jobs:
+    drop the least-essential sections first (from the end) rather than risk
+    reply_text() raising on an oversized message.
+
+    Makes the refresh outcome explicit rather than just showing content:
+    total failure (no usable data at all) gets a plain error message;
+    "refresh failed but serving a prior good result" says so up front
+    instead of silently looking like a fresh success.
+    """
+    if run.research is None:
+        return f"Company research failed: {run.error or 'unknown error'}"
+
+    result = run.research
+    header_lines = [
+        f"Company: {result.company_name}",
+        f"Industry: {result.industry or 'unknown'}",
+        f"Status: {result.research_status} (confidence {result.confidence})",
+    ]
+    if run.served_stale:
+        header_lines.append(f"Refresh failed — showing cached research. ({run.error})")
+    elif run.refresh_superseded:
+        header_lines.append("Another refresh completed first — showing the newer result.")
+    sections = ["\n".join(header_lines)]
+    if result.short_summary:
+        sections.append(result.short_summary[:500])
+    facts = result.relevant_facts or [item.claim for item in result.evidence if item.type == "FACT"]
+    if facts:
+        sections.append(f"Facts: {_format_list(facts)}")
+    if result.technologies:
+        sections.append(f"Technologies: {_format_list(result.technologies)}")
+    if result.positive_signals:
+        sections.append(f"Positive signals: {_format_list(result.positive_signals)}")
+    if result.risk_signals:
+        sections.append(f"Risks: {_format_list(result.risk_signals)}")
+
+    text = "\n".join(sections)
+    while len(text) > RESEARCH_REPLY_SOFT_LIMIT and len(sections) > 1:
+        sections.pop()
+        text = "\n".join(sections)
+    return text[:RESEARCH_REPLY_SOFT_LIMIT]
+
+
+@require_authorized
+async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /research <job_id>")
+        return
+    try:
+        job_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /research <job_id> (id must be a number)")
+        return
+
+    settings = get_settings()
+    db = SessionLocal()
+    try:
+        try:
+            run = await _run_company_research(db, settings, job_id, force_refresh=False)
+        except ProviderNotConfiguredError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        except InvalidCompanyIdentityError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        except AmbiguousCompanyIdentityError as exc:
+            # FR-M-01: never show research for an arbitrarily-picked company
+            # when the name is ambiguous across multiple known domains.
+            await update.message.reply_text(str(exc))
+            return
+    finally:
+        db.close()
+
+    if run is None:
+        await update.message.reply_text(f"Job #{job_id} not found.")
+        return
+
+    await update.message.reply_text(_build_research_reply(run))
+
+
 @require_authorized
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = get_settings()
@@ -310,6 +405,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("job", cmd_job))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("run", cmd_run))
+    application.add_handler(CommandHandler("research", cmd_research))
     application.add_error_handler(_handle_error)
     return application
 

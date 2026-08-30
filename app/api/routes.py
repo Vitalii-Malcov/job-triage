@@ -27,12 +27,24 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.company_research import (
+    CompanyResearchResponse,
+    CompanyResearchRunResponse,
+    ResearchRequest,
+)
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
+from app.providers.base import ProviderNotConfiguredError
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_collector_rate_limit,
+    enforce_company_research_rate_limit,
     enforce_rate_limit,
     enforce_xing_rate_limit,
+)
+from app.services.company_research import (
+    AmbiguousCompanyIdentityError,
+    CompanyResearchService,
+    InvalidCompanyIdentityError,
 )
 from app.services.telegram import TelegramNotifier
 
@@ -175,6 +187,138 @@ def patch_job_status(
     return _to_detail(record)
 
 
+async def _run_company_research(
+    db: Session, settings, job_id: int, *, force_refresh: bool
+) -> CompanyResearchRunResponse | None:
+    """Fetch (or reuse cached) company research for one job.
+
+    Shared by POST /jobs/{id}/research and the Telegram control center's
+    `/research <id>` command (app/services/telegram_bot.py) — see
+    `_run_bundesagentur` below for the same rationale. Returns None if the
+    job doesn't exist; callers translate that into their own presentation
+    (404 vs. a chat message). Raises ProviderNotConfiguredError if the
+    active provider needs configuration that isn't set,
+    InvalidCompanyIdentityError if the job has no usable company name, or
+    AmbiguousCompanyIdentityError (FR-M-01) if the job's normalized company
+    name is shared by 2+ distinct known-domain companies on file — no other
+    provider failure propagates here, see
+    CompanyResearchService.get_or_run's failure-isolation contract and
+    CompanyResearchRunResponse's refresh-outcome fields.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+    return await CompanyResearchService().get_or_run(db, job, settings, force_refresh=force_refresh)
+
+
+@router.post(
+    "/jobs/{job_id}/research",
+    response_model=CompanyResearchRunResponse,
+    dependencies=[Depends(require_api_key), Depends(enforce_company_research_rate_limit)],
+)
+async def run_company_research(
+    job_id: int,
+    body: ResearchRequest = ResearchRequest(),
+    db: Session = Depends(get_db),
+) -> CompanyResearchRunResponse:
+    settings = get_settings()
+    try:
+        result = await _run_company_research(db, settings, job_id, force_refresh=body.force_refresh)
+    except ProviderNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except InvalidCompanyIdentityError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except AmbiguousCompanyIdentityError as exc:
+        # FR-M-01: the input (job id) is itself valid, but the identity it
+        # resolves to is ambiguous relative to current DB state — 409, not
+        # 422/404. Never falls back to returning an arbitrary company.
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    if result is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    if result.research is None and not result.refresh_succeeded:
+        # Total failure: the provider failed and there was no prior good
+        # record to fall back to — nothing usable exists, so this must not
+        # look like a successful 200 (see CompanyResearchRunResponse
+        # docstring). The FAILED row CompanyResearchService already
+        # persisted stays available for diagnostics/retry via GET.
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=result.error or "Company research failed.",
+        )
+    return result
+
+
+@router.get(
+    "/jobs/{job_id}/research",
+    response_model=CompanyResearchResponse,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_company_research(job_id: int, db: Session = Depends(get_db)) -> CompanyResearchResponse:
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    try:
+        result = CompanyResearchService().get_cached(db, job)
+    except AmbiguousCompanyIdentityError as exc:
+        # FR-M-01: GET is a pure cache read and must never arbitrarily pick
+        # one of several known-domain companies sharing this job's
+        # normalized company name — same controlled 409 as POST.
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Company research not found for this job. POST /jobs/{id}/research to run it.",
+        )
+    return result
+
+
+async def _maybe_auto_research(
+    db: Session,
+    settings,
+    record: JobRecord,
+    result: JobScore,
+    budget: dict[str, int],
+) -> None:
+    """Best-effort, opt-in company research for a just-persisted high-score job.
+
+    Off by default (settings.company_research_auto_enabled) — see
+    app/core/config.py. Shared by _run_bundesagentur/_run_xing so the
+    "research automatically for APPLY-recommended jobs" rule lives in one
+    place. Failures here must never affect a collector run's
+    created/updated/failed counts, same best-effort contract as the
+    Telegram notification block right below each call site.
+
+    `budget` is a per-collector-run mutable counter
+    (`{"remaining": settings.company_research_auto_max_per_run}`, created
+    once by the caller before its loop starts) — bounds how many automatic
+    research runs a single collector run can trigger regardless of how many
+    APPLY jobs it produces, so a large batch can't silently fan out into an
+    unbounded number of research runs. Manual triggers (POST
+    /jobs/{id}/research, Telegram /research) are unaffected by this budget.
+    """
+    if not settings.company_research_auto_enabled or result.recommendation != "APPLY":
+        return
+    if budget["remaining"] <= 0:
+        return
+    budget["remaining"] -= 1
+    try:
+        await CompanyResearchService().get_or_run(db, record, settings)
+    except Exception:
+        logger.warning(
+            "company_research_auto_run_failed job_id=%s company=%s",
+            record.id,
+            record.company,
+            exc_info=True,
+        )
+
+
 async def _run_bundesagentur(db: Session, settings) -> dict[str, int]:
     """Fetch + score + persist one Bundesagentur collector run.
 
@@ -214,6 +358,7 @@ async def _run_bundesagentur(db: Session, settings) -> dict[str, int]:
     updated_count = 0
     failed_count = 0
     notified_count = 0
+    auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for job in jobs:
         try:
             existing = get_job_by_fingerprint(db, job)
@@ -260,7 +405,7 @@ async def _run_bundesagentur(db: Session, settings) -> dict[str, int]:
                 # committed by upsert_job. If scoring/persistence fails, the
                 # surrounding rollback also restores the previous description.
                 existing.description = description
-            _, result, created = _score_and_persist(db, profile, job)
+            job_record, result, created = _score_and_persist(db, profile, job)
         except Exception:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and
@@ -282,6 +427,8 @@ async def _run_bundesagentur(db: Session, settings) -> dict[str, int]:
             created_count += 1
         else:
             updated_count += 1
+
+        await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
 
         if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
             # Notification delivery is best-effort orchestration on top of
@@ -388,11 +535,12 @@ async def _run_xing(db: Session, settings) -> dict[str, int]:
     updated_count = 0
     failed_count = 0
     notified_count = 0
+    auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for batch in message_batches:
         batch_failed = False
         for job in batch.jobs:
             try:
-                _, result, created = _score_and_persist(db, profile, job)
+                job_record, result, created = _score_and_persist(db, profile, job)
             except Exception:
                 # One bad job must not abort the run, but its source message
                 # must remain unacknowledged. A later run will parse the whole
@@ -414,6 +562,8 @@ async def _run_xing(db: Session, settings) -> dict[str, int]:
                 created_count += 1
             else:
                 updated_count += 1
+
+            await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
 
             if (
                 result.recommendation == "APPLY"
