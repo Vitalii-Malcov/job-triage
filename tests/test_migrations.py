@@ -625,3 +625,94 @@ def test_candidate_cv_drafts_downgrade_removes_table_then_upgrade_restores_it(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "candidate_cv_drafts" in inspector.get_table_names()
+
+
+def test_bewerbung_drafts_migration_creates_table_and_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_bewerbung_drafts.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "bewerbung_drafts" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("bewerbung_drafts")}
+    assert columns == {
+        "id",
+        "job_id",
+        "cv_draft_id",
+        "match_id",
+        "candidate_profile_version",
+        "job_snapshot_fingerprint",
+        "match_algorithm_version",
+        "cv_adapter_version",
+        "bewerbung_generator_version",
+        "provider",
+        "status",
+        "draft_json",
+        "created_at",
+    }
+
+    indexes = {tuple(idx["column_names"]) for idx in inspector.get_indexes("bewerbung_drafts")}
+    assert ("job_id",) in indexes
+    assert ("cv_draft_id",) in indexes
+    assert ("match_id",) in indexes
+
+    # No cache-identity UNIQUE constraint (unlike candidate_cv_drafts) —
+    # deliberate, see BewerbungDraftRecord's docstring: every successful
+    # generation always inserts a new row.
+    assert inspector.get_unique_constraints("bewerbung_drafts") == []
+
+
+def test_bewerbung_drafts_allows_duplicate_pinned_inputs(tmp_path: Path) -> None:
+    """Regeneration is intentional (Stage 6D section 35) — two rows with
+    byte-identical pinned inputs must both insert successfully, unlike
+    candidate_cv_drafts' cache-identity UNIQUE constraint."""
+    db_path = tmp_path / "migrations_bewerbung_drafts_duplicates.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert_sql = text(
+        """
+        INSERT INTO bewerbung_drafts (
+            job_id, cv_draft_id, match_id, candidate_profile_version,
+            job_snapshot_fingerprint, match_algorithm_version, cv_adapter_version,
+            bewerbung_generator_version, provider, status, draft_json, created_at
+        ) VALUES (
+            1, 1, 1, 1, 'fp-a', 'v1', 'v1', 'v1', 'deterministic', 'DRAFT', '{}',
+            CURRENT_TIMESTAMP
+        )
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert_sql)
+        connection.execute(insert_sql)
+
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM bewerbung_drafts")).scalar_one()
+    assert count == 2
+
+
+def test_bewerbung_drafts_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_bewerbung_drafts_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "db47a801596b")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "bewerbung_drafts" not in tables
+    # Downgrading one step must not touch the previous (Candidate CV
+    # Draft) migration's own tables.
+    assert "candidate_cv_drafts" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "bewerbung_drafts" in inspector.get_table_names()

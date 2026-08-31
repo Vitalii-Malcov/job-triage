@@ -605,3 +605,51 @@ class CandidateCVDraftRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
+
+
+class BewerbungDraftRecord(Base):
+    """An immutable, provider-generated Bewerbung (cover letter) draft
+    snapshot (Stage 6D) — see app/services/bewerbung.py for orchestration
+    and app/agents/bewerbung_generator.py for the evidence-packet/
+    validation rules a provider's output must satisfy before a row is ever
+    written here.
+
+    **No cache-identity UNIQUE constraint (unlike CandidateJobMatchRecord/
+    CandidateCVDraftRecord) — deliberate (Stage 6D section 35).**
+    LLM/provider output can legitimately vary between calls with identical
+    pinned inputs, and regeneration is intentional; every successful
+    BewerbungService.generate() call always inserts a new row rather than
+    reusing one keyed by a cache identity.
+
+    Deliberately not linked to JobRecord/CandidateCVDraftRecord/
+    CandidateJobMatchRecord via a ForeignKey — same rationale as
+    CandidateCVDraftRecord's own docstring: this table's snapshot pins must
+    survive the referenced draft/match/profile moving on to a later state
+    without cascading deletes.
+    """
+
+    __tablename__ = "bewerbung_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # The one specific persisted CandidateCVDraftRecord.id this Bewerbung is
+    # pinned to (Stage 6D section 3) — never "whatever GET .../cv-draft
+    # currently returns."
+    cv_draft_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Traceability copy of the pinned CV draft's own match_id (section 4) —
+    # the CV draft already pins job content/profile version transitively,
+    # so this is not an independent identity component.
+    match_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    candidate_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_algorithm_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    cv_adapter_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    bewerbung_generator_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
+    draft_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )

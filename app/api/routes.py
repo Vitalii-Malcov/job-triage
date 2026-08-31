@@ -6,6 +6,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.agents.bewerbung_generator import (
+    BewerbungCVDraftJobMismatchError,
+    BewerbungCVDraftNotFoundError,
+    BewerbungJobChangedError,
+    BewerbungMatchInconsistentError,
+    BewerbungMatchNotFoundError,
+    BewerbungProfileChangedError,
+)
+from app.agents.bewerbung_renderer import BewerbungPlanRejectedError
 from app.agents.candidate_job_matcher import ALGORITHM_VERSION, JobMatchInput, compute_match
 from app.agents.cv_adapter import (
     CV_ADAPTER_VERSION,
@@ -21,6 +30,11 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.core.config import get_settings
+from app.db.bewerbung_repository import (
+    get_bewerbung_draft_by_id,
+    get_latest_bewerbung_draft,
+    to_bewerbung_draft,
+)
 from app.db.candidate_cv_draft_repository import (
     create_draft,
     get_cached_draft,
@@ -57,6 +71,7 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
+from app.models.bewerbung import BewerbungDraft, BewerbungDraftRequest
 from app.models.candidate_job_match import CandidateJobMatch, MatchRequest
 from app.models.candidate_profile import CandidateProfile, CandidateProfilePatchRequest
 from app.models.company_research import (
@@ -67,8 +82,10 @@ from app.models.company_research import (
 from app.models.cv_draft import CVDraftRequest, TailoredCVDraft
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.providers.base import ProviderNotConfiguredError
+from app.providers.bewerbung.base import BewerbungProviderError, BewerbungProviderNotConfiguredError
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
+    enforce_bewerbung_rate_limit,
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
     enforce_cv_draft_rate_limit,
@@ -76,6 +93,7 @@ from app.security.rate_limit import (
     enforce_rate_limit,
     enforce_xing_rate_limit,
 )
+from app.services.bewerbung import BewerbungService
 from app.services.company_research import (
     AmbiguousCompanyIdentityError,
     CompanyResearchService,
@@ -621,6 +639,132 @@ def get_candidate_cv_draft_by_id(draft_id: int, db: Session = Depends(get_db)) -
     if record is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="CV draft not found")
     return to_tailored_cv_draft(record)
+
+
+async def _run_bewerbung_draft(db: Session, job_id: int, cv_draft_id: int) -> BewerbungDraft | None:
+    """Generate a Bewerbung draft pinned to one specific persisted CV draft
+    (Stage 6D). Returns None if the job doesn't exist — callers translate
+    that into their own 404. Raises BewerbungCVDraftNotFoundError /
+    BewerbungCVDraftJobMismatchError / BewerbungProfileChangedError /
+    BewerbungJobChangedError / BewerbungMatchNotFoundError /
+    BewerbungMatchInconsistentError / BewerbungPlanRejectedError /
+    BewerbungProviderError for every other failure — see those classes'
+    docstrings in app/agents/bewerbung_generator.py,
+    app/agents/bewerbung_renderer.py, and app/providers/bewerbung/base.py
+    for the exact status-code mapping below.
+
+    Unlike _run_candidate_job_match/_run_candidate_cv_draft, this is async:
+    BewerbungService.generate calls out to a BewerbungProvider, which may
+    (for a future non-deterministic provider) perform real I/O.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+
+    service = BewerbungService()
+    return await service.generate(db, job, cv_draft_id)
+
+
+@router.post(
+    "/jobs/{job_id}/bewerbung-draft",
+    response_model=BewerbungDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_bewerbung_rate_limit)],
+)
+async def run_bewerbung_draft(
+    job_id: int,
+    body: BewerbungDraftRequest,
+    db: Session = Depends(get_db),
+) -> BewerbungDraft:
+    """Generate a new Bewerbung draft pinned to `body.cv_draft_id`.
+    `cv_draft_id` is required (no "latest CV draft" fallback — section 3).
+    Every successful call creates a NEW immutable draft row (section 35) —
+    never reused/cached, unlike POST .../match or .../cv-draft.
+    """
+    try:
+        result = await _run_bewerbung_draft(db, job_id, body.cv_draft_id)
+    except BewerbungCVDraftNotFoundError as exc:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except BewerbungCVDraftJobMismatchError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except BewerbungProfileChangedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "cv_draft_profile_version": exc.cv_draft_profile_version,
+                "current_profile_version": exc.current_profile_version,
+            },
+        ) from exc
+    except BewerbungJobChangedError as exc:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except BewerbungMatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+    except BewerbungMatchInconsistentError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+    except BewerbungProviderNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except BewerbungProviderError as exc:
+        raise HTTPException(status_code=http_status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except BewerbungPlanRejectedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"message": str(exc), "codes": exc.codes},
+        ) from exc
+
+    if result is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return result
+
+
+@router.get(
+    "/jobs/{job_id}/bewerbung-draft",
+    response_model=BewerbungDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_bewerbung_draft_for_job(job_id: int, db: Session = Depends(get_db)) -> BewerbungDraft:
+    """Pure cache read — never generates. Returns the most recently
+    created Bewerbung draft for this job, whatever CV draft/match/profile
+    version/job content it was generated against.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    record = get_latest_bewerbung_draft(db, job_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=(
+                "No Bewerbung draft found for this job. "
+                "POST /jobs/{id}/bewerbung-draft to create one."
+            ),
+        )
+    return to_bewerbung_draft(record)
+
+
+@router.get(
+    "/bewerbung-drafts/{draft_id}",
+    response_model=BewerbungDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_bewerbung_draft_snapshot(draft_id: int, db: Session = Depends(get_db)) -> BewerbungDraft:
+    """Returns the exact immutable draft snapshot for `draft_id` — never
+    regenerated, never mutated.
+    """
+    record = get_bewerbung_draft_by_id(db, draft_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Bewerbung draft not found"
+        )
+    return to_bewerbung_draft(record)
 
 
 async def _maybe_auto_research(

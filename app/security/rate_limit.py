@@ -149,6 +149,33 @@ def enforce_cv_draft_rate_limit(request: Request) -> None:
         bucket.append(now)
 
 
+# Separate, stricter bucket for Bewerbung generation: unlike match/cv-draft
+# (pure local computation), this endpoint calls out to a BewerbungProvider
+# (spec: "generation is an external/expensive operation" even though v1's
+# only shipped provider is local/deterministic — sized for a future
+# real-LLM provider's cost profile now rather than widening later).
+_bewerbung_requests: dict[str, deque[float]] = defaultdict(deque)
+BEWERBUNG_RATE_LIMIT_REQUESTS = 5
+BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_bewerbung_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _bewerbung_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= BEWERBUNG_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Bewerbung draft rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_company_research_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()
