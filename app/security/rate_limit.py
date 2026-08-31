@@ -191,3 +191,31 @@ def enforce_company_research_rate_limit(request: Request) -> None:
                 detail="Company research rate limit exceeded",
             )
         bucket.append(now)
+
+
+# Separate bucket for review-package writes (create/patch/approve/reject):
+# like match/cv-draft, this is pure local DB read+write with zero network
+# cost (spec: "Approval does not need external-operation limits ... Do not
+# reuse an expensive LLM rate bucket unnecessarily") — sized identically to
+# MATCH_RATE_LIMIT/CV_DRAFT_RATE_LIMIT rather than the stricter Bewerbung
+# generation bucket.
+_review_write_requests: dict[str, deque[float]] = defaultdict(deque)
+REVIEW_WRITE_RATE_LIMIT_REQUESTS = 30
+REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_review_write_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _review_write_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= REVIEW_WRITE_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Review package rate limit exceeded",
+            )
+        bucket.append(now)

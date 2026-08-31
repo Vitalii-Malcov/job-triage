@@ -147,6 +147,23 @@ def get_or_create_candidate_profile(db: Session) -> CandidateProfileRecord:
     return profile
 
 
+def get_candidate_profile(db: Session) -> CandidateProfileRecord | None:
+    """Pure lookup of the singleton `CandidateProfileRecord` — `None` if
+    it has never been created, with **no create-on-miss side effect**.
+
+    Exists specifically for safety-sensitive freshness/authority checks
+    (Stage 6E's review creation/approval flow) where a missing profile
+    must fail closed rather than be silently (re)created merely to
+    satisfy a version comparison — using `get_or_create_candidate_profile`
+    there would let a deleted profile "pass" a version check against a
+    freshly created empty replacement, which is not the historical
+    authority that actually produced the reviewed content. Do not use this
+    for `GET /api/v1/candidate-profile`, which deliberately always
+    initializes the singleton — see `get_or_create_candidate_profile`.
+    """
+    return db.get(CandidateProfileRecord, _CANDIDATE_PROFILE_SINGLETON_ID)
+
+
 def _skill_to_record(skill: CandidateSkill) -> CandidateSkillRecord:
     return CandidateSkillRecord(
         name=skill.name,

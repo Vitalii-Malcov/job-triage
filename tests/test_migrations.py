@@ -716,3 +716,146 @@ def test_bewerbung_drafts_downgrade_removes_table_then_upgrade_restores_it(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "bewerbung_drafts" in inspector.get_table_names()
+
+
+def test_application_package_reviews_migration_creates_tables_and_indexes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_application_package_reviews.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "application_package_reviews" in inspector.get_table_names()
+    assert "application_package_review_revisions" in inspector.get_table_names()
+
+    review_columns = {col["name"] for col in inspector.get_columns("application_package_reviews")}
+    assert review_columns == {
+        "id",
+        "job_id",
+        "cv_draft_id",
+        "bewerbung_draft_id",
+        "match_id",
+        "candidate_profile_version",
+        "job_snapshot_fingerprint",
+        "match_algorithm_version",
+        "cv_adapter_version",
+        "bewerbung_generator_version",
+        "status",
+        "review_version",
+        "has_manual_overrides",
+        "approved_revision_id",
+        "decision_note",
+        "decided_at",
+        "created_at",
+        "updated_at",
+    }
+
+    revision_columns = {
+        col["name"] for col in inspector.get_columns("application_package_review_revisions")
+    }
+    assert revision_columns == {
+        "id",
+        "review_id",
+        "revision_number",
+        "reviewed_cv_json",
+        "reviewed_bewerbung_json",
+        "manual_override_paths_json",
+        "edit_note",
+        "created_at",
+    }
+
+    review_indexes = {
+        tuple(idx["column_names"]) for idx in inspector.get_indexes("application_package_reviews")
+    }
+    assert ("job_id",) in review_indexes
+    assert ("cv_draft_id",) in review_indexes
+    assert ("bewerbung_draft_id",) in review_indexes
+
+    revision_indexes = {
+        tuple(idx["column_names"])
+        for idx in inspector.get_indexes("application_package_review_revisions")
+    }
+    assert ("review_id",) in revision_indexes
+
+    revision_unique = inspector.get_unique_constraints("application_package_review_revisions")
+    assert any(
+        set(uc["column_names"]) == {"review_id", "revision_number"} for uc in revision_unique
+    )
+
+
+def test_application_package_review_revisions_rejects_duplicate_revision_number(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_application_package_reviews_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO application_package_reviews (
+                    job_id, cv_draft_id, bewerbung_draft_id, match_id,
+                    candidate_profile_version, job_snapshot_fingerprint,
+                    match_algorithm_version, cv_adapter_version, bewerbung_generator_version,
+                    status, review_version, has_manual_overrides, created_at, updated_at
+                ) VALUES (
+                    1, 1, 1, 1, 1, 'fp-a', 'v1', 'v1', 'v1',
+                    'PENDING_REVIEW', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO application_package_review_revisions (
+                    review_id, revision_number, reviewed_cv_json, reviewed_bewerbung_json,
+                    manual_override_paths_json, created_at
+                ) VALUES (1, 1, '{}', '{}', '[]', CURRENT_TIMESTAMP)
+                """
+            )
+        )
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO application_package_review_revisions (
+                        review_id, revision_number, reviewed_cv_json, reviewed_bewerbung_json,
+                        manual_override_paths_json, created_at
+                    ) VALUES (1, 1, '{}', '{}', '[]', CURRENT_TIMESTAMP)
+                    """
+                )
+            )
+
+
+def test_application_package_reviews_downgrade_removes_tables_then_upgrade_restores_them(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_application_package_reviews_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "2a3383bb29c5")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "application_package_reviews" not in tables
+    assert "application_package_review_revisions" not in tables
+    # Downgrading one step must not touch the previous (Bewerbung Drafts)
+    # migration's own tables.
+    assert "bewerbung_drafts" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    tables = set(inspector.get_table_names())
+    assert "application_package_reviews" in tables
+    assert "application_package_review_revisions" in tables

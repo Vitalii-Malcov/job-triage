@@ -1,0 +1,302 @@
+"""Application Package Review persistence (Stage 6E).
+
+Unlike every other repository in this project (6B/6C/6D), the review
+record itself is genuinely mutated in place — via atomic
+compare-and-swap (CAS) UPDATEs conditioned on `id` + `status` +
+`review_version`, never a blind SELECT-then-UPDATE — so two concurrent
+PATCH/approve/reject calls can never both "win" (spec section 11/34/35).
+The reviewed *content* lives in `ApplicationPackageReviewRevisionRecord`
+rows, which remain pure insert-only immutable history, exactly like
+6B/6C/6D's own tables.
+"""
+
+import json
+import logging
+from datetime import UTC, datetime
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
+
+from app.db.models import ApplicationPackageReviewRecord, ApplicationPackageReviewRevisionRecord
+from app.models.review_package import (
+    ReviewedBewerbungContent,
+    ReviewedCVContent,
+    ReviewPackage,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ReviewCASConflict(Exception):
+    """Internal signal raised when a CAS UPDATE affects zero rows —
+    callers (app.services.review_package.ReviewPackageService) inspect
+    the current row afterward to decide whether that means "not found",
+    "no longer PENDING_REVIEW", or "stale review_version", and raise the
+    corresponding typed error from app.agents.review_package_builder.
+    Never escapes app/db/review_package_repository.py.
+    """
+
+
+def get_review_by_id(db: Session, review_id: int) -> ApplicationPackageReviewRecord | None:
+    """Pure read by primary key — used by GET /review-packages/{id} and
+    by every write operation's own load-before-CAS step. Never mutates.
+    """
+    return db.get(ApplicationPackageReviewRecord, review_id)
+
+
+def get_latest_review_for_job(db: Session, job_id: int) -> ApplicationPackageReviewRecord | None:
+    """Pure cache read for GET /jobs/{id}/review-package: the most
+    recently created review for this job, regardless of status. Never
+    generates/creates.
+    """
+    stmt = (
+        select(ApplicationPackageReviewRecord)
+        .where(ApplicationPackageReviewRecord.job_id == job_id)
+        .order_by(ApplicationPackageReviewRecord.id.desc())
+        .limit(1)
+    )
+    return db.scalar(stmt)
+
+
+def get_latest_approved_review_for_job(
+    db: Session, job_id: int
+) -> ApplicationPackageReviewRecord | None:
+    """Pure read for GET /jobs/{id}/approved-package: the most recently
+    *approved* review for this job (spec section 31) — never a
+    PENDING_REVIEW or REJECTED one, and never auto-approved. If more than
+    one review has ever been approved for the same job (duplicates are
+    allowed at creation time — spec section 36), the most recent decision
+    wins; this is a documented, deliberate choice, not an ambiguity.
+    """
+    stmt = (
+        select(ApplicationPackageReviewRecord)
+        .where(
+            ApplicationPackageReviewRecord.job_id == job_id,
+            ApplicationPackageReviewRecord.status == "APPROVED",
+        )
+        .order_by(ApplicationPackageReviewRecord.id.desc())
+        .limit(1)
+    )
+    return db.scalar(stmt)
+
+
+def get_revision_by_id(
+    db: Session, revision_id: int
+) -> ApplicationPackageReviewRevisionRecord | None:
+    return db.get(ApplicationPackageReviewRevisionRecord, revision_id)
+
+
+def get_latest_revision(
+    db: Session, review_id: int
+) -> ApplicationPackageReviewRevisionRecord | None:
+    stmt = (
+        select(ApplicationPackageReviewRevisionRecord)
+        .where(ApplicationPackageReviewRevisionRecord.review_id == review_id)
+        .order_by(ApplicationPackageReviewRevisionRecord.revision_number.desc())
+        .limit(1)
+    )
+    return db.scalar(stmt)
+
+
+def get_current_revision(
+    db: Session, record: ApplicationPackageReviewRecord
+) -> ApplicationPackageReviewRevisionRecord | None:
+    """The revision a GET response's content should come from: the
+    explicitly pinned `approved_revision_id` once APPROVED (spec section
+    33 — never re-derived as "whatever the latest revision is", even
+    though no new revision can ever be created after a decision anyway),
+    otherwise the latest revision.
+    """
+    if record.status == "APPROVED" and record.approved_revision_id is not None:
+        return get_revision_by_id(db, record.approved_revision_id)
+    return get_latest_revision(db, record.id)
+
+
+def create_review(
+    db: Session,
+    *,
+    job_id: int,
+    cv_draft_id: int,
+    bewerbung_draft_id: int,
+    match_id: int,
+    candidate_profile_version: int,
+    job_snapshot_fingerprint: str,
+    match_algorithm_version: str,
+    cv_adapter_version: str,
+    bewerbung_generator_version: str,
+    reviewed_cv: ReviewedCVContent,
+    reviewed_bewerbung: ReviewedBewerbungContent,
+) -> tuple[ApplicationPackageReviewRecord, ApplicationPackageReviewRevisionRecord]:
+    """Persist a freshly created review package + its revision 1, in one
+    transaction. `db.flush()` obtains the review's autogenerated `id`
+    before the revision row (which references it) is added — both commit
+    together, so a review row is never observable without at least one
+    revision.
+    """
+    record = ApplicationPackageReviewRecord(
+        job_id=job_id,
+        cv_draft_id=cv_draft_id,
+        bewerbung_draft_id=bewerbung_draft_id,
+        match_id=match_id,
+        candidate_profile_version=candidate_profile_version,
+        job_snapshot_fingerprint=job_snapshot_fingerprint,
+        match_algorithm_version=match_algorithm_version,
+        cv_adapter_version=cv_adapter_version,
+        bewerbung_generator_version=bewerbung_generator_version,
+        status="PENDING_REVIEW",
+        review_version=1,
+        has_manual_overrides=False,
+    )
+    db.add(record)
+    db.flush()
+
+    revision = ApplicationPackageReviewRevisionRecord(
+        review_id=record.id,
+        revision_number=1,
+        reviewed_cv_json=reviewed_cv.model_dump_json(),
+        reviewed_bewerbung_json=reviewed_bewerbung.model_dump_json(),
+        manual_override_paths_json="[]",
+        edit_note=None,
+    )
+    db.add(revision)
+    db.commit()
+    db.refresh(record)
+    db.refresh(revision)
+    return record, revision
+
+
+def create_revision(
+    db: Session,
+    *,
+    review_id: int,
+    expected_review_version: int,
+    reviewed_cv: ReviewedCVContent,
+    reviewed_bewerbung: ReviewedBewerbungContent,
+    has_manual_overrides: bool,
+    manual_override_paths: list[str],
+    edit_note: str | None,
+) -> tuple[ApplicationPackageReviewRecord, ApplicationPackageReviewRevisionRecord]:
+    """Atomically bump `review_version` (CAS on `id` + `status=
+    'PENDING_REVIEW'` + `review_version=expected_review_version`) and
+    persist the new revision. Raises `ReviewCASConflict` if the CAS UPDATE
+    affects zero rows — the caller (app.services.review_package) inspects
+    the current row to raise the specific typed error (not found / not
+    pending / stale version).
+    """
+    new_version = expected_review_version + 1
+    now = datetime.now(UTC)
+    stmt = (
+        update(ApplicationPackageReviewRecord)
+        .where(
+            ApplicationPackageReviewRecord.id == review_id,
+            ApplicationPackageReviewRecord.status == "PENDING_REVIEW",
+            ApplicationPackageReviewRecord.review_version == expected_review_version,
+        )
+        .values(
+            review_version=new_version,
+            has_manual_overrides=has_manual_overrides,
+            updated_at=now,
+        )
+    )
+    result = db.execute(stmt)
+    if result.rowcount == 0:
+        db.rollback()
+        raise ReviewCASConflict()
+
+    revision = ApplicationPackageReviewRevisionRecord(
+        review_id=review_id,
+        revision_number=new_version,
+        reviewed_cv_json=reviewed_cv.model_dump_json(),
+        reviewed_bewerbung_json=reviewed_bewerbung.model_dump_json(),
+        manual_override_paths_json=json.dumps(manual_override_paths),
+        edit_note=edit_note,
+    )
+    db.add(revision)
+    db.commit()
+    db.refresh(revision)
+    record = db.get(ApplicationPackageReviewRecord, review_id)
+    return record, revision
+
+
+def decide_review(
+    db: Session,
+    *,
+    review_id: int,
+    expected_review_version: int,
+    new_status: str,
+    decision_note: str | None,
+    approved_revision_id: int | None = None,
+) -> ApplicationPackageReviewRecord:
+    """Atomically transition `PENDING_REVIEW -> APPROVED|REJECTED` (CAS on
+    `id` + `status='PENDING_REVIEW'` + `review_version=expected_review_version`).
+    Raises `ReviewCASConflict` if the CAS UPDATE affects zero rows.
+    """
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "status": new_status,
+        "decided_at": now,
+        "decision_note": decision_note,
+        "updated_at": now,
+    }
+    if approved_revision_id is not None:
+        values["approved_revision_id"] = approved_revision_id
+
+    stmt = (
+        update(ApplicationPackageReviewRecord)
+        .where(
+            ApplicationPackageReviewRecord.id == review_id,
+            ApplicationPackageReviewRecord.status == "PENDING_REVIEW",
+            ApplicationPackageReviewRecord.review_version == expected_review_version,
+        )
+        .values(**values)
+    )
+    result = db.execute(stmt)
+    if result.rowcount == 0:
+        db.rollback()
+        raise ReviewCASConflict()
+
+    db.commit()
+    return db.get(ApplicationPackageReviewRecord, review_id)
+
+
+def to_review_package(
+    record: ApplicationPackageReviewRecord, revision: ApplicationPackageReviewRevisionRecord
+) -> ReviewPackage:
+    """Convert a persisted review row + its current revision into the
+    typed API response shape. Never logs or otherwise exposes reviewed
+    content outside this explicit, structured conversion (privacy-safe
+    logging — see app/services/review_package.py, which logs only
+    review_id/job_id/cv_draft_id/bewerbung_draft_id/review_version/status/
+    has_manual_overrides, never CV/Bewerbung text).
+    """
+    reviewed_cv = ReviewedCVContent.model_validate_json(revision.reviewed_cv_json)
+    reviewed_bewerbung = ReviewedBewerbungContent.model_validate_json(
+        revision.reviewed_bewerbung_json
+    )
+    manual_override_paths = json.loads(revision.manual_override_paths_json)
+    verification_state = "HUMAN_OVERRIDDEN" if record.has_manual_overrides else "EVIDENCE_BOUND"
+    return ReviewPackage(
+        id=record.id,
+        job_id=record.job_id,
+        cv_draft_id=record.cv_draft_id,
+        bewerbung_draft_id=record.bewerbung_draft_id,
+        match_id=record.match_id,
+        candidate_profile_version=record.candidate_profile_version,
+        job_snapshot_fingerprint=record.job_snapshot_fingerprint,
+        match_algorithm_version=record.match_algorithm_version,
+        cv_adapter_version=record.cv_adapter_version,
+        bewerbung_generator_version=record.bewerbung_generator_version,
+        status=record.status,
+        review_version=record.review_version,
+        has_manual_overrides=record.has_manual_overrides,
+        verification_state=verification_state,
+        reviewed_cv=reviewed_cv,
+        reviewed_bewerbung=reviewed_bewerbung,
+        manual_override_paths=manual_override_paths,
+        decision_note=record.decision_note,
+        decided_at=record.decided_at,
+        approved_revision_id=record.approved_revision_id,
+        current_revision_id=revision.id,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )

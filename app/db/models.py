@@ -653,3 +653,108 @@ class BewerbungDraftRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
+
+
+class ApplicationPackageReviewRecord(Base):
+    """The human-in-the-loop review of one exact, pinned pair of Stage
+    6C/6D drafts (Stage 6E) — see app/services/review_package.py for
+    orchestration and app/agents/review_package_builder.py for the
+    pin/consistency rules a (cv_draft_id, bewerbung_draft_id) pair must
+    satisfy before a row is ever written here.
+
+    **Deliberately mutable — unlike every other Stage 6B/6C/6D table.**
+    `status`/`review_version`/`has_manual_overrides`/decision columns are
+    updated in place via CAS (compare-and-swap) UPDATEs conditioned on
+    `id` + `status='PENDING_REVIEW'` + `review_version=<expected>` (see
+    app/db/review_package_repository.py's `create_revision`/
+    `decide_review`) — Stage 6E explicitly requires real state transitions
+    (PENDING_REVIEW -> APPROVED/REJECTED), unlike 6B/6C/6D's pure
+    insert-only immutable snapshots. The actual reviewed content lives in
+    ApplicationPackageReviewRevisionRecord rows, which ARE insert-only and
+    immutable — this row is only ever a status/version header pointing at
+    the current state of that history.
+
+    Deliberately not linked to JobRecord/CandidateCVDraftRecord/
+    BewerbungDraftRecord via a ForeignKey — same rationale as
+    BewerbungDraftRecord's own docstring: this table's snapshot pins must
+    survive the referenced draft/match/profile moving on to a later state
+    without cascading deletes. An approved review is a permanent audit
+    artifact (spec section 54) and must never be cascade-deleted merely
+    because a later job/draft/match/profile change/deletion occurs
+    upstream.
+    """
+
+    __tablename__ = "application_package_reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    cv_draft_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    bewerbung_draft_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    match_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    candidate_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_snapshot_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_algorithm_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    cv_adapter_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    bewerbung_generator_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING_REVIEW")
+    review_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    has_manual_overrides: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Set exactly once, at approval time — see
+    # ApplicationPackageReviewRevisionRecord's docstring for why this
+    # pins one specific immutable revision rather than "whatever the
+    # latest revision happens to be".
+    approved_revision_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+
+class ApplicationPackageReviewRevisionRecord(Base):
+    """One immutable snapshot of reviewed CV/Bewerbung content (Stage 6E
+    section 21/22) — a review's full history is the ordered set of these
+    rows for its `review_id`, never overwritten. Revision 1 is always an
+    exact copy of the pinned 6C/6D drafts' human-visible fields (all
+    `origin="MACHINE"`, see app.agents.review_package_builder.
+    build_initial_reviewed_cv/build_initial_reviewed_bewerbung); each
+    subsequent revision is produced by one accepted PATCH.
+
+    No FK to ApplicationPackageReviewRecord — same historical-snapshot
+    rationale as that table's own docstring.
+    """
+
+    __tablename__ = "application_package_review_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_id",
+            "revision_number",
+            name="uq_application_package_review_revisions_number",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    reviewed_cv_json: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewed_bewerbung_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # Redundant with per-field `origin` tags inside reviewed_cv_json/
+    # reviewed_bewerbung_json — persisted separately anyway (spec section
+    # 14) for cheap inspection without deserializing either blob.
+    manual_override_paths_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    edit_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )

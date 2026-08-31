@@ -31,7 +31,7 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 6B Job-to-profile matching — детерминированный evidence-first матчинг, см. "Candidate Job Match" ниже.
    - [x] 6C CV adaptation — детерминированный evidence-first CV-черновик, см. "Tailored CV Draft" ниже.
    - [x] 6D Bewerbung generation — evidence-bound, provider-selects-structure-only черновик сопроводительного письма, см. "Bewerbung Draft" ниже.
-   - [ ] 6E Draft review / approval
+   - [x] 6E Draft review / approval
 7. Gmail Response + Follow-up Agent
 
 ## Запуск
@@ -1082,6 +1082,160 @@ summary, скиллы или содержимое вакансии.
 закешированный результат, если явно потреблён — в v1 не потребляется вовсе),
 выбор провайдера через настройки (единственный провайдер v1 — детерминирован,
 внедряется через конструктор сервиса, как и у `CompanyResearchService`).
+
+## Draft Review / Human Approval (Stage 6E)
+
+Человеко-контролируемый слой поверх уже неизменяемых Stage 6C/6D черновиков:
+**Tailored CV Draft + Bewerbung Draft → Review Package → APPROVED/REJECTED**
+(`app/agents/review_package_builder.py` + `app/services/review_package.py`).
+`APPROVED` — это **не отправка**: ничего в Stage 6E не может отправить письмо,
+загрузить CV, открыть форму заявки, написать рекрутёру, открыть
+XING/LinkedIn или сменить статус заявки. `APPROVED` означает только "человек
+одобрил именно этот пакет" — будущий Stage submission должен явно
+потреблять `GET /jobs/{id}/approved-package`, а не «последний» CV/Bewerbung
+и не `PENDING_REVIEW`-пакет.
+
+**Жёсткая граница одобрения.** Ни генерация, ни `GET`, ни `PATCH` не могут
+перевести пакет в `APPROVED` — единственный путь: явный
+`POST /review-packages/{id}/approve`. `PENDING_REVIEW -> APPROVED` и
+`PENDING_REVIEW -> REJECTED` необратимы: `APPROVED`/`REJECTED` — терминальные
+решения, `PATCH`/повторное решение над ними всегда `409`.
+
+**Точная привязка к исходной паре (раздел 4/5).** Создание пакета требует
+явных `cv_draft_id` + `bewerbung_draft_id` — никакого implicit "последний
+CV"/"последний Bewerbung". Перед созданием `verify_source_pair` проверяет,
+что оба черновика реально образуют одну пару: `bewerbung.cv_draft_id ==
+cv.id`, совпадение `match_id`/`candidate_profile_version`/
+`job_snapshot_fingerprint`/`match_algorithm_version`/`cv_adapter_version` —
+иначе `422` со списком **имён** несовпавших полей (никогда не значений).
+
+**Свежесть проверяется дважды — при создании И заново перед одобрением
+(раздел 6/7, это критично).** Пока пакет находится в `PENDING_REVIEW`,
+Candidate Profile или вакансия могут измениться. Перед `approve` заново
+сверяются `review.candidate_profile_version`/`review.job_snapshot_fingerprint`
+с текущим состоянием — несовпадение даёт `409`, одобрение не происходит,
+черновики не трогаются. Для `reject` этой повторной проверки не требуется
+(отклонить устаревший пакет безопасно в любом случае).
+
+**Одобрение требует, чтобы ТЕКУЩИЕ Candidate Profile и Job вообще
+существовали — отсутствие авторитета закрывает операцию, а не пропускает
+проверку (blocker-фикс).** Более ранняя версия использовала
+`get_or_create_candidate_profile` внутри проверки свежести — если профиль
+был удалён, эта функция молча создавала пустой профиль с
+`profile_version=1`, который случайно совпадал с закреплённой версией, и
+`approve` проходил над пакетом, чья реальная историческая основа больше не
+существует. Аналогично проверка вакансии была `if job is not None: сверить
+fingerprint` — отсутствующая вакансия просто пропускала проверку вместо
+провала. Обе дыры закрыты: и создание ревью, и `approve` используют
+`app.db.candidate_profile_repository.get_candidate_profile` — чистый lookup
+**без побочного эффекта создания** (`CandidateProfileRecord | None`, никогда
+не пишет строку) — и явный `job = db.get(JobRecord, ...)`, где `None` в
+обоих случаях означает `409` (`ReviewCurrentProfileMissingError`/
+`ReviewCurrentJobMissingError`), а не "считать текущим/пропустить". Ни
+создание, ни одобрение ревью **никогда** не создают и не изменяют
+Candidate Profile или Job — Stage 6E остаётся чисто потребляющим слоем.
+Историческое чтение (`GET /review-packages/{id}`) продолжает работать даже
+после удаления исходных Job/Profile — ломается только `approve` (свежесть в
+принципе не может быть установлена без текущего авторитета), а `reject`
+по-прежнему разрешён над таким пакетом (отклонение устаревшего/непроверяемого
+материала безопасно в любом случае).
+
+**Source-черновики остаются неизменными навсегда.** Stage 6E никогда не
+пишет в `candidate_cv_drafts`/`bewerbung_drafts`/`candidate_job_matches` —
+редактирование живёт исключительно в собственных таблицах ревью-слоя.
+
+**Ревью-запись мутируется явно (единственное отличие от 6B/6C/6D).**
+`application_package_reviews.status`/`review_version`/`has_manual_overrides`/
+метаданные решения обновляются через атомарный CAS `UPDATE ... WHERE id=:id
+AND status='PENDING_REVIEW' AND review_version=:expected` — ноль
+затронутых строк означает конфликт (не найден / уже решён / версия устарела),
+и вызывающий код перечитывает текущее состояние, чтобы вернуть точную
+причину. Сам просматриваемый контент (`reviewed_cv`/`reviewed_bewerbung`)
+живёт в отдельной **неизменяемой** таблице `application_package_review_revisions`
+— каждый принятый `PATCH` создаёт новую строку-ревизию, старые никогда не
+перезаписываются.
+
+**Узкая, явно документированная v1-поверхность редактирования (раздел 18).**
+Полное редактирование структурированного CV (skills/experience/projects/
+education/certifications/languages как evidence-bound списков) сознательно
+не реализовано — редактируются только свободнотекстовые "обрамляющие" поля:
+для CV — `professional_title`/`professional_summary`/`section_order`; для
+Bewerbung — `subject`/`salutation`/`opening`/`body_paragraphs`
+(по индексу)/`closing`/`signature_name`. Всё остальное показывается
+read-only из закреплённого исходного черновика.
+
+**Происхождение, а не поддельное evidence (раздел 16/17).** Каждое
+редактируемое поле несёт `origin: "MACHINE" | "USER_EDIT"`. Правка
+никогда не выдаётся за верифицированный факт 6A/6B/6C/6D — она хранится и
+показывается именно как человеческая правка. Отредактированный
+Bewerbung-параграф сохраняет `original_source_claim_ids` **того самого
+изначального машинного текста на этой позиции** — эти id никогда не
+трактуются как доказательство новой, отредактированной формулировки
+(раздел 20). `has_manual_overrides`/`manual_override_paths`/
+`verification_state` (`EVIDENCE_BOUND` | `HUMAN_OVERRIDDEN`) вычисляются
+сканированием этих меток по текущей (объединённой) ревизии — кумулятивно,
+не по отдельному diff одного `PATCH`.
+
+**Одобрение человеческих правок требует явного подтверждения (раздел 15).**
+Если `has_manual_overrides=true`, `approve` без `acknowledge_manual_overrides:
+true` — `422`, статус остаётся `PENDING_REVIEW`. Без единой ручной правки
+подтверждение не требуется — одобряется чисто evidence-bound пакет.
+
+**Оптимистичная конкуренция (раздел 11/34/35).** Каждый принятый `PATCH`
+атомарно увеличивает `review_version`; `approve`/`reject` требуют
+`expected_review_version` и используют тот же CAS `UPDATE`. Два
+одновременных `PATCH` с одинаковым `expected_review_version` — только один
+создаёт новую ревизию, второй получает `409`. Два одновременных
+`approve`/`reject` — только один переводит статус, второй получает `409`;
+DB-уровневый CAS исключает состояние "и `APPROVED`, и `REJECTED`
+одновременно".
+
+**HTTP API:**
+```bash
+curl -X POST -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"cv_draft_id": 7, "bewerbung_draft_id": 3}' \
+  http://localhost:8000/api/v1/jobs/42/review-package
+
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/jobs/42/review-package
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/review-packages/5
+
+curl -X PATCH -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"expected_review_version": 1, "bewerbung_changes": {"opening": "..."}}' \
+  http://localhost:8000/api/v1/review-packages/5
+
+curl -X POST -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"expected_review_version": 2, "acknowledge_manual_overrides": true}' \
+  http://localhost:8000/api/v1/review-packages/5/approve
+
+curl -X POST -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
+  -d '{"expected_review_version": 2}' \
+  http://localhost:8000/api/v1/review-packages/5/reject
+
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/api/v1/jobs/42/approved-package
+```
+`GET .../review-package`, `GET .../review-packages/{id}` и
+`GET .../approved-package` — чистые чтения, **никогда не создают, не
+одобряют, не мутируют**. `approved-package` возвращает только
+действительно `APPROVED` пакет, привязанный к явно закреплённому
+`approved_revision_id` (не "последней" ревизии) — `404`, если ни один
+пакет для вакансии ещё не одобрен. Повторное создание пакета для той же
+пары черновиков разрешено (раздел 36) — дедупликация сознательно не
+реализована, каждый `POST` — независимая попытка ревью.
+
+**Безопасность:** без LLM, без сети, без нового вызова Bewerbung-провайдера
+или Company Research — Stage 6E полностью детерминирован и работает только с
+уже загруженными данными БД. Ничего здесь не отправляет email/Telegram, не
+открывает XING/LinkedIn, не пишет рекрутёру и не меняет `ApplicationStatus`.
+В логах — только `review_id`/`job_id`/`cv_draft_id`/`bewerbung_draft_id`/
+`review_version`/`status`/`has_manual_overrides`, никогда текст CV/письма,
+имя кандидата или заметка решения (`decision_note`/`edit_note`).
+
+**Осознанно не в Stage 6E:** отправка одобренного пакета (будущий submission
+stage — единственный законный потребитель `approved-package`), рендеринг
+DOCX/PDF, редактирование структурированных evidence-bound списков CV
+(skills/experience/projects/education/certifications/languages),
+моделирование контактных данных кандидата (`CONTACT_DATA_NOT_MODELED`
+остаётся как есть — это отдельная задача, не блокирующая 6E).
 
 ## Проверки
 ```bash
