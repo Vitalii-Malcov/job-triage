@@ -198,6 +198,131 @@ class ProcessedEmailMessage(Base):
     )
 
 
+class GmailThreadRecord(Base):
+    """A neutral (non-Gmail-native) correspondence thread grouping (Stage
+    7A) — see app/db/gmail_repository.py's `resolve_thread_anchor` for how
+    `thread_key` is derived from Message-ID/In-Reply-To/References
+    headers, and app/providers/email/imap.py's module docstring for the
+    documented limitation this implies (a message with In-Reply-To but no
+    References can end up anchored to its immediate parent rather than
+    the true thread root).
+
+    `thread_key` is not a Gmail thread id — standard IMAP does not expose
+    Gmail's X-GM-THRID extension via this project's read-only ImapClient
+    Protocol, so none is ever fabricated. It is either the RFC 5322
+    Message-ID this thread is anchored to (the oldest ancestor referenced
+    by any message seen so far), or a synthetic
+    "synthetic:<mailbox>:<uid_validity>:<uid>" key for a message with no
+    Message-ID/In-Reply-To/References at all (an unlinkable singleton
+    thread of one).
+    """
+
+    __tablename__ = "gmail_threads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_key: Mapped[str] = mapped_column(String(998), nullable=False, unique=True)
+    subject: Mapped[str] = mapped_column(String(998), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    messages: Mapped[list["GmailMessageRecord"]] = relationship(back_populates="thread")
+
+
+class GmailMessageRecord(Base):
+    """One inbound/outbound Gmail mailbox message, persisted read-only
+    (Stage 7A Gmail Inbox Foundation) — see app/services/gmail_inbox.py
+    for sync orchestration and app/providers/email/imap.py for the IMAP
+    fetch/MIME-parsing this is populated from.
+
+    Deliberately a separate table from `ProcessedEmailMessage`:
+    ProcessedEmailMessage is a minimal per-source Message-ID
+    acknowledgment marker used by job-digest collectors (see
+    app/collectors/xing_email.py) to avoid re-parsing an email into `Job`
+    rows; this table is the actual normalized correspondence record
+    future stages (7B-7E) read from, and stores real message content.
+
+    **Dedup identity is `(mailbox, uid_validity, uid)`, not
+    `message_id_header`.** An IMAP UID is only guaranteed stable while
+    UIDVALIDITY for that mailbox hasn't changed, so both must be compared
+    together — never the bare UID alone. `message_id_header` is kept for
+    threading only (see GmailThreadRecord) and is deliberately NOT the
+    dedup identity: it can be absent (a message with no Message-ID header
+    at all is still deduplicated correctly via its UID), and in principle
+    a malformed mail could repeat one.
+
+    **Privacy.** Every field here is personal correspondence content.
+    app/services/gmail_inbox.py's sync logging never includes subject,
+    body, addresses, or names — only internal id/counts/status. Nothing
+    in this project logs `body_plain`, `subject`, `from_address`,
+    `from_display_name`, `to_addresses_json`, or `cc_addresses_json`.
+    """
+
+    __tablename__ = "gmail_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "mailbox", "uid_validity", "uid", name="uq_gmail_messages_provider_identity"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
+    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # RFC 5322 Message-ID / In-Reply-To / References headers. Indexed
+    # (not unique) — see the class docstring for why this is never the
+    # dedup identity.
+    message_id_header: Mapped[str | None] = mapped_column(String(998), nullable=True, index=True)
+    in_reply_to: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    references_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    from_address: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    from_display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    to_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    cc_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    subject: Mapped[str] = mapped_column(String(998), default="", nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When this sync run persisted the message — distinct from `sent_at`
+    # (the email's own Date header, which may be absent/malformed).
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    # "INBOUND" | "OUTBOUND" — derived purely from comparing the From
+    # address against the configured mailbox account address (see
+    # app/providers/email/imap.py's `_direction`). Never an interpretation
+    # of message meaning/content.
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    # Plaintext only — HTML is never rendered/executed/fetched, see
+    # app/providers/email/imap.py's module docstring. Bounded to
+    # MAX_BODY_LENGTH chars; body_truncated records whether it was cut.
+    body_plain: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    body_truncated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    has_html: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # JSON list of {"filename": str | None, "content_type": str, "size":
+    # int | None} — metadata only, attachment content is never downloaded
+    # or stored (see ParsedAttachment's docstring).
+    attachments_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    thread: Mapped["GmailThreadRecord"] = relationship(back_populates="messages")
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may

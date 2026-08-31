@@ -72,6 +72,14 @@ from app.db.candidate_profile_repository import (
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
+from app.db.gmail_repository import (
+    get_message_by_id,
+    get_thread_by_id,
+    list_messages,
+    list_threads,
+    to_gmail_message,
+    to_gmail_thread,
+)
 from app.db.models import JobRecord, UserProfile
 from app.db.repositories import (
     get_job_by_fingerprint,
@@ -102,6 +110,7 @@ from app.models.company_research import (
     ResearchRequest,
 )
 from app.models.cv_draft import CVDraftRequest, TailoredCVDraft
+from app.models.gmail import GmailMessage, GmailSyncResult, GmailThread
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.models.review_package import (
     ReviewPackage,
@@ -112,12 +121,15 @@ from app.models.review_package import (
 )
 from app.providers.base import ProviderNotConfiguredError
 from app.providers.bewerbung.base import BewerbungProviderError, BewerbungProviderNotConfiguredError
+from app.providers.email.base import GmailProviderError
+from app.providers.email.imap import GmailImapProvider
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_bewerbung_rate_limit,
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
     enforce_cv_draft_rate_limit,
+    enforce_gmail_rate_limit,
     enforce_match_rate_limit,
     enforce_rate_limit,
     enforce_review_write_rate_limit,
@@ -129,11 +141,15 @@ from app.services.company_research import (
     CompanyResearchService,
     InvalidCompanyIdentityError,
 )
+from app.services.gmail_inbox import GmailInboxService
 from app.services.review_package import ReviewPackageService, get_approved_package
 from app.services.telegram import TelegramNotifier
 
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
+
+GMAIL_DEFAULT_LIST_LIMIT = 50
+GMAIL_MAX_LIST_LIMIT = 200
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -1429,3 +1445,114 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
             status_code=http_status.HTTP_502_BAD_GATEWAY,
             detail=f"XING mailbox collector request failed: {exc}",
         ) from exc
+
+
+async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
+    """Fetch (read-only IMAP) + persist one Gmail Inbox Foundation sync run.
+
+    The configuration check lives here (not inside GmailInboxService),
+    mirroring _run_xing/_run_bundesagentur's own split between "not
+    configured" (503, see run_gmail_sync below) and "upstream/provider
+    failure" (502) — GmailInboxService itself never fails closed on
+    missing credentials, it just orchestrates fetch+persist for an
+    already-constructed provider.
+    """
+    if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
+        raise CollectorNotConfiguredError(
+            "Gmail inbox sync is not configured: set GMAIL_USERNAME and GMAIL_APP_PASSWORD."
+        )
+
+    provider = GmailImapProvider(
+        imap_host=settings.gmail_imap_host,
+        imap_port=settings.gmail_imap_port,
+        username=settings.gmail_username,
+        app_password=settings.gmail_app_password,
+        mailbox=settings.gmail_mailbox,
+        lookback_days=settings.gmail_lookback_days,
+    )
+    return await GmailInboxService().sync(db, provider)
+
+
+@router.post(
+    "/gmail/sync",
+    response_model=GmailSyncResult,
+    dependencies=[Depends(require_api_key), Depends(enforce_gmail_rate_limit)],
+)
+async def run_gmail_sync(db: Session = Depends(get_db)) -> GmailSyncResult:
+    """Read-only IMAP fetch + idempotent persist. Never sends, replies,
+    drafts, marks read, deletes, or otherwise mutates the mailbox; never
+    changes Job/ApplicationStatus; never invokes an LLM or classifier
+    (Stage 7A scope — see CLAUDE.md).
+    """
+    settings = get_settings()
+    try:
+        return await _run_gmail_sync(db, settings)
+    except CollectorNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except GmailProviderError as exc:
+        logger.exception("gmail_sync_run_failed")
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gmail inbox sync request failed: {exc}",
+        ) from exc
+
+
+@router.get(
+    "/gmail/messages",
+    response_model=list[GmailMessage],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_messages(
+    limit: int = Query(default=GMAIL_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_MAX_LIST_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[GmailMessage]:
+    """Pure read of already-synced messages. Never triggers a sync itself
+    — POST /gmail/sync is the only endpoint that reads the mailbox.
+    """
+    records = list_messages(db, limit=limit, offset=offset)
+    return [to_gmail_message(record) for record in records]
+
+
+@router.get(
+    "/gmail/messages/{message_id}",
+    response_model=GmailMessage,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_message(message_id: int, db: Session = Depends(get_db)) -> GmailMessage:
+    record = get_message_by_id(db, message_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        )
+    return to_gmail_message(record)
+
+
+@router.get(
+    "/gmail/threads",
+    response_model=list[GmailThread],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_threads(
+    limit: int = Query(default=GMAIL_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_MAX_LIST_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[GmailThread]:
+    records = list_threads(db, limit=limit, offset=offset)
+    return [to_gmail_thread(db, record) for record in records]
+
+
+@router.get(
+    "/gmail/threads/{thread_id}",
+    response_model=GmailThread,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_thread(thread_id: int, db: Session = Depends(get_db)) -> GmailThread:
+    record = get_thread_by_id(db, thread_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail thread not found"
+        )
+    return to_gmail_thread(db, record)

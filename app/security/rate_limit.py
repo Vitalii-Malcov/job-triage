@@ -204,6 +204,34 @@ REVIEW_WRITE_RATE_LIMIT_REQUESTS = 30
 REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
+# Separate, stricter bucket for the Gmail inbox IMAP sync endpoint — same
+# rationale as XING_RATE_LIMIT above (repeated/rapid IMAP logins risk
+# tripping the mailbox provider's own abuse detection, e.g. Gmail
+# temporarily locking the account). Kept in its own bucket rather than
+# sharing XING's so the two independent mailboxes/credentials never
+# compete for the same budget.
+_gmail_requests: dict[str, deque[float]] = defaultdict(deque)
+GMAIL_RATE_LIMIT_REQUESTS = 3
+GMAIL_RATE_LIMIT_WINDOW_SECONDS = 600
+
+
+def enforce_gmail_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - GMAIL_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _gmail_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= GMAIL_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Gmail inbox sync rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_review_write_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()

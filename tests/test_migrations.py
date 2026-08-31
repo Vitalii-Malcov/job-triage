@@ -859,3 +859,137 @@ def test_application_package_reviews_downgrade_removes_tables_then_upgrade_resto
     tables = set(inspector.get_table_names())
     assert "application_package_reviews" in tables
     assert "application_package_review_revisions" in tables
+
+
+def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_inbox.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "gmail_threads" in inspector.get_table_names()
+    assert "gmail_messages" in inspector.get_table_names()
+
+    thread_columns = {col["name"] for col in inspector.get_columns("gmail_threads")}
+    assert thread_columns == {
+        "id",
+        "thread_key",
+        "subject",
+        "created_at",
+        "updated_at",
+    }
+
+    message_columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
+    assert message_columns == {
+        "id",
+        "thread_id",
+        "mailbox",
+        "uid_validity",
+        "uid",
+        "message_id_header",
+        "in_reply_to",
+        "references_json",
+        "from_address",
+        "from_display_name",
+        "to_addresses_json",
+        "cc_addresses_json",
+        "subject",
+        "sent_at",
+        "received_at",
+        "direction",
+        "body_plain",
+        "body_truncated",
+        "has_html",
+        "attachments_json",
+        "created_at",
+    }
+
+    thread_unique = inspector.get_unique_constraints("gmail_threads")
+    assert any(uc["column_names"] == ["thread_key"] for uc in thread_unique)
+
+    message_unique = inspector.get_unique_constraints("gmail_messages")
+    assert any(
+        set(uc["column_names"]) == {"mailbox", "uid_validity", "uid"} for uc in message_unique
+    )
+
+    message_indexes = {
+        tuple(idx["column_names"]) for idx in inspector.get_indexes("gmail_messages")
+    }
+    assert ("thread_id",) in message_indexes
+    assert ("message_id_header",) in message_indexes
+
+
+def test_gmail_messages_rejects_duplicate_provider_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_inbox_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_threads (thread_key, subject, created_at, updated_at)
+                VALUES ('<root@example.com>', 'Hello', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_messages (
+                    thread_id, mailbox, uid_validity, uid, references_json,
+                    to_addresses_json, cc_addresses_json, subject, received_at,
+                    direction, body_plain, body_truncated, has_html, attachments_json,
+                    created_at
+                ) VALUES (
+                    1, 'INBOX', 100, 1, '[]', '[]', '[]', 'Hello', CURRENT_TIMESTAMP,
+                    'INBOUND', 'hi', 0, 0, '[]', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO gmail_messages (
+                        thread_id, mailbox, uid_validity, uid, references_json,
+                        to_addresses_json, cc_addresses_json, subject, received_at,
+                        direction, body_plain, body_truncated, has_html, attachments_json,
+                        created_at
+                    ) VALUES (
+                        1, 'INBOX', 100, 1, '[]', '[]', '[]', 'Hello again', CURRENT_TIMESTAMP,
+                        'INBOUND', 'hi again', 0, 0, '[]', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+
+def test_gmail_inbox_downgrade_removes_tables_then_upgrade_restores_them(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_inbox_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "0ce10aaf8c86")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "gmail_threads" not in tables
+    assert "gmail_messages" not in tables
+    # Downgrading one step must not touch the previous (Application
+    # Package Reviews) migration's own tables.
+    assert "application_package_reviews" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    tables = set(inspector.get_table_names())
+    assert "gmail_threads" in tables
+    assert "gmail_messages" in tables

@@ -58,6 +58,24 @@ class Settings(BaseSettings):
     company_research_auto_enabled: bool = False
     company_research_auto_max_per_run: int = Field(default=20, ge=0)
 
+    # Gmail inbox foundation (Stage 7A — POST /gmail/sync). Deliberately its
+    # own, non-XING-prefixed config block: this reads the user's actual
+    # response/reply inbox (not a job-digest-only mailbox), and must not be
+    # coupled to XING_MAILBOX_* — see app/collectors/xing_email.py and
+    # app/providers/email/ for why the two are kept as fully independent
+    # credential sets and code paths. No default on username/app_password on
+    # purpose: unset means the sync endpoint fails closed (503) instead of
+    # attempting an IMAP login with empty credentials.
+    gmail_imap_host: str = "imap.gmail.com"
+    gmail_imap_port: int = Field(default=993, ge=1, le=65535)
+    gmail_username: str = ""
+    gmail_app_password: str = ""
+    gmail_mailbox: str = "INBOX"
+    # Bounded so a misconfigured value can't turn a sync into an
+    # effectively-unbounded full-mailbox-history fetch (upper bound ~3
+    # years) or a no-op (must fetch at least 1 day back).
+    gmail_lookback_days: int = Field(default=30, ge=1, le=1095)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
