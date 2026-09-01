@@ -393,15 +393,27 @@ class GmailMessageIdClaimRecord(Base):
     provider message identity can ever hold the claim for a given
     Message-ID within an account. Whichever concurrent INSERT commits
     first wins; every other concurrent (or later) attempt to claim the
-    same (account_key, message_id_header) fails on this constraint and is
-    routed to its own synthetic "collision" thread instead of the
-    winner's — see app/db/gmail_repository.py's
-    `_claim_message_id_or_get_collision_thread`.
+    same (account_key, message_id_header) fails on this constraint —
+    what happens next depends on WHO the existing claim actually belongs
+    to (see app/db/gmail_repository.py's
+    `_claim_message_id_or_get_collision_thread`):
 
-    **`contested`** is set True the first time a second claim attempt
-    loses this race. Once set, it is permanent (mirrors this project's
-    "immutable historical" bias elsewhere — e.g. CandidateCVDraftRecord):
-    a Message-ID that has ever been proven ambiguous stays untrusted for
+    - **Same provider identity** (same `claimant_mailbox`/
+      `claimant_uid_validity`/`claimant_uid` as the losing attempt): not
+      a collision at all — this is a concurrent or later retry of the
+      exact same message racing against itself (e.g. two overlapping
+      sync runs). The existing claim's thread is reused untouched;
+      `contested` is never set.
+    - **Different provider identity**: a genuinely different message
+      reused/replayed this Message-ID. Routed to its own synthetic
+      "collision" thread instead of the winner's, and the winning claim
+      is marked `contested`.
+
+    **`contested`** is set True the first time a claim loses this race to
+    a genuinely *different* provider identity (never for a same-identity
+    retry). Once set, it is permanent (mirrors this project's "immutable
+    historical" bias elsewhere — e.g. CandidateCVDraftRecord): a
+    Message-ID that has ever been proven ambiguous stays untrusted for
     every future message that merely *references* it too (see
     `_resolve_thread_for_message`'s reply branch) — an ambiguous anchor
     is never later treated as if it had turned out fine after all.

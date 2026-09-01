@@ -243,6 +243,18 @@ def _mark_claim_contested(db: Session, account_key: str, message_id_header: str)
     db.commit()
 
 
+def _same_claimant_identity(claim: GmailMessageIdClaimRecord, parsed: ParsedGmailMessage) -> bool:
+    """True if `claim`'s recorded owner IS `parsed`'s own provider
+    identity — i.e. this is a concurrent/later retry of the exact same
+    message, not a different message that happens to share a Message-ID.
+    """
+    return (
+        claim.claimant_mailbox == parsed.mailbox
+        and claim.claimant_uid_validity == parsed.uid_validity
+        and claim.claimant_uid == parsed.uid
+    )
+
+
 def _claim_message_id_or_get_collision_thread(
     db: Session, parsed: ParsedGmailMessage, anchor: str
 ) -> GmailThreadRecord:
@@ -254,12 +266,24 @@ def _claim_message_id_or_get_collision_thread(
     root — see `_resolve_thread_for_message`'s reply branch), otherwise
     creates one. Either way, the actual ownership decision is made by
     the claim INSERT below, never by whichever caller happened to see
-    "no thread yet" first: if the claim INSERT fails (a concurrent or
-    earlier different message already claimed this exact Message-ID),
-    this message is treated as an unrelated, ambiguous collision and
-    routed to its own brand-new synthetic thread — it never joins the
-    winner's thread just because it momentarily observed the same
-    (about-to-be-superseded) thread row.
+    "no thread yet" first.
+
+    If the claim INSERT fails, the existing claim is reloaded and
+    classified — never assumed to be a collision outright:
+
+    - **Same provider identity** (mailbox/uid_validity/uid all match
+      `parsed`'s own): this is a concurrent or later retry of the exact
+      same message racing against itself (e.g. two overlapping sync
+      runs), not ambiguity. The existing claim's thread is reused as-is;
+      `contested` is never touched.
+    - **Different provider identity**: a genuinely different message
+      already legitimately owns this exact Message-ID — this message's
+      claim to share it is unverifiable and must not be trusted as proof
+      of shared conversation. The winning claim is marked permanently
+      `contested` (see `_resolve_thread_for_message`) and this message is
+      routed to its own brand-new synthetic thread — it never joins the
+      winner's thread just because it momentarily observed the same
+      (about-to-be-superseded) thread row.
     """
     existing_thread = db.scalar(
         select(GmailThreadRecord).where(
@@ -282,10 +306,29 @@ def _claim_message_id_or_get_collision_thread(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # Someone else already legitimately owns this exact Message-ID —
-        # this message's claim to be "the" root sharing that ID is
-        # unverifiable and must not be trusted as proof of shared
-        # conversation. Mark the winning claim as permanently contested
+        existing_claim = _get_message_id_claim(db, parsed.account_key, anchor)
+        if existing_claim is None:
+            raise GmailRepositoryConsistencyError(
+                f"Expected a gmail_message_id_claims row for account_key="
+                f"{parsed.account_key!r} message_id_header={anchor!r} after a "
+                "UNIQUE constraint collision, but none was found."
+            ) from None
+
+        if _same_claimant_identity(existing_claim, parsed):
+            # Not a collision — this IS the claim's own owner, racing
+            # against itself (concurrent retry of the same message).
+            # Reuse its thread untouched; never mark contested.
+            owner_thread = db.get(GmailThreadRecord, existing_claim.thread_id)
+            if owner_thread is None:
+                raise GmailRepositoryConsistencyError(
+                    f"gmail_message_id_claims row for account_key={parsed.account_key!r} "
+                    f"message_id_header={anchor!r} points at missing thread_id="
+                    f"{existing_claim.thread_id}."
+                ) from None
+            return owner_thread
+
+        # A genuinely different provider identity already owns this
+        # Message-ID — mark the winning claim as permanently contested
         # (so future replies referencing this anchor stop trusting it
         # too — see _resolve_thread_for_message) and give this message
         # its own separate, never-shared synthetic thread.

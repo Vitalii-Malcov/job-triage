@@ -479,6 +479,180 @@ def test_concurrent_self_anchored_collision_across_real_sessions_and_threads(tmp
         verify_session.close()
 
 
+def _run_concurrent_upserts(
+    session_factory, parsed_messages: list[ParsedGmailMessage]
+) -> tuple[dict[int, tuple[int, int, bool]], dict[int, BaseException]]:
+    """Runs `upsert_message` for each of `parsed_messages` in its own real
+    thread + real Session, synchronized via a Barrier to maximize
+    interleaving. Returns `(results, errors)` keyed by list index (not by
+    uid — the same-identity test below uses the same uid for every
+    message, so uid can't be used as a results key there).
+    """
+    barrier = threading.Barrier(len(parsed_messages))
+    results: dict[int, tuple[int, int, bool]] = {}
+    errors: dict[int, BaseException] = {}
+
+    def worker(index: int, parsed: ParsedGmailMessage) -> None:
+        session = session_factory()
+        try:
+            barrier.wait(timeout=5)
+            record, created = upsert_message(session, parsed)
+            results[index] = (record.id, record.thread_id, created)
+            # The session must remain usable after the race.
+            session.execute(select(GmailMessageRecord)).all()
+        except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+            errors[index] = exc
+        finally:
+            session.close()
+
+    threads = [
+        threading.Thread(target=worker, args=(index, parsed))
+        for index, parsed in enumerate(parsed_messages)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    return results, errors
+
+
+def test_same_provider_identity_concurrent_retry_does_not_contest_claim(tmp_path):
+    """GMAIL-011 fix (Test 1, required): 5 real Sessions/threads all
+    importing the EXACT SAME provider identity (same account/mailbox/
+    uid_validity/uid/Message-ID) concurrently must converge on ONE
+    message, ONE thread, ONE UNCONTESTED claim — this is a concurrent
+    retry of the same message racing against itself, not ambiguity. The
+    prior version of this guard could not distinguish "the existing
+    claim is MY OWN identity" from "a different identity already owns
+    this" and incorrectly marked the claim contested in this scenario.
+    """
+    db_path = tmp_path / "gmail_repository_same_identity_concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    parsed_messages = [_parsed(uid=1, message_id="<same-identity@example.com>") for _ in range(5)]
+    results, errors = _run_concurrent_upserts(session_factory, parsed_messages)
+
+    assert errors == {}, f"unhandled exception(s) in worker threads: {errors}"
+    assert len(results) == 5
+
+    message_ids = {record_id for record_id, _thread_id, _created in results.values()}
+    thread_ids = {thread_id for _record_id, thread_id, _created in results.values()}
+    assert len(message_ids) == 1, "same provider identity must persist as exactly one message"
+    assert len(thread_ids) == 1, "same provider identity must resolve to exactly one thread"
+
+    verify_session = session_factory()
+    try:
+        from app.db.gmail_repository import _get_message_id_claim
+
+        assert len(list_messages(verify_session, ACCOUNT_A, limit=10, offset=0)) == 1
+        claim = _get_message_id_claim(verify_session, ACCOUNT_A, "<same-identity@example.com>")
+        assert claim is not None
+        assert claim.contested is False
+    finally:
+        verify_session.close()
+
+
+def test_different_provider_identities_concurrent_collision_still_separates(tmp_path):
+    """Regression guard: the same-identity fix above must not weaken
+    genuine collision detection (Test 3, required) — 5 DIFFERENT
+    provider messages (different uid each) racing to claim the same
+    reused Message-ID must still end up as 5 persisted messages across 5
+    different threads, with the claim marked contested.
+    """
+    db_path = tmp_path / "gmail_repository_different_identity_concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    parsed_messages = [
+        _parsed(uid=uid, message_id="<collision@example.com>") for uid in range(1, 6)
+    ]
+    results, errors = _run_concurrent_upserts(session_factory, parsed_messages)
+
+    assert errors == {}, f"unhandled exception(s) in worker threads: {errors}"
+    assert len(results) == 5
+
+    message_ids = {record_id for record_id, _thread_id, _created in results.values()}
+    thread_ids = {thread_id for _record_id, thread_id, _created in results.values()}
+    assert len(message_ids) == 5
+    assert len(thread_ids) == 5
+    assert all(created for _record_id, _thread_id, created in results.values())
+
+    verify_session = session_factory()
+    try:
+        from app.db.gmail_repository import _get_message_id_claim
+
+        claim = _get_message_id_claim(verify_session, ACCOUNT_A, "<collision@example.com>")
+        assert claim is not None
+        assert claim.contested is True
+    finally:
+        verify_session.close()
+
+
+def test_legitimate_reply_after_same_identity_retry_joins_same_thread(db):
+    """Test 2 (required): after a same-identity retry leaves a claim
+    uncontested, a genuinely different message that References that
+    Message-ID must still join the root's thread normally — it was never
+    actually ambiguous.
+
+    Uses `_resolve_thread_for_message` directly (not the public
+    `upsert_message`) to deterministically simulate the "second racer
+    reaches thread resolution before either message row is inserted"
+    window that `upsert_message`'s own early already-persisted check
+    would otherwise short-circuit in a purely sequential call.
+    """
+    from app.db.gmail_repository import _get_message_id_claim, _resolve_thread_for_message
+
+    parsed = _parsed(uid=1, message_id="<root-retry@example.com>")
+    first_thread = _resolve_thread_for_message(db, parsed)
+    second_thread = _resolve_thread_for_message(db, parsed)  # same-identity "retry"
+    assert first_thread.id == second_thread.id
+
+    claim = _get_message_id_claim(db, ACCOUNT_A, "<root-retry@example.com>")
+    assert claim is not None
+    assert claim.contested is False
+
+    reply, _ = upsert_message(
+        db,
+        _parsed(
+            uid=2,
+            message_id="<reply@example.com>",
+            references=("<root-retry@example.com>",),
+            subject="Re: Root",
+        ),
+    )
+
+    assert reply.thread_id == first_thread.id
+
+
+def test_ordinary_sequential_retry_same_identity_leaves_claim_uncontested(db):
+    """Test 4 (required): an ordinary, non-concurrent retry of the same
+    provider identity — created=True then created=False — must leave the
+    claim uncontested and resolve to the same message/thread both times.
+    """
+    parsed = _parsed(uid=1, message_id="<sequential-retry@example.com>")
+    first, created_first = upsert_message(db, parsed)
+    second, created_second = upsert_message(db, parsed)
+
+    assert created_first is True
+    assert created_second is False
+    assert first.id == second.id
+    assert first.thread_id == second.thread_id
+
+    from app.db.gmail_repository import _get_message_id_claim
+
+    claim = _get_message_id_claim(db, ACCOUNT_A, "<sequential-retry@example.com>")
+    assert claim is not None
+    assert claim.contested is False
+
+
 def test_to_gmail_thread_reports_message_count_from_grouped_query(db):
     upsert_message(db, _parsed(uid=1, message_id="<root@example.com>"))
     upsert_message(
