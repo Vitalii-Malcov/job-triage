@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.gmail_analysis_repository import (
+    compute_context_fingerprint,
     get_job_candidates,
     get_or_create_analysis,
     get_thread_prior_matches,
@@ -21,7 +22,7 @@ from app.db.gmail_analysis_repository import (
 from app.db.gmail_repository import upsert_message
 from app.db.models import GmailMessageAnalysisRecord, JobRecord
 from app.providers.email.base import ParsedGmailMessage
-from app.services.email_matching import EmailMatchResult
+from app.services.email_matching import EmailMatchResult, ThreadPriorMatch
 from app.services.gmail_message_analysis import (
     ANALYSIS_VERSION,
     analyze_gmail_message,
@@ -159,6 +160,7 @@ def test_new_algorithm_version_creates_new_revision(db):
         gmail_message_id=msg.id,
         analysis_version=1,
         input_fingerprint=fingerprint,
+        context_fingerprint="ctx-fixed",
         match_result=match_result,
         classification_category="UNKNOWN",
         classification_confidence="LOW",
@@ -172,6 +174,7 @@ def test_new_algorithm_version_creates_new_revision(db):
         gmail_message_id=msg.id,
         analysis_version=2,
         input_fingerprint=fingerprint,
+        context_fingerprint="ctx-fixed",
         match_result=match_result,
         classification_category="UNKNOWN",
         classification_confidence="LOW",
@@ -209,6 +212,7 @@ def test_changed_input_fingerprint_does_not_overwrite_prior_analysis(db):
         gmail_message_id=msg.id,
         analysis_version=1,
         input_fingerprint="fingerprint-a",
+        context_fingerprint="ctx-fixed",
         match_result=match_result,
         classification_category="UNKNOWN",
         classification_confidence="LOW",
@@ -222,6 +226,7 @@ def test_changed_input_fingerprint_does_not_overwrite_prior_analysis(db):
         gmail_message_id=msg.id,
         analysis_version=1,
         input_fingerprint="fingerprint-b",
+        context_fingerprint="ctx-fixed",
         match_result=match_result,
         classification_category="UNKNOWN",
         classification_confidence="LOW",
@@ -392,13 +397,18 @@ def test_determine_requires_human_review_matches_spec_bullets():
         classification="APPLICATION_RECEIVED",
         classification_confidence="HIGH",
     )
-    # Consequential classifications always require review even at HIGH confidence
+    # Consequential classifications always require review even at HIGH
+    # confidence — 7B-009: REQUEST_FOR_INFORMATION and
+    # GENERAL_RECRUITER_MESSAGE were added after a Codex review reproduced
+    # a HIGH-confidence REQUEST_FOR_INFORMATION with review skipped.
     for classification in (
         "OFFER",
         "INTERVIEW_INVITATION",
         "REJECTION",
         "INTERVIEW_RESCHEDULE",
         "WITHDRAWAL_OR_POSITION_CLOSED",
+        "REQUEST_FOR_INFORMATION",
+        "GENERAL_RECRUITER_MESSAGE",
     ):
         assert determine_requires_human_review(
             match_type="APPLICATION",
@@ -424,3 +434,344 @@ def test_determine_requires_human_review_matches_spec_bullets():
 
 def test_analysis_version_constant_is_positive():
     assert ANALYSIS_VERSION > 0
+
+
+# ---------------------------------------------------------------------------
+# 7B-003/004: analysis identity must be sensitive to the EFFECTIVE
+# candidate/thread context an analysis run actually considered, not just
+# the message's own unchanged content.
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_context_freshness_no_job_then_correct_job_added(db):
+    """Test 1 (spec's exact scenario, 7B-003): analyze with no matching
+    candidate -> UNMATCHED. Add the correct JobRecord. Re-analyze the
+    SAME unchanged email under the SAME algorithm version. Must produce a
+    NEW revision that now correctly matches — never silently return the
+    stale UNMATCHED row. The old revision must remain queryable.
+    """
+    msg, _ = upsert_message(db, _parsed())
+
+    record1, created1 = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+    assert created1 is True
+    assert record1.match_type == "UNMATCHED"
+
+    _add_job(db, status="APPLIED")
+
+    record2, created2 = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+    assert created2 is True
+    assert record2.id != record1.id
+    assert record2.match_type == "APPLICATION"
+    assert record2.matched_job_id is not None
+
+    # Previous immutable historical row must remain queryable.
+    still_there = db.get(GmailMessageAnalysisRecord, record1.id)
+    assert still_there is not None
+    assert still_there.match_type == "UNMATCHED"
+
+    # Re-analyzing again with unchanged context is idempotent.
+    record3, created3 = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+    assert created3 is False
+    assert record3.id == record2.id
+
+
+def test_thread_context_freshness_root_reanalyzed_after_reply_gains_association(db):
+    """7B-004: a root message analyzed before any useful thread
+    association exists, then re-analyzed after a legitimate reply
+    establishes a strong (corroborated) job association in the same
+    thread — must reflect the new context, not the stale cached result.
+    """
+    job = _add_job(
+        db, status="APPLIED", company="TrustedCo GmbH", url="https://trustedco.example.com/jobs/1"
+    )
+
+    root, _ = upsert_message(
+        db,
+        _parsed(
+            uid=1,
+            message_id="<root@example.com>",
+            from_address="someone@unrelated.example",
+            body_plain="unrelated small talk with no job context at all",
+        ),
+    )
+    record_root_1, _ = analyze_gmail_message(db, ACCOUNT_A, root.id)
+    assert record_root_1.match_type == "UNMATCHED"
+
+    upsert_message(
+        db,
+        _parsed(
+            uid=2,
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references=("<root@example.com>",),
+            from_address="hr@trustedco.example.com",
+            body_plain="Following up on your application to TrustedCo GmbH.",
+        ),
+    )
+    from app.db.gmail_repository import get_message_by_identity
+
+    reply_record = get_message_by_identity(db, ACCOUNT_A, "INBOX", 100, 2)
+    reply_analysis, _ = analyze_gmail_message(db, ACCOUNT_A, reply_record.id)
+    assert reply_analysis.matched_job_id == job.id
+
+    record_root_2, created = analyze_gmail_message(db, ACCOUNT_A, root.id)
+    assert created is True
+    assert record_root_2.id != record_root_1.id
+    assert record_root_2.matched_job_id == job.id
+
+
+# ---------------------------------------------------------------------------
+# 7B-005: thread prior matches must reflect only each message's LATEST
+# analysis revision, never an older decisive revision superseded by a
+# newer non-decisive one.
+# ---------------------------------------------------------------------------
+
+
+def test_thread_prior_matches_uses_latest_revision_not_stale_decisive_one(db):
+    """Scenario A (spec): revision 1 matched job A, revision 2 UNMATCHED
+    -> thread association must NOT expose A.
+    """
+    msg, _ = upsert_message(db, _parsed())
+    matched_a = EmailMatchResult(
+        match_type="APPLICATION",
+        matched_job_id=42,
+        confidence="HIGH",
+        score=90,
+        evidence=(),
+        candidates=(),
+    )
+    unmatched = EmailMatchResult(
+        match_type="UNMATCHED",
+        matched_job_id=None,
+        confidence="LOW",
+        score=0,
+        evidence=(),
+        candidates=(),
+    )
+
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp1",
+        context_fingerprint="ctx1",
+        match_result=matched_a,
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp1",
+        context_fingerprint="ctx2",
+        match_result=unmatched,
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+
+    prior = get_thread_prior_matches(
+        db, account_key=ACCOUNT_A, thread_id=msg.thread_id, exclude_gmail_message_id=999999
+    )
+    assert prior == []
+
+
+def test_thread_prior_matches_uses_latest_revision_b_over_a(db):
+    """Scenario B (spec): revision 1 matched A, revision 2 matched B ->
+    only B is current.
+    """
+    msg, _ = upsert_message(db, _parsed())
+    matched_a = EmailMatchResult(
+        match_type="APPLICATION",
+        matched_job_id=1,
+        confidence="HIGH",
+        score=90,
+        evidence=(),
+        candidates=(),
+    )
+    matched_b = EmailMatchResult(
+        match_type="APPLICATION",
+        matched_job_id=2,
+        confidence="HIGH",
+        score=90,
+        evidence=(),
+        candidates=(),
+    )
+
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp1",
+        context_fingerprint="ctx1",
+        match_result=matched_a,
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp1",
+        context_fingerprint="ctx2",
+        match_result=matched_b,
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+
+    prior = get_thread_prior_matches(
+        db, account_key=ACCOUNT_A, thread_id=msg.thread_id, exclude_gmail_message_id=999999
+    )
+    assert prior == [ThreadPriorMatch(job_id=2, match_type="APPLICATION")]
+
+
+def test_thread_prior_matches_multiple_historical_rows_do_not_create_false_ambiguity(db):
+    """Scenario C (spec): multiple historical rows for the SAME message
+    must not each be counted separately (that would fabricate an
+    apparent multi-job thread and defeat the single-distinct-job
+    association tier) — only one ThreadPriorMatch per distinct message.
+    """
+    msg, _ = upsert_message(db, _parsed())
+    for i, job_id in enumerate((1, 1, 1), start=1):
+        get_or_create_analysis(
+            db,
+            account_key=ACCOUNT_A,
+            gmail_message_id=msg.id,
+            analysis_version=1,
+            input_fingerprint="fp1",
+            context_fingerprint=f"ctx{i}",
+            match_result=EmailMatchResult(
+                match_type="APPLICATION",
+                matched_job_id=job_id,
+                confidence="HIGH",
+                score=90,
+                evidence=(),
+                candidates=(),
+            ),
+            classification_category="UNKNOWN",
+            classification_confidence="LOW",
+            classification_evidence=(),
+            is_automated=False,
+            requires_human_review=True,
+        )
+
+    prior = get_thread_prior_matches(
+        db, account_key=ACCOUNT_A, thread_id=msg.thread_id, exclude_gmail_message_id=999999
+    )
+    assert prior == [ThreadPriorMatch(job_id=1, match_type="APPLICATION")]
+
+
+# ---------------------------------------------------------------------------
+# 7B-007: old exact-referenced job discoverable beyond the recency window.
+# ---------------------------------------------------------------------------
+
+
+def test_get_job_candidates_finds_old_job_beyond_recency_limit_via_reference(db):
+    from datetime import timedelta
+
+    base = datetime.now(UTC)
+    old_job = JobRecord(
+        fingerprint="old-beyond-500",
+        source="test",
+        title="Old Role",
+        company="OldCo",
+        location="",
+        url="https://oldco.example.com/jobs/999888",
+        description="",
+        score=1,
+        recommendation="SKIP",
+        status="NEW",
+        last_seen_at=base - timedelta(days=1000),
+    )
+    db.add(old_job)
+    for i in range(30):
+        db.add(
+            JobRecord(
+                fingerprint=f"new-{i}",
+                source="test",
+                title=f"New Role {i}",
+                company=f"NewCo{i}",
+                location="",
+                url=f"https://newco{i}.example.com",
+                description="",
+                score=1,
+                recommendation="SKIP",
+                status="NEW",
+                last_seen_at=base,
+            )
+        )
+    db.commit()
+
+    without_reference = get_job_candidates(db, limit=10)
+    assert old_job.id not in {c.job_id for c in without_reference}
+
+    with_reference = get_job_candidates(db, limit=10, reference_tokens=frozenset({"999888"}))
+    assert old_job.id in {c.job_id for c in with_reference}
+
+
+def test_get_job_candidates_query_count_stays_bounded_with_and_without_reference(db):
+    for i in range(20):
+        _add_job(db, fingerprint=f"bulk-{i}", title=f"Role {i}")
+
+    statements: list[str] = []
+
+    def _track(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _track)
+    try:
+        get_job_candidates(db)
+        no_ref_count = len(statements)
+        statements.clear()
+        get_job_candidates(db, reference_tokens=frozenset({"ABC123"}))
+        with_ref_count = len(statements)
+    finally:
+        event.remove(engine, "before_cursor_execute", _track)
+
+    assert no_ref_count == 1
+    assert with_ref_count == 2
+
+
+# ---------------------------------------------------------------------------
+# compute_context_fingerprint: deterministic, order-independent.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_context_fingerprint_is_order_independent():
+    from app.services.email_matching import JobCandidate
+
+    a = JobCandidate(job_id=1, title="T", company="C", location="L", url="U", status="NEW")
+    b = JobCandidate(job_id=2, title="T2", company="C2", location="L2", url="U2", status="NEW")
+
+    fp1 = compute_context_fingerprint([a, b], [])
+    fp2 = compute_context_fingerprint([b, a], [])
+    assert fp1 == fp2
+
+
+def test_compute_context_fingerprint_changes_when_candidate_pool_changes():
+    from app.services.email_matching import JobCandidate
+
+    a = JobCandidate(job_id=1, title="T", company="C", location="L", url="U", status="NEW")
+    b = JobCandidate(job_id=2, title="T2", company="C2", location="L2", url="U2", status="NEW")
+
+    fp_before = compute_context_fingerprint([a], [])
+    fp_after = compute_context_fingerprint([a, b], [])
+    assert fp_before != fp_after

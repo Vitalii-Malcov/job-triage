@@ -1283,10 +1283,11 @@ def test_gmail_account_scope_downgrade_preflight_blocks_message_conflict_from_he
     assert "Cannot downgrade" in str(exc_info.value)
     assert "account_key" in str(exc_info.value)
 
-    # Nothing must have changed — not even 813c9d5086d0's own DDL
-    # (dropping gmail_message_analyses) or e6ccb9b4271b's OWN DDL
-    # (dropping gmail_message_id_claims) may have run.
-    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    # Nothing must have changed — not even 847b7f5c87d8's own DDL
+    # (altering gmail_message_analyses), 813c9d5086d0's own DDL (dropping
+    # gmail_message_analyses), or e6ccb9b4271b's OWN DDL (dropping
+    # gmail_message_id_claims) may have run.
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1319,7 +1320,7 @@ def test_gmail_account_scope_downgrade_preflight_blocks_thread_conflict_from_hea
     assert "Cannot downgrade" in str(exc_info.value)
     assert "thread_key" in str(exc_info.value)
 
-    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1355,10 +1356,13 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
+    assert "context_fingerprint" in {
+        col["name"] for col in inspector.get_columns("gmail_message_analyses")
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1383,6 +1387,7 @@ def test_gmail_message_analyses_table_shape(tmp_path: Path) -> None:
         "gmail_message_id",
         "analysis_version",
         "input_fingerprint",
+        "context_fingerprint",
         "match_type",
         "matched_job_id",
         "match_confidence",
@@ -1399,7 +1404,8 @@ def test_gmail_message_analyses_table_shape(tmp_path: Path) -> None:
 
     unique_constraints = inspector.get_unique_constraints("gmail_message_analyses")
     assert any(
-        set(uc["column_names"]) == {"gmail_message_id", "analysis_version", "input_fingerprint"}
+        set(uc["column_names"])
+        == {"gmail_message_id", "analysis_version", "input_fingerprint", "context_fingerprint"}
         for uc in unique_constraints
     )
 
@@ -1461,9 +1467,12 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
+    assert "context_fingerprint" in {
+        col["name"] for col in inspector.get_columns("gmail_message_analyses")
+    }
     with engine.connect() as connection:
         analysis_count = connection.execute(
             text("SELECT COUNT(*) FROM gmail_message_analyses")
@@ -1471,3 +1480,68 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
         message_count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
     assert analysis_count == 0  # documented: analyses do not survive a downgrade cycle
     assert message_count == 1  # sibling data is untouched
+
+
+def test_gmail_message_analyses_context_fingerprint_upgrade_downgrade_upgrade_cycle(
+    tmp_path: Path,
+) -> None:
+    """847b7f5c87d8's own narrow cycle: adding/removing just the
+    `context_fingerprint` column + widened UNIQUE constraint, with
+    existing gmail_message_analyses rows (inserted under the OLD 3-column
+    identity) surviving the ADD COLUMN step via the column's
+    server_default.
+    """
+    db_path = tmp_path / "migrations_gmail_context_fingerprint_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "813c9d5086d0")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="a@example.com", uid=1)
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_message_analyses (
+                    account_key, gmail_message_id, analysis_version, input_fingerprint,
+                    match_type, matched_job_id, match_confidence, match_score,
+                    match_evidence_json, candidate_matches_json,
+                    classification, classification_confidence, classification_evidence_json,
+                    is_automated, requires_human_review, created_at
+                ) VALUES (
+                    'a@example.com', 1, 1, 'fp1',
+                    'UNMATCHED', NULL, 'LOW', 0,
+                    '[]', '[]',
+                    'UNKNOWN', 'LOW', '[]',
+                    0, 1, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    upgrade(cfg, "847b7f5c87d8")
+
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("gmail_message_analyses")}
+    assert "context_fingerprint" in columns
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT context_fingerprint FROM gmail_message_analyses WHERE id = 1")
+        ).fetchone()
+    assert row is not None
+    assert row[0] == ""  # backfilled via server_default
+
+    downgrade(cfg, "813c9d5086d0")
+    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("gmail_message_analyses")}
+    assert "context_fingerprint" not in columns
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_message_analyses")).scalar()
+    assert count == 1  # row itself survives the column drop
+
+    upgrade(cfg, "847b7f5c87d8")
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"

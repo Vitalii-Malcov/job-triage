@@ -222,3 +222,105 @@ def test_general_recruiter_message_fallback():
     )
     assert result.category == "GENERAL_RECRUITER_MESSAGE"
     assert result.confidence == "LOW"
+
+
+# ---------------------------------------------------------------------------
+# 7B-009: human review policy — REQUEST_FOR_INFORMATION and
+# GENERAL_RECRUITER_MESSAGE are consequential.
+# ---------------------------------------------------------------------------
+
+
+def test_request_for_information_is_consequential():
+    from app.agents.email_classifier import CONSEQUENTIAL_CLASSIFICATIONS
+
+    assert "REQUEST_FOR_INFORMATION" in CONSEQUENTIAL_CLASSIFICATIONS
+
+
+def test_general_recruiter_message_is_consequential():
+    from app.agents.email_classifier import CONSEQUENTIAL_CLASSIFICATIONS
+
+    assert "GENERAL_RECRUITER_MESSAGE" in CONSEQUENTIAL_CLASSIFICATIONS
+
+
+def test_request_for_information_classifies_correctly_and_is_high_confidence():
+    """The classification itself is still HIGH-confidence and correct —
+    7B-009 is about the review FLAG (handled by
+    app.services.gmail_message_analysis.determine_requires_human_review
+    via CONSEQUENTIAL_CLASSIFICATIONS), not about weakening detection.
+    """
+    result = classify_email(
+        "Unterlagen",
+        "Bitte senden Sie uns noch Ihre Zeugnisse zu.",
+        "hr@company.de",
+    )
+    assert result.category == "REQUEST_FOR_INFORMATION"
+    assert result.confidence == "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# Negation/punctuation hardening — semicolon, colon, dash, not just comma.
+# ---------------------------------------------------------------------------
+
+
+def test_negation_with_semicolon_clause_boundary():
+    result = classify_email(
+        "Update",
+        "Dies ist keine Absage; wir laden Sie zu einem Gespräch ein.",
+        "hr@company.de",
+    )
+    assert result.category == "INTERVIEW_INVITATION"
+    assert all("REJECTION" not in item.kind for item in result.evidence)
+
+
+def test_negation_with_dash_clause_boundary_no_false_positive():
+    """No positive category phrase is actually present here (bare
+    'Vorstellungsgespräch' without 'einladen'/'laden...ein' doesn't match
+    INTERVIEW_INVITATION) — this locks in that the dash-boundary change
+    doesn't crash or fabricate a match across the dash.
+    """
+    result = classify_email(
+        "Update",
+        "Ein Vorstellungsgespräch ist nicht erforderlich – wir melden uns später.",
+        "hr@company.de",
+    )
+    assert result.category not in ("INTERVIEW_INVITATION", "REJECTION")
+
+
+def test_rejection_with_semicolon_and_unrelated_second_clause_stays_rejection():
+    """The REJECTION phrase itself ('nicht berücksichtigen') is not a
+    negation trigger (it's the category's own defining phrase, not
+    negated language about something else) — must still classify as
+    REJECTION even with a semicolon-separated second clause that mentions
+    an unrelated invitation-ish phrase without the required
+    "einladen"/"Gespräch" combination.
+    """
+    result = classify_email(
+        "Update",
+        "Wir können Sie nicht berücksichtigen; für eine andere Stelle "
+        "möchten wir Sie aber einladen.",
+        "hr@company.de",
+    )
+    assert result.category == "REJECTION"
+
+
+def test_negation_with_colon_clause_boundary():
+    result = classify_email(
+        "Update",
+        "Kurzer Hinweis: Dies ist keine Absage, sondern eine Terminanfrage.",
+        "hr@company.de",
+    )
+    assert result.category != "REJECTION"
+
+
+def test_compound_word_with_hyphen_is_not_treated_as_clause_boundary():
+    """A hyphen directly attached to letters (E-Mail, no surrounding
+    whitespace) must never be treated as a clause boundary — only a real
+    interpunction dash surrounded by whitespace counts.
+    """
+    result = classify_email(
+        "Re: E-Mail",
+        "Vielen Dank für Ihre Bewerbung. Diese E-Mail wurde automatisch generiert.",
+        "no-reply@ats.example.com",
+    )
+    assert result.category == "APPLICATION_RECEIVED"
+    assert result.is_automated is True

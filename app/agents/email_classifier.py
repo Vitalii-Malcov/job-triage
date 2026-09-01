@@ -19,16 +19,18 @@ convention shared with app/collectors/xing_email.py: phrases like "mark
 this application rejected" appearing IN the email body are correspondence
 content, not commands to this code).
 
-**Negation, sentence-scoped.** A single shared `_NEGATION_PATTERN`
-(German + English) is checked per sentence, exactly like
-app.agents.requirement_extractor's `_NEGATION_PATTERN` — if a sentence
-matches the negation pattern, no positive category phrase found in that
-SAME sentence is counted as evidence (other sentences are unaffected).
-This is deliberately a single shared pattern rather than one per
-category: "Dies ist keine Absage" (negates REJECTION) and "Interview is
-not required" (negates INTERVIEW_INVITATION) are both instances of the
-same general "keine/nicht ... erforderlich/noun" negation shape, not two
-unrelated rules.
+**Negation, clause-scoped.** A single shared `_NEGATION_PATTERN`
+(German + English) is checked per CLAUSE — the comma/semicolon/colon/
+dash-delimited span immediately around one specific category match (see
+`_clause_span`/`_CLAUSE_BOUNDARY_PATTERN`), not the whole sentence: if a
+sentence contains both a negation ("Dies ist keine Absage") AND an
+unrelated genuine match in a LATER clause ("...; wir laden Sie zu einem
+Gespräch ein."), only the negated clause's own match is suppressed — the
+genuine invitation survives. This is deliberately a single shared
+negation pattern rather than one per category: "Dies ist keine Absage"
+(negates REJECTION) and "Interview is not required" (negates
+INTERVIEW_INVITATION) are both instances of the same general "keine/
+nicht ... erforderlich/noun" negation shape, not two unrelated rules.
 
 **Precedence over ambiguity.** When more than one of the seven specific
 lifecycle categories matches (non-negated) in the same email, a
@@ -223,6 +225,24 @@ _CONTRADICTORY_WITH_REJECTION: frozenset[EmailCategory] = frozenset(
 # correspondence stays visible even at high confidence" bias (Stage 7B
 # spec) applies — used by
 # app.services.gmail_message_analysis.determine_requires_human_review.
+#
+# 7B-009 (Codex remediation round 1): REQUEST_FOR_INFORMATION was
+# reproduced reaching HIGH confidence with requires_human_review=False —
+# unsafe, since a recruiter asking for documents/availability/salary
+# expectations/work authorization IS actionable correspondence a human
+# needs to see, even though this project never acts on it automatically.
+# GENERAL_RECRUITER_MESSAGE is included too, for the same "genuinely
+# non-actionable only" bar (spec: "requires_human_review=False should be
+# reserved for genuinely non-actionable informational mail where no user
+# response/decision is implied") — explicit here rather than relying
+# only on that category's classifier confidence happening to always be
+# LOW (see classify_email's GENERAL_RECRUITER_MESSAGE branch), since a
+# future classifier tuning change could otherwise silently reopen this
+# gap. APPLICATION_RECEIVED, AUTOMATED_NOTIFICATION, and UNKNOWN remain
+# excluded — genuinely non-actionable acknowledgements/unclassifiable
+# mail, the only cases requires_human_review=False may still apply to
+# (and even then only when match confidence is also non-LOW — see
+# determine_requires_human_review).
 CONSEQUENTIAL_CLASSIFICATIONS: frozenset[EmailCategory] = frozenset(
     {
         "OFFER",
@@ -230,6 +250,8 @@ CONSEQUENTIAL_CLASSIFICATIONS: frozenset[EmailCategory] = frozenset(
         "INTERVIEW_RESCHEDULE",
         "REJECTION",
         "WITHDRAWAL_OR_POSITION_CLOSED",
+        "REQUEST_FOR_INFORMATION",
+        "GENERAL_RECRUITER_MESSAGE",
         "OTHER",
     }
 )
@@ -261,21 +283,36 @@ def _truncate(fragment: str) -> str:
     return fragment[:EVIDENCE_FRAGMENT_MAX_LENGTH].rstrip() + "..."
 
 
+# Codex remediation round 1 (negation/punctuation hardening): a clause
+# boundary is comma, semicolon, or colon, OR a dash/en-dash/em-dash
+# SURROUNDED BY WHITESPACE (so "E-Mail"/"Vorstellungsgespräch-Termin"
+# compound words are never mistaken for a clause break — only a real
+# interpunction dash like " - "/" – "/" — " counts). Originally
+# comma-only, which under-scoped negation for equally common German
+# recruiter punctuation ("Dies ist keine Absage; wir laden Sie ein.").
+_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,;:]|(?<=\s)[-–—](?=\s)")
+
+
 def _clause_span(sentence: str, match: re.Match[str]) -> tuple[int, int]:
-    """The comma-delimited clause containing `match`, exactly mirroring
+    """The delimited clause containing `match` — same technique as
     app.agents.requirement_extractor._clause_span (duplicated, not
-    imported — that function is private to its own module and this is
-    one line of arithmetic, not a decision). Needed so "Dies ist keine
-    Absage, wir laden Sie herzlich zu einem Vorstellungsgespräch ein."
+    imported — that function is private to its own module and this is a
+    few lines of arithmetic, not a decision), generalized from
+    comma-only to `_CLAUSE_BOUNDARY_PATTERN`. Needed so "Dies ist keine
+    Absage; wir laden Sie herzlich zu einem Vorstellungsgespräch ein."
     only suppresses REJECTION's own clause — the genuine
-    INTERVIEW_INVITATION in the second clause of the SAME sentence must
-    not be discarded merely because the sentence also contains a
-    negation elsewhere in it.
+    INTERVIEW_INVITATION in a LATER clause of the SAME sentence must not
+    be discarded merely because the sentence also contains a negation
+    elsewhere in it, regardless of which punctuation mark separates them.
     """
-    start = sentence.rfind(",", 0, match.start()) + 1
-    end = sentence.find(",", match.end())
-    if end == -1:
-        end = len(sentence)
+    start = 0
+    end = len(sentence)
+    for boundary in _CLAUSE_BOUNDARY_PATTERN.finditer(sentence):
+        if boundary.start() < match.start():
+            start = boundary.end()
+        elif boundary.start() >= match.end():
+            end = boundary.start()
+            break
     return start, end
 
 
@@ -285,8 +322,9 @@ def _matched_categories(text: str) -> dict[EmailCategory, str]:
     first matching, non-negated mention found — matches this project's
     existing "first match wins for evidence text" convention, e.g.
     extract_education_requirement). Negation is checked per CLAUSE
-    (comma-delimited span around the specific match), not per whole
-    sentence — see `_clause_span`.
+    (comma/semicolon/colon/dash-delimited span around the specific
+    match, see `_CLAUSE_BOUNDARY_PATTERN`), not per whole sentence — see
+    `_clause_span`.
     """
     matches: dict[EmailCategory, str] = {}
     for sentence in _sentences(text):

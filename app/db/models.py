@@ -472,15 +472,14 @@ class GmailMessageAnalysisRecord(Base):
     **Immutable, versioned, never UPDATEd** — mirrors
     CandidateCVDraftRecord's "immutable historical" convention elsewhere
     in this file. Re-analyzing a message (a bumped `analysis_version`
-    after an algorithm change, or — hypothetically, since no code path
-    mutates a persisted `GmailMessageRecord` today — a changed
-    `input_fingerprint`) inserts a NEW row; the prior revision is never
-    overwritten and stays queryable. `(gmail_message_id, analysis_version,
-    input_fingerprint)` is the idempotency identity (UNIQUE constraint):
-    repeating the exact same analysis of the exact same bounded input
-    under the exact same algorithm version returns the existing row,
-    never inserts a duplicate. See `input_fingerprint`'s own note below
-    for exactly what it does and does not cover.
+    after an algorithm change, a changed `input_fingerprint`, OR a
+    changed `context_fingerprint` — see below) inserts a NEW row; the
+    prior revision is never overwritten and stays queryable.
+    `(gmail_message_id, analysis_version, input_fingerprint,
+    context_fingerprint)` is the idempotency identity (UNIQUE
+    constraint): repeating the exact same analysis of the exact same
+    bounded input AND effective context under the exact same algorithm
+    version returns the existing row, never inserts a duplicate.
 
     **`matched_job_id` is deliberately not a ForeignKey** — same
     "traceability, not identity" rationale as
@@ -493,13 +492,21 @@ class GmailMessageAnalysisRecord(Base):
     message's own fields the classifier/matcher actually read (subject,
     from_address, body_plain — see
     app.services.gmail_message_analysis.compute_input_fingerprint).
-    Deliberately excludes thread-context (sibling messages) and the
-    candidate `JobRecord` pool: those can legitimately change between two
-    analyses of the SAME unchanged message (a new reply arrives in the
-    thread; a new job is tracked) without the message's own content
-    having changed — that is new information to re-analyze against under
-    a bumped `analysis_version`, not something `input_fingerprint` is
-    meant to track.
+
+    **`context_fingerprint` (Codex remediation round 1, 7B-003/004)** is
+    a SHA-256 digest over the EFFECTIVE candidate `JobRecord` pool and
+    thread prior-match context an analysis run actually considered — see
+    app.db.gmail_analysis_repository.compute_context_fingerprint. This
+    column exists because `input_fingerprint` alone let a STALE analysis
+    silently masquerade as current: e.g. a message analyzed as UNMATCHED
+    before its correct `JobRecord` was ever tracked would keep returning
+    that same stale UNMATCHED row forever after the correct job was
+    added, since the message's OWN content (what `input_fingerprint`
+    covers) never changed. `context_fingerprint` makes such an
+    externally-changed-context re-analysis produce a genuinely NEW
+    revision instead of reusing a now-outdated cached result, while the
+    OLD revision remains queryable (never overwritten) — an accurate
+    historical record of what the evidence looked like at the time.
 
     **Evidence is bounded, structured, and PII-minimal** — see
     MATCH_EVIDENCE_MAX_ITEMS / EVIDENCE_FRAGMENT_MAX_LENGTH in
@@ -514,6 +521,7 @@ class GmailMessageAnalysisRecord(Base):
             "gmail_message_id",
             "analysis_version",
             "input_fingerprint",
+            "context_fingerprint",
             name="uq_gmail_message_analyses_identity",
         ),
         CheckConstraint("analysis_version > 0", name="ck_gmail_message_analyses_version_positive"),
@@ -553,6 +561,7 @@ class GmailMessageAnalysisRecord(Base):
     )
     analysis_version: Mapped[int] = mapped_column(Integer, nullable=False)
     input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
 
     match_type: Mapped[str] = mapped_column(String(20), nullable=False)
     # Not a ForeignKey — see class docstring.

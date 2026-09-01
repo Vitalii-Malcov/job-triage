@@ -37,13 +37,14 @@ from sqlalchemy.orm import Session
 
 from app.agents.email_classifier import CONSEQUENTIAL_CLASSIFICATIONS, classify_email
 from app.db.gmail_analysis_repository import (
+    compute_context_fingerprint,
     get_job_candidates,
     get_or_create_analysis,
     get_thread_prior_matches,
 )
 from app.db.gmail_repository import get_message_by_id
 from app.db.models import GmailMessageAnalysisRecord
-from app.services.email_matching import match_email_to_job
+from app.services.email_matching import extract_reference_tokens, match_email_to_job
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,13 @@ def analyze_gmail_message(
             f"No gmail_messages row for account_key={account_key!r} id={gmail_message_id!r}"
         )
 
-    job_candidates = get_job_candidates(db)
+    # 7B-007: extract the email's own reference tokens FIRST so
+    # get_job_candidates can run its targeted lookup alongside the
+    # recency-bounded pool — an exact reference match older than the
+    # recency window must still be discoverable (see that function's
+    # docstring).
+    reference_tokens = extract_reference_tokens(f"{message.subject}\n{message.body_plain}")
+    job_candidates = get_job_candidates(db, reference_tokens=reference_tokens)
     thread_prior_matches = get_thread_prior_matches(
         db,
         account_key=account_key,
@@ -159,6 +166,10 @@ def analyze_gmail_message(
     input_fingerprint = compute_input_fingerprint(
         message.subject, message.from_address, message.body_plain
     )
+    # 7B-003/004: makes the identity sensitive to the EFFECTIVE candidate
+    # pool and thread context actually considered — see
+    # compute_context_fingerprint's own docstring for why this exists.
+    context_fingerprint = compute_context_fingerprint(job_candidates, thread_prior_matches)
 
     record, created = get_or_create_analysis(
         db,
@@ -166,6 +177,7 @@ def analyze_gmail_message(
         gmail_message_id=message.id,
         analysis_version=ANALYSIS_VERSION,
         input_fingerprint=input_fingerprint,
+        context_fingerprint=context_fingerprint,
         match_result=match_result,
         classification_category=classification_result.category,
         classification_confidence=classification_result.confidence,
