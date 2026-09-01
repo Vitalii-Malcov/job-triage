@@ -72,6 +72,11 @@ from app.db.candidate_profile_repository import (
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
+from app.db.gmail_analysis_repository import (
+    get_latest_analysis_for_message,
+    list_analyses,
+    to_gmail_message_analysis,
+)
 from app.db.gmail_repository import (
     THREAD_DETAIL_DEFAULT_MESSAGE_LIMIT,
     THREAD_DETAIL_MAX_MESSAGE_LIMIT,
@@ -123,6 +128,7 @@ from app.models.gmail import (
     GmailThread,
     GmailThreadDetail,
 )
+from app.models.gmail_analysis import GmailMessageAnalysis
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.models.review_package import (
     ReviewPackage,
@@ -141,6 +147,7 @@ from app.security.rate_limit import (
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
     enforce_cv_draft_rate_limit,
+    enforce_gmail_analysis_rate_limit,
     enforce_gmail_rate_limit,
     enforce_match_rate_limit,
     enforce_rate_limit,
@@ -154,6 +161,7 @@ from app.services.company_research import (
     InvalidCompanyIdentityError,
 )
 from app.services.gmail_inbox import GmailInboxService
+from app.services.gmail_message_analysis import GmailMessageNotFoundError, analyze_gmail_message
 from app.services.review_package import ReviewPackageService, get_approved_package
 from app.services.telegram import TelegramNotifier
 
@@ -162,6 +170,9 @@ MAX_LIST_LIMIT = 200
 
 GMAIL_DEFAULT_LIST_LIMIT = 50
 GMAIL_MAX_LIST_LIMIT = 200
+
+GMAIL_ANALYSES_DEFAULT_LIST_LIMIT = 50
+GMAIL_ANALYSES_MAX_LIST_LIMIT = 200
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -1615,3 +1626,95 @@ def get_gmail_thread(
         )
     message_count = get_thread_message_count(db, account_key, record.id)
     return to_gmail_thread_detail(db, record, message_count, message_limit=message_limit)
+
+
+@router.post(
+    "/gmail/messages/{message_id}/analyze",
+    response_model=GmailMessageAnalysis,
+    dependencies=[Depends(require_api_key), Depends(enforce_gmail_analysis_rate_limit)],
+)
+def run_gmail_message_analysis(
+    message_id: int, db: Session = Depends(get_db)
+) -> GmailMessageAnalysis:
+    """Deterministic, evidence-based job/application matching +
+    correspondence classification for one already-persisted Gmail
+    message (Stage 7B). INFORMATION ONLY — see
+    app/services/gmail_message_analysis.py's module docstring for the
+    full hard boundary (no send/draft/reply, no mailbox mutation, no
+    ApplicationStatus mutation, no email-derived HTTP, no LLM/external
+    call). Idempotent: re-analyzing the same message under the same
+    algorithm version and unchanged content returns the existing
+    revision rather than creating a duplicate.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        record, _created = analyze_gmail_message(db, account_key, message_id)
+    except GmailMessageNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        ) from exc
+    except Exception as exc:
+        # Mirrors GMAIL-003 (POST /gmail/sync): never interpolate a
+        # caught exception into the HTTP response or the log line — a
+        # driver-level DB error's own message text could in principle
+        # embed row content (subject/body/addresses). Log only the
+        # exception's type; respond with a fixed, generic detail string.
+        db.rollback()
+        logger.warning("gmail_message_analysis_run_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Gmail message analysis failed",
+        ) from exc
+    return to_gmail_message_analysis(record)
+
+
+@router.get(
+    "/gmail/messages/{message_id}/analysis",
+    response_model=GmailMessageAnalysis,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_message_analysis(
+    message_id: int, db: Session = Depends(get_db)
+) -> GmailMessageAnalysis:
+    """The latest analysis revision for one message, if it has already
+    been analyzed — pure read, never triggers analysis itself (mirrors
+    GET /gmail/messages not triggering a sync — see
+    POST /gmail/messages/{id}/analyze for that).
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    # Also confirms the message itself exists and belongs to this
+    # account before reporting "no analysis found" vs. "message not
+    # found" — two distinct 404 reasons.
+    message = get_message_by_id(db, account_key, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        )
+    record = get_latest_analysis_for_message(db, account_key, message_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message has not been analyzed"
+        )
+    return to_gmail_message_analysis(record)
+
+
+@router.get(
+    "/gmail/analyses",
+    response_model=list[GmailMessageAnalysis],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_analyses(
+    limit: int = Query(
+        default=GMAIL_ANALYSES_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_ANALYSES_MAX_LIST_LIMIT
+    ),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[GmailMessageAnalysis]:
+    """Bounded, most-recent-first list of persisted analysis revisions
+    for the configured mailbox account. Each row is one immutable
+    revision (not deduplicated to "latest per message") — a message
+    re-analyzed under a new ANALYSIS_VERSION appears here more than once.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    records = list_analyses(db, account_key, limit=limit, offset=offset)
+    return [to_gmail_message_analysis(record) for record in records]

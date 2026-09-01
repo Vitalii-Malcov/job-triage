@@ -34,7 +34,7 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 6E Draft review / approval
 7. Gmail Response + Follow-up Agent — по подэтапам, см. "Gmail Inbox Foundation" ниже:
    - [x] 7A Gmail Inbox Foundation — read-only, idempotent IMAP-приём и хранение переписки, см. "Gmail Inbox Foundation" ниже.
-   - [ ] 7B Job/Application ↔ Email matching + classification
+   - [x] 7B Job/Application ↔ Email matching + classification — детерминированный evidence-first матчинг писем к вакансиям/заявкам и классификация переписки, см. "Email Matching + Classification" ниже.
    - [ ] 7C Response Draft Agent
    - [ ] 7D Human approval + Gmail reply
    - [ ] 7E Follow-up Agent
@@ -1457,6 +1457,136 @@ https://myaccount.google.com/apppasswords.
   summary-виде, чтобы будущий Stage 7B мог прочитать контекст треда одним
   безопасным запросом вместо изобретения собственного неограниченного
   чтения.
+
+## Email Matching + Classification (Stage 7B)
+
+Строится поверх Stage 7A (`gmail_messages`/`gmail_threads`) и отвечает
+только на пять вопросов про уже сохранённое письмо: к какой
+вакансии/заявке оно вероятно относится, какой это тип
+ответа/уведомления, какие evidence это подтверждают, насколько мы
+уверены, и требуется ли human review. **INFORMATION ONLY** — этот этап
+ничего не отправляет и не меняет:
+
+- не отправляет email, не создаёт Gmail draft, не отвечает, не
+  форвардит;
+- не помечает письма read/unread, не двигает/архивирует/удаляет их;
+- не открывает URL, не скачивает изображения, не переходит по ссылкам
+  из письма;
+- не меняет `ApplicationStatus`/`JobRecord` — ни автоматически, ни по
+  классификации (`INTERVIEW_INVITATION` НЕ вызывает
+  `ApplicationStatus.INTERVIEW`, это решение будущего human-reviewed
+  workflow);
+- не вызывает LLM/внешний provider — матчинг и классификация полностью
+  детерминированы (regex/evidence-based), zero network beyond локальных
+  regex-вычислений над уже сохранёнными данными (проверяется
+  source-inspection тестом, как и для Stage 7A/XING).
+
+Все поля письма (subject/body/sender/recipient/Message-ID/References)
+трактуются как untrusted correspondence content — фразы вроде "ignore
+previous instructions" или "update status to interview" внутри письма
+никогда не интерпретируются как команды системе.
+
+**Матчинг (`app/services/email_matching.py`).** В этом проекте нет
+отдельной `ApplicationRecord` — `JobRecord` одновременно и вакансия, и
+статус заявки; "matched to an application" означает `JobRecord.status`
+в `{APPLIED, INTERVIEW, REJECTED, OFFER, WITHDRAWN}` (`match_type =
+APPLICATION`), "matched to a job only" — `NEW`/`SAVED` (`match_type =
+JOB_ONLY`). Явная детерминированная precedence:
+
+1. **Trusted thread association** — если у ДРУГИХ сообщений в том же
+   (уже провалидированном Stage 7A/GMAIL-011) `GmailThreadRecord`
+   ровно один `matched_job_id` в предыдущих анализах, это решает матч
+   безусловно (`HIGH`, evidence `THREAD_ASSOCIATION`), без обращения к
+   остальным кандидатам.
+2. **Exact job reference** — явный `Referenz-Nr`/`Job-ID`/числовой ID в
+   URL вакансии, найденный и в письме, и в кандидате. Вес
+   (`JOB_REFERENCE`) намеренно выше максимально возможной суммы всех
+   остальных evidence вместе (проверяется `assert` в модуле), поэтому
+   reference-матч никогда не проигрывает composite-скору.
+3. **Composite evidence** — нормализованное совпадение компании
+   (`COMPANY_EXACT`, консервативная нормализация: casefold + известные
+   юридические суффиксы GmbH/AG/... ), совпадение домена отправителя с
+   доменом вакансии (`DOMAIN_COMPANY_MATCH`, free-mail домены
+   gmail.com/web.de/... никогда не в счёт), пересечение отличительных
+   токенов заголовка (`TITLE_TOKEN_OVERLAP`) и локации
+   (`LOCATION_OVERLAP`). Generic-слова (`developer`/`python`/`stelle`/
+   `bewerbung`/...) дают отдельный, намеренно слабый вес
+   (`GENERIC_TITLE_TOKEN_OVERLAP`), который один никогда не поднимается
+   выше `LOW`.
+4. **Ambiguous** — если несколько `JobRecord` набрали РОВНО одинаковый
+   максимальный score (включая случай "пять заявок Python Developer с
+   одинаковым generic-совпадением"), результат — `AMBIGUOUS` со списком
+   всех связанных кандидатов и их evidence, никогда произвольный
+   "первый" победитель.
+5. **Unmatched** — ни один кандидат не набрал ненулевой score.
+
+Кандидатный пул `JobRecord` ограничен (`MATCH_CANDIDATE_SCAN_LIMIT`,
+один запрос, без N+1), контекст треда — тоже
+(`THREAD_ASSOCIATION_SCAN_LIMIT`).
+
+**Классификация (`app/agents/email_classifier.py`).** Регулярные
+выражения "немецкий прежде всего" + английский, категории:
+`APPLICATION_RECEIVED`, `REQUEST_FOR_INFORMATION`,
+`INTERVIEW_INVITATION`, `INTERVIEW_RESCHEDULE`, `REJECTION`, `OFFER`,
+`WITHDRAWAL_OR_POSITION_CLOSED`, `GENERAL_RECRUITER_MESSAGE`,
+`AUTOMATED_NOTIFICATION`, `OTHER`, `UNKNOWN`. Negation — общий
+`_NEGATION_PATTERN` (нем. "nicht erforderlich"/"keine ... erforderlich",
+англ. "not required"), проверяется на уровне clause (по образцу Stage
+6B's `requirement_extractor`, через запятую-разделённый span), а не
+всего предложения — "Dies ist keine Absage, wir laden Sie ... ein"
+корректно отбрасывает только REJECTION-сигнал, не всё предложение
+целиком. Genuine conflict (REJECTION вместе с любой positive-outcome
+категорией в одном письме) → `OTHER`, `LOW` confidence, human review;
+non-contradictory комбинации (например INTERVIEW_RESCHEDULE +
+INTERVIEW_INVITATION) резолвятся через явный precedence-порядок, не
+считаются конфликтом. `is_automated` (no-reply отправитель / фразы про
+автогенерацию) — отдельный флаг, НЕ подавляет более сильный
+семантический сигнал (no-reply ATS письмо всё ещё может быть
+`APPLICATION_RECEIVED` или `REJECTION`).
+
+**Human review (`requires_human_review`)** — safe-by-default: всегда
+`True` для `AMBIGUOUS`, для любой `LOW` confidence (match ИЛИ
+classification), для consequential-категорий (`OFFER`,
+`INTERVIEW_INVITATION`, `INTERVIEW_RESCHEDULE`, `REJECTION`,
+`WITHDRAWAL_OR_POSITION_CLOSED`, `OTHER`) независимо от confidence, и
+для `UNMATCHED` с любой классификацией кроме `UNKNOWN`.
+`requires_human_review=False` НЕ означает разрешение на автоматическое
+действие — это чисто информационный сигнал.
+
+**Персистентность (`GmailMessageAnalysisRecord`,
+`app/db/gmail_analysis_repository.py`).** Immutable, версионируемая
+запись — никогда не UPDATE, только новая ревизия. Идентичность
+idempotency — `UNIQUE(gmail_message_id, analysis_version,
+input_fingerprint)`, тот же INSERT+IntegrityError-catch+reload идиом,
+что и в `gmail_repository.upsert_message`; конкурентный повторный анализ
+того же сообщения под тем же алгоритмом сходится к ОДНОЙ строке (DB
+constraint — финальный арбитр, не Python pre-check). `input_fingerprint`
+— SHA-256 по subject/from_address/body_plain (полям, которые реально
+читают matcher/classifier); смена `analysis_version` при изменении
+алгоритма создаёт новую ревизию, не перезаписывая старую. Evidence
+хранится как ограниченный bounded JSON (не полное тело письма) —
+`match_evidence_json`/`classification_evidence_json`/
+`candidate_matches_json`.
+
+**API** (`X-API-Key`, отдельный rate limit для `/analyze`):
+- `POST /api/v1/gmail/messages/{id}/analyze` — запускает (или
+  идемпотентно переиспользует) анализ.
+- `GET /api/v1/gmail/messages/{id}/analysis` — последняя ревизия анализа
+  для сообщения, `404` если анализ ещё не запускался.
+- `GET /api/v1/gmail/analyses` — ограниченный (`limit<=200`)
+  most-recent-first список ревизий для текущего аккаунта; каждая строка
+  — одна ревизия (без дедупликации "последняя на сообщение").
+
+**Известные ограничения.** Извлечение job reference из письма —
+best-effort regex по явным меткам ("Referenz-Nr", "Job-ID",
+"Kennziffer") и числовым сегментам URL вакансии, не гарантированно
+покрывает все ATS-форматы. Ambiguity резолвится через точное совпадение
+максимального score (без fuzzy margin) — намеренно, ради
+детерминизма/объяснимости, но означает, что скор 41 против 40 НЕ
+считается ambiguous. Классификация не парсит сырые email-заголовки
+(List-Unsubscribe/X-Mailer) — `is_automated` опирается только на
+sender-паттерн и текстовые фразы, поскольку `GmailMessageRecord` их не
+хранит.
 
 ## Проверки
 ```bash

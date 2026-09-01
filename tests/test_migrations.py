@@ -1226,13 +1226,15 @@ def test_gmail_account_scope_downgrade_preflight_blocks_cross_account_thread_key
 
 # ---------------------------------------------------------------------------
 # GMAIL-013 (upper preflight): the tests above start from 7058c097a542
-# directly (the "lower preflight" scenario). Current HEAD is one
-# migration further (e6ccb9b4271b, adding gmail_message_id_claims) —
-# these tests reproduce the exact regression: without e6ccb9b4271b's OWN
-# preflight, downgrading from HEAD would drop gmail_message_id_claims
-# and advance the revision to 7058c097a542 BEFORE that migration's own
-# preflight ever got a chance to object, mutating the database ahead of
-# a failure that's supposed to leave it untouched.
+# directly (the "lower preflight" scenario). Current HEAD is two
+# migrations further (e6ccb9b4271b adding gmail_message_id_claims, then
+# 813c9d5086d0 adding gmail_message_analyses for Stage 7B) — both of
+# those migrations duplicate the SAME account-scope preflight in their
+# own downgrade(), specifically so downgrading from whatever the current
+# HEAD happens to be fails closed before ANY of their own DDL (dropping
+# gmail_message_id_claims / gmail_message_analyses) has run, rather than
+# mutating the database ahead of 7058c097a542's preflight catching the
+# conflict several steps later.
 # ---------------------------------------------------------------------------
 
 
@@ -1281,12 +1283,14 @@ def test_gmail_account_scope_downgrade_preflight_blocks_message_conflict_from_he
     assert "Cannot downgrade" in str(exc_info.value)
     assert "account_key" in str(exc_info.value)
 
-    # Nothing must have changed — not even e6ccb9b4271b's OWN DDL
+    # Nothing must have changed — not even 813c9d5086d0's own DDL
+    # (dropping gmail_message_analyses) or e6ccb9b4271b's OWN DDL
     # (dropping gmail_message_id_claims) may have run.
-    assert _alembic_current_revision(engine) == "e6ccb9b4271b"
+    assert _alembic_current_revision(engine) == "813c9d5086d0"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
+    assert "gmail_message_analyses" in tables
     assert not any(table.startswith("_alembic_tmp") for table in tables)
     assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_messages")}
     with engine.connect() as connection:
@@ -1315,10 +1319,11 @@ def test_gmail_account_scope_downgrade_preflight_blocks_thread_conflict_from_hea
     assert "Cannot downgrade" in str(exc_info.value)
     assert "thread_key" in str(exc_info.value)
 
-    assert _alembic_current_revision(engine) == "e6ccb9b4271b"
+    assert _alembic_current_revision(engine) == "813c9d5086d0"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
+    assert "gmail_message_analyses" in tables
     assert not any(table.startswith("_alembic_tmp") for table in tables)
     assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_threads")}
     with engine.connect() as connection:
@@ -1346,9 +1351,123 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" not in tables
+    assert "gmail_message_analyses" not in tables
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "e6ccb9b4271b"
+    assert _alembic_current_revision(engine) == "813c9d5086d0"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
+    assert "gmail_message_analyses" in inspector.get_table_names()
+
+
+# ---------------------------------------------------------------------------
+# 813c9d5086d0 (Stage 7B: gmail_message_analyses)
+# ---------------------------------------------------------------------------
+
+
+def test_gmail_message_analyses_table_shape(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_message_analyses_shape.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = inspector.get_table_names()
+    assert "gmail_message_analyses" in tables
+
+    columns = {col["name"] for col in inspector.get_columns("gmail_message_analyses")}
+    assert columns == {
+        "id",
+        "account_key",
+        "gmail_message_id",
+        "analysis_version",
+        "input_fingerprint",
+        "match_type",
+        "matched_job_id",
+        "match_confidence",
+        "match_score",
+        "match_evidence_json",
+        "candidate_matches_json",
+        "classification",
+        "classification_confidence",
+        "classification_evidence_json",
+        "is_automated",
+        "requires_human_review",
+        "created_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("gmail_message_analyses")
+    assert any(
+        set(uc["column_names"]) == {"gmail_message_id", "analysis_version", "input_fingerprint"}
+        for uc in unique_constraints
+    )
+
+    check_constraint_names = {
+        cc["name"] for cc in inspector.get_check_constraints("gmail_message_analyses")
+    }
+    assert "ck_gmail_message_analyses_match_type_valid" in check_constraint_names
+    assert "ck_gmail_message_analyses_classification_valid" in check_constraint_names
+
+    foreign_keys = inspector.get_foreign_keys("gmail_message_analyses")
+    assert any(fk["referred_table"] == "gmail_messages" for fk in foreign_keys)
+
+
+def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
+    tmp_path: Path,
+) -> None:
+    """813c9d5086d0's own data (analysis rows) is documented as acceptable
+    to lose on downgrade (re-derivable) — but its SIBLING tables
+    (gmail_messages/gmail_threads/gmail_message_id_claims) must survive
+    the cycle completely untouched.
+    """
+    db_path = tmp_path / "migrations_gmail_message_analyses_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="a@example.com", uid=1)
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_message_analyses (
+                    account_key, gmail_message_id, analysis_version, input_fingerprint,
+                    match_type, matched_job_id, match_confidence, match_score,
+                    match_evidence_json, candidate_matches_json,
+                    classification, classification_confidence, classification_evidence_json,
+                    is_automated, requires_human_review, created_at
+                ) VALUES (
+                    'a@example.com', 1, 1, 'fp1',
+                    'UNMATCHED', NULL, 'LOW', 0,
+                    '[]', '[]',
+                    'UNKNOWN', 'LOW', '[]',
+                    0, 1, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    downgrade(cfg, "e6ccb9b4271b")
+
+    assert _alembic_current_revision(engine) == "e6ccb9b4271b"
+    inspector = inspect(engine)
+    assert "gmail_message_analyses" not in inspector.get_table_names()
+    with engine.connect() as connection:
+        message_count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+        thread_count = connection.execute(text("SELECT COUNT(*) FROM gmail_threads")).scalar()
+    assert message_count == 1
+    assert thread_count == 1
+
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == "813c9d5086d0"
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "gmail_message_analyses" in inspector.get_table_names()
+    with engine.connect() as connection:
+        analysis_count = connection.execute(
+            text("SELECT COUNT(*) FROM gmail_message_analyses")
+        ).scalar()
+        message_count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+    assert analysis_count == 0  # documented: analyses do not survive a downgrade cycle
+    assert message_count == 1  # sibling data is untouched
