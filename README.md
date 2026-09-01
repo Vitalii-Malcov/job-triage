@@ -32,7 +32,12 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 6C CV adaptation — детерминированный evidence-first CV-черновик, см. "Tailored CV Draft" ниже.
    - [x] 6D Bewerbung generation — evidence-bound, provider-selects-structure-only черновик сопроводительного письма, см. "Bewerbung Draft" ниже.
    - [x] 6E Draft review / approval
-7. Gmail Response + Follow-up Agent
+7. Gmail Response + Follow-up Agent — по подэтапам, см. "Gmail Inbox Foundation" ниже:
+   - [x] 7A Gmail Inbox Foundation — read-only, idempotent IMAP-приём и хранение переписки, см. "Gmail Inbox Foundation" ниже.
+   - [ ] 7B Job/Application ↔ Email matching + classification
+   - [ ] 7C Response Draft Agent
+   - [ ] 7D Human approval + Gmail reply
+   - [ ] 7E Follow-up Agent
 
 ## Запуск
 ```bash
@@ -1236,6 +1241,222 @@ DOCX/PDF, редактирование структурированных eviden
 (skills/experience/projects/education/certifications/languages),
 моделирование контактных данных кандидата (`CONTACT_DATA_NOT_MODELED`
 остаётся как есть — это отдельная задача, не блокирующая 6E).
+
+## Gmail Inbox Foundation (Stage 7A)
+
+Read-only, idempotent слой получения и хранения email-переписки для будущих
+подэтапов Stage 7 (7B matching/classification, 7C response drafts, 7D human
+approval + reply, 7E follow-up). Сам по себе Stage 7A **ничего не решает и
+ничего не отправляет** — это чистая infrastructure-прослойка
+Gmail/IMAP → fetch → normalize → persist → read API.
+
+**Read-only гарантия.** `GmailImapProvider`
+(`app/providers/email/imap.py`) открывает mailbox через `IMAP4_SSL`,
+`SELECT ... readonly=True`, и использует только read-команды: `LOGIN`,
+`SELECT`, `STATUS`, `UID SEARCH`, `UID FETCH` (`RFC822.SIZE`/`BODY.PEEK[]`),
+`CLOSE`, `LOGOUT`. Нигде нет `STORE`/`EXPUNGE`/`COPY`/`APPEND` —
+сообщения никогда не помечаются прочитанными, не удаляются, не
+перемещаются, не архивируются. Ничего в Stage 7A не отправляет email, не
+создаёт Gmail draft, не отвечает рекрутёру — эти операции целиком
+относятся к будущим 7C/7D.
+
+**`BODY.PEEK[]`, никогда голый `RFC822`/`BODY[]` (security fix round,
+GMAIL-001).** Обычный `RFC822`/`BODY[]` FETCH по RFC 3501 неявно
+проставляет `\Seen` как побочный эффект передачи тела письма — то есть
+выглядящее как чтение действие на самом деле мутирует mailbox. `.PEEK`
+передаёт то же содержимое без этого побочного эффекта; регрессионные
+тесты проверяют точную команду и падают, если кто-то вернёт код к
+`RFC822`.
+
+**Отдельная схема, отдельные credentials.** Provider и persistence-слой
+полностью независимы от `app/collectors/xing_email.py` — разные mailbox
+(реальный inbox с ответами кандидату, а не job-digest-only ящик), разные
+переменные окружения (`GMAIL_*`, не `XING_MAILBOX_*`), разные модели
+(`GmailThreadRecord`/`GmailMessageRecord` в `app/db/models.py`, не
+`ProcessedEmailMessage` — тот остаётся минимальным acknowledgment-маркером
+для job-digest коллекторов). XING-коллектор не тронут.
+
+**Приватность и sanitized errors (security fix round, GMAIL-003).** Тело
+письма, тема, адреса, имена — персональные данные.
+`app/services/gmail_inbox.py`'s sync-логирование содержит только внутренний
+id, счётчики (`fetched`/`created`/`duplicates`/`skipped`/`failed`) и
+`type(exc).__name__` — никогда subject/body/адреса/имена/attachment-имена
+и никогда текст самого исключения (traceback/`exc_info` нигде не
+логируется в Gmail-коде: сообщение исключения от драйвера БД или IMAP
+сервера в принципе может содержать эхо содержимого письма или адреса
+сервера). `POST /gmail/sync` при ошибке возвращает фиксированную строку
+`"Gmail inbox sync failed"`, никогда `f"...{exc}"` — ни один provider/DB
+error text не попадает ни в HTTP-ответ, ни в лог.
+
+**Dedup identity — `(account_key, mailbox, uid_validity, uid)`, не
+Message-ID (security fix round, GMAIL-002).** IMAP UID стабилен только
+пока не меняется `UIDVALIDITY` почтового ящика, и то и другое имеет смысл
+только в рамках ОДНОГО аккаунта — `account_key`
+(`app.providers.email.base.normalize_account_key`, нормализованный
+`GMAIL_USERNAME`, никогда не пароль) добавлен в идентичность специально,
+чтобы смена `GMAIL_USERNAME` на другой аккаунт никогда не путала и не
+наследовала историю другого аккаунта. Уникальный constraint —
+`uq_gmail_messages_account_provider_identity`. RFC Message-ID хранится
+отдельно (`message_id_header`, индексирован, но не unique) только для
+threading — письмо без Message-ID всё равно корректно дедуплицируется по
+своему UID. Read-эндпоинты (`GET /gmail/messages`, `GET /gmail/threads`)
+тоже скоуплены по текущему `account_key` — история предыдущего
+`GMAIL_USERNAME` никогда не "протечёт" через read API после смены
+аккаунта. Повторный `POST /gmail/sync` не создаёт вторых строк;
+конкурентные одновременные sync-запросы разрешаются через
+`IntegrityError`-catch + reload (DB constraint — последняя линия защиты,
+не только `SELECT`-затем-`INSERT` в Python — это подтверждено
+регрессионным тестом и не было ослаблено в security fix round).
+
+**Threading — нейтральное, не Gmail-native, скоуплено по аккаунту.**
+Стандартный IMAP (через `ImapClient` Protocol) не даёт доступа к
+Gmail-специфичному `X-GM-THRID`, поэтому Stage 7A не выдумывает Gmail
+thread id. Вместо этого `app/db/gmail_repository.py`'s
+`resolve_thread_anchor` строит группировку по
+`References`/`In-Reply-To`/`Message-ID`: `References[0]` (корень треда,
+если он присутствует) предпочтительнее `In-Reply-To` (только
+непосредственный родитель), что делает якорь треда стабильным независимо
+от порядка получения писем. Письмо совсем без этих заголовков получает
+свой собственный synthetic thread
+(`synthetic:<mailbox>:<uid_validity>:<uid>`). Уникальность `thread_key`
+теперь составная — `(account_key, thread_key)` — треды из разных
+аккаунтов никогда не пересекаются и не коллизируют.
+
+**Message-ID collision guard (security fix round, GMAIL-011).** Если
+письмо становится "корнем" треда только по собственному Message-ID (нет
+`References`/`In-Reply-To`), а этот же Message-ID уже использован ДРУГИМ,
+отдельным сообщением в этом аккаунте — это не доверяется как доказательство
+общей переписки (переиспользованный/malformed/потенциально злонамеренный
+Message-ID), и сообщение получает собственный synthetic thread вместо
+слияния с чужим. Письмо, которое явно ссылается на существующий тред через
+`References`/`In-Reply-To`, этим guard'ом не затрагивается — это
+легитимное, протокольно-предусмотренное использование Message-ID.
+
+**Известное ограничение threading (документировано, не баг).** Если
+письмо содержит `In-Reply-To`, но не содержит `References` (некоторые
+почтовые клиенты его опускают), оно привязывается к Message-ID своего
+непосредственного родителя, а не к истинному корню треда — в редких
+случаях это может разбить один длинный тред на несколько
+`GmailThreadRecord`. Полноценный Gmail-native threading — возможная
+будущая доработка, не часть Stage 7A.
+
+**MIME parsing и attachment isolation (security fix round, GMAIL-004).**
+Предпочтение отдаётся `text/plain`; HTML никогда не рендерится/не
+исполняется — если есть только HTML-часть, `body_plain` остаётся пустым,
+а `has_html=true`. Обход MIME-дерева — рекурсивный, а не плоский
+`Message.walk()`: как только часть определена как attachment (включая
+ЛЮБОЙ `message/rfc822`, независимо от `Content-Disposition`), её
+поддерево целиком пропускается и никогда не обходится — иначе текст
+ВЛОЖЕННОГО письма мог попасть в `body_plain` родительского сообщения
+(реальный найденный баг: HTML-only родитель + `message/rfc822` attachment
+с внутренним `text/plain` → без этой изоляции внутренний текст становился
+телом письма). Тело письма ограничено 20 000 символами (`body_truncated`
+фиксирует обрезку), заголовки и адреса ограничены разумными длинами (RFC
+5322/5321-совместимые лимиты).
+
+**Attachment content — честный контракт (security fix round, GMAIL-006).**
+Верно безусловно: содержимое вложения никогда не сохраняется, не
+открывается/рендерится и не анализируется как бизнес-контент — хранятся
+только `filename`/`content_type`/`size` (максимум 20 вложений на письмо).
+НЕ верно безусловно: байты вложения могут быть переданы с IMAP-сервера —
+Stage 7A не использует section-level partial fetch, чтобы избежать этой
+передачи; `BODY.PEEK[]` тянет письмо целиком (в рамках `MAX_RAW_MESSAGE_SIZE`,
+см. ниже). Вычисление `size` по-прежнему требует ограниченного decode
+payload'а — задокументированное остаточное ограничение (IMAP-команды,
+доступные через read-only `ImapClient` Protocol, не дают дешёвого
+per-part size без парсинга `BODYSTRUCTURE`).
+
+**Границы ресурсов до дорогой работы (security fix round, GMAIL-005).**
+Перед полным `BODY.PEEK[]` fetch выполняется лёгкий `RFC822.SIZE`
+pre-check — письмо больше `MAX_RAW_MESSAGE_SIZE` (5 МБ) пропускается без
+передачи тела вообще, **если** сервер вообще ответил на `RFC822.SIZE`
+парсящимся значением. **Честно задокументированный остаточный риск:**
+если `RFC822.SIZE` отсутствует/не парсится/не поддерживается сервером,
+`_read_message_size` возвращает `None`, и код продолжает к полному
+`BODY.PEEK[]` fetch БЕЗ какого-либо pre-transfer size-bound для этого
+конкретного письма — `MAX_RAW_MESSAGE_SIZE` в этом fallback-пути не
+действует вообще, а не "действует слабее". Остаются только post-transfer
+границы (`MAX_BODY_LENGTH` обрезает уже распарсенный текст) и
+`MAX_MESSAGES_PER_SYNC` (ограничивает, сколько таких писем один run
+вообще попробует). Настоящий Gmail IMAP всегда отвечает на `RFC822.SIZE`,
+так что этот fallback не ожидается достижимым против самого Gmail — он
+существует на случай другого/будущего IMAP-сервера. Мы не заявляем более
+сильную гарантию, чем реально обеспечивает код.
+
+`MAX_MESSAGES_PER_SYNC` (500) ограничивает, сколько тел писем один sync
+вообще запросит. **Anti-starvation (важное уточнение после review):**
+недостаточно просто выбирать "самые старые UID" при превышении cap —
+без дополнительной фильтрации уже персистентных UID это привело бы к
+противоположной проблеме: если backlog стабильно больше cap, каждый sync
+тратил бы весь свой бюджет на ПОВТОРНУЮ выборку одних и тех же уже
+сохранённых старых писем и никогда не добрался бы до новых. Поэтому
+`GmailImapProvider` принимает `is_uid_known` callable (bind к
+`db.Session` через closure в `_run_gmail_sync`, зеркалирует
+`XingEmailCollector`'s `is_message_processed`) — уже персистентные UID
+отфильтровываются ДО применения cap, и только затем из оставшихся
+(genuinely новых) UID приоритет отдаётся самым старым. Это гарантирует
+реальный прогресс на каждом sync: backlog действительно дренируется, а
+не залипает на одном и том же срезе. `MAX_MIME_PARTS`/`MAX_MIME_DEPTH`
+ограничивают стоимость обхода патологической (очень широкой или очень
+глубоко вложенной) MIME-структуры.
+
+**Malformed FETCH response isolation (security fix round, GMAIL-010).**
+Разбор формы IMAP FETCH-ответа (короткий tuple, не-tuple элемент, payload
+не bytes и т.д.) выполняется внутри той же per-message try/except секции,
+что и парсинг MIME — одно malformed сообщение никогда не прерывает
+остальную часть sync; счётчики (`skipped`) остаются корректными.
+
+**Zero network beyond IMAP.** Ни `app/providers/email/`, ни
+`app/services/gmail_inbox.py` не делают ни одного HTTP-запроса — нет
+зависимости от `httpx`/`requests`/`aiohttp`/`urllib` (проверяется
+source-inspection тестом, как и для XING-коллектора). Ссылки, вложения и
+любой другой контент письма никогда не открываются/не скачиваются кодом.
+
+**Zero LLM, zero classification, zero job linkage, zero status changes.**
+Stage 7A не вызывает ни одну LLM, не классифицирует письма
+(interview/rejection/etc.), не связывает письмо с конкретной
+вакансией/заявкой и не меняет `ApplicationStatus` — это полностью
+детерминированная infrastructure-прослойка. Всё перечисленное — предмет
+Stage 7B+.
+
+**Конфигурация** (`.env.example`):
+```bash
+GMAIL_IMAP_HOST=imap.gmail.com
+GMAIL_IMAP_PORT=993
+GMAIL_USERNAME=
+GMAIL_APP_PASSWORD=
+GMAIL_MAILBOX=INBOX
+GMAIL_LOOKBACK_DAYS=30
+```
+`GMAIL_USERNAME`/`GMAIL_APP_PASSWORD` без значения по умолчанию —
+`POST /gmail/sync` отвечает `503`, если они не заданы, вместо попытки
+IMAP-логина с пустыми credentials. `GMAIL_IMAP_HOST`/`GMAIL_MAILBOX`,
+наоборот, никогда не могут быть пустыми/whitespace-only — Settings
+валидирует это при старте (security fix round, GMAIL-009), в отличие от
+username/password, где пустое значение — осознанное состояние
+"не настроено". App Password (требует 2FA):
+https://myaccount.google.com/apppasswords.
+
+**API** (все endpoints — `X-API-Key`, отдельный строгий rate limit для
+`/gmail/sync`, аналогично XING-коллектору):
+- `POST /api/v1/gmail/sync` — единственная операция, читающая mailbox.
+  Возвращает `{"fetched", "created", "duplicates", "skipped", "failed"}`.
+- `GET /api/v1/gmail/messages` — компактный summary-список (GMAIL-007):
+  без `body_plain`, без полных списков получателей/references/attachment
+  detail — только `id`/`thread_id`/`direction`/`from_address`/`subject`/
+  `sent_at`/`received_at`/`has_html`/`body_truncated`/`attachment_count`.
+  Никогда не инициирует sync. Пагинация (`limit`/`offset`) с жёстким
+  максимумом (`limit<=200`).
+- `GET /api/v1/gmail/messages/{id}` — полная детализация письма,
+  включая `body_plain`.
+- `GET /api/v1/gmail/threads` — thread-группировки с `message_count`,
+  вычисленным ОДНИМ grouped-запросом на всю страницу (не отдельный COUNT
+  на каждый тред — исправленный N+1, GMAIL-008).
+- `GET /api/v1/gmail/threads/{id}` — заголовок треда плюс ограниченный
+  (`message_limit`, максимум 200) хронологический список его сообщений в
+  summary-виде, чтобы будущий Stage 7B мог прочитать контекст треда одним
+  безопасным запросом вместо изобретения собственного неограниченного
+  чтения.
 
 ## Проверки
 ```bash

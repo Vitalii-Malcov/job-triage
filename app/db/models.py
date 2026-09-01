@@ -198,6 +198,261 @@ class ProcessedEmailMessage(Base):
     )
 
 
+class GmailThreadRecord(Base):
+    """A neutral (non-Gmail-native) correspondence thread grouping (Stage
+    7A) — see app/db/gmail_repository.py's `resolve_thread_anchor` for how
+    `thread_key` is derived from Message-ID/In-Reply-To/References
+    headers, and app/providers/email/imap.py's module docstring for the
+    documented limitation this implies (a message with In-Reply-To but no
+    References can end up anchored to its immediate parent rather than
+    the true thread root).
+
+    `thread_key` is not a Gmail thread id — standard IMAP does not expose
+    Gmail's X-GM-THRID extension via this project's read-only ImapClient
+    Protocol, so none is ever fabricated. It is either the RFC 5322
+    Message-ID this thread is anchored to (the oldest ancestor referenced
+    by any message seen so far), or a synthetic
+    "synthetic:<mailbox>:<uid_validity>:<uid>" key for a message with no
+    Message-ID/In-Reply-To/References at all (an unlinkable singleton
+    thread of one).
+
+    **`account_key` (GMAIL-002).** `thread_key` alone is scoped to
+    `account_key` — a raw Message-ID/In-Reply-To/References value is
+    trusted only within one configured mailbox account. Without this, a
+    later switch of `GMAIL_USERNAME` to a different account could
+    silently join threads with (or collide identity against) an entirely
+    different account's history purely because both happen to reference
+    the same Message-ID string. See `normalize_account_key` in
+    app/providers/email/base.py.
+
+    **Message-ID collision policy (GMAIL-011).** A `thread_key` equal to
+    a message's own Message-ID (the "this message is a thread root"
+    case — see `resolve_thread_anchor`) is not treated as trustworthy
+    proof of shared conversation if that same Message-ID string is *also*
+    already used by a different, already-persisted message in this
+    account: app/db/gmail_repository.py's `upsert_message` routes that
+    case to a separate synthetic thread instead of silently merging two
+    unrelated messages that happen to share a (possibly malformed or
+    replayed) Message-ID. A message that *references* an existing thread
+    via `References`/`In-Reply-To` is unaffected by this guard — that is
+    the legitimate, protocol-intended use of Message-ID.
+    """
+
+    __tablename__ = "gmail_threads"
+    __table_args__ = (
+        UniqueConstraint("account_key", "thread_key", name="uq_gmail_threads_account_thread_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Normalized GMAIL_USERNAME (never a password/secret) — see
+    # app.providers.email.base.normalize_account_key.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    thread_key: Mapped[str] = mapped_column(String(998), nullable=False)
+    subject: Mapped[str] = mapped_column(String(998), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    messages: Mapped[list["GmailMessageRecord"]] = relationship(back_populates="thread")
+
+
+class GmailMessageRecord(Base):
+    """One inbound/outbound Gmail mailbox message, persisted read-only
+    (Stage 7A Gmail Inbox Foundation) — see app/services/gmail_inbox.py
+    for sync orchestration and app/providers/email/imap.py for the IMAP
+    fetch/MIME-parsing this is populated from.
+
+    Deliberately a separate table from `ProcessedEmailMessage`:
+    ProcessedEmailMessage is a minimal per-source Message-ID
+    acknowledgment marker used by job-digest collectors (see
+    app/collectors/xing_email.py) to avoid re-parsing an email into `Job`
+    rows; this table is the actual normalized correspondence record
+    future stages (7B-7E) read from, and stores real message content.
+
+    **Dedup identity is `(account_key, mailbox, uid_validity, uid)`, not
+    `message_id_header`.** An IMAP UID is only guaranteed stable while
+    UIDVALIDITY for that mailbox hasn't changed, AND is only meaningful
+    within the one account whose mailbox it belongs to (GMAIL-002) — so
+    all four must be compared together, never the bare UID alone.
+    `message_id_header` is kept for threading only (see
+    GmailThreadRecord) and is deliberately NOT the dedup identity: it can
+    be absent (a message with no Message-ID header at all is still
+    deduplicated correctly via its UID), and in principle a malformed
+    mail could repeat one.
+
+    **Privacy.** Every field here is personal correspondence content.
+    app/services/gmail_inbox.py's sync logging never includes subject,
+    body, addresses, or names — only internal id/counts/status. Nothing
+    in this project logs `body_plain`, `subject`, `from_address`,
+    `from_display_name`, `to_addresses_json`, or `cc_addresses_json`.
+
+    **Invariants enforced at the DB layer (GMAIL-009), not just in
+    application code**: `uid`/`uid_validity` must be positive (0 and
+    negative values are never valid IMAP identifiers), and `direction`
+    must be one of the two known values — defense in depth against any
+    insert path that bypasses app/db/gmail_repository.py.
+    """
+
+    __tablename__ = "gmail_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key",
+            "mailbox",
+            "uid_validity",
+            "uid",
+            name="uq_gmail_messages_account_provider_identity",
+        ),
+        CheckConstraint("uid > 0", name="ck_gmail_messages_uid_positive"),
+        CheckConstraint("uid_validity > 0", name="ck_gmail_messages_uid_validity_positive"),
+        CheckConstraint(
+            "direction IN ('INBOUND', 'OUTBOUND')", name="ck_gmail_messages_direction_valid"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # Normalized GMAIL_USERNAME (never a password/secret) — see
+    # app.providers.email.base.normalize_account_key.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
+    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # RFC 5322 Message-ID / In-Reply-To / References headers. Indexed
+    # (not unique) — see the class docstring for why this is never the
+    # dedup identity.
+    message_id_header: Mapped[str | None] = mapped_column(String(998), nullable=True, index=True)
+    in_reply_to: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    references_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    from_address: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    from_display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    to_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    cc_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    subject: Mapped[str] = mapped_column(String(998), default="", nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When this sync run persisted the message — distinct from `sent_at`
+    # (the email's own Date header, which may be absent/malformed).
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    # "INBOUND" | "OUTBOUND" — derived purely from comparing the From
+    # address against the configured mailbox account address (see
+    # app/providers/email/imap.py's `_direction`). Never an interpretation
+    # of message meaning/content.
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    # Plaintext only — HTML is never rendered/executed/fetched, see
+    # app/providers/email/imap.py's module docstring. Bounded to
+    # MAX_BODY_LENGTH chars; body_truncated records whether it was cut.
+    body_plain: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    body_truncated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    has_html: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # JSON list of {"filename": str | None, "content_type": str, "size":
+    # int | None} — metadata only. Attachment content is never persisted,
+    # opened, or analyzed; the underlying bytes may still be transferred
+    # from IMAP as part of the bounded BODY.PEEK[] fetch (see
+    # app.providers.email.base.ParsedAttachment's docstring, GMAIL-006).
+    attachments_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    thread: Mapped["GmailThreadRecord"] = relationship(back_populates="messages")
+
+
+class GmailMessageIdClaimRecord(Base):
+    """The DB-enforced atomic arbiter of "who owns this Message-ID"
+    within one account (GMAIL-011 concurrency fix).
+
+    **Why this table exists.** The original Message-ID collision guard
+    (a Python `SELECT ... WHERE message_id_header = :anchor` followed by
+    a decision) was itself racy: two concurrent messages sharing a
+    reused/malformed Message-ID could both observe "not found yet" and
+    both proceed to treat themselves as the legitimate owner, silently
+    merging two unrelated conversations. A check-then-act Python
+    decision can never close that window — only a real DB UNIQUE
+    constraint, contended for via an INSERT + IntegrityError-catch, can.
+
+    `UNIQUE(account_key, message_id_header)` is that arbiter: exactly one
+    provider message identity can ever hold the claim for a given
+    Message-ID within an account. Whichever concurrent INSERT commits
+    first wins; every other concurrent (or later) attempt to claim the
+    same (account_key, message_id_header) fails on this constraint —
+    what happens next depends on WHO the existing claim actually belongs
+    to (see app/db/gmail_repository.py's
+    `_claim_message_id_or_get_collision_thread`):
+
+    - **Same provider identity** (same `claimant_mailbox`/
+      `claimant_uid_validity`/`claimant_uid` as the losing attempt): not
+      a collision at all — this is a concurrent or later retry of the
+      exact same message racing against itself (e.g. two overlapping
+      sync runs). The existing claim's thread is reused untouched;
+      `contested` is never set.
+    - **Different provider identity**: a genuinely different message
+      reused/replayed this Message-ID. Routed to its own synthetic
+      "collision" thread instead of the winner's, and the winning claim
+      is marked `contested`.
+
+    **`contested`** is set True the first time a claim loses this race to
+    a genuinely *different* provider identity (never for a same-identity
+    retry). Once set, it is permanent (mirrors this project's "immutable
+    historical" bias elsewhere — e.g. CandidateCVDraftRecord): a
+    Message-ID that has ever been proven ambiguous stays untrusted for
+    every future message that merely *references* it too (see
+    `_resolve_thread_for_message`'s reply branch) — an ambiguous anchor
+    is never later treated as if it had turned out fine after all.
+
+    Deliberately not a UNIQUE(thread_id) — one thread can legitimately be
+    the target of exactly one claim (the root's own Message-ID), but
+    nothing here needs to look up "which claim belongs to this thread",
+    only "who owns this Message-ID".
+    """
+
+    __tablename__ = "gmail_message_id_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key", "message_id_header", name="uq_gmail_message_id_claims_account_message_id"
+        ),
+        CheckConstraint("claimant_uid > 0", name="ck_gmail_message_id_claims_uid_positive"),
+        CheckConstraint(
+            "claimant_uid_validity > 0", name="ck_gmail_message_id_claims_uid_validity_positive"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    message_id_header: Mapped[str] = mapped_column(String(998), nullable=False)
+    # The provider identity that WON this claim — traceability only, not
+    # itself part of any uniqueness (mirrors CandidateJobMatchRecord's own
+    # "traceability, not identity" columns elsewhere in this file).
+    claimant_mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    claimant_uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
+    claimant_uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    thread_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    contested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may
