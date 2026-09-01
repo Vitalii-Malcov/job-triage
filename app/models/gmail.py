@@ -17,11 +17,13 @@ class GmailAttachment(BaseModel):
 
 
 class GmailMessage(BaseModel):
-    """One persisted, read-only-synced Gmail message.
+    """One persisted, read-only-synced Gmail message — the FULL detail
+    representation (GET /gmail/messages/{id} only, GMAIL-007).
 
     Contains personal correspondence content (subject/body/addresses) —
     never logged (see app.services.gmail_inbox's module docstring) and
-    only ever returned behind API-key auth.
+    only ever returned behind API-key auth. Deliberately NOT returned in
+    bulk from the list endpoint — see `GmailMessageSummary`.
     """
 
     id: int
@@ -44,10 +46,32 @@ class GmailMessage(BaseModel):
     created_at: datetime
 
 
+class GmailMessageSummary(BaseModel):
+    """Compact representation for GET /gmail/messages (GMAIL-007).
+
+    Deliberately excludes `body_plain`, full recipient arrays (`to`/`cc`),
+    `references`, and per-attachment detail — a bulk list response (up to
+    `GMAIL_MAX_LIST_LIMIT` rows) should not carry full correspondence
+    content for every row. `GET /gmail/messages/{id}` remains the
+    authenticated full-detail endpoint (`GmailMessage`).
+    """
+
+    id: int
+    thread_id: int
+    direction: Direction
+    from_address: str | None
+    subject: str
+    sent_at: datetime | None
+    received_at: datetime
+    has_html: bool
+    body_truncated: bool
+    attachment_count: int
+
+
 class GmailThread(BaseModel):
     """A neutral (non-Gmail-native) thread grouping — see
     app.db.models.GmailThreadRecord's docstring for `thread_key`'s
-    derivation and documented limitation.
+    derivation, account scoping, and documented limitations.
     """
 
     id: int
@@ -56,6 +80,19 @@ class GmailThread(BaseModel):
     message_count: int
     created_at: datetime
     updated_at: datetime
+
+
+class GmailThreadDetail(GmailThread):
+    """GET /gmail/threads/{id}'s response: the thread header plus a
+    bounded (never unbounded) list of its messages, so a Stage 7B
+    consumer has one coherent, safe way to read a thread's correspondence
+    context without an additional unbounded query of its own devising.
+    Message content stays summary-level here too (GMAIL-007's rationale
+    applies equally to a thread's message list) — fetch
+    `GET /gmail/messages/{id}` for full detail on any one of them.
+    """
+
+    messages: list[GmailMessageSummary]
 
 
 class GmailSyncResult(BaseModel):

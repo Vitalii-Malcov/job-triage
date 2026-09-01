@@ -215,12 +215,41 @@ class GmailThreadRecord(Base):
     "synthetic:<mailbox>:<uid_validity>:<uid>" key for a message with no
     Message-ID/In-Reply-To/References at all (an unlinkable singleton
     thread of one).
+
+    **`account_key` (GMAIL-002).** `thread_key` alone is scoped to
+    `account_key` — a raw Message-ID/In-Reply-To/References value is
+    trusted only within one configured mailbox account. Without this, a
+    later switch of `GMAIL_USERNAME` to a different account could
+    silently join threads with (or collide identity against) an entirely
+    different account's history purely because both happen to reference
+    the same Message-ID string. See `normalize_account_key` in
+    app/providers/email/base.py.
+
+    **Message-ID collision policy (GMAIL-011).** A `thread_key` equal to
+    a message's own Message-ID (the "this message is a thread root"
+    case — see `resolve_thread_anchor`) is not treated as trustworthy
+    proof of shared conversation if that same Message-ID string is *also*
+    already used by a different, already-persisted message in this
+    account: app/db/gmail_repository.py's `upsert_message` routes that
+    case to a separate synthetic thread instead of silently merging two
+    unrelated messages that happen to share a (possibly malformed or
+    replayed) Message-ID. A message that *references* an existing thread
+    via `References`/`In-Reply-To` is unaffected by this guard — that is
+    the legitimate, protocol-intended use of Message-ID.
     """
 
     __tablename__ = "gmail_threads"
+    __table_args__ = (
+        UniqueConstraint("account_key", "thread_key", name="uq_gmail_threads_account_thread_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    thread_key: Mapped[str] = mapped_column(String(998), nullable=False, unique=True)
+    # Normalized GMAIL_USERNAME (never a password/secret) — see
+    # app.providers.email.base.normalize_account_key.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    thread_key: Mapped[str] = mapped_column(String(998), nullable=False)
     subject: Mapped[str] = mapped_column(String(998), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
@@ -248,26 +277,43 @@ class GmailMessageRecord(Base):
     rows; this table is the actual normalized correspondence record
     future stages (7B-7E) read from, and stores real message content.
 
-    **Dedup identity is `(mailbox, uid_validity, uid)`, not
+    **Dedup identity is `(account_key, mailbox, uid_validity, uid)`, not
     `message_id_header`.** An IMAP UID is only guaranteed stable while
-    UIDVALIDITY for that mailbox hasn't changed, so both must be compared
-    together — never the bare UID alone. `message_id_header` is kept for
-    threading only (see GmailThreadRecord) and is deliberately NOT the
-    dedup identity: it can be absent (a message with no Message-ID header
-    at all is still deduplicated correctly via its UID), and in principle
-    a malformed mail could repeat one.
+    UIDVALIDITY for that mailbox hasn't changed, AND is only meaningful
+    within the one account whose mailbox it belongs to (GMAIL-002) — so
+    all four must be compared together, never the bare UID alone.
+    `message_id_header` is kept for threading only (see
+    GmailThreadRecord) and is deliberately NOT the dedup identity: it can
+    be absent (a message with no Message-ID header at all is still
+    deduplicated correctly via its UID), and in principle a malformed
+    mail could repeat one.
 
     **Privacy.** Every field here is personal correspondence content.
     app/services/gmail_inbox.py's sync logging never includes subject,
     body, addresses, or names — only internal id/counts/status. Nothing
     in this project logs `body_plain`, `subject`, `from_address`,
     `from_display_name`, `to_addresses_json`, or `cc_addresses_json`.
+
+    **Invariants enforced at the DB layer (GMAIL-009), not just in
+    application code**: `uid`/`uid_validity` must be positive (0 and
+    negative values are never valid IMAP identifiers), and `direction`
+    must be one of the two known values — defense in depth against any
+    insert path that bypasses app/db/gmail_repository.py.
     """
 
     __tablename__ = "gmail_messages"
     __table_args__ = (
         UniqueConstraint(
-            "mailbox", "uid_validity", "uid", name="uq_gmail_messages_provider_identity"
+            "account_key",
+            "mailbox",
+            "uid_validity",
+            "uid",
+            name="uq_gmail_messages_account_provider_identity",
+        ),
+        CheckConstraint("uid > 0", name="ck_gmail_messages_uid_positive"),
+        CheckConstraint("uid_validity > 0", name="ck_gmail_messages_uid_validity_positive"),
+        CheckConstraint(
+            "direction IN ('INBOUND', 'OUTBOUND')", name="ck_gmail_messages_direction_valid"
         ),
     )
 
@@ -276,6 +322,11 @@ class GmailMessageRecord(Base):
         Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
+    # Normalized GMAIL_USERNAME (never a password/secret) — see
+    # app.providers.email.base.normalize_account_key.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
     mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
     uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
     uid: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -312,8 +363,10 @@ class GmailMessageRecord(Base):
     body_truncated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     has_html: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # JSON list of {"filename": str | None, "content_type": str, "size":
-    # int | None} — metadata only, attachment content is never downloaded
-    # or stored (see ParsedAttachment's docstring).
+    # int | None} — metadata only. Attachment content is never persisted,
+    # opened, or analyzed; the underlying bytes may still be transferred
+    # from IMAP as part of the bounded BODY.PEEK[] fetch (see
+    # app.providers.email.base.ParsedAttachment's docstring, GMAIL-006).
     attachments_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(

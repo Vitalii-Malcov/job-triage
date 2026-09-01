@@ -46,3 +46,28 @@ def test_gmail_imap_port_rejects_out_of_range_values():
         Settings(gmail_imap_port=0)
     with pytest.raises(ValidationError):
         Settings(gmail_imap_port=70_000)
+
+
+def test_gmail_imap_host_rejects_blank_and_whitespace_only():
+    with pytest.raises(ValidationError):
+        Settings(gmail_imap_host="")
+    with pytest.raises(ValidationError):
+        Settings(gmail_imap_host="   ")
+
+
+def test_gmail_mailbox_rejects_blank_and_whitespace_only():
+    with pytest.raises(ValidationError):
+        Settings(gmail_mailbox="")
+    with pytest.raises(ValidationError):
+        Settings(gmail_mailbox="   ")
+
+
+def test_gmail_username_and_app_password_blank_is_still_allowed():
+    """Unlike host/mailbox, a blank username/app_password is a
+    deliberate, meaningful "not configured" state (fails closed at the
+    collector/provider, not at Settings construction) — see
+    app/api/routes.py's _run_gmail_sync.
+    """
+    settings = Settings(gmail_username="", gmail_app_password="")
+    assert settings.gmail_username == ""
+    assert settings.gmail_app_password == ""

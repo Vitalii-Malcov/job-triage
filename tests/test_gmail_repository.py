@@ -1,25 +1,33 @@
-"""Tests for app.db.gmail_repository (Stage 7A) — dedup identity, race
-handling, neutral threading, and pagination.
+"""Tests for app.db.gmail_repository (Stage 7A + security fix round) —
+dedup identity, account scoping (GMAIL-002), race handling, neutral
+threading (incl. GMAIL-011 collision guard), pagination, and the
+GMAIL-008 grouped thread-count query.
 """
 
 import json
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.gmail_repository import (
+    get_message_by_identity,
     get_or_create_thread,
     get_thread_by_id,
+    get_thread_message_count,
     list_messages,
-    list_threads,
+    list_messages_for_thread,
+    list_threads_with_counts,
     resolve_thread_anchor,
     to_gmail_thread,
     upsert_message,
 )
 from app.providers.email.base import ParsedGmailMessage
+
+ACCOUNT_A = "a@example.com"
+ACCOUNT_B = "b@example.com"
 
 
 @pytest.fixture()
@@ -38,6 +46,7 @@ def db(tmp_path):
 
 def _parsed(
     *,
+    account_key: str = ACCOUNT_A,
     uid: int = 1,
     uid_validity: int = 100,
     mailbox: str = "INBOX",
@@ -48,6 +57,7 @@ def _parsed(
     from_address: str | None = "recruiter@example.com",
 ) -> ParsedGmailMessage:
     return ParsedGmailMessage(
+        account_key=account_key,
         mailbox=mailbox,
         uid=uid,
         uid_validity=uid_validity,
@@ -79,6 +89,7 @@ def test_upsert_creates_new_message(db):
     assert record.mailbox == "INBOX"
     assert record.uid == 1
     assert record.uid_validity == 100
+    assert record.account_key == ACCOUNT_A
 
 
 def test_upsert_same_identity_twice_is_idempotent(db):
@@ -88,18 +99,19 @@ def test_upsert_same_identity_twice_is_idempotent(db):
     assert created_first is True
     assert created_second is False
     assert first.id == second.id
-    assert len(list_messages(db, limit=200, offset=0)) == 1
+    assert len(list_messages(db, ACCOUNT_A, limit=200, offset=0)) == 1
 
 
 def test_same_message_id_but_different_uid_is_not_deduplicated(db):
     """Two distinct UIDs sharing a Message-ID (e.g. a malformed resend)
     must not be silently merged into one row — dedup identity is the
-    provider (mailbox, uid_validity, uid), never the Message-ID alone.
+    provider (account_key, mailbox, uid_validity, uid), never the
+    Message-ID alone.
     """
     upsert_message(db, _parsed(uid=1, message_id="<same@example.com>"))
     upsert_message(db, _parsed(uid=2, message_id="<same@example.com>"))
 
-    assert len(list_messages(db, limit=200, offset=0)) == 2
+    assert len(list_messages(db, ACCOUNT_A, limit=200, offset=0)) == 2
 
 
 def test_different_uid_validity_is_not_deduplicated(db):
@@ -110,7 +122,7 @@ def test_different_uid_validity_is_not_deduplicated(db):
     upsert_message(db, _parsed(uid=1, uid_validity=100))
     upsert_message(db, _parsed(uid=1, uid_validity=200))
 
-    assert len(list_messages(db, limit=200, offset=0)) == 2
+    assert len(list_messages(db, ACCOUNT_A, limit=200, offset=0)) == 2
 
 
 def test_message_without_message_id_is_persisted_and_deduplicated(db):
@@ -142,11 +154,11 @@ def test_concurrent_duplicate_insert_resolves_via_unique_constraint(db, monkeypa
     original_get = gmail_repository_module.get_message_by_identity
     calls = {"n": 0}
 
-    def flaky_get(db_, mailbox, uid_validity, uid):
+    def flaky_get(db_, account_key, mailbox, uid_validity, uid):
         calls["n"] += 1
         if calls["n"] == 1:
             return None
-        return original_get(db_, mailbox, uid_validity, uid)
+        return original_get(db_, account_key, mailbox, uid_validity, uid)
 
     monkeypatch.setattr(gmail_repository_module, "get_message_by_identity", flaky_get)
 
@@ -154,7 +166,49 @@ def test_concurrent_duplicate_insert_resolves_via_unique_constraint(db, monkeypa
 
     assert created is False
     assert record.id == winner.id
-    assert len(list_messages(db, limit=200, offset=0)) == 1
+    assert len(list_messages(db, ACCOUNT_A, limit=200, offset=0)) == 1
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-002: account scoping
+# ---------------------------------------------------------------------------
+
+
+def test_same_mailbox_uid_uidvalidity_across_two_accounts_remain_distinct(db):
+    """The exact GMAIL-002 regression: switching GMAIL_USERNAME to a
+    different account must never collide with another account's history
+    merely because mailbox/uid_validity/uid happen to match.
+    """
+    record_a, created_a = upsert_message(db, _parsed(account_key=ACCOUNT_A, uid=1))
+    record_b, created_b = upsert_message(db, _parsed(account_key=ACCOUNT_B, uid=1))
+
+    assert created_a is True
+    assert created_b is True
+    assert record_a.id != record_b.id
+    assert get_message_by_identity(db, ACCOUNT_A, "INBOX", 100, 1).id == record_a.id
+    assert get_message_by_identity(db, ACCOUNT_B, "INBOX", 100, 1).id == record_b.id
+    assert len(list_messages(db, ACCOUNT_A, limit=200, offset=0)) == 1
+    assert len(list_messages(db, ACCOUNT_B, limit=200, offset=0)) == 1
+
+
+def test_two_accounts_referencing_same_message_id_get_separate_threads(db):
+    """Threads must be namespaced by account_key — the same Message-ID
+    string in two different accounts is never the same conversation.
+    """
+    record_a, _ = upsert_message(
+        db, _parsed(account_key=ACCOUNT_A, uid=1, message_id="<shared@example.com>")
+    )
+    record_b, _ = upsert_message(
+        db, _parsed(account_key=ACCOUNT_B, uid=1, message_id="<shared@example.com>")
+    )
+
+    thread_a = get_thread_by_id(db, ACCOUNT_A, record_a.thread_id)
+    thread_b = get_thread_by_id(db, ACCOUNT_B, record_b.thread_id)
+    assert thread_a is not None
+    assert thread_b is not None
+    assert thread_a.id != thread_b.id
+    # Cross-account lookup must not find the other account's thread.
+    assert get_thread_by_id(db, ACCOUNT_B, thread_a.id) is None
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +272,7 @@ def test_root_arriving_before_reply_joins_same_thread(db):
 def test_message_with_no_threading_headers_gets_its_own_synthetic_thread(db):
     record, _ = upsert_message(db, _parsed(uid=1, message_id=None))
 
-    thread = get_thread_by_id(db, record.thread_id)
+    thread = get_thread_by_id(db, ACCOUNT_A, record.thread_id)
     assert thread.thread_key == "synthetic:INBOX:100:1"
 
 
@@ -230,23 +284,124 @@ def test_unrelated_messages_get_separate_threads(db):
 
 
 def test_get_or_create_thread_race_resolves_to_single_row(db):
-    thread_a = get_or_create_thread(db, "<root@example.com>", "Subject")
-    thread_b = get_or_create_thread(db, "<root@example.com>", "Subject")
+    thread_a = get_or_create_thread(db, ACCOUNT_A, "<root@example.com>", "Subject")
+    thread_b = get_or_create_thread(db, ACCOUNT_A, "<root@example.com>", "Subject")
 
     assert thread_a.id == thread_b.id
 
 
-def test_to_gmail_thread_reports_message_count(db):
+# ---------------------------------------------------------------------------
+# GMAIL-011: Message-ID collision-aware threading
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_message_id_without_references_does_not_trust_merge(db):
+    """Two independent messages sharing a Message-ID, neither of which
+    actually references the other via References/In-Reply-To, must not
+    be silently merged into the same thread merely because the header
+    string matches — this could be a malformed resend or a malicious
+    replay, not proof of shared conversation.
+    """
+    first, _ = upsert_message(
+        db, _parsed(uid=1, message_id="<reused@example.com>", subject="First message")
+    )
+    second, _ = upsert_message(
+        db, _parsed(uid=2, message_id="<reused@example.com>", subject="Unrelated second message")
+    )
+
+    assert first.thread_id != second.thread_id
+
+
+def test_duplicate_message_id_still_allows_legitimate_reference(db):
+    """The GMAIL-011 collision guard must not interfere with a message
+    that legitimately References an existing thread anchor, even if some
+    other unrelated message elsewhere reused that same Message-ID as its
+    own identity.
+    """
+    root, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>", subject="Root"))
+    # An unrelated message elsewhere happens to reuse "<root@example.com>"
+    # as its own self-anchored identity — must get its own thread.
+    unrelated, _ = upsert_message(
+        db, _parsed(uid=2, message_id="<root@example.com>", subject="Unrelated")
+    )
+    # A genuine reply that actually references the root.
+    reply, _ = upsert_message(
+        db,
+        _parsed(
+            uid=3,
+            message_id="<reply@example.com>",
+            references=("<root@example.com>",),
+            subject="Re: Root",
+        ),
+    )
+
+    assert reply.thread_id == root.thread_id
+    assert unrelated.thread_id != root.thread_id
+
+
+def test_to_gmail_thread_reports_message_count_from_grouped_query(db):
     upsert_message(db, _parsed(uid=1, message_id="<root@example.com>"))
     upsert_message(
         db,
         _parsed(uid=2, message_id="<reply@example.com>", references=("<root@example.com>",)),
     )
 
-    thread_record = get_or_create_thread(db, "<root@example.com>", "Subject")
-    thread = to_gmail_thread(db, thread_record)
-
+    pairs = list_threads_with_counts(db, ACCOUNT_A, limit=200, offset=0)
+    assert len(pairs) == 1
+    thread = to_gmail_thread(*pairs[0])
     assert thread.message_count == 2
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-008: thread list query count must not scale with thread count
+# ---------------------------------------------------------------------------
+
+
+def test_list_threads_with_counts_query_count_is_bounded(db, tmp_path):
+    for uid in range(1, 11):
+        upsert_message(db, _parsed(uid=uid, message_id=f"<{uid}@example.com>"))
+
+    executed_statements = []
+
+    def _track(conn, cursor, statement, parameters, context, executemany):
+        executed_statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _track)
+    try:
+        pairs = list_threads_with_counts(db, ACCOUNT_A, limit=200, offset=0)
+    finally:
+        event.remove(engine, "before_cursor_execute", _track)
+
+    assert len(pairs) == 10
+    # One query for the whole page, regardless of how many threads it
+    # returns — not one COUNT query per thread (the N+1 GMAIL-008 bug).
+    select_statements = [s for s in executed_statements if s.strip().upper().startswith("SELECT")]
+    assert len(select_statements) == 1
+
+
+def test_get_thread_message_count_single_thread(db):
+    record, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>"))
+    upsert_message(
+        db, _parsed(uid=2, message_id="<r2@example.com>", references=("<root@example.com>",))
+    )
+
+    assert get_thread_message_count(db, ACCOUNT_A, record.thread_id) == 2
+
+
+def test_list_messages_for_thread_is_bounded_and_scoped(db):
+    root, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>"))
+    for uid in range(2, 6):
+        upsert_message(
+            db,
+            _parsed(uid=uid, message_id=f"<{uid}@example.com>", references=("<root@example.com>",)),
+        )
+
+    messages = list_messages_for_thread(db, ACCOUNT_A, root.thread_id, limit=2)
+    assert len(messages) == 2
+
+    # Cross-account access must return nothing even for a valid thread id.
+    assert list_messages_for_thread(db, ACCOUNT_B, root.thread_id, limit=200) == []
 
 
 # ---------------------------------------------------------------------------
@@ -258,19 +413,19 @@ def test_list_messages_respects_limit_and_offset(db):
     for uid in range(1, 6):
         upsert_message(db, _parsed(uid=uid, message_id=f"<{uid}@example.com>"))
 
-    page_one = list_messages(db, limit=2, offset=0)
-    page_two = list_messages(db, limit=2, offset=2)
+    page_one = list_messages(db, ACCOUNT_A, limit=2, offset=0)
+    page_two = list_messages(db, ACCOUNT_A, limit=2, offset=2)
 
     assert len(page_one) == 2
     assert len(page_two) == 2
     assert {record.id for record in page_one}.isdisjoint({record.id for record in page_two})
 
 
-def test_list_threads_respects_limit_and_offset(db):
+def test_list_threads_with_counts_respects_limit_and_offset(db):
     for uid in range(1, 6):
         upsert_message(db, _parsed(uid=uid, message_id=f"<{uid}@example.com>"))
 
-    page = list_threads(db, limit=3, offset=0)
+    page = list_threads_with_counts(db, ACCOUNT_A, limit=3, offset=0)
     assert len(page) == 3
 
 

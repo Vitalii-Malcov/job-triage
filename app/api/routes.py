@@ -73,12 +73,18 @@ from app.db.candidate_profile_repository import (
     to_candidate_profile_response,
 )
 from app.db.gmail_repository import (
+    THREAD_DETAIL_DEFAULT_MESSAGE_LIMIT,
+    THREAD_DETAIL_MAX_MESSAGE_LIMIT,
     get_message_by_id,
     get_thread_by_id,
+    get_thread_message_count,
+    is_message_known,
     list_messages,
-    list_threads,
+    list_threads_with_counts,
     to_gmail_message,
+    to_gmail_message_summary,
     to_gmail_thread,
+    to_gmail_thread_detail,
 )
 from app.db.models import JobRecord, UserProfile
 from app.db.repositories import (
@@ -110,7 +116,13 @@ from app.models.company_research import (
     ResearchRequest,
 )
 from app.models.cv_draft import CVDraftRequest, TailoredCVDraft
-from app.models.gmail import GmailMessage, GmailSyncResult, GmailThread
+from app.models.gmail import (
+    GmailMessage,
+    GmailMessageSummary,
+    GmailSyncResult,
+    GmailThread,
+    GmailThreadDetail,
+)
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.models.review_package import (
     ReviewPackage,
@@ -121,7 +133,7 @@ from app.models.review_package import (
 )
 from app.providers.base import ProviderNotConfiguredError
 from app.providers.bewerbung.base import BewerbungProviderError, BewerbungProviderNotConfiguredError
-from app.providers.email.base import GmailProviderError
+from app.providers.email.base import GmailProviderError, normalize_account_key
 from app.providers.email.imap import GmailImapProvider
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
@@ -1462,6 +1474,7 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
             "Gmail inbox sync is not configured: set GMAIL_USERNAME and GMAIL_APP_PASSWORD."
         )
 
+    account_key = normalize_account_key(settings.gmail_username)
     provider = GmailImapProvider(
         imap_host=settings.gmail_imap_host,
         imap_port=settings.gmail_imap_port,
@@ -1469,6 +1482,13 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
         app_password=settings.gmail_app_password,
         mailbox=settings.gmail_mailbox,
         lookback_days=settings.gmail_lookback_days,
+        # GMAIL-005 starvation fix: bound to this request's db.Session via
+        # closure, mirroring is_message_processed for XING above — lets
+        # the provider skip already-persisted UIDs before applying its
+        # MAX_MESSAGES_PER_SYNC cap.
+        is_uid_known=lambda uid_validity, uid: is_message_known(
+            db, account_key, settings.gmail_mailbox, uid_validity, uid
+        ),
     )
     return await GmailInboxService().sync(db, provider)
 
@@ -1492,28 +1512,50 @@ async def run_gmail_sync(db: Session = Depends(get_db)) -> GmailSyncResult:
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     except GmailProviderError as exc:
-        logger.exception("gmail_sync_run_failed")
+        # GMAIL-003: never interpolate the caught exception into the HTTP
+        # response or into the log line — a provider/persistence error's
+        # own message text could otherwise carry back a server-echoed
+        # mailbox address, hostname, or (via a driver-level error further
+        # down the stack) message content. Log only the exception's type;
+        # respond with a fixed, generic detail string.
+        logger.warning("gmail_sync_run_failed error_type=%s", type(exc).__name__)
         raise HTTPException(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gmail inbox sync request failed: {exc}",
+            detail="Gmail inbox sync failed",
         ) from exc
+
+
+def _current_gmail_account_key(settings) -> str:
+    """The account_key every Gmail read endpoint scopes itself to
+    (GMAIL-002) — the currently configured GMAIL_USERNAME, normalized.
+    Read endpoints never require Gmail to be configured to respond (an
+    empty account_key simply matches no persisted rows, which is a safe,
+    fail-closed default), but scoping every read by it means a later
+    GMAIL_USERNAME change can never leak a previous account's persisted
+    correspondence through the read API.
+    """
+    return normalize_account_key(settings.gmail_username)
 
 
 @router.get(
     "/gmail/messages",
-    response_model=list[GmailMessage],
+    response_model=list[GmailMessageSummary],
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
 def get_gmail_messages(
     limit: int = Query(default=GMAIL_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_MAX_LIST_LIMIT),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
-) -> list[GmailMessage]:
-    """Pure read of already-synced messages. Never triggers a sync itself
-    — POST /gmail/sync is the only endpoint that reads the mailbox.
+) -> list[GmailMessageSummary]:
+    """Pure read of already-synced messages, in compact summary form
+    (GMAIL-007) — never body_plain/full recipients/references; see
+    GET /gmail/messages/{id} for full detail. Never triggers a sync
+    itself — POST /gmail/sync is the only endpoint that reads the
+    mailbox.
     """
-    records = list_messages(db, limit=limit, offset=offset)
-    return [to_gmail_message(record) for record in records]
+    account_key = _current_gmail_account_key(get_settings())
+    records = list_messages(db, account_key, limit=limit, offset=offset)
+    return [to_gmail_message_summary(record) for record in records]
 
 
 @router.get(
@@ -1522,7 +1564,8 @@ def get_gmail_messages(
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
 def get_gmail_message(message_id: int, db: Session = Depends(get_db)) -> GmailMessage:
-    record = get_message_by_id(db, message_id)
+    account_key = _current_gmail_account_key(get_settings())
+    record = get_message_by_id(db, account_key, message_id)
     if record is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
@@ -1540,19 +1583,35 @@ def get_gmail_threads(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[GmailThread]:
-    records = list_threads(db, limit=limit, offset=offset)
-    return [to_gmail_thread(db, record) for record in records]
+    account_key = _current_gmail_account_key(get_settings())
+    # GMAIL-008: one grouped query for the whole page, never a per-thread
+    # COUNT query.
+    pairs = list_threads_with_counts(db, account_key, limit=limit, offset=offset)
+    return [to_gmail_thread(record, count) for record, count in pairs]
 
 
 @router.get(
     "/gmail/threads/{thread_id}",
-    response_model=GmailThread,
+    response_model=GmailThreadDetail,
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
-def get_gmail_thread(thread_id: int, db: Session = Depends(get_db)) -> GmailThread:
-    record = get_thread_by_id(db, thread_id)
+def get_gmail_thread(
+    thread_id: int,
+    message_limit: int = Query(
+        default=THREAD_DETAIL_DEFAULT_MESSAGE_LIMIT, ge=1, le=THREAD_DETAIL_MAX_MESSAGE_LIMIT
+    ),
+    db: Session = Depends(get_db),
+) -> GmailThreadDetail:
+    """Thread header plus a bounded, chronologically-ordered list of its
+    messages in summary form (section 13 "thread detail API readiness") —
+    a Stage 7B consumer never needs to devise its own unbounded query to
+    read one thread's correspondence context.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    record = get_thread_by_id(db, account_key, thread_id)
     if record is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail thread not found"
         )
-    return to_gmail_thread(db, record)
+    message_count = get_thread_message_count(db, account_key, record.id)
+    return to_gmail_thread_detail(db, record, message_count, message_limit=message_limit)

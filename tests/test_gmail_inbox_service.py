@@ -28,8 +28,12 @@ def db(tmp_path):
         session.close()
 
 
+ACCOUNT = "me@example.com"
+
+
 def _parsed(uid: int, message_id: str | None = None) -> ParsedGmailMessage:
     return ParsedGmailMessage(
+        account_key=ACCOUNT,
         mailbox="INBOX",
         uid=uid,
         uid_validity=100,
@@ -88,7 +92,7 @@ async def test_sync_twice_reports_duplicates_on_second_run(db):
     assert second.created == 0
     assert second.duplicates == 2
     assert second.failed == 0
-    assert len(list_messages(db, limit=200, offset=0)) == 2
+    assert len(list_messages(db, ACCOUNT, limit=200, offset=0)) == 2
 
 
 @pytest.mark.asyncio
@@ -113,7 +117,7 @@ async def test_one_message_persistence_failure_does_not_lose_the_others(db, monk
     assert result.fetched == 3
     assert result.created == 2
     assert result.failed == 1
-    assert len(list_messages(db, limit=200, offset=0)) == 2
+    assert len(list_messages(db, ACCOUNT, limit=200, offset=0)) == 2
 
 
 @pytest.mark.asyncio
@@ -137,3 +141,36 @@ async def test_sync_result_never_contains_message_content(db):
 
     dumped = result.model_dump()
     assert set(dumped.keys()) == {"fetched", "created", "duplicates", "skipped", "failed"}
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_never_logs_exception_text_or_pii(db, monkeypatch, caplog):
+    """GMAIL-003: a persistence-layer exception's own message string could
+    in principle embed row content (subject/body/addresses secrets) —
+    this must never reach the logs, only the exception's type name.
+    """
+    import logging
+
+    import app.services.gmail_inbox as service_module
+
+    secret_markers = [
+        "victim@example.com",
+        "SECRET_PASSWORD_MARKER",
+        "Private subject line",
+        "attachment-name.pdf",
+        "imap.internal.example.com",
+    ]
+
+    def poisoned_upsert(db_, parsed):
+        raise RuntimeError(" ".join(secret_markers))
+
+    monkeypatch.setattr(service_module, "upsert_message", poisoned_upsert)
+
+    provider = FakeProvider([_parsed(1)])
+    with caplog.at_level(logging.DEBUG):
+        result = await GmailInboxService().sync(db, provider)
+
+    assert result.failed == 1
+    log_text = caplog.text
+    for marker in secret_markers:
+        assert marker not in log_text

@@ -20,10 +20,26 @@ mocked IMAP client.
 =====================================================================
 
 Read-only guarantee: every IMAP command this package issues is a read
-command (LOGIN, SELECT ... readonly=True, STATUS, UID SEARCH, UID FETCH,
-CLOSE, LOGOUT). Nothing here ever calls STORE, EXPUNGE, COPY, APPEND, or
-any other command that could mutate the mailbox (mark read/unread,
-delete, move, label, send, or create a draft).
+command (LOGIN, SELECT ... readonly=True, STATUS, UID SEARCH, UID FETCH
+of RFC822.SIZE/BODY.PEEK[], CLOSE, LOGOUT). Nothing here ever calls STORE,
+EXPUNGE, COPY, APPEND, or any other command that could mutate the mailbox
+(mark read/unread, delete, move, label, send, or create a draft).
+**`BODY.PEEK[]` — never bare `RFC822` or `BODY[]`** — is used specifically
+because a plain `RFC822`/`BODY[]` FETCH is defined by RFC 3501 to
+implicitly set the `\\Seen` flag as a side effect of transferring the
+body; `.PEEK` is the documented way to fetch the same content without
+that mutation. See app/providers/email/imap.py's
+`test_module_never_calls_mailbox_write_commands`-style regression tests.
+
+Attachment content note (see ParsedAttachment's docstring for the full,
+honest contract): a bounded `BODY.PEEK[]` fetch transfers the complete
+raw message, including attachment bytes, from the IMAP server — Stage 7A
+does not use section-level partial fetches to avoid that transfer. What
+Stage 7A guarantees is narrower and still true: attachment bytes are
+never persisted, never opened/rendered, and never analyzed as business
+content — only bounded metadata (filename/content_type/byte length) is
+kept, and the decoded bytes are discarded immediately after measuring
+their length.
 """
 
 from dataclasses import dataclass, field
@@ -44,6 +60,66 @@ MAX_REFERENCES = 20
 MAX_BODY_LENGTH = 20_000
 MAX_ATTACHMENTS = 20
 
+# GMAIL-005: bounds applied BEFORE the expensive part of a fetch, not just
+# after decoding.
+#
+# `MAX_RAW_MESSAGE_SIZE` gates a lightweight `RFC822.SIZE` FETCH against
+# the server-reported size before the full `BODY.PEEK[]` body transfer is
+# ever requested — an oversized message is skipped without pulling its
+# body across the wire at all, PROVIDED the server actually answers
+# RFC822.SIZE with a parseable value.
+#
+# Documented residual risk (honesty per GMAIL-005 — do not claim a
+# stronger guarantee than the code provides): if RFC822.SIZE is missing,
+# unparseable, or the server simply doesn't support it,
+# app.providers.email.imap.GmailImapProvider._read_message_size returns
+# None, and the caller (`_fetch_one`) proceeds to the full `BODY.PEEK[]`
+# fetch anyway — the pre-transfer size gate is skipped entirely for that
+# one message, not conservatively enforced. In that fallback path,
+# MAX_RAW_MESSAGE_SIZE provides NO bound on the bytes transferred/held in
+# memory for that message; the only bounds still in effect are
+# MAX_BODY_LENGTH (post-transfer truncation of the parsed text) and
+# MAX_MESSAGES_PER_SYNC (how many such messages one run will attempt).
+# Real Gmail IMAP always answers RFC822.SIZE, so this fallback is not
+# expected to be reachable in production against Gmail itself — it exists
+# for any other/future IMAP server this provider might point at.
+#
+# `MAX_MESSAGES_PER_SYNC` bounds how many messages one sync run will fetch
+# bodies for at all. The OLDEST UIDs are prioritized, not the newest — see
+# app.providers.email.imap.GmailImapProvider._fetch_sync's comment for why
+# preferring the newest UIDs would risk starving the same backlog of
+# older messages out of the lookback window forever, rather than merely
+# deferring them.
+#
+# `MAX_MIME_PARTS`/`MAX_MIME_DEPTH` bound the cost of walking a
+# pathological (very wide or very deeply nested) MIME structure.
+#
+# Documented residual limitation (honesty per GMAIL-005/006): computing an
+# individual attachment part's byte-length still requires decoding that
+# part's payload (base64/quoted-printable) — IMAP has no cheap
+# per-MIME-part size query in the subset of commands this project's
+# read-only ImapClient Protocol exposes, and adding one (BODYSTRUCTURE
+# parsing) was judged not worth the added parsing-surface complexity for
+# Stage 7A. This decode is bounded, not unbounded, when the RFC822.SIZE
+# gate above did fire; it is NOT bounded by MAX_RAW_MESSAGE_SIZE in the
+# fallback path described above.
+MAX_RAW_MESSAGE_SIZE = 5_000_000
+MAX_MESSAGES_PER_SYNC = 500
+MAX_MIME_PARTS = 500
+MAX_MIME_DEPTH = 20
+
+
+def normalize_account_key(username: str) -> str:
+    """The stable, non-secret identity a mailbox account is scoped by
+    (GMAIL-002) — never the password, never anything else secret.
+
+    Deliberately simple (strip + casefold of the configured
+    `GMAIL_USERNAME`): this is an account *identity* for dedup/threading
+    namespacing, not a validated email address — an operator typo still
+    produces a stable, self-consistent key.
+    """
+    return username.strip().casefold()
+
 
 class GmailProviderError(Exception):
     """Base exception for the Gmail inbox provider (auth, connection, or
@@ -51,6 +127,15 @@ class GmailProviderError(Exception):
     single type to distinguish "not configured" / "auth rejected" /
     "connection failed" from a persistence-layer error, mirroring
     app.collectors.base.CollectorError's role for job collectors.
+
+    GMAIL-003: every message raised anywhere in this package is a fixed,
+    static string — never an f-string embedding the *upstream*
+    exception/server-response text (which could otherwise carry back a
+    server-echoed mailbox address or other operator-identifying text to
+    an API caller, or into a log line). Callers must also never log
+    `str(exc)` for one of these — see app/services/gmail_inbox.py and
+    app/api/routes.py's Gmail error handling, which log only
+    `type(exc).__name__`.
     """
 
 
@@ -69,10 +154,20 @@ class GmailConnectionError(GmailProviderError):
 
 @dataclass(frozen=True)
 class ParsedAttachment:
-    """Attachment metadata only — Stage 7A never downloads, stores, or
-    inspects attachment content. `size` is the decoded byte length,
-    computed only to report it; the decoded bytes are discarded
-    immediately afterward and never persisted.
+    """Attachment metadata only.
+
+    True, unconditionally: attachment content is never PERSISTED, never
+    OPENED/rendered, and never analyzed as Stage 7A/7B business content —
+    only this bounded metadata is kept.
+
+    NOT unconditionally true: attachment BYTES may still be TRANSFERRED
+    from the IMAP server as part of the bounded `BODY.PEEK[]` full-message
+    fetch (see app/providers/email/base.py's module docstring and
+    MAX_RAW_MESSAGE_SIZE) — Stage 7A does not use section-level partial
+    IMAP fetches to avoid that transfer, and computing `size` below
+    requires briefly decoding the part's payload. The decoded bytes are
+    discarded immediately after measuring their length; they are never
+    stored in `size` or anywhere else beyond this int.
     """
 
     filename: str | None
@@ -84,16 +179,21 @@ class ParsedAttachment:
 class ParsedGmailMessage:
     """One fully-parsed, ready-to-persist inbound/outbound message.
 
-    `uid`/`uid_validity`/`mailbox` are the stable provider identity used
-    for dedup (see app/db/gmail_repository.py) — IMAP UIDs are only
-    guaranteed unique for as long as UIDVALIDITY doesn't change, so both
-    must be stored and compared together, never the UID alone.
+    `account_key`/`mailbox`/`uid`/`uid_validity` together are the stable
+    provider identity used for dedup (see app/db/gmail_repository.py).
+    `account_key` (GMAIL-002) scopes identity to the configured mailbox
+    account: IMAP UID/UIDVALIDITY are only meaningful within one account's
+    mailbox, so switching `GMAIL_USERNAME` to a different account must
+    never collide with — or silently inherit — another account's history.
     `message_id_header` (the RFC 5322 Message-ID) is kept separately for
-    threading, but is deliberately NOT the dedup identity: it can be
-    missing, and in principle a malformed/replayed message could repeat
-    one.
+    threading, but is deliberately NOT part of the dedup identity: it can
+    be missing, and in principle a malformed/replayed message could repeat
+    one (see GmailMessageRecord's docstring and
+    app/db/gmail_repository.py's collision-aware thread anchoring,
+    GMAIL-011).
     """
 
+    account_key: str
     mailbox: str
     uid: int
     uid_validity: int
@@ -119,8 +219,9 @@ class GmailFetchResult:
 
     `skipped_count` counts messages that could not be parsed into a
     ParsedGmailMessage at all (structurally malformed MIME, unreadable
-    fetch response) — distinct from a persistence failure, which the
-    caller (app.services.gmail_inbox) tracks separately once messages
+    fetch response, oversized per MAX_RAW_MESSAGE_SIZE, or deferred past
+    MAX_MESSAGES_PER_SYNC) — distinct from a persistence failure, which
+    the caller (app.services.gmail_inbox) tracks separately once messages
     reach the database layer.
     """
 

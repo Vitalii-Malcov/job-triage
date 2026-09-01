@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,6 +77,20 @@ class Settings(BaseSettings):
     gmail_lookback_days: int = Field(default=30, ge=1, le=1095)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # GMAIL-009: unlike gmail_username/gmail_app_password (blank means
+    # "not configured" — a deliberate, meaningful state that fails closed
+    # at the collector, not at Settings construction), a blank/
+    # whitespace-only host or mailbox name is never valid: both have
+    # sensible non-blank defaults, and an explicit override to "" or " "
+    # is a configuration mistake that should fail fast at startup rather
+    # than reach the IMAP client.
+    @field_validator("gmail_imap_host", "gmail_mailbox")
+    @classmethod
+    def _reject_blank_gmail_value(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
 
 @lru_cache

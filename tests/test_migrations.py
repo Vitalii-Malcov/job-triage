@@ -875,6 +875,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
     thread_columns = {col["name"] for col in inspector.get_columns("gmail_threads")}
     assert thread_columns == {
         "id",
+        "account_key",
         "thread_key",
         "subject",
         "created_at",
@@ -885,6 +886,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
     assert message_columns == {
         "id",
         "thread_id",
+        "account_key",
         "mailbox",
         "uid_validity",
         "uid",
@@ -907,11 +909,12 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
     }
 
     thread_unique = inspector.get_unique_constraints("gmail_threads")
-    assert any(uc["column_names"] == ["thread_key"] for uc in thread_unique)
+    assert any(set(uc["column_names"]) == {"account_key", "thread_key"} for uc in thread_unique)
 
     message_unique = inspector.get_unique_constraints("gmail_messages")
     assert any(
-        set(uc["column_names"]) == {"mailbox", "uid_validity", "uid"} for uc in message_unique
+        set(uc["column_names"]) == {"account_key", "mailbox", "uid_validity", "uid"}
+        for uc in message_unique
     )
 
     message_indexes = {
@@ -919,6 +922,59 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
     }
     assert ("thread_id",) in message_indexes
     assert ("message_id_header",) in message_indexes
+    assert ("account_key",) in message_indexes
+
+    thread_indexes = {tuple(idx["column_names"]) for idx in inspector.get_indexes("gmail_threads")}
+    assert ("account_key",) in thread_indexes
+
+
+def _insert_gmail_thread(
+    connection, *, account_key: str = "a@example.com", thread_key: str
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO gmail_threads (account_key, thread_key, subject, created_at, updated_at)
+            VALUES (:account_key, :thread_key, 'Hello', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """
+        ),
+        {"account_key": account_key, "thread_key": thread_key},
+    )
+
+
+def _insert_gmail_message(
+    connection,
+    *,
+    thread_id: int = 1,
+    account_key: str = "a@example.com",
+    mailbox: str = "INBOX",
+    uid_validity: int = 100,
+    uid: int = 1,
+    direction: str = "INBOUND",
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO gmail_messages (
+                thread_id, account_key, mailbox, uid_validity, uid, references_json,
+                to_addresses_json, cc_addresses_json, subject, received_at,
+                direction, body_plain, body_truncated, has_html, attachments_json,
+                created_at
+            ) VALUES (
+                :thread_id, :account_key, :mailbox, :uid_validity, :uid, '[]', '[]', '[]',
+                'Hello', CURRENT_TIMESTAMP, :direction, 'hi', 0, 0, '[]', CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "thread_id": thread_id,
+            "account_key": account_key,
+            "mailbox": mailbox,
+            "uid_validity": uid_validity,
+            "uid": uid,
+            "direction": direction,
+        },
+    )
 
 
 def test_gmail_messages_rejects_duplicate_provider_identity(tmp_path: Path) -> None:
@@ -928,47 +984,62 @@ def test_gmail_messages_rejects_duplicate_provider_identity(tmp_path: Path) -> N
 
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO gmail_threads (thread_key, subject, created_at, updated_at)
-                VALUES ('<root@example.com>', 'Hello', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO gmail_messages (
-                    thread_id, mailbox, uid_validity, uid, references_json,
-                    to_addresses_json, cc_addresses_json, subject, received_at,
-                    direction, body_plain, body_truncated, has_html, attachments_json,
-                    created_at
-                ) VALUES (
-                    1, 'INBOX', 100, 1, '[]', '[]', '[]', 'Hello', CURRENT_TIMESTAMP,
-                    'INBOUND', 'hi', 0, 0, '[]', CURRENT_TIMESTAMP
-                )
-                """
-            )
-        )
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
 
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         with engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO gmail_messages (
-                        thread_id, mailbox, uid_validity, uid, references_json,
-                        to_addresses_json, cc_addresses_json, subject, received_at,
-                        direction, body_plain, body_truncated, has_html, attachments_json,
-                        created_at
-                    ) VALUES (
-                        1, 'INBOX', 100, 1, '[]', '[]', '[]', 'Hello again', CURRENT_TIMESTAMP,
-                        'INBOUND', 'hi again', 0, 0, '[]', CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-            )
+            _insert_gmail_message(connection)
+
+
+def test_gmail_messages_same_identity_across_two_accounts_is_allowed(tmp_path: Path) -> None:
+    """GMAIL-002: the UNIQUE constraint is (account_key, mailbox,
+    uid_validity, uid) — two different accounts may legitimately share
+    the same mailbox/uid_validity/uid values without colliding.
+    """
+    db_path = tmp_path / "migrations_gmail_inbox_account_scope.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="a@example.com")
+        _insert_gmail_thread(connection, account_key="b@example.com", thread_key="<root@b>")
+        _insert_gmail_message(connection, thread_id=2, account_key="b@example.com")
+
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+    assert count == 2
+
+
+def test_gmail_messages_check_constraints_reject_invalid_values(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_inbox_checks.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_gmail_message(connection, uid=0)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_gmail_message(connection, uid=-1)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_gmail_message(connection, uid_validity=0)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_gmail_message(connection, direction="MALICIOUS")
+
+    with engine.begin() as connection:
+        _insert_gmail_message(connection, uid=1, uid_validity=100, direction="OUTBOUND")
 
 
 def test_gmail_inbox_downgrade_removes_tables_then_upgrade_restores_them(tmp_path: Path) -> None:
@@ -983,8 +1054,8 @@ def test_gmail_inbox_downgrade_removes_tables_then_upgrade_restores_them(tmp_pat
     tables = set(inspector.get_table_names())
     assert "gmail_threads" not in tables
     assert "gmail_messages" not in tables
-    # Downgrading one step must not touch the previous (Application
-    # Package Reviews) migration's own tables.
+    # Downgrading past both Gmail migrations must not touch the previous
+    # (Application Package Reviews) migration's own tables.
     assert "application_package_reviews" in tables
 
     upgrade(cfg, "head")
@@ -993,3 +1064,40 @@ def test_gmail_inbox_downgrade_removes_tables_then_upgrade_restores_them(tmp_pat
     tables = set(inspector.get_table_names())
     assert "gmail_threads" in tables
     assert "gmail_messages" in tables
+
+
+def test_gmail_account_scope_migration_downgrades_one_step_cleanly(tmp_path: Path) -> None:
+    """The account-scoping/hardening migration (7058c097a542) downgrades
+    to the original Stage 7A schema (8634f4be953a) without touching its
+    tables — only the account_key columns/constraints it added.
+    """
+    db_path = tmp_path / "migrations_gmail_account_scope_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "8634f4be953a")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "gmail_threads" in tables
+    assert "gmail_messages" in tables
+
+    message_columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
+    assert "account_key" not in message_columns
+    thread_columns = {col["name"] for col in inspector.get_columns("gmail_threads")}
+    assert "account_key" not in thread_columns
+
+    # The original (pre-account-scoping) unique constraints must be
+    # restored exactly.
+    message_unique = inspector.get_unique_constraints("gmail_messages")
+    assert any(
+        set(uc["column_names"]) == {"mailbox", "uid_validity", "uid"} for uc in message_unique
+    )
+    thread_unique = inspector.get_unique_constraints("gmail_threads")
+    assert any(uc["column_names"] == ["thread_key"] for uc in thread_unique)
+
+    upgrade(cfg, "head")
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    message_columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
+    assert "account_key" in message_columns

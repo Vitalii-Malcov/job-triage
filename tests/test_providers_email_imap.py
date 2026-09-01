@@ -1,4 +1,5 @@
-"""Tests for app.providers.email.imap.GmailImapProvider (Stage 7A).
+"""Tests for app.providers.email.imap.GmailImapProvider (Stage 7A + the
+Stage 7A security fix round — GMAIL-001/004/005/009/010).
 
 Mirrors tests/test_collectors_xing_email.py's approach: a lightweight fake
 IMAP client (no real socket/network I/O anywhere), plus a source-inspection
@@ -11,6 +12,7 @@ import inspect
 from email import encoders
 from email.header import Header
 from email.mime.base import MIMEBase
+from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -27,6 +29,11 @@ ACCOUNT = "me@example.com"
 class FakeImapClient:
     """Minimal fake matching the ImapClient Protocol. No real socket/network
     I/O anywhere in this class.
+
+    Discriminates a "fetch" UID command by its requested item spec:
+    `(RFC822.SIZE)` returns a size-only response (GMAIL-005's pre-check),
+    anything else (in practice always `(BODY.PEEK[])`) returns the full
+    raw message.
     """
 
     def __init__(
@@ -36,12 +43,16 @@ class FakeImapClient:
         select_typ: str = "OK",
         status_data: list[bytes] | None = None,
         search_typ: str = "OK",
+        search_uids: list[int] | None = None,
+        size_override: dict[int, int] | None = None,
     ) -> None:
         self._messages = messages or {}
         self._uid_validity = uid_validity
         self._select_typ = select_typ
         self._status_data = status_data
         self._search_typ = search_typ
+        self._search_uids = search_uids
+        self._size_override = size_override or {}
         self.select_calls: list[tuple[str, bool]] = []
         self.uid_calls: list[tuple[str, tuple]] = []
         self.closed = False
@@ -64,14 +75,19 @@ class FakeImapClient:
         if command == "search":
             if self._search_typ != "OK":
                 return (self._search_typ, [None])
-            uids = b" ".join(str(u).encode() for u in sorted(self._messages))
-            return ("OK", [uids])
+            uids = self._search_uids if self._search_uids is not None else sorted(self._messages)
+            data = b" ".join(str(u).encode() for u in uids)
+            return ("OK", [data])
         if command == "fetch":
             uid = int(args[0])
+            item_spec = args[1] if len(args) > 1 else ""
             raw = self._messages.get(uid)
             if raw is None:
                 return ("OK", [None])
-            return ("OK", [(b"1 (RFC822 {%d}" % len(raw), raw)])
+            if "RFC822.SIZE" in item_spec:
+                size = self._size_override.get(uid, len(raw))
+                return ("OK", [f"{uid} (UID {uid} RFC822.SIZE {size})".encode()])
+            return ("OK", [(b"%d (UID %d BODY[] {%d}" % (uid, uid, len(raw)), raw)])
         raise AssertionError(f"unexpected uid command {command!r}")
 
     def close(self) -> tuple[str, list[bytes]]:
@@ -104,8 +120,9 @@ def _build_email(
     references: str | None = None,
     date: str | None = None,
     attachments: list[tuple[str, str, bytes]] | None = None,
+    extra_parts: list[MIMEBase] | None = None,
 ) -> bytes:
-    if html_body is not None or attachments:
+    if html_body is not None or attachments or extra_parts:
         msg = MIMEMultipart("mixed")
         if html_body is not None:
             alt = MIMEMultipart("alternative")
@@ -121,6 +138,8 @@ def _build_email(
             part.set_payload(data)
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(part)
+        for part in extra_parts or []:
             msg.attach(part)
     else:
         msg = MIMEText(plaintext_body or "", "plain", "utf-8")
@@ -237,6 +256,32 @@ async def test_search_failure_raises_connection_error():
 
 
 # ---------------------------------------------------------------------------
+# GMAIL-009: identity invariants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_zero_uidvalidity_raises_connection_error():
+    client = FakeImapClient(status_data=[b'"INBOX" (UIDVALIDITY 0)'])
+    provider = _provider(client)
+
+    with pytest.raises(GmailConnectionError):
+        await provider.fetch()
+
+
+@pytest.mark.asyncio
+async def test_zero_uid_is_skipped_not_crashed():
+    raw = _build_email()
+    client = FakeImapClient(messages={0: raw}, search_uids=[0])
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Read-only guarantee
 # ---------------------------------------------------------------------------
 
@@ -289,6 +334,321 @@ def test_module_never_calls_mailbox_write_commands():
         assert forbidden_uid_command not in source, (
             f"module must not issue IMAP UID command {forbidden_uid_command}"
         )
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-001: BODY.PEEK[], never bare RFC822/BODY[]
+# ---------------------------------------------------------------------------
+
+
+def test_body_fetch_uses_peek_never_plain_rfc822_or_bare_body():
+    """Static regression guard: if this module is ever changed back to a
+    bare `(RFC822)` or `(BODY[])` fetch item, this test fails even before
+    any runtime test does — see base.py's module docstring for why a
+    non-PEEK fetch is itself a mailbox mutation (\\Seen).
+    """
+    source = inspect.getsource(gmail_imap_module)
+    assert "BODY.PEEK[]" in source
+    assert "RFC822)" not in source
+    assert "BODY[])" not in source
+
+
+@pytest.mark.asyncio
+async def test_fetch_issues_body_peek_command_not_rfc822():
+    raw = _build_email()
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    await provider.fetch()
+
+    fetch_items = [args[1] for cmd, args in client.uid_calls if cmd == "fetch" and len(args) > 1]
+    assert "(BODY.PEEK[])" in fetch_items
+    assert "(RFC822)" not in fetch_items
+    assert "(BODY[])" not in fetch_items
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-005: bound resources before large allocation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oversized_message_is_skipped_before_body_fetch():
+    raw = _build_email(plaintext_body="small body")
+    client = FakeImapClient(messages={1: raw}, size_override={1: 10_000_000})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+    body_fetch_calls = [
+        args
+        for cmd, args in client.uid_calls
+        if cmd == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])"
+    ]
+    assert body_fetch_calls == [], "an oversized message's body must never be fetched at all"
+
+
+@pytest.mark.asyncio
+async def test_unknown_size_proceeds_to_fetch_body():
+    """A server/fake that can't report RFC822.SIZE cleanly must not fail
+    closed — size gating is a best-effort optimization on top of the
+    other bounds, not the only one."""
+    raw = _build_email(plaintext_body="hello")
+    client = FakeImapClient(messages={1: raw}, status_data=None)
+    # Simulate a SIZE response with no parseable size at all.
+    original_uid = client.uid
+
+    def uid_no_size(command, *args):
+        if command == "fetch" and len(args) > 1 and "RFC822.SIZE" in args[1]:
+            return ("OK", [b"1 (UID 1)"])
+        return original_uid(command, *args)
+
+    client.uid = uid_no_size
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert len(result.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_messages_per_sync_is_capped(monkeypatch):
+    monkeypatch.setattr(gmail_imap_module, "MAX_MESSAGES_PER_SYNC", 3)
+    messages = {uid: _build_email(message_id=f"<{uid}@example.com>") for uid in range(1, 6)}
+    client = FakeImapClient(messages=messages)
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert len(result.messages) == 3
+    assert result.skipped_count == 2
+    # The OLDEST (lowest) UIDs are prioritized — see _fetch_sync's
+    # comment: preferring the newest UIDs would risk starving the same
+    # backlog of older messages out of the lookback window forever
+    # whenever arrivals sustainedly exceed the cap, instead of merely
+    # deferring them one sync at a time.
+    fetched_uids = {msg.uid for msg in result.messages}
+    assert fetched_uids == {1, 2, 3}
+
+
+@pytest.mark.asyncio
+async def test_messages_per_sync_cap_drains_backlog_across_syncs_via_is_uid_known(monkeypatch):
+    """The concrete GMAIL-005 starvation scenario: a sustained backlog
+    (arrivals exceeding the cap on every sync) must make real forward
+    progress across successive syncs, not perpetually re-fetch the same
+    slice.
+
+    Oldest-first prioritization ALONE is not sufficient for this — IMAP
+    UID SEARCH always returns the same full backlog every time (nothing
+    about the mailbox itself changes), so without filtering by
+    `is_uid_known` the oldest UIDs would win the cap forever and the
+    provider would never reach anything newer as long as the backlog
+    stays above the cap. `is_uid_known` (bound to already-persisted state
+    by the caller — see app/api/routes.py's _run_gmail_sync) is what
+    actually lets each sync's cap apply to genuinely new work.
+    """
+    monkeypatch.setattr(gmail_imap_module, "MAX_MESSAGES_PER_SYNC", 2)
+    known: set[int] = set()
+    messages = {uid: _build_email(message_id=f"<{uid}@example.com>") for uid in range(1, 5)}
+    client = FakeImapClient(messages=messages)
+    provider = _provider(
+        client,
+        is_uid_known=lambda uid_validity, uid: uid in known,
+    )
+
+    first_run = await provider.fetch()
+    assert {msg.uid for msg in first_run.messages} == {1, 2}
+    known.update({1, 2})  # simulate the caller persisting these
+
+    second_run = await provider.fetch()
+    assert {msg.uid for msg in second_run.messages} == {3, 4}
+
+
+@pytest.mark.asyncio
+async def test_already_known_uids_are_not_counted_as_skipped():
+    known = {1}
+    messages = {1: _build_email(), 2: _build_email(message_id="<2@example.com>")}
+    client = FakeImapClient(messages=messages)
+    provider = _provider(client, is_uid_known=lambda uid_validity, uid: uid in known)
+
+    result = await provider.fetch()
+
+    assert {msg.uid for msg in result.messages} == {2}
+    assert result.skipped_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mime_part_count_is_bounded(monkeypatch):
+    monkeypatch.setattr(gmail_imap_module, "MAX_MIME_PARTS", 5)
+    many_parts = [MIMEText(f"part {i}", "plain", "utf-8") for i in range(50)]
+    raw = _build_email(plaintext_body=None, extra_parts=many_parts)
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    # Must not hang/crash; some body text is still captured from the
+    # first parts visited before the bound was reached.
+    assert len(result.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_mime_depth_is_bounded(monkeypatch):
+    monkeypatch.setattr(gmail_imap_module, "MAX_MIME_DEPTH", 3)
+    inner = MIMEText("deep", "plain", "utf-8")
+    for _ in range(10):
+        wrapper = MIMEMultipart("mixed")
+        wrapper.attach(inner)
+        inner = wrapper
+    raw = _build_email(plaintext_body=None, extra_parts=[inner])
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert len(result.messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-010: malformed FETCH response isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_malformed_fetch_response_is_skipped_not_raised():
+    client = FakeImapClient(messages={})
+    original_uid = client.uid
+
+    def uid_with_phantom(command, *args):
+        if command == "search":
+            return ("OK", [b"999"])
+        return original_uid(command, *args)
+
+    client.uid = uid_with_phantom
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+
+
+@pytest.mark.parametrize(
+    "broken_response",
+    [
+        pytest.param(("OK", []), id="empty_response"),
+        pytest.param(("OK", [None]), id="none_item"),
+        pytest.param(("OK", [(b"1 (UID 1 BODY[] {5}",)]), id="short_tuple"),
+        pytest.param(("OK", [b"1 (UID 1)"]), id="metadata_only_non_tuple"),
+        pytest.param(("OK", ["not-a-tuple"]), id="non_tuple_item"),
+        pytest.param(("OK", [(b"1 (UID 1 BODY[] {5}", "not-bytes")]), id="payload_not_bytes"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_fetch_response_shapes_are_skipped(broken_response):
+    client = FakeImapClient(messages={1: _build_email()})
+    original_uid = client.uid
+
+    def uid_with_broken_body(command, *args):
+        if command == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])":
+            return broken_response
+        return original_uid(command, *args)
+
+    client.uid = uid_with_broken_body
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+
+
+@pytest.mark.asyncio
+async def test_valid_malformed_valid_sequence_all_processed():
+    """One malformed FETCH response between two valid ones must not
+    prevent the valid messages from being processed (GMAIL-010)."""
+    messages = {
+        1: _build_email(message_id="<first@example.com>", subject="First"),
+        2: _build_email(message_id="<second@example.com>", subject="Second"),
+        3: _build_email(message_id="<third@example.com>", subject="Third"),
+    }
+    client = FakeImapClient(messages=messages)
+    original_uid = client.uid
+
+    def uid_break_middle(command, *args):
+        if command == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])" and args[0] == b"2":
+            return ("OK", [None])
+        return original_uid(command, *args)
+
+    client.uid = uid_break_middle
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    subjects = {msg.subject for msg in result.messages}
+    assert subjects == {"First", "Third"}
+    assert result.skipped_count == 1
+
+
+@pytest.mark.asyncio
+async def test_structurally_malformed_message_is_skipped(monkeypatch):
+    raw = _build_email()
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    def broken_extract(msg):
+        raise email.errors.MessageParseError("boom")
+
+    monkeypatch.setattr(gmail_imap_module, "_extract_content", broken_extract)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+
+
+@pytest.mark.asyncio
+async def test_one_bad_message_does_not_prevent_others_from_syncing():
+    good_raw = _build_email(message_id="<good@example.com>", subject="Good message")
+    client = FakeImapClient(messages={1: good_raw})
+    original_uid = client.uid
+
+    def uid_with_extra_phantom(command, *args):
+        if command == "search":
+            return ("OK", [b"1 999"])
+        return original_uid(command, *args)
+
+    client.uid = uid_with_extra_phantom
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.skipped_count == 1
+    assert len(result.messages) == 1
+    assert result.messages[0].subject == "Good message"
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-002: account scoping
+# ---------------------------------------------------------------------------
+
+
+def test_account_key_is_normalized_username():
+    provider = _provider(None, username="  Someone@Example.com  ")
+    assert provider.account_key == "someone@example.com"
+
+
+@pytest.mark.asyncio
+async def test_parsed_messages_carry_the_provider_account_key():
+    raw = _build_email()
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client, username=ACCOUNT)
+
+    result = await provider.fetch()
+
+    assert result.messages[0].account_key == "me@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -443,61 +803,126 @@ async def test_direction_inbound_when_sender_is_not_account_address():
     assert result.messages[0].direction == "INBOUND"
 
 
-@pytest.mark.asyncio
-async def test_malformed_fetch_response_is_skipped_not_raised():
-    client = FakeImapClient(messages={})
-    # Simulate a UID present in SEARCH results but missing from FETCH
-    # (e.g. deleted between SEARCH and FETCH) by overriding the uid()
-    # search result to advertise a uid with no backing message.
-    original_uid = client.uid
+# ---------------------------------------------------------------------------
+# GMAIL-004: MIME attachment subtree isolation
+# ---------------------------------------------------------------------------
 
-    def uid_with_phantom(command, *args):
-        if command == "search":
-            return ("OK", [b"999"])
-        return original_uid(command, *args)
 
-    client.uid = uid_with_phantom
-    provider = _provider(client)
-
-    result = await provider.fetch()
-
-    assert result.messages == ()
-    assert result.skipped_count == 1
+def _rfc822_attachment(inner: MIMEText | MIMEMultipart, filename: str | None = "original.eml"):
+    part = MIMEMessage(inner)
+    if filename is not None:
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+    return part
 
 
 @pytest.mark.asyncio
-async def test_structurally_malformed_message_is_skipped(monkeypatch):
-    raw = _build_email()
+async def test_message_rfc822_attachment_does_not_leak_into_body():
+    inner = MIMEText(
+        "This is the ORIGINAL forwarded email body — must never leak.", "plain", "utf-8"
+    )
+    inner["Subject"] = "Original conversation"
+    attachment = _rfc822_attachment(inner)
+
+    raw = _build_email(
+        plaintext_body=None,
+        html_body="<p>Please see forwarded email</p>",
+        extra_parts=[attachment],
+    )
     client = FakeImapClient(messages={1: raw})
     provider = _provider(client)
 
-    def broken_extract(msg):
-        raise email.errors.MessageParseError("boom")
-
-    monkeypatch.setattr(gmail_imap_module, "_extract_content", broken_extract)
-
     result = await provider.fetch()
 
-    assert result.messages == ()
-    assert result.skipped_count == 1
+    message = result.messages[0]
+    assert message.body_plain == ""
+    assert message.has_html is True
+    assert len(message.attachments) == 1
+    assert message.attachments[0].content_type == "message/rfc822"
 
 
 @pytest.mark.asyncio
-async def test_one_bad_message_does_not_prevent_others_from_syncing():
-    good_raw = _build_email(message_id="<good@example.com>", subject="Good message")
-    client = FakeImapClient(messages={1: good_raw})
-    original_uid = client.uid
+async def test_nested_message_rfc822_attachment_does_not_crash():
+    innermost = MIMEText("innermost body", "plain", "utf-8")
+    nested = _rfc822_attachment(innermost, filename="innermost.eml")
+    wrapper = MIMEMultipart("mixed")
+    wrapper.attach(MIMEText("middle layer", "plain", "utf-8"))
+    wrapper.attach(nested)
+    outer_attachment = _rfc822_attachment(wrapper, filename="outer.eml")
 
-    def uid_with_extra_phantom(command, *args):
-        if command == "search":
-            return ("OK", [b"1 999"])
-        return original_uid(command, *args)
-
-    client.uid = uid_with_extra_phantom
+    raw = _build_email(plaintext_body="Top-level body", extra_parts=[outer_attachment])
+    client = FakeImapClient(messages={1: raw})
     provider = _provider(client)
 
     result = await provider.fetch()
 
-    assert result.skipped_count == 1
-    assert len(result.messages) == 1
-    assert result.messages[0].subject == "Good message"
+    message = result.messages[0]
+    assert message.body_plain == "Top-level body"
+    assert len(message.attachments) == 1
+    assert message.attachments[0].content_type == "message/rfc822"
+
+
+@pytest.mark.asyncio
+async def test_multipart_attachment_is_isolated():
+    multipart_attachment = MIMEMultipart("mixed")
+    multipart_attachment.attach(MIMEText("hidden inner text", "plain", "utf-8"))
+    multipart_attachment.add_header("Content-Disposition", "attachment", filename="bundle.mixed")
+
+    raw = _build_email(plaintext_body="Visible body", extra_parts=[multipart_attachment])
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    message = result.messages[0]
+    assert message.body_plain == "Visible body"
+    assert len(message.attachments) == 1
+
+
+@pytest.mark.asyncio
+async def test_text_plain_attachment_is_not_treated_as_body():
+    raw = _build_email(
+        plaintext_body=None,
+        attachments=[("notes.txt", "text/plain", b"attachment file content")],
+    )
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    message = result.messages[0]
+    assert message.body_plain == ""
+    assert len(message.attachments) == 1
+    assert message.attachments[0].filename == "notes.txt"
+
+
+@pytest.mark.asyncio
+async def test_attachment_without_filename_is_isolated():
+    part = MIMEText("attachment body with no filename", "plain", "utf-8")
+    part.add_header("Content-Disposition", "attachment")
+
+    raw = _build_email(plaintext_body="Real body", extra_parts=[part])
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    message = result.messages[0]
+    assert message.body_plain == "Real body"
+    assert len(message.attachments) == 1
+    assert message.attachments[0].filename is None
+
+
+@pytest.mark.asyncio
+async def test_multipart_related_container_is_not_treated_as_attachment():
+    related = MIMEMultipart("related")
+    related.attach(MIMEText("related body text", "plain", "utf-8"))
+
+    raw = _build_email(plaintext_body=None, extra_parts=[related])
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    message = result.messages[0]
+    assert message.body_plain == "related body text"
+    assert message.attachments == ()

@@ -13,11 +13,15 @@ candidate-job matching, and calls no LLM/provider of any kind — purely
 deterministic fetch + persist infrastructure (CLAUDE.md's Stage 7A
 constraints).
 
-**Privacy.** Logging here never includes subject/body/addresses/display
-names — only internal counts and error types (spec section 6). One bad
-message's persistence failure is isolated (rolled back and counted as
-`failed`) and never aborts the rest of the sync run, mirroring
-`_run_xing`'s per-job isolation.
+**Privacy (GMAIL-003).** Logging here never includes subject/body/
+addresses/display names, and never logs a caught exception's message
+text or traceback (`exc_info`) — only `type(exc).__name__` and safe
+counters. A persistence-layer error (e.g. a driver-level IntegrityError)
+can in principle embed row content in its own message string; this
+module never risks serializing that into a log line. One bad message's
+persistence failure is isolated (rolled back and counted as `failed`)
+and never aborts the rest of the sync run, mirroring `_run_xing`'s
+per-job isolation.
 """
 
 import logging
@@ -41,14 +45,19 @@ class GmailInboxService:
         for parsed in fetch_result.messages:
             try:
                 _, was_created = upsert_message(db, parsed)
-            except Exception:
+            except Exception as exc:
                 # Isolate one bad message's persistence failure — the rest
                 # of an otherwise-successful sync must not be lost. A later
                 # sync will see the same message again (its IMAP UID is
                 # unaffected by our own failed write) and retry it.
+                #
+                # GMAIL-003: log only the exception's type, never its
+                # message text or traceback (no exc_info) — a driver-level
+                # error message can embed row content (subject/body/
+                # addresses), which must never reach the logs.
                 db.rollback()
                 failed += 1
-                logger.exception("gmail_message_persist_failed")
+                logger.warning("gmail_message_persist_failed error_type=%s", type(exc).__name__)
                 continue
 
             if was_created:

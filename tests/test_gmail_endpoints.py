@@ -1,7 +1,12 @@
 """API endpoint tests for Stage 7A Gmail Inbox Foundation:
 POST /gmail/sync, GET /gmail/messages(/{id}), GET /gmail/threads(/{id}).
+
+Includes the Stage 7A security fix round's endpoint-level regressions:
+GMAIL-002 (account scoping), GMAIL-003 (sanitized errors/logs), GMAIL-007
+(summary vs. detail), GMAIL-008 (thread list query count).
 """
 
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -11,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
+from app.db.gmail_repository import upsert_message
 from app.db.session import get_db
 from app.main import app
 from app.providers.email.base import (
@@ -22,10 +28,13 @@ from app.providers.email.base import (
 from app.security import rate_limit as rate_limit_module
 
 API_KEY = "test-api-key"
+ACCOUNT = "me@example.com"
+OTHER_ACCOUNT = "someone-else@example.com"
 
 
 def _parsed(uid: int, message_id: str | None = None, **overrides) -> ParsedGmailMessage:
     data = dict(
+        account_key=ACCOUNT,
         mailbox="INBOX",
         uid=uid,
         uid_validity=100,
@@ -83,7 +92,7 @@ def client(tmp_path, monkeypatch):
         api_key=API_KEY,
         rate_limit_requests=1000,
         rate_limit_window_seconds=60,
-        gmail_username="me@example.com",
+        gmail_username=ACCOUNT,
         gmail_app_password="app-password",
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
@@ -234,6 +243,40 @@ class TestRunGmailSync:
         assert second.status_code == 429
 
 
+class TestGmailSyncErrorSanitization:
+    """GMAIL-003: neither the HTTP response nor the server logs may ever
+    carry an upstream exception's message text — only a fixed, generic
+    detail string and the exception's type name.
+    """
+
+    SECRET_MARKERS = [
+        "victim@example.com",
+        "SECRET_PASSWORD_MARKER",
+        "Private subject line",
+        "attachment-name.pdf",
+        "imap.internal.example.com",
+    ]
+
+    def test_poisoned_exception_text_never_reaches_response_or_logs(
+        self, client, monkeypatch, caplog
+    ):
+        test_client, _ = client
+        poisoned_message = " ".join(self.SECRET_MARKERS)
+        monkeypatch.setattr(
+            "app.api.routes.GmailImapProvider",
+            lambda **kwargs: FakeProvider(error=GmailConnectionError(poisoned_message)),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
+
+        assert response.status_code == 502
+        assert response.json() == {"detail": "Gmail inbox sync failed"}
+        for marker in self.SECRET_MARKERS:
+            assert marker not in response.text
+            assert marker not in caplog.text
+
+
 class TestGetGmailMessagesAndThreads:
     def test_requires_api_key_auth(self, client):
         test_client, _ = client
@@ -325,6 +368,109 @@ class TestGetGmailMessagesAndThreads:
         threads = response.json()
         assert len(threads) == 2
         assert all("message_count" in thread for thread in threads)
+
+
+class TestGmailMessageSummaryVsDetail:
+    """GMAIL-007: the list endpoint must never return full correspondence
+    content in bulk; the by-id detail endpoint remains the full-content
+    representation.
+    """
+
+    def test_list_excludes_body_plain_and_full_recipients(self, client, monkeypatch):
+        test_client, _ = client
+        monkeypatch.setattr(
+            "app.api.routes.GmailImapProvider",
+            lambda **kwargs: FakeProvider(
+                messages=[_parsed(1, body_plain="Confidential recruiter message body")]
+            ),
+        )
+        test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
+
+        response = test_client.get("/api/v1/gmail/messages", headers=_auth_headers())
+
+        assert response.status_code == 200
+        item = response.json()[0]
+        assert "body_plain" not in item
+        assert "to_addresses" not in item
+        assert "references" not in item
+        assert "attachments" not in item
+        assert "Confidential" not in response.text
+        assert "attachment_count" in item
+
+    def test_detail_includes_body_plain(self, client, monkeypatch):
+        test_client, _ = client
+        monkeypatch.setattr(
+            "app.api.routes.GmailImapProvider",
+            lambda **kwargs: FakeProvider(
+                messages=[_parsed(1, body_plain="Confidential recruiter message body")]
+            ),
+        )
+        test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
+        listed = test_client.get("/api/v1/gmail/messages", headers=_auth_headers()).json()
+        message_id = listed[0]["id"]
+
+        response = test_client.get(f"/api/v1/gmail/messages/{message_id}", headers=_auth_headers())
+
+        assert response.status_code == 200
+        assert response.json()["body_plain"] == "Confidential recruiter message body"
+
+
+class TestGmailThreadDetail:
+    def test_thread_detail_returns_bounded_message_list(self, client, monkeypatch):
+        test_client, _ = client
+        monkeypatch.setattr(
+            "app.api.routes.GmailImapProvider",
+            lambda **kwargs: FakeProvider(
+                messages=[
+                    _parsed(1, message_id="<root@example.com>"),
+                    _parsed(
+                        2,
+                        message_id="<reply@example.com>",
+                        references=("<root@example.com>",),
+                    ),
+                ]
+            ),
+        )
+        test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
+        threads = test_client.get("/api/v1/gmail/threads", headers=_auth_headers()).json()
+        thread_id = threads[0]["id"]
+
+        response = test_client.get(f"/api/v1/gmail/threads/{thread_id}", headers=_auth_headers())
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["message_count"] == 2
+        assert len(body["messages"]) == 2
+        # Thread detail message entries are summary-shaped, not full detail.
+        assert "body_plain" not in body["messages"][0]
+
+    def test_thread_detail_message_limit_is_bounded(self, client):
+        test_client, _ = client
+        response = test_client.get(
+            "/api/v1/gmail/threads/1?message_limit=100000", headers=_auth_headers()
+        )
+        assert response.status_code == 422
+
+
+class TestGmailAccountScoping:
+    """GMAIL-002: read endpoints must scope to the currently configured
+    Gmail account and never surface another account's persisted
+    correspondence.
+    """
+
+    def test_get_endpoints_never_show_another_accounts_messages(self, client):
+        test_client, session_factory = client
+        session = session_factory()
+        try:
+            upsert_message(session, _parsed(1, account_key=OTHER_ACCOUNT))
+        finally:
+            session.close()
+
+        messages = test_client.get("/api/v1/gmail/messages", headers=_auth_headers()).json()
+        threads = test_client.get("/api/v1/gmail/threads", headers=_auth_headers()).json()
+
+        assert messages == []
+        assert threads == []
 
 
 class TestGmailInboxIsReadOnly:
