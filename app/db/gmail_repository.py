@@ -14,10 +14,20 @@ rows for it (spec section 22).
 Message-ID/In-Reply-To/References headers, and every thread lookup is
 scoped to `account_key` (GMAIL-002) so two different configured mailbox
 accounts can never merge or collide threads merely because they
-reference the same Message-ID string. See app/providers/email/imap.py's
-module docstring for the documented References/In-Reply-To limitation,
-and `upsert_message`'s docstring for the additional Message-ID
-collision guard (GMAIL-011).
+reference the same Message-ID string.
+
+**Message-ID ownership is a DB-enforced atomic claim, not a Python
+check-then-act decision (GMAIL-011).** A message that self-anchors on
+its own Message-ID (no References/In-Reply-To) atomically claims
+`(account_key, message_id_header)` in `GmailMessageIdClaimRecord` via
+INSERT + IntegrityError-catch — never a SELECT-then-decide sequence,
+which a Codex concurrency probe proved could let two concurrent
+unrelated messages sharing a reused Message-ID both "win" and get
+silently merged into one thread. See `_claim_message_id_or_get_collision_thread`
+and `GmailMessageIdClaimRecord`'s own docstring for the full design and
+the permanent `contested` flag it sets once a collision is ever proven.
+See app/providers/email/imap.py's module docstring for the documented
+References/In-Reply-To limitation this is independent of.
 
 Nothing in this module logs message content (subject/body/addresses) —
 see app/services/gmail_inbox.py for the sync orchestration and its
@@ -25,12 +35,13 @@ privacy-safe logging.
 """
 
 import json
+from collections.abc import Collection
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import GmailMessageRecord, GmailThreadRecord
+from app.db.models import GmailMessageIdClaimRecord, GmailMessageRecord, GmailThreadRecord
 from app.models.gmail import (
     GmailAttachment,
     GmailMessage,
@@ -93,15 +104,59 @@ def is_message_known(
 ) -> bool:
     """True if this exact provider identity is already persisted.
 
-    Bound into `GmailImapProvider` via closure as `is_uid_known` (see
+    A plain single-UID convenience wrapper around
+    `get_message_by_identity` — NOT what `GmailImapProvider` is wired to
+    (see `get_known_uids` below, GMAIL-012): calling this once per
+    candidate UID is exactly the query-per-UID amplification a Codex
+    probe reproduced as 100 SEARCH results -> 100 SELECTs, before
+    MAX_MESSAGES_PER_SYNC was even applied. Kept as a small, honestly
+    named utility for call sites that only ever need to check one UID.
+    """
+    return get_message_by_identity(db, account_key, mailbox, uid_validity, uid) is not None
+
+
+# GMAIL-012: chunk size for get_known_uids' bulk membership queries — kept
+# comfortably under SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999) so a
+# single chunk's `IN (...)` clause never risks that limit, while still
+# being large enough that a real sync's candidate list (bounded well
+# below this by MAX_MESSAGES_PER_SYNC's own order of magnitude) needs only
+# one or two chunk queries, not hundreds.
+KNOWN_UIDS_QUERY_CHUNK_SIZE = 500
+
+
+def get_known_uids(
+    db: Session,
+    account_key: str,
+    mailbox: str,
+    uid_validity: int,
+    candidate_uids: Collection[int],
+) -> set[int]:
+    """Bulk membership check (GMAIL-012): which of `candidate_uids` are
+    already persisted for this (account_key, mailbox, uid_validity)
+    generation.
+
+    Bound into `GmailImapProvider` via closure as `get_known_uids` (see
     app/api/routes.py's `_run_gmail_sync`) so the provider can filter
     already-synced UIDs out BEFORE applying MAX_MESSAGES_PER_SYNC
     (GMAIL-005 starvation fix — see app/providers/email/imap.py's
-    `_fetch_sync`) — mirrors
-    app.collectors.xing_email.XingEmailCollector's own
-    `is_message_processed` callable/rationale.
+    `_fetch_sync`), using ONE query per
+    `KNOWN_UIDS_QUERY_CHUNK_SIZE`-sized chunk of candidates — never one
+    query per UID, regardless of how many UIDs IMAP SEARCH returns.
     """
-    return get_message_by_identity(db, account_key, mailbox, uid_validity, uid) is not None
+    candidates = list(dict.fromkeys(candidate_uids))  # de-dup, preserve order
+    known: set[int] = set()
+    for start in range(0, len(candidates), KNOWN_UIDS_QUERY_CHUNK_SIZE):
+        chunk = candidates[start : start + KNOWN_UIDS_QUERY_CHUNK_SIZE]
+        rows = db.scalars(
+            select(GmailMessageRecord.uid).where(
+                GmailMessageRecord.account_key == account_key,
+                GmailMessageRecord.mailbox == mailbox,
+                GmailMessageRecord.uid_validity == uid_validity,
+                GmailMessageRecord.uid.in_(chunk),
+            )
+        ).all()
+        known.update(rows)
+    return known
 
 
 def get_message_by_identity(
@@ -115,30 +170,6 @@ def get_message_by_identity(
             GmailMessageRecord.uid_validity == uid_validity,
             GmailMessageRecord.uid == uid,
         )
-    )
-
-
-def _message_id_used_by_another_message(
-    db: Session, account_key: str, message_id_header: str
-) -> bool:
-    """True if some already-persisted message in this account already
-    carries this exact Message-ID header (GMAIL-011).
-
-    Only ever called from the self-anchoring branch of `upsert_message`
-    (a message whose own Message-ID is being used as a *new* thread
-    root), and only after `upsert_message` has already confirmed this
-    message's own provider identity is not yet persisted — so any match
-    found here necessarily belongs to a *different* message, never this
-    same one re-synced.
-    """
-    return (
-        db.scalar(
-            select(GmailMessageRecord.id).where(
-                GmailMessageRecord.account_key == account_key,
-                GmailMessageRecord.message_id_header == message_id_header,
-            )
-        )
-        is not None
     )
 
 
@@ -185,39 +216,145 @@ def get_or_create_thread(
     return record
 
 
-def _resolve_anchor(db: Session, parsed: ParsedGmailMessage) -> str:
-    """The thread_key `upsert_message` should use for `parsed` — wraps
-    `resolve_thread_anchor` with the GMAIL-011 Message-ID collision guard
-    and the synthetic-key fallback.
+def _get_message_id_claim(
+    db: Session, account_key: str, message_id_header: str
+) -> GmailMessageIdClaimRecord | None:
+    return db.scalar(
+        select(GmailMessageIdClaimRecord).where(
+            GmailMessageIdClaimRecord.account_key == account_key,
+            GmailMessageIdClaimRecord.message_id_header == message_id_header,
+        )
+    )
+
+
+def _mark_claim_contested(db: Session, account_key: str, message_id_header: str) -> None:
+    """Permanently flag a Message-ID as proven ambiguous (GMAIL-011) —
+    idempotent (safe to call redundantly if multiple losers race).
+    """
+    stmt = (
+        update(GmailMessageIdClaimRecord)
+        .where(
+            GmailMessageIdClaimRecord.account_key == account_key,
+            GmailMessageIdClaimRecord.message_id_header == message_id_header,
+        )
+        .values(contested=True)
+    )
+    db.execute(stmt)
+    db.commit()
+
+
+def _claim_message_id_or_get_collision_thread(
+    db: Session, parsed: ParsedGmailMessage, anchor: str
+) -> GmailThreadRecord:
+    """Atomically claim `(account_key, anchor)` for `parsed` — the sole
+    arbiter of self-anchored Message-ID ownership (GMAIL-011).
+
+    Reuses an existing `GmailThreadRecord` at this `thread_key` if one
+    already exists (e.g. created by a reply that arrived before this
+    root — see `_resolve_thread_for_message`'s reply branch), otherwise
+    creates one. Either way, the actual ownership decision is made by
+    the claim INSERT below, never by whichever caller happened to see
+    "no thread yet" first: if the claim INSERT fails (a concurrent or
+    earlier different message already claimed this exact Message-ID),
+    this message is treated as an unrelated, ambiguous collision and
+    routed to its own brand-new synthetic thread — it never joins the
+    winner's thread just because it momentarily observed the same
+    (about-to-be-superseded) thread row.
+    """
+    existing_thread = db.scalar(
+        select(GmailThreadRecord).where(
+            GmailThreadRecord.account_key == parsed.account_key,
+            GmailThreadRecord.thread_key == anchor,
+        )
+    )
+    thread = existing_thread or get_or_create_thread(db, parsed.account_key, anchor, parsed.subject)
+
+    claim = GmailMessageIdClaimRecord(
+        account_key=parsed.account_key,
+        message_id_header=anchor,
+        claimant_mailbox=parsed.mailbox,
+        claimant_uid_validity=parsed.uid_validity,
+        claimant_uid=parsed.uid,
+        thread_id=thread.id,
+    )
+    db.add(claim)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Someone else already legitimately owns this exact Message-ID —
+        # this message's claim to be "the" root sharing that ID is
+        # unverifiable and must not be trusted as proof of shared
+        # conversation. Mark the winning claim as permanently contested
+        # (so future replies referencing this anchor stop trusting it
+        # too — see _resolve_thread_for_message) and give this message
+        # its own separate, never-shared synthetic thread.
+        _mark_claim_contested(db, parsed.account_key, anchor)
+        return get_or_create_thread(
+            db,
+            parsed.account_key,
+            f"synthetic-collision:{parsed.mailbox}:{parsed.uid_validity}:{parsed.uid}",
+            parsed.subject,
+        )
+
+    return thread
+
+
+def _resolve_thread_for_message(db: Session, parsed: ParsedGmailMessage) -> GmailThreadRecord:
+    """The `GmailThreadRecord` `upsert_message` should attach `parsed` to.
 
     Three cases:
     1. No usable Message-ID/In-Reply-To/References at all: an
-       unlinkable singleton, given its own synthetic key.
+       unlinkable singleton, given its own synthetic thread.
     2. The resolved anchor came from `references[0]`/`in_reply_to` (this
        message explicitly points at another message as its
-       parent/ancestor): trusted as the legitimate, protocol-intended use
-       of Message-ID — joins that thread.
+       parent/ancestor): the legitimate, protocol-intended use of
+       Message-ID. Joins the thread already claimed for that anchor —
+       UNLESS that anchor has been proven `contested` (GMAIL-011: an
+       ambiguous Message-ID is never later trusted just because this
+       particular reference looks legitimate), in which case this
+       message gets its own synthetic thread too. If no claim exists yet
+       (the root hasn't been synced), falls back to joining/creating a
+       plain thread keyed on the anchor, so a later-arriving root that
+       claims the same anchor finds and reuses this same thread (see
+       `_claim_message_id_or_get_collision_thread`'s `existing_thread`
+       reuse).
     3. The resolved anchor is this message's OWN Message-ID (no
-       References/In-Reply-To of its own — it is establishing itself as a
-       would-be thread root): only trusted if no *other*, already
-       distinct message in this account has already used that exact
-       Message-ID. If one has, this is a reused/malformed/malicious
-       Message-ID, not proof of shared conversation (GMAIL-011) — routed
-       to its own synthetic thread instead of silently merging two
-       unrelated messages.
+       References/In-Reply-To of its own — it is establishing itself as
+       a would-be thread root): resolved via an atomic DB claim, never a
+       Python check-then-act decision (GMAIL-011) — see
+       `_claim_message_id_or_get_collision_thread`.
     """
     anchor = resolve_thread_anchor(parsed.message_id_header, parsed.in_reply_to, parsed.references)
-    synthetic_key = f"synthetic:{parsed.mailbox}:{parsed.uid_validity}:{parsed.uid}"
     if anchor is None:
-        return synthetic_key
+        synthetic_key = f"synthetic:{parsed.mailbox}:{parsed.uid_validity}:{parsed.uid}"
+        return get_or_create_thread(db, parsed.account_key, synthetic_key, parsed.subject)
 
     self_anchored = (
         anchor == parsed.message_id_header and not parsed.references and not parsed.in_reply_to
     )
-    if self_anchored and _message_id_used_by_another_message(db, parsed.account_key, anchor):
-        return f"synthetic-collision:{synthetic_key}"
 
-    return anchor
+    if not self_anchored:
+        claim = _get_message_id_claim(db, parsed.account_key, anchor)
+        if claim is not None:
+            if claim.contested:
+                return get_or_create_thread(
+                    db,
+                    parsed.account_key,
+                    f"synthetic-ambiguous-reply:{parsed.mailbox}:{parsed.uid_validity}:{parsed.uid}",
+                    parsed.subject,
+                )
+            thread = db.get(GmailThreadRecord, claim.thread_id)
+            if thread is not None:
+                return thread
+            raise GmailRepositoryConsistencyError(
+                f"gmail_message_id_claims row for account_key={parsed.account_key!r} "
+                f"message_id_header={anchor!r} points at missing thread_id="
+                f"{claim.thread_id}."
+            )
+        return get_or_create_thread(db, parsed.account_key, anchor, parsed.subject)
+
+    return _claim_message_id_or_get_collision_thread(db, parsed, anchor)
 
 
 def upsert_message(db: Session, parsed: ParsedGmailMessage) -> tuple[GmailMessageRecord, bool]:
@@ -237,8 +374,7 @@ def upsert_message(db: Session, parsed: ParsedGmailMessage) -> tuple[GmailMessag
     if existing is not None:
         return existing, False
 
-    anchor = _resolve_anchor(db, parsed)
-    thread = get_or_create_thread(db, parsed.account_key, anchor, parsed.subject)
+    thread = _resolve_thread_for_message(db, parsed)
 
     record = GmailMessageRecord(
         thread_id=thread.id,

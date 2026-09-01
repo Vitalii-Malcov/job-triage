@@ -75,10 +75,10 @@ from app.db.candidate_profile_repository import (
 from app.db.gmail_repository import (
     THREAD_DETAIL_DEFAULT_MESSAGE_LIMIT,
     THREAD_DETAIL_MAX_MESSAGE_LIMIT,
+    get_known_uids,
     get_message_by_id,
     get_thread_by_id,
     get_thread_message_count,
-    is_message_known,
     list_messages,
     list_threads_with_counts,
     to_gmail_message,
@@ -1482,12 +1482,12 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
         app_password=settings.gmail_app_password,
         mailbox=settings.gmail_mailbox,
         lookback_days=settings.gmail_lookback_days,
-        # GMAIL-005 starvation fix: bound to this request's db.Session via
-        # closure, mirroring is_message_processed for XING above — lets
-        # the provider skip already-persisted UIDs before applying its
-        # MAX_MESSAGES_PER_SYNC cap.
-        is_uid_known=lambda uid_validity, uid: is_message_known(
-            db, account_key, settings.gmail_mailbox, uid_validity, uid
+        # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound to
+        # this request's db.Session via closure — lets the provider skip
+        # already-persisted UIDs before applying its MAX_MESSAGES_PER_SYNC
+        # cap, in one query per chunk rather than one query per UID.
+        get_known_uids=lambda uid_validity, candidate_uids: get_known_uids(
+            db, account_key, settings.gmail_mailbox, uid_validity, candidate_uids
         ),
     )
     return await GmailInboxService().sync(db, provider)

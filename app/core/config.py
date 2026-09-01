@@ -3,6 +3,12 @@ from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.providers.email.base import (
+    MAX_ADDRESS_LENGTH,
+    MAX_IMAP_HOST_LENGTH,
+    MAX_MAILBOX_NAME_LENGTH,
+)
+
 
 class Settings(BaseSettings):
     app_env: str = "development"
@@ -78,19 +84,49 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # GMAIL-009: unlike gmail_username/gmail_app_password (blank means
-    # "not configured" — a deliberate, meaningful state that fails closed
-    # at the collector, not at Settings construction), a blank/
-    # whitespace-only host or mailbox name is never valid: both have
-    # sensible non-blank defaults, and an explicit override to "" or " "
-    # is a configuration mistake that should fail fast at startup rather
-    # than reach the IMAP client.
-    @field_validator("gmail_imap_host", "gmail_mailbox")
+    # GMAIL-009: length/blank invariants, consistent with the DB columns
+    # and identity normalization these values ultimately feed
+    # (app.db.models.GmailMessageRecord/GmailThreadRecord, and
+    # app.providers.email.base.normalize_account_key). Each validator
+    # strips before measuring/returning, so Settings and
+    # normalize_account_key (which also strips, then casefolds) can never
+    # disagree about what the "real" value is — Settings never applies
+    # casefold itself, since gmail_username is also the literal IMAP LOGIN
+    # credential, not just an identity key.
+    @field_validator("gmail_username")
     @classmethod
-    def _reject_blank_gmail_value(cls, value: str) -> str:
-        if not value.strip():
+    def _validate_gmail_username(cls, value: str) -> str:
+        # Unlike host/mailbox below, blank remains a deliberate, meaningful
+        # "not configured" state (fails closed at the collector — see
+        # app/api/routes.py's _run_gmail_sync — not at Settings
+        # construction), so an empty/whitespace-only value is returned as
+        # "" rather than rejected.
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if len(stripped) > MAX_ADDRESS_LENGTH:
+            raise ValueError(f"must not exceed {MAX_ADDRESS_LENGTH} characters")
+        return stripped
+
+    @field_validator("gmail_mailbox")
+    @classmethod
+    def _validate_gmail_mailbox(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
             raise ValueError("must not be blank")
-        return value
+        if len(stripped) > MAX_MAILBOX_NAME_LENGTH:
+            raise ValueError(f"must not exceed {MAX_MAILBOX_NAME_LENGTH} characters")
+        return stripped
+
+    @field_validator("gmail_imap_host")
+    @classmethod
+    def _validate_gmail_imap_host(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        if len(stripped) > MAX_IMAP_HOST_LENGTH:
+            raise ValueError(f"must not exceed {MAX_IMAP_HOST_LENGTH} characters")
+        return stripped
 
 
 @lru_cache

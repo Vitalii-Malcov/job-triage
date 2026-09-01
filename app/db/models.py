@@ -376,6 +376,71 @@ class GmailMessageRecord(Base):
     thread: Mapped["GmailThreadRecord"] = relationship(back_populates="messages")
 
 
+class GmailMessageIdClaimRecord(Base):
+    """The DB-enforced atomic arbiter of "who owns this Message-ID"
+    within one account (GMAIL-011 concurrency fix).
+
+    **Why this table exists.** The original Message-ID collision guard
+    (a Python `SELECT ... WHERE message_id_header = :anchor` followed by
+    a decision) was itself racy: two concurrent messages sharing a
+    reused/malformed Message-ID could both observe "not found yet" and
+    both proceed to treat themselves as the legitimate owner, silently
+    merging two unrelated conversations. A check-then-act Python
+    decision can never close that window — only a real DB UNIQUE
+    constraint, contended for via an INSERT + IntegrityError-catch, can.
+
+    `UNIQUE(account_key, message_id_header)` is that arbiter: exactly one
+    provider message identity can ever hold the claim for a given
+    Message-ID within an account. Whichever concurrent INSERT commits
+    first wins; every other concurrent (or later) attempt to claim the
+    same (account_key, message_id_header) fails on this constraint and is
+    routed to its own synthetic "collision" thread instead of the
+    winner's — see app/db/gmail_repository.py's
+    `_claim_message_id_or_get_collision_thread`.
+
+    **`contested`** is set True the first time a second claim attempt
+    loses this race. Once set, it is permanent (mirrors this project's
+    "immutable historical" bias elsewhere — e.g. CandidateCVDraftRecord):
+    a Message-ID that has ever been proven ambiguous stays untrusted for
+    every future message that merely *references* it too (see
+    `_resolve_thread_for_message`'s reply branch) — an ambiguous anchor
+    is never later treated as if it had turned out fine after all.
+
+    Deliberately not a UNIQUE(thread_id) — one thread can legitimately be
+    the target of exactly one claim (the root's own Message-ID), but
+    nothing here needs to look up "which claim belongs to this thread",
+    only "who owns this Message-ID".
+    """
+
+    __tablename__ = "gmail_message_id_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key", "message_id_header", name="uq_gmail_message_id_claims_account_message_id"
+        ),
+        CheckConstraint("claimant_uid > 0", name="ck_gmail_message_id_claims_uid_positive"),
+        CheckConstraint(
+            "claimant_uid_validity > 0", name="ck_gmail_message_id_claims_uid_validity_positive"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    message_id_header: Mapped[str] = mapped_column(String(998), nullable=False)
+    # The provider identity that WON this claim — traceability only, not
+    # itself part of any uniqueness (mirrors CandidateJobMatchRecord's own
+    # "traceability, not identity" columns elsewhere in this file).
+    claimant_mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    claimant_uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
+    claimant_uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    thread_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    contested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may

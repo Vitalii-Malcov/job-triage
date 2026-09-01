@@ -60,6 +60,19 @@ MAX_REFERENCES = 20
 MAX_BODY_LENGTH = 20_000
 MAX_ATTACHMENTS = 20
 
+# GMAIL-009: config-level bounds, kept here (not duplicated in
+# app.core.config) so app.core.config.Settings and normalize_account_key
+# below can never drift apart on what "too long" means for the same
+# underlying value.
+#
+# GMAIL_USERNAME is effectively a mailbox account address — reuses
+# MAX_ADDRESS_LENGTH (RFC 5321) rather than a separate constant.
+# GMAIL_MAILBOX mirrors app.db.models.GmailMessageRecord.mailbox's column
+# width (String(100)). GMAIL_IMAP_HOST uses RFC 1035/1123's 253-character
+# maximum total hostname length.
+MAX_MAILBOX_NAME_LENGTH = 100
+MAX_IMAP_HOST_LENGTH = 253
+
 # GMAIL-005: bounds applied BEFORE the expensive part of a fetch, not just
 # after decoding.
 #

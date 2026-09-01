@@ -5,14 +5,16 @@ GMAIL-008 grouped thread-count query.
 """
 
 import json
+import threading
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.gmail_repository import (
+    get_known_uids,
     get_message_by_identity,
     get_or_create_thread,
     get_thread_by_id,
@@ -24,6 +26,7 @@ from app.db.gmail_repository import (
     to_gmail_thread,
     upsert_message,
 )
+from app.db.models import GmailMessageRecord
 from app.providers.email.base import ParsedGmailMessage
 
 ACCOUNT_A = "a@example.com"
@@ -312,19 +315,42 @@ def test_duplicate_message_id_without_references_does_not_trust_merge(db):
     assert first.thread_id != second.thread_id
 
 
-def test_duplicate_message_id_still_allows_legitimate_reference(db):
-    """The GMAIL-011 collision guard must not interfere with a message
-    that legitimately References an existing thread anchor, even if some
-    other unrelated message elsewhere reused that same Message-ID as its
-    own identity.
+def test_legitimate_reply_to_an_unambiguous_root_joins_same_thread(db):
+    """A genuine reply that References a root whose Message-ID has never
+    been contested must join that root's thread normally."""
+    root, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>", subject="Root"))
+    reply, _ = upsert_message(
+        db,
+        _parsed(
+            uid=2,
+            message_id="<reply@example.com>",
+            references=("<root@example.com>",),
+            subject="Re: Root",
+        ),
+    )
+
+    assert reply.thread_id == root.thread_id
+
+
+def test_reply_to_a_contested_message_id_does_not_join_either_side(db):
+    """Once a Message-ID is proven ambiguous (two unrelated messages both
+    claimed it), a later message that merely References that same ID
+    must NOT be silently trusted as belonging to either side's
+    conversation — GMAIL-011: "replies to an anchor already classified as
+    ambiguous/reused must not automatically be treated as trusted common
+    correspondence context."
     """
     root, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>", subject="Root"))
     # An unrelated message elsewhere happens to reuse "<root@example.com>"
-    # as its own self-anchored identity — must get its own thread.
+    # as its own self-anchored identity — must get its own thread, and
+    # must permanently mark that Message-ID as contested.
     unrelated, _ = upsert_message(
         db, _parsed(uid=2, message_id="<root@example.com>", subject="Unrelated")
     )
-    # A genuine reply that actually references the root.
+    assert unrelated.thread_id != root.thread_id
+
+    # A message that References the now-contested anchor must not join
+    # either root's or unrelated's thread.
     reply, _ = upsert_message(
         db,
         _parsed(
@@ -335,8 +361,122 @@ def test_duplicate_message_id_still_allows_legitimate_reference(db):
         ),
     )
 
-    assert reply.thread_id == root.thread_id
-    assert unrelated.thread_id != root.thread_id
+    assert reply.thread_id != root.thread_id
+    assert reply.thread_id != unrelated.thread_id
+
+
+def test_third_self_anchor_on_a_contested_message_id_also_gets_its_own_thread(db):
+    """The contested flag is permanent — a THIRD message that also tries
+    to self-anchor on an already-contested Message-ID must keep getting
+    its own separate thread, never silently merged with any prior
+    claimant.
+    """
+    root, _ = upsert_message(db, _parsed(uid=1, message_id="<root@example.com>", subject="Root"))
+    second, _ = upsert_message(
+        db, _parsed(uid=2, message_id="<root@example.com>", subject="Second")
+    )
+    third, _ = upsert_message(db, _parsed(uid=3, message_id="<root@example.com>", subject="Third"))
+
+    thread_ids = {root.thread_id, second.thread_id, third.thread_id}
+    assert len(thread_ids) == 3
+
+
+def test_same_provider_message_retry_is_idempotent_even_when_self_anchored(db):
+    """Re-syncing the exact same message (same provider identity) must
+    never be treated as a Message-ID collision against itself."""
+    parsed = _parsed(uid=1, message_id="<root@example.com>")
+    first, created_first = upsert_message(db, parsed)
+    second, created_second = upsert_message(db, parsed)
+
+    assert created_first is True
+    assert created_second is False
+    assert first.id == second.id
+    assert first.thread_id == second.thread_id
+
+
+def test_cross_account_same_message_id_claims_are_independent(db):
+    """Message-ID ownership claims are account-scoped — the same
+    Message-ID self-anchored in two different accounts must never
+    collide with (or contest) each other."""
+    account_a_msg, _ = upsert_message(
+        db, _parsed(account_key=ACCOUNT_A, uid=1, message_id="<shared@example.com>")
+    )
+    account_b_msg, _ = upsert_message(
+        db, _parsed(account_key=ACCOUNT_B, uid=1, message_id="<shared@example.com>")
+    )
+
+    assert account_a_msg.thread_id != account_b_msg.thread_id
+
+    # Neither claim should have been marked contested by the other.
+    from app.db.gmail_repository import _get_message_id_claim
+
+    claim_a = _get_message_id_claim(db, ACCOUNT_A, "<shared@example.com>")
+    claim_b = _get_message_id_claim(db, ACCOUNT_B, "<shared@example.com>")
+    assert claim_a.contested is False
+    assert claim_b.contested is False
+
+
+def test_concurrent_self_anchored_collision_across_real_sessions_and_threads(tmp_path):
+    """GMAIL-011 (real concurrency, not monkeypatch simulation): two
+    genuinely separate SQLAlchemy Sessions, each in its own OS thread,
+    each importing a DIFFERENT provider message (different uid) that
+    shares one reused Message-ID with no References/In-Reply-To.
+
+    The old check-then-act guard could let both threads observe "not
+    found yet" and both treat themselves as the legitimate owner. The
+    DB-enforced claim (UNIQUE(account_key, message_id_header) + INSERT +
+    IntegrityError-catch) must be the sole arbiter regardless of
+    interleaving: both messages persist, their thread_ids differ, no
+    IntegrityError escapes either thread, and both sessions remain
+    usable afterward.
+    """
+    db_path = tmp_path / "gmail_repository_concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    barrier = threading.Barrier(2)
+    results: dict[int, tuple[int, int, bool]] = {}
+    errors: dict[int, BaseException] = {}
+
+    def worker(uid: int) -> None:
+        session = session_factory()
+        try:
+            barrier.wait(timeout=5)
+            record, created = upsert_message(
+                session, _parsed(uid=uid, message_id="<race@example.com>")
+            )
+            results[uid] = (record.id, record.thread_id, created)
+            # The session must remain usable after the race, whichever
+            # side (winner or collision-loser) this thread landed on.
+            session.execute(select(GmailMessageRecord)).all()
+        except BaseException as exc:  # noqa: BLE001 - captured for the main thread to assert on
+            errors[uid] = exc
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker, args=(uid,)) for uid in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert errors == {}, f"unhandled exception(s) in worker threads: {errors}"
+    assert set(results.keys()) == {1, 2}
+
+    _, thread_id_1, created_1 = results[1]
+    _, thread_id_2, created_2 = results[2]
+    assert created_1 is True
+    assert created_2 is True
+    assert thread_id_1 != thread_id_2
+
+    verify_session = session_factory()
+    try:
+        assert len(list_messages(verify_session, ACCOUNT_A, limit=10, offset=0)) == 2
+    finally:
+        verify_session.close()
 
 
 def test_to_gmail_thread_reports_message_count_from_grouped_query(db):
@@ -378,6 +518,78 @@ def test_list_threads_with_counts_query_count_is_bounded(db, tmp_path):
     # returns — not one COUNT query per thread (the N+1 GMAIL-008 bug).
     select_statements = [s for s in executed_statements if s.strip().upper().startswith("SELECT")]
     assert len(select_statements) == 1
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-012: bulk known-UID lookup must not scale one-query-per-UID
+# ---------------------------------------------------------------------------
+
+
+def _count_select_statements(engine, action) -> int:
+    executed = []
+
+    def _track(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT"):
+            executed.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _track)
+    try:
+        action()
+    finally:
+        event.remove(engine, "before_cursor_execute", _track)
+    return len(executed)
+
+
+def test_get_known_uids_issues_one_query_for_a_single_candidate(db):
+    engine = db.get_bind()
+    query_count = _count_select_statements(
+        engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, [1])
+    )
+    assert query_count == 1
+
+
+def test_get_known_uids_issues_one_query_for_100_candidates(db):
+    engine = db.get_bind()
+    query_count = _count_select_statements(
+        engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, list(range(1, 101)))
+    )
+    assert query_count == 1
+
+
+def test_get_known_uids_issues_bounded_chunked_queries_for_10000_candidates(db):
+    """The critical GMAIL-012 regression: 10,000 candidate UIDs must
+    never produce anywhere close to 10,000 SELECTs — only
+    ceil(10000 / KNOWN_UIDS_QUERY_CHUNK_SIZE) chunk queries.
+    """
+    from app.db.gmail_repository import KNOWN_UIDS_QUERY_CHUNK_SIZE
+
+    engine = db.get_bind()
+    candidate_uids = list(range(1, 10_001))
+    query_count = _count_select_statements(
+        engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, candidate_uids)
+    )
+    expected_chunks = -(-len(candidate_uids) // KNOWN_UIDS_QUERY_CHUNK_SIZE)  # ceil div
+    assert query_count == expected_chunks
+    assert query_count < 100  # nowhere close to one-query-per-UID
+
+
+def test_get_known_uids_returns_correct_membership_across_chunk_boundaries(db):
+    for uid in (1, 500, 501, 999, 1000, 1500):
+        upsert_message(db, _parsed(uid=uid, message_id=f"<{uid}@example.com>"))
+
+    known = get_known_uids(db, ACCOUNT_A, "INBOX", 100, list(range(1, 1501)))
+
+    assert known == {1, 500, 501, 999, 1000, 1500}
+
+
+def test_get_known_uids_is_scoped_by_account_mailbox_and_uid_validity(db):
+    upsert_message(db, _parsed(account_key=ACCOUNT_A, uid=1, message_id="<a@example.com>"))
+    upsert_message(db, _parsed(account_key=ACCOUNT_B, uid=1, message_id="<b@example.com>"))
+
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 100, [1]) == {1}
+    assert get_known_uids(db, ACCOUNT_B, "INBOX", 100, [1]) == {1}
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 200, [1]) == set()
+    assert get_known_uids(db, ACCOUNT_A, "OTHERBOX", 100, [1]) == set()
 
 
 def test_get_thread_message_count_single_thread(db):

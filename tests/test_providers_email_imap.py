@@ -434,7 +434,7 @@ async def test_messages_per_sync_is_capped(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_messages_per_sync_cap_drains_backlog_across_syncs_via_is_uid_known(monkeypatch):
+async def test_messages_per_sync_cap_drains_backlog_across_syncs_via_get_known_uids(monkeypatch):
     """The concrete GMAIL-005 starvation scenario: a sustained backlog
     (arrivals exceeding the cap on every sync) must make real forward
     progress across successive syncs, not perpetually re-fetch the same
@@ -443,11 +443,11 @@ async def test_messages_per_sync_cap_drains_backlog_across_syncs_via_is_uid_know
     Oldest-first prioritization ALONE is not sufficient for this — IMAP
     UID SEARCH always returns the same full backlog every time (nothing
     about the mailbox itself changes), so without filtering by
-    `is_uid_known` the oldest UIDs would win the cap forever and the
+    `get_known_uids` the oldest UIDs would win the cap forever and the
     provider would never reach anything newer as long as the backlog
-    stays above the cap. `is_uid_known` (bound to already-persisted state
-    by the caller — see app/api/routes.py's _run_gmail_sync) is what
-    actually lets each sync's cap apply to genuinely new work.
+    stays above the cap. `get_known_uids` (bound to already-persisted
+    state by the caller — see app/api/routes.py's _run_gmail_sync) is
+    what actually lets each sync's cap apply to genuinely new work.
     """
     monkeypatch.setattr(gmail_imap_module, "MAX_MESSAGES_PER_SYNC", 2)
     known: set[int] = set()
@@ -455,7 +455,7 @@ async def test_messages_per_sync_cap_drains_backlog_across_syncs_via_is_uid_know
     client = FakeImapClient(messages=messages)
     provider = _provider(
         client,
-        is_uid_known=lambda uid_validity, uid: uid in known,
+        get_known_uids=lambda uid_validity, candidate_uids: known & set(candidate_uids),
     )
 
     first_run = await provider.fetch()
@@ -471,12 +471,36 @@ async def test_already_known_uids_are_not_counted_as_skipped():
     known = {1}
     messages = {1: _build_email(), 2: _build_email(message_id="<2@example.com>")}
     client = FakeImapClient(messages=messages)
-    provider = _provider(client, is_uid_known=lambda uid_validity, uid: uid in known)
+    provider = _provider(
+        client, get_known_uids=lambda uid_validity, candidate_uids: known & set(candidate_uids)
+    )
 
     result = await provider.fetch()
 
     assert {msg.uid for msg in result.messages} == {2}
     assert result.skipped_count == 0
+
+
+@pytest.mark.asyncio
+async def test_get_known_uids_is_called_once_with_the_full_candidate_list_not_per_uid():
+    """GMAIL-012: the provider must call `get_known_uids` ONCE with the
+    whole candidate list, never once per UID — a Codex probe reproduced
+    the old per-UID wiring as literally N calls for N SEARCH results.
+    """
+    call_log: list[list[int]] = []
+
+    def recording_get_known_uids(uid_validity, candidate_uids):
+        call_log.append(list(candidate_uids))
+        return set()
+
+    messages = {uid: _build_email(message_id=f"<{uid}@example.com>") for uid in range(1, 101)}
+    client = FakeImapClient(messages=messages)
+    provider = _provider(client, get_known_uids=recording_get_known_uids)
+
+    await provider.fetch()
+
+    assert len(call_log) == 1
+    assert sorted(call_log[0]) == list(range(1, 101))
 
 
 @pytest.mark.asyncio

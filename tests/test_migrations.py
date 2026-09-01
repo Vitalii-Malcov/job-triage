@@ -1101,3 +1101,124 @@ def test_gmail_account_scope_migration_downgrades_one_step_cleanly(tmp_path: Pat
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     message_columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
     assert "account_key" in message_columns
+
+
+# ---------------------------------------------------------------------------
+# GMAIL-013: safe downgrade preflight — 7058c097a542's downgrade() must
+# refuse to collapse account-scoped identity into a colliding old-schema
+# identity, and must do so BEFORE any DDL runs.
+# ---------------------------------------------------------------------------
+
+
+def _alembic_current_revision(engine) -> str:
+    with engine.connect() as connection:
+        return connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+
+
+def test_gmail_account_scope_downgrade_preflight_allows_clean_cycle(tmp_path: Path) -> None:
+    """Case 1 (no cross-account conflicts): the normal upgrade -> downgrade
+    -> upgrade cycle must still succeed when there is nothing for the
+    preflight to object to.
+    """
+    db_path = tmp_path / "migrations_gmail_downgrade_preflight_clean.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "7058c097a542")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="a@example.com", uid=1)
+
+    downgrade(cfg, "8634f4be953a")
+
+    assert _alembic_current_revision(engine) == "8634f4be953a"
+    inspector = inspect(engine)
+    assert "_alembic_tmp_gmail_messages" not in inspector.get_table_names()
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+    assert count == 1
+
+    upgrade(cfg, "8634f4be953a")  # re-upgrade back for symmetry with other tests
+    assert _alembic_current_revision(engine) == "8634f4be953a"
+
+
+def test_gmail_account_scope_downgrade_preflight_blocks_cross_account_message_conflict(
+    tmp_path: Path,
+) -> None:
+    """Case 2 (adverse): two different accounts sharing the exact same
+    (mailbox, uid_validity, uid) — legitimate under account-scoped
+    identity, but something the pre-account-scoping schema's UNIQUE
+    constraint cannot represent. Downgrade must fail BEFORE any DDL,
+    leaving revision/rows/schema completely untouched, and must never
+    leave behind a `_alembic_tmp_gmail_messages` table.
+    """
+    db_path = tmp_path / "migrations_gmail_downgrade_preflight_message_conflict.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "7058c097a542")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(
+            connection,
+            thread_id=1,
+            account_key="a@example.com",
+            mailbox="INBOX",
+            uid_validity=100,
+            uid=1,
+        )
+        _insert_gmail_thread(connection, account_key="b@example.com", thread_key="<root@b>")
+        _insert_gmail_message(
+            connection,
+            thread_id=2,
+            account_key="b@example.com",
+            mailbox="INBOX",
+            uid_validity=100,
+            uid=1,
+        )
+
+    with pytest.raises(Exception) as exc_info:  # noqa: PT011 - migration-defined exception type
+        downgrade(cfg, "8634f4be953a")
+    assert "Cannot downgrade" in str(exc_info.value)
+    assert "account_key" in str(exc_info.value)
+
+    # Nothing must have changed: revision, rows, schema, no leftover
+    # batch-mode temp table.
+    assert _alembic_current_revision(engine) == "7058c097a542"
+    inspector = inspect(engine)
+    assert "_alembic_tmp_gmail_messages" not in inspector.get_table_names()
+    assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_messages")}
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+    assert count == 2
+
+
+def test_gmail_account_scope_downgrade_preflight_blocks_cross_account_thread_key_conflict(
+    tmp_path: Path,
+) -> None:
+    """Same as the message-identity case above, but for thread_key: two
+    different accounts sharing the exact same thread_key — legitimate
+    under account-scoped identity, unrepresentable by the old
+    (account_key-less) gmail_threads UNIQUE constraint.
+    """
+    db_path = tmp_path / "migrations_gmail_downgrade_preflight_thread_conflict.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "7058c097a542")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<shared@x>")
+        _insert_gmail_thread(connection, account_key="b@example.com", thread_key="<shared@x>")
+
+    with pytest.raises(Exception) as exc_info:  # noqa: PT011 - migration-defined exception type
+        downgrade(cfg, "8634f4be953a")
+    assert "Cannot downgrade" in str(exc_info.value)
+    assert "thread_key" in str(exc_info.value)
+
+    assert _alembic_current_revision(engine) == "7058c097a542"
+    inspector = inspect(engine)
+    assert "_alembic_tmp_gmail_threads" not in inspector.get_table_names()
+    assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_threads")}
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_threads")).scalar()
+    assert count == 2

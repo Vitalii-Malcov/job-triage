@@ -7,8 +7,20 @@ Direction = Literal["INBOUND", "OUTBOUND"]
 
 
 class GmailAttachment(BaseModel):
-    """Attachment metadata only (Stage 7A) — content is never downloaded,
-    stored, or opened. See app.providers.email.base.ParsedAttachment.
+    """Attachment metadata only (Stage 7A).
+
+    True, unconditionally: attachment content is never PERSISTED, never
+    OPENED/rendered, and never analyzed as business/correspondence
+    content — only this bounded metadata is kept.
+
+    NOT true unconditionally: attachment BYTES may still be TRANSFERRED
+    from the IMAP server as part of the full-message `BODY.PEEK[]` fetch
+    (bounded by MAX_RAW_MESSAGE_SIZE — see
+    app.providers.email.base.ParsedAttachment's docstring, GMAIL-006).
+    Stage 7A does not use section-level partial IMAP fetches to avoid
+    that transfer, and computing `size` requires briefly decoding the
+    part's payload; the decoded bytes are discarded immediately after
+    measuring their length.
     """
 
     filename: str | None = None

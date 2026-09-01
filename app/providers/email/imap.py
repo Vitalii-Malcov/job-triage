@@ -273,7 +273,7 @@ class GmailImapProvider:
         mailbox: str = "INBOX",
         lookback_days: int = 30,
         imap_client: ImapClient | None = None,
-        is_uid_known: Callable[[int, int], bool] | None = None,
+        get_known_uids: Callable[[int, list[int]], set[int]] | None = None,
     ) -> None:
         self.imap_host = imap_host
         self.imap_port = imap_port
@@ -287,17 +287,20 @@ class GmailImapProvider:
         # Injected only by tests, to avoid a real IMAP connection —
         # mirrors app.collectors.xing_email.XingEmailCollector.
         self._injected_client = imap_client
-        # GMAIL-005 starvation fix: bound to the caller's db.Session via
-        # closure (see app/api/routes.py's _run_gmail_sync), mirroring
-        # XingEmailCollector's own is_message_processed callable — lets
-        # this provider skip already-persisted UIDs BEFORE applying
-        # MAX_MESSAGES_PER_SYNC, so the cap only ever constrains genuinely
-        # new work. Without this, a sustained backlog larger than the cap
-        # would waste every sync's entire budget re-fetching the same
-        # already-known messages and never make progress on newer ones —
-        # merely relocating the starvation failure mode rather than fixing
-        # it (oldest-first alone is not sufficient; see _fetch_sync).
-        self._is_uid_known = is_uid_known or (lambda _uid_validity, _uid: False)
+        # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound to
+        # the caller's db.Session via closure (see app/api/routes.py's
+        # _run_gmail_sync) — lets this provider skip already-persisted
+        # UIDs BEFORE applying MAX_MESSAGES_PER_SYNC, so the cap only ever
+        # constrains genuinely new work. Without this, a sustained backlog
+        # larger than the cap would waste every sync's entire budget
+        # re-fetching the same already-known messages and never make
+        # progress on newer ones — merely relocating the starvation
+        # failure mode rather than fixing it (oldest-first alone is not
+        # sufficient; see _fetch_sync). Takes the FULL candidate UID list
+        # and returns the known subset in one call — a Codex probe proved
+        # a per-UID callable here reproduces as one DB query per SEARCH
+        # result (100 UIDs -> 100 SELECTs) before the cap is even applied.
+        self._get_known_uids = get_known_uids or (lambda _uid_validity, _uids: set())
 
     async def fetch(self, since: datetime | None = None) -> GmailFetchResult:
         if not is_configured(self.username) or not is_configured(self.app_password):
@@ -330,14 +333,30 @@ class GmailImapProvider:
             uids = data[0].split() if data and data[0] else []
             skipped_count = 0
 
-            # GMAIL-005 starvation fix: filter out UIDs already known to
-            # be persisted BEFORE the cap below is applied — otherwise,
-            # once a backlog exceeds MAX_MESSAGES_PER_SYNC, every sync
-            # would spend its entire budget re-fetching bodies for the
-            # same already-known messages and never reach anything new,
+            # GMAIL-005 starvation fix (GMAIL-012: one bulk lookup, not
+            # one query per UID): filter out UIDs already known to be
+            # persisted BEFORE the cap below is applied — otherwise, once
+            # a backlog exceeds MAX_MESSAGES_PER_SYNC, every sync would
+            # spend its entire budget re-fetching bodies for the same
+            # already-known messages and never reach anything new,
             # regardless of which end (oldest/newest) is prioritized.
-            # Mirrors app.collectors.xing_email.XingEmailCollector's
-            # is_message_processed callable.
+            # Malformed (non-integer) UID tokens are left in the
+            # candidate list unfiltered — downstream per-message handling
+            # in _fetch_one treats them as malformed the same way it
+            # always has.
+            candidate_uid_ints: list[int] = []
+            for uid_bytes in uids:
+                try:
+                    candidate_uid_ints.append(int(uid_bytes))
+                except ValueError:
+                    continue
+
+            known_uids = (
+                self._get_known_uids(uid_validity, candidate_uid_ints)
+                if candidate_uid_ints
+                else set()
+            )
+
             not_yet_known = []
             for uid_bytes in uids:
                 try:
@@ -345,7 +364,7 @@ class GmailImapProvider:
                 except ValueError:
                     not_yet_known.append(uid_bytes)
                     continue
-                if not self._is_uid_known(uid_validity, uid_int):
+                if uid_int not in known_uids:
                     not_yet_known.append(uid_bytes)
             uids = not_yet_known
 
