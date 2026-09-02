@@ -56,7 +56,21 @@ SUPPORTED_RESPONSE_CLASSIFICATIONS: frozenset[str] = frozenset(
 # messages, rather than being masked by the (gmail_message_id, analysis_id,
 # candidate_profile_version, generator_version) idempotency identity — see
 # app.db.models.ResponseDraftRecord's docstring.
-RESPONSE_DRAFT_GENERATOR_VERSION = "v1"
+#
+# v1 -> v2 (Codex remediation, final blocker): the job-trust-laundering
+# fix in app.services.response_draft (TRUSTED_JOB_SOURCES) changed what
+# SAFE output looks like for a message matched to an untrusted-source
+# (e.g. XING email-derived) job, but did not change any template text
+# this module owns directly. generator_version is still bumped because
+# it is part of ResponseDraftRecord's idempotency identity (see that
+# model's docstring) — without the bump, a pre-fix v1 row already
+# persisted for a given (gmail_message_id, analysis_id,
+# candidate_profile_version) identity would keep being returned as-is by
+# get_or_create_response_draft's idempotent lookup, silently masking the
+# fix for every message analyzed before it shipped. Bumping forces a
+# fresh, sanitized v2 revision instead, while the old v1 row remains
+# queryable, unmodified, immutable history (never deleted/overwritten).
+RESPONSE_DRAFT_GENERATOR_VERSION = "v2"
 RESPONSE_DRAFT_PROVIDER = "deterministic_template"
 
 _NO_JOB_PLACEHOLDER: dict[Language, str] = {
