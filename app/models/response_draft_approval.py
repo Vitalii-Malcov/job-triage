@@ -17,9 +17,15 @@ outcome of an attempted send:
   email may have actually reached the recipient — `UNCERTAIN` requires
   manual reconciliation outside this project and must never be treated
   as safe to retry.
-- `status="PENDING"`/`"FAILED"` — no transmission was ever confirmed
-  attempted at all (`FAILED` covers only a DEFINITE pre-transmission
-  failure — see `ResponseDraftSendStatus`'s own docstring).
+- `status="PENDING"` — a send attempt is claimed/in progress; the
+  outbound provider may not have been called yet, or a call to it may be
+  in flight RIGHT NOW. Delivery outcome is not yet final either way.
+- `status="FAILED"` — a DEFINITE pre-transmission failure (auth/
+  connection/message-construction — see
+  app.providers.email.outbound_base.EmailSendConnectionError/
+  EmailSendAuthError's docstrings): transmission never started, so "not
+  sent" is provably true, and a retry under the existing send gate is
+  safe.
 """
 
 from datetime import datetime
