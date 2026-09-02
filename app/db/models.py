@@ -777,6 +777,200 @@ class ResponseDraftRecord(Base):
     )
 
 
+class ResponseDraftApprovalRecord(Base):
+    """An immutable human APPROVE/REJECT decision on one exact,
+    already-persisted `ResponseDraftRecord` revision (Stage 7D) — see
+    app/services/response_draft_send.py for the orchestration that
+    creates these and enforces "NO APPROVAL = NO SEND".
+
+    **Pins the exact content being authorized.** `pinned_subject`/
+    `pinned_body` are copied verbatim from the target `ResponseDraftRecord`
+    at decision time — never re-read live from that row when a send is
+    later attempted (see `ResponseDraftSendRecord`). `ResponseDraftRecord`
+    rows are already immutable (never UPDATEd — see that model's
+    docstring), so in the normal case these copies can never drift from
+    the source; the pin exists as an explicit, auditable "this is exactly
+    what the human saw and approved" anchor, and as defense in depth
+    against a hypothetical future bug that reads the wrong revision at
+    send time.
+
+    **One decision per draft revision, ever — `UNIQUE(response_draft_id)`.**
+    A human cannot "change their mind" on an already-decided revision;
+    approving/rejecting an already-decided `response_draft_id` fails (see
+    `app.db.response_draft_approval_repository.create_approval`) rather
+    than silently overwriting the prior decision. This is deliberate, not
+    a missing feature: Stage 7C's response-draft generation is itself
+    idempotent-per-identity but produces a NEW revision whenever the
+    underlying analysis/candidate-profile/generator version changes (see
+    `ResponseDraftRecord`'s own docstring) — "I want to reconsider" is
+    always expressed by generating and approving a NEW revision, which
+    naturally gets its own fresh approval, never by mutating a past
+    decision. This also means a REJECTED decision is permanent for that
+    exact revision — never later flipped to APPROVED.
+
+    Deliberately NOT linked to `GmailMessageAnalysisRecord`/`JobRecord`
+    via a ForeignKey (same "traceability, not identity" rationale as
+    `ResponseDraftRecord.analysis_id`/`matched_job_id`) — `gmail_message_id`
+    here is a denormalized copy for query/account-scoping convenience
+    only.
+    """
+
+    __tablename__ = "response_draft_approvals"
+    __table_args__ = (
+        UniqueConstraint("response_draft_id", name="uq_response_draft_approvals_response_draft"),
+        CheckConstraint(
+            "decision IN ('APPROVED', 'REJECTED')",
+            name="ck_response_draft_approvals_decision_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    response_draft_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("response_drafts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Denormalized traceability only — see class docstring.
+    gmail_message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Verbatim copies of the approved ResponseDraftRecord's own
+    # subject/body at decision time — see class docstring.
+    pinned_subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    pinned_body: Mapped[str] = mapped_column(Text, nullable=False)
+
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class ResponseDraftSendRecord(Base):
+    """The DB-enforced atomic arbiter of "has this approved response
+    draft already been sent, or is a send currently in flight" (Stage
+    7D) — see app/services/response_draft_send.py's module docstring for
+    the full send-gate/idempotency contract this table is the concurrency
+    backbone of.
+
+    **Why this table exists (mirrors `GmailMessageIdClaimRecord`'s own
+    "atomic arbiter via UNIQUE + INSERT/IntegrityError" pattern exactly).**
+    A Python check-then-act ("is there already a SENT/PENDING row for
+    this draft? if not, send") is racy: two concurrent send requests for
+    the same approved draft could both observe "no row yet" and both
+    proceed to call the outbound provider, resulting in the recruiter
+    receiving the reply twice. `UNIQUE(response_draft_id)` closes that
+    window structurally — only ONE row can ever exist for a given
+    `response_draft_id`, and whichever concurrent request's INSERT
+    commits first is the one that may actually call the provider; every
+    other concurrent (or later) request instead reads the existing row
+    and acts on ITS state (see `app.db.response_draft_approval_repository`'s
+    `claim_send_attempt`/`retry_send_attempt`).
+
+    **`status` is a real, CAS-guarded state machine — mirrors
+    `ApplicationPackageReviewRecord`'s own "deliberately mutable" precedent
+    (the only other place in this project a row is UPDATEd in place rather
+    than only ever inserted):**
+
+    - `PENDING` — a send attempt is currently claimed/in flight. Set only
+      by the INSERT that wins the UNIQUE-constraint race, or by a
+      FAILED -> PENDING retry CAS (`WHERE id=:id AND status='FAILED'`,
+      requiring exactly 1 row affected).
+    - `SENT` — the outbound provider CONFIRMED success. Set only by a
+      PENDING -> SENT CAS (`WHERE id=:id AND status='PENDING'`) executed
+      AFTER `OutboundEmailProvider.send` returns without raising — never
+      before (spec: "Do not mark SENT before provider success"). Once
+      SENT, permanent: no code path ever transitions out of it.
+    - `FAILED` — a DEFINITE pre-transmission failure only (auth/
+      connection/message-construction — see
+      `app.providers.email.outbound_base.EmailSendConnectionError`/
+      `EmailSendAuthError`) — `send_message()` was never actually
+      invoked, so "not sent" is provably true. Set only by a
+      PENDING -> FAILED CAS, alongside `last_error`. A FAILED row does
+      NOT consume the approval permanently — it may be retried
+      (FAILED -> PENDING, `attempt_count` incremented), so one transient
+      pre-send failure can never permanently block a legitimately
+      approved reply from ever being sent, while still making it
+      impossible for two concurrent retries to both win the same PENDING
+      claim (the CAS `WHERE status='FAILED'` guard only ever lets one
+      concurrent UPDATE affect a row).
+    - `UNCERTAIN` — transmission was ATTEMPTED (the provider's
+      `send_message()`-equivalent call was actually invoked) but an
+      exception occurred before delivery could be confirmed OR ruled
+      out — see `app.providers.email.outbound_base.EmailSendOutcomeUnknownError`'s
+      docstring for the "safest-acceptable" classification rule this
+      follows. Set only by a PENDING -> UNCERTAIN CAS, alongside
+      `last_error`; `attempt_count` is left untouched (this is not a
+      "failed attempt to be retried", it is a terminal, ambiguous
+      outcome). **Fail-closed and terminal: NO code path ever
+      transitions a row OUT of `UNCERTAIN`** — never automatically, and
+      never via a later send request for the same draft (which is
+      refused, provider never called again, before reaching this table's
+      claim logic — see `app.services.response_draft_send`'s
+      `ResponseDraftSendOutcomeUncertainError`). Manual reconciliation
+      (checking whether the recruiter actually received the reply, and
+      deciding what to do next) is intentionally out of scope for Stage
+      7D — this table's job is only to make the ambiguity visible and
+      prevent an automated duplicate-send risk, not to resolve it.
+
+    Deliberately NOT linked to `GmailMessageAnalysisRecord`/`JobRecord`
+    via a ForeignKey, same rationale as `ResponseDraftApprovalRecord`.
+    `approval_id` IS a real ForeignKey — a send attempt is meaningless
+    without the approval that authorized it.
+    """
+
+    __tablename__ = "response_draft_sends"
+    __table_args__ = (
+        UniqueConstraint("response_draft_id", name="uq_response_draft_sends_response_draft"),
+        CheckConstraint(
+            "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
+            name="ck_response_draft_sends_status_valid",
+        ),
+        CheckConstraint("attempt_count > 0", name="ck_response_draft_sends_attempt_count_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    response_draft_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("response_drafts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    approval_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("response_draft_approvals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalized traceability only — see ResponseDraftApprovalRecord's
+    # class docstring for the same convention.
+    gmail_message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # RFC 5322 Message-ID the provider reported for the sent message, if
+    # any — traceability only, never an identity/dedup key (mirrors
+    # GmailMessageRecord.message_id_header's own convention). Set only on
+    # SENT.
+    provider_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    # Bounded, sanitized (str(exc), never a traceback/secret) — mirrors
+    # CompanyResearchRecord.last_error's convention. Set only on FAILED.
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Set only on a CONFIRMED successful send — see class docstring.
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may

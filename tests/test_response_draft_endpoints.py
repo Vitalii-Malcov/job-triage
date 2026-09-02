@@ -593,10 +593,22 @@ class TestImmutableRevisions:
 
 class TestNoExternalSideEffects:
     def test_no_send_draft_reply_forward_endpoints_registered_for_response_draft(self):
+        """Stage 7C's OWN endpoint surface (`/gmail/messages/{id}/...`)
+        must remain generation/read-only — it never sends. This is
+        deliberately scoped to Stage 7C's own path prefix, not the
+        broader "response-draft" substring: Stage 7D legitimately adds
+        exactly ONE approval-gated `/response-drafts/{draft_id}/send`
+        endpoint elsewhere (see
+        tests/test_response_draft_send_endpoints.py's
+        test_no_send_reply_forward_style_endpoints_beyond_the_one_explicit_send
+        for that endpoint's own, narrower guard).
+        """
         from app.api.routes import router
 
         paths = {route.path for route in router.routes if hasattr(route, "path")}
-        response_draft_paths = {p for p in paths if "response-draft" in p}
+        response_draft_paths = {
+            p for p in paths if p.startswith("/gmail/messages/") and "response-draft" in p
+        }
         assert response_draft_paths  # sanity: endpoints actually registered
         forbidden_fragments = (
             "send",

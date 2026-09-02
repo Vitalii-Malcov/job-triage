@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     # years) or a no-op (must fetch at least 1 day back).
     gmail_lookback_days: int = Field(default=30, ge=1, le=1095)
 
+    # Stage 7D outbound SMTP (POST /response-drafts/{id}/send). Reuses
+    # gmail_username/gmail_app_password above — a Gmail App Password is
+    # valid for both IMAP and SMTP against the same account, so no new
+    # secret is introduced. See app/providers/email/smtp.py's module
+    # docstring. No default host override needed beyond Gmail's standard
+    # SMTPS endpoint; kept configurable only for tests/future flexibility.
+    gmail_smtp_host: str = "smtp.gmail.com"
+    gmail_smtp_port: int = Field(default=465, ge=1, le=65535)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns

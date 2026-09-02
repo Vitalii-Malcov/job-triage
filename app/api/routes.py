@@ -103,6 +103,10 @@ from app.db.repositories import (
     update_job_status,
     upsert_job,
 )
+from app.db.response_draft_approval_repository import (
+    to_response_draft_approval,
+    to_response_draft_send_status,
+)
 from app.db.response_draft_repository import (
     RESPONSE_DRAFT_HISTORY_DEFAULT_LIMIT,
     RESPONSE_DRAFT_HISTORY_MAX_LIMIT,
@@ -138,6 +142,12 @@ from app.models.gmail import (
 from app.models.gmail_analysis import GmailMessageAnalysis
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.models.response_draft import ResponseDraft
+from app.models.response_draft_approval import (
+    ResponseDraftApproval,
+    ResponseDraftApprovalRequest,
+    ResponseDraftSendStatus,
+    ResponseDraftState,
+)
 from app.models.review_package import (
     ReviewPackage,
     ReviewPackageApproveRequest,
@@ -149,6 +159,7 @@ from app.providers.base import ProviderNotConfiguredError
 from app.providers.bewerbung.base import BewerbungProviderError, BewerbungProviderNotConfiguredError
 from app.providers.email.base import GmailProviderError, normalize_account_key
 from app.providers.email.imap import GmailImapProvider
+from app.providers.email.smtp import GmailSmtpProvider
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_bewerbung_rate_limit,
@@ -159,7 +170,9 @@ from app.security.rate_limit import (
     enforce_gmail_rate_limit,
     enforce_match_rate_limit,
     enforce_rate_limit,
+    enforce_response_draft_decision_rate_limit,
     enforce_response_draft_rate_limit,
+    enforce_response_draft_send_rate_limit,
     enforce_review_write_rate_limit,
     enforce_xing_rate_limit,
 )
@@ -175,6 +188,20 @@ from app.services.response_draft import (
     ResponseDraftAnalysisNotFoundError,
     ResponseDraftMessageNotFoundError,
     generate_response_draft_for_message,
+)
+from app.services.response_draft_send import (
+    ResponseDraftAlreadyDecidedError,
+    ResponseDraftAlreadySentError,
+    ResponseDraftMissingRecipientError,
+    ResponseDraftNotApprovableError,
+    ResponseDraftNotApprovedError,
+    ResponseDraftNotFoundError,
+    ResponseDraftSendFailedError,
+    ResponseDraftSendInProgressError,
+    ResponseDraftSendOutcomeUncertainError,
+    approve_or_reject_response_draft,
+    get_response_draft_state,
+    send_response_draft,
 )
 from app.services.review_package import ReviewPackageService, get_approved_package
 from app.services.telegram import TelegramNotifier
@@ -1829,3 +1856,167 @@ def get_gmail_message_response_draft_history(
         )
     records = list_response_drafts_for_message(db, account_key, message_id, limit, offset)
     return [to_response_draft(record) for record in records]
+
+
+@router.post(
+    "/response-drafts/{draft_id}/decision",
+    response_model=ResponseDraftApproval,
+    dependencies=[Depends(require_api_key), Depends(enforce_response_draft_decision_rate_limit)],
+)
+def decide_response_draft(
+    draft_id: int, body: ResponseDraftApprovalRequest, db: Session = Depends(get_db)
+) -> ResponseDraftApproval:
+    """Record one immutable APPROVE/REJECT human decision on an exact
+    Stage 7C response-draft revision (Stage 7D). Pins the exact
+    `subject`/`body` being authorized at decision time. A decision is
+    permanent: approving/rejecting an already-decided revision fails
+    (409) rather than overwriting it — generate a new draft revision to
+    reconsider. This endpoint NEVER sends anything — see
+    POST /response-drafts/{draft_id}/send for the only endpoint that
+    does, and only once this decision is APPROVED.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        record = approve_or_reject_response_draft(
+            db, account_key, draft_id, body.decision, body.note
+        )
+    except ResponseDraftNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
+        ) from exc
+    except ResponseDraftNotApprovableError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Response draft has no content to approve or reject",
+        ) from exc
+    except ResponseDraftAlreadyDecidedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Response draft already has a recorded decision",
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.warning("response_draft_decision_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Response draft decision failed",
+        ) from exc
+    return to_response_draft_approval(record)
+
+
+@router.post(
+    "/response-drafts/{draft_id}/send",
+    response_model=ResponseDraftSendStatus,
+    dependencies=[Depends(require_api_key), Depends(enforce_response_draft_send_rate_limit)],
+)
+def send_response_draft_endpoint(
+    draft_id: int, db: Session = Depends(get_db)
+) -> ResponseDraftSendStatus:
+    """Send an APPROVED Stage 7C response draft as a real Gmail reply
+    (Stage 7D) — the ONLY endpoint in this project that transmits
+    outbound email. NO APPROVAL = NO SEND: see
+    app/services/response_draft_send.py's module docstring for the exact
+    gate this enforces (existence + account ownership, PROPOSED status,
+    an APPROVED decision pinned to this exact revision, and that the
+    approval has not already been consumed by a prior send). Safe against
+    duplicate/concurrent/retried requests — never sends the same approval
+    twice; a prior provider failure may be retried.
+    """
+    settings = get_settings()
+    if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outbound email sending is not configured",
+        )
+
+    account_key = _current_gmail_account_key(settings)
+    provider = GmailSmtpProvider(
+        smtp_host=settings.gmail_smtp_host,
+        smtp_port=settings.gmail_smtp_port,
+        username=settings.gmail_username,
+        app_password=settings.gmail_app_password,
+    )
+    try:
+        record = send_response_draft(db, account_key, draft_id, provider)
+    except ResponseDraftNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
+        ) from exc
+    except ResponseDraftNotApprovableError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Response draft is not sendable",
+        ) from exc
+    except ResponseDraftNotApprovedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Response draft has not been approved",
+        ) from exc
+    except ResponseDraftMissingRecipientError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No recipient address is available for this message",
+        ) from exc
+    except ResponseDraftAlreadySentError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Response draft has already been sent",
+        ) from exc
+    except ResponseDraftSendInProgressError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="A send attempt for this response draft is already in progress",
+        ) from exc
+    except ResponseDraftSendFailedError as exc:
+        # ResponseDraftSendFailedError already carries no upstream
+        # exception text (see EmailSendError's docstring) — log only the
+        # type, same GMAIL-003-style discipline as every other Gmail
+        # error path in this file. Only ever raised for a DEFINITE
+        # pre-transmission failure — see ResponseDraftSendOutcomeUncertainError
+        # for the separate, never-auto-retried ambiguous-outcome case.
+        logger.warning("response_draft_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="Sending the response draft failed",
+        ) from exc
+    except ResponseDraftSendOutcomeUncertainError as exc:
+        # Delivery could be neither confirmed nor ruled out — fail
+        # closed. This is NEVER auto-retried; a later POST here is
+        # refused before the provider is called again (see
+        # app.services.response_draft_send's module docstring).
+        logger.warning("response_draft_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "Response draft send outcome is uncertain; manual reconciliation is "
+                "required, not an automatic retry"
+            ),
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.warning("response_draft_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Response draft send failed",
+        ) from exc
+    return to_response_draft_send_status(record)
+
+
+@router.get(
+    "/response-drafts/{draft_id}/state",
+    response_model=ResponseDraftState,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_response_draft_state_endpoint(
+    draft_id: int, db: Session = Depends(get_db)
+) -> ResponseDraftState:
+    """Pure read of the combined approval/send state for one exact
+    response-draft revision — never triggers a decision or a send.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        return get_response_draft_state(db, account_key, draft_id)
+    except ResponseDraftNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
+        ) from exc
