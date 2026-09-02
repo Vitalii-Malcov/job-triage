@@ -644,6 +644,139 @@ class GmailMessageAnalysisRecord(Base):
     )
 
 
+class ResponseDraftRecord(Base):
+    """An immutable, versioned Stage 7C response-draft PROPOSAL for one
+    Stage 7B `GmailMessageAnalysisRecord` — see
+    app/services/response_draft.py for orchestration and
+    app/agents/response_draft_generator.py for the deterministic,
+    template-based, no-LLM content generation itself.
+
+    **INFORMATION ONLY — a stored suggestion, never an action.** Nothing
+    that reads this table sends email, creates a Gmail draft, replies,
+    forwards, or mutates mailbox/`JobRecord`/`ApplicationStatus` state —
+    same hard boundary as `GmailMessageAnalysisRecord` (see that class's
+    docstring), one stage further downstream. `requires_human_review` is
+    always `True` for every row Stage 7C writes (spec-mandated; Stage 7D,
+    not this stage, owns approval/send). `status='PROPOSED'` never means
+    "ready to send" — only that a template produced draft text a human
+    can review, edit, and send manually.
+
+    **`status`.** `'PROPOSED'` (subject/body populated) for the bounded
+    set of classifications a reply plausibly makes sense for (see
+    `app.agents.response_draft_generator.SUPPORTED_RESPONSE_CLASSIFICATIONS`).
+    `'NO_RESPONSE_RECOMMENDED'` (subject/body/language NULL, `reason`
+    populated) for every other classification (REJECTION,
+    APPLICATION_RECEIVED, WITHDRAWAL_OR_POSITION_CLOSED,
+    AUTOMATED_NOTIFICATION, OTHER, UNKNOWN) — a safe, explicit,
+    always-persisted "no" rather than silently generating nothing.
+
+    **Never invents facts.** Generated `subject`/`body` text is built
+    exclusively from already-trusted stored facts — `CandidateProfileRecord`
+    fields that pass `is_top_level_fact_usable_for_generation`, and the
+    matched `JobRecord`'s own title/company — never from the analyzed
+    email's own subject/body/from_address (that content is untrusted
+    correspondence text; see `app.agents.response_draft_generator`'s
+    module docstring for why it is never even passed in). Anything the
+    generator could not determine (candidate name, matched job, specific
+    information a recruiter asked for, availability, salary/offer
+    decisions) is listed in `missing_fields_json` and represented as an
+    explicit bracketed placeholder in the body — never guessed.
+
+    **Immutable, versioned, never UPDATEd** — same convention as
+    `GmailMessageAnalysisRecord`. `UNIQUE(gmail_message_id, analysis_id,
+    candidate_profile_version, generator_version)` is the idempotency
+    identity: repeating the exact same generation request against the
+    same analysis revision and the same candidate profile version returns
+    the existing row; a later re-analysis (new `analysis_id`) or a
+    candidate profile edit (`candidate_profile_version` bumped) produces
+    a NEW revision instead, while every prior revision remains queryable.
+
+    **Accepted limitation (documented, not engineered around in v1):**
+    identity does not pin a `JobRecord` content fingerprint the way
+    `CandidateCVDraftRecord`/`CandidateJobMatchRecord` pin
+    `job_snapshot_fingerprint` — an edit to the matched job's
+    title/company between two identical-looking generation calls will not
+    by itself trigger a new revision. Job title/company change after
+    initial collection is rare in practice (see `app.db.repositories.upsert_job`,
+    which does not even update `url` on existing rows); a full
+    content-fingerprint pin is deferred rather than spec'd speculatively.
+
+    **`analysis_id`/`matched_job_id` are deliberately not ForeignKeys** —
+    same "traceability, not identity" rationale as
+    `GmailMessageAnalysisRecord.matched_job_id`'s own docstring: this row
+    must remain a legible historical record even if the referenced
+    analysis/job is later removed by some future maintenance path.
+    `gmail_message_id` IS a real ForeignKey (`ondelete="CASCADE"`) —
+    mirrors `GmailMessageAnalysisRecord.gmail_message_id`: a response
+    draft has no meaning independent of the message it responds to.
+    """
+
+    __tablename__ = "response_drafts"
+    __table_args__ = (
+        UniqueConstraint(
+            "gmail_message_id",
+            "analysis_id",
+            "candidate_profile_version",
+            "generator_version",
+            name="uq_response_drafts_identity",
+        ),
+        CheckConstraint(
+            "status IN ('PROPOSED', 'NO_RESPONSE_RECOMMENDED')",
+            name="ck_response_drafts_status_valid",
+        ),
+        CheckConstraint(
+            "language IS NULL OR language IN ('de', 'en')",
+            name="ck_response_drafts_language_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Denormalized from the parent gmail_messages row — same GMAIL-002-style
+    # account-isolation convention as GmailMessageAnalysisRecord.account_key.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    gmail_message_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Not a ForeignKey — see class docstring.
+    analysis_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    analysis_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Not a ForeignKey — see class docstring. None when the analysis this
+    # draft is based on has no matched job (match_type != APPLICATION/JOB_ONLY).
+    matched_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Copied from the pinned analysis for cheap filtering without a join.
+    classification: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Populated only for status == 'NO_RESPONSE_RECOMMENDED'.
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Populated only for status == 'PROPOSED'.
+    subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    # Bounded JSON list of str — see class docstring's "never invents facts".
+    missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    # Provenance metadata (spec requirement) — always the deterministic
+    # local generator in v1; no external/LLM provider exists yet.
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    generator_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # Always True for every row this stage writes — see class docstring.
+    # Not DB-CHECK-enforced (a fixed-True boolean CHECK is unusual in this
+    # codebase's conventions, which reserve CHECK for enums/ranges); the
+    # boundary is enforced by construction in
+    # app/services/response_draft.py, which never passes False.
+    requires_human_review: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may

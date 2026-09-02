@@ -103,6 +103,13 @@ from app.db.repositories import (
     update_job_status,
     upsert_job,
 )
+from app.db.response_draft_repository import (
+    RESPONSE_DRAFT_HISTORY_DEFAULT_LIMIT,
+    RESPONSE_DRAFT_HISTORY_MAX_LIMIT,
+    get_latest_response_draft_for_message,
+    list_response_drafts_for_message,
+    to_response_draft,
+)
 from app.db.review_package_repository import (
     get_current_revision,
     get_latest_review_for_job,
@@ -130,6 +137,7 @@ from app.models.gmail import (
 )
 from app.models.gmail_analysis import GmailMessageAnalysis
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
+from app.models.response_draft import ResponseDraft
 from app.models.review_package import (
     ReviewPackage,
     ReviewPackageApproveRequest,
@@ -151,6 +159,7 @@ from app.security.rate_limit import (
     enforce_gmail_rate_limit,
     enforce_match_rate_limit,
     enforce_rate_limit,
+    enforce_response_draft_rate_limit,
     enforce_review_write_rate_limit,
     enforce_xing_rate_limit,
 )
@@ -162,6 +171,11 @@ from app.services.company_research import (
 )
 from app.services.gmail_inbox import GmailInboxService
 from app.services.gmail_message_analysis import GmailMessageNotFoundError, analyze_gmail_message
+from app.services.response_draft import (
+    ResponseDraftAnalysisNotFoundError,
+    ResponseDraftMessageNotFoundError,
+    generate_response_draft_for_message,
+)
 from app.services.review_package import ReviewPackageService, get_approved_package
 from app.services.telegram import TelegramNotifier
 
@@ -1718,3 +1732,100 @@ def get_gmail_analyses(
     account_key = _current_gmail_account_key(get_settings())
     records = list_analyses(db, account_key, limit=limit, offset=offset)
     return [to_gmail_message_analysis(record) for record in records]
+
+
+@router.post(
+    "/gmail/messages/{message_id}/response-draft",
+    response_model=ResponseDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_response_draft_rate_limit)],
+)
+def create_gmail_message_response_draft(
+    message_id: int, db: Session = Depends(get_db)
+) -> ResponseDraft:
+    """Generate (or idempotently re-fetch) a Stage 7C response-draft
+    PROPOSAL for an already-analyzed Gmail message. INFORMATION ONLY —
+    see app/services/response_draft.py's module docstring for the full
+    hard boundary (no send/Gmail-draft-creation/reply, no mailbox
+    mutation, no ApplicationStatus mutation, no LLM/external call).
+    `requires_human_review` is always `True` in the response — this
+    endpoint only ever proposes text for a human to review and send
+    manually. Requires POST /gmail/messages/{id}/analyze to have already
+    run for this message (409 otherwise) — 7C reuses 7B's analysis, it
+    never re-derives matching/classification itself.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        record, _created = generate_response_draft_for_message(db, account_key, message_id)
+    except ResponseDraftMessageNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        ) from exc
+    except ResponseDraftAnalysisNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Gmail message has not been analyzed yet",
+        ) from exc
+    except Exception as exc:
+        # Mirrors POST /gmail/messages/{id}/analyze: never interpolate a
+        # caught exception into the HTTP response or the log line.
+        db.rollback()
+        logger.warning("response_draft_generation_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Response draft generation failed",
+        ) from exc
+    return to_response_draft(record)
+
+
+@router.get(
+    "/gmail/messages/{message_id}/response-draft",
+    response_model=ResponseDraft,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_message_response_draft(
+    message_id: int, db: Session = Depends(get_db)
+) -> ResponseDraft:
+    """The latest response-draft revision for one message, if one has
+    already been generated — pure read, never triggers generation itself
+    (mirrors GET /gmail/messages/{id}/analysis not triggering analysis).
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    message = get_message_by_id(db, account_key, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        )
+    record = get_latest_response_draft_for_message(db, account_key, message_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Gmail message has no response draft",
+        )
+    return to_response_draft(record)
+
+
+@router.get(
+    "/gmail/messages/{message_id}/response-drafts",
+    response_model=list[ResponseDraft],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_gmail_message_response_draft_history(
+    message_id: int,
+    limit: int = Query(
+        default=RESPONSE_DRAFT_HISTORY_DEFAULT_LIMIT, ge=1, le=RESPONSE_DRAFT_HISTORY_MAX_LIMIT
+    ),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[ResponseDraft]:
+    """The FULL, bounded, most-recent-first history of response-draft
+    revisions for one message — each row is one immutable revision, not
+    deduplicated to "latest" (see GET .../response-draft for that).
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    message = get_message_by_id(db, account_key, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
+        )
+    records = list_response_drafts_for_message(db, account_key, message_id, limit, offset)
+    return [to_response_draft(record) for record in records]
