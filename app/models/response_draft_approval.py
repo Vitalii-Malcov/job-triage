@@ -5,8 +5,21 @@ module docstring for the full "NO APPROVAL = NO SEND" hard invariant
 this subsystem enforces. A `ResponseDraftApproval` records a human
 decision; it is never itself authorization for anything beyond the exact
 `response_draft_id` it pins. A `ResponseDraftSendStatus` records the
-outcome of an attempted send — `status="SENT"` is the only state in
-which this project has ever transmitted an email on the user's behalf.
+outcome of an attempted send:
+
+- `status="SENT"` — the outbound provider CONFIRMED the message was
+  accepted for delivery.
+- `status="UNCERTAIN"` — transmission was ATTEMPTED and the message MAY
+  already have been accepted/delivered, but this project has no way to
+  confirm OR rule that out (see
+  app.providers.email.outbound_base.EmailSendOutcomeUnknownError's
+  docstring). `status="SENT"` is therefore NOT the only state in which an
+  email may have actually reached the recipient — `UNCERTAIN` requires
+  manual reconciliation outside this project and must never be treated
+  as safe to retry.
+- `status="PENDING"`/`"FAILED"` — no transmission was ever confirmed
+  attempted at all (`FAILED` covers only a DEFINITE pre-transmission
+  failure — see `ResponseDraftSendStatus`'s own docstring).
 """
 
 from datetime import datetime
