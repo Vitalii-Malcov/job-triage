@@ -301,3 +301,56 @@ def enforce_review_write_rate_limit(request: Request) -> None:
                 detail="Review package rate limit exceeded",
             )
         bucket.append(now)
+
+
+# Bucket for Stage 7D approve/reject decisions: pure local DB read+write,
+# zero network cost — sized like MATCH_RATE_LIMIT/REVIEW_WRITE_RATE_LIMIT
+# rather than the stricter network-bound buckets below.
+_response_draft_decision_requests: dict[str, deque[float]] = defaultdict(deque)
+RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS = 30
+RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_response_draft_decision_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _response_draft_decision_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Response draft decision rate limit exceeded",
+            )
+        bucket.append(now)
+
+
+# Separate, stricter bucket for Stage 7D SEND — same rationale as
+# XING_RATE_LIMIT/GMAIL_RATE_LIMIT above: this is the one endpoint in
+# this project that transmits a real outbound email, and repeated/rapid
+# SMTP logins risk tripping Gmail's own abuse detection on the same
+# account the read-only IMAP sync uses. Kept in its own bucket, sized
+# tightly, rather than sharing any other bucket.
+_response_draft_send_requests: dict[str, deque[float]] = defaultdict(deque)
+RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS = 5
+RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_response_draft_send_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _response_draft_send_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Response draft send rate limit exceeded",
+            )
+        bucket.append(now)

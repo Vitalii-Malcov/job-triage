@@ -1288,7 +1288,7 @@ def test_gmail_account_scope_downgrade_preflight_blocks_message_conflict_from_he
     # gmail_message_analyses), 813c9d5086d0's own DDL (dropping
     # gmail_message_analyses), or e6ccb9b4271b's OWN DDL (dropping
     # gmail_message_id_claims) may have run.
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1322,7 +1322,7 @@ def test_gmail_account_scope_downgrade_preflight_blocks_thread_conflict_from_hea
     assert "Cannot downgrade" in str(exc_info.value)
     assert "thread_key" in str(exc_info.value)
 
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1359,7 +1359,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1471,7 +1471,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1643,7 +1643,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1733,7 +1733,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2022,6 +2022,306 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7147bc999415"
+    assert _alembic_current_revision(engine) == "9daea6d21904"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
+
+
+# ---------------------------------------------------------------------------
+# Stage 7D (response_draft_approvals, response_draft_sends)
+# ---------------------------------------------------------------------------
+
+
+def _insert_response_draft_approval(
+    connection,
+    *,
+    response_draft_id: int = 1,
+    account_key: str = "a@example.com",
+    gmail_message_id: int = 1,
+    decision: str = "APPROVED",
+    pinned_subject: str = "Re: Test",
+    pinned_body: str = "Body text.",
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO response_draft_approvals (
+                account_key, response_draft_id, gmail_message_id, decision,
+                decision_note, pinned_subject, pinned_body, decided_at
+            ) VALUES (
+                :account_key, :response_draft_id, :gmail_message_id, :decision,
+                NULL, :pinned_subject, :pinned_body, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "account_key": account_key,
+            "response_draft_id": response_draft_id,
+            "gmail_message_id": gmail_message_id,
+            "decision": decision,
+            "pinned_subject": pinned_subject,
+            "pinned_body": pinned_body,
+        },
+    )
+
+
+def _insert_response_draft_send(
+    connection,
+    *,
+    response_draft_id: int = 1,
+    approval_id: int = 1,
+    account_key: str = "a@example.com",
+    gmail_message_id: int = 1,
+    status: str = "PENDING",
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO response_draft_sends (
+                account_key, response_draft_id, approval_id, gmail_message_id,
+                status, attempt_count, provider_message_id, last_error, sent_at,
+                created_at, updated_at
+            ) VALUES (
+                :account_key, :response_draft_id, :approval_id, :gmail_message_id,
+                :status, 1, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "account_key": account_key,
+            "response_draft_id": response_draft_id,
+            "approval_id": approval_id,
+            "gmail_message_id": gmail_message_id,
+            "status": status,
+        },
+    )
+
+
+def _seed_response_draft_row(connection, *, gmail_message_id: int = 1) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO response_drafts (
+                account_key, gmail_message_id, analysis_id, analysis_version,
+                candidate_profile_version, matched_job_id, classification, status,
+                reason, subject, body, language, missing_fields_json, provider,
+                generator_version, requires_human_review, created_at
+            ) VALUES (
+                'a@example.com', :gmail_message_id, 1, 1, 0, NULL,
+                'INTERVIEW_INVITATION', 'PROPOSED', NULL, 'Re: Test', 'Body text.',
+                'en', '[]', 'deterministic_template', 'v2', 1, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {"gmail_message_id": gmail_message_id},
+    )
+
+
+def test_response_draft_approvals_table_shape(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_approvals_shape.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "response_draft_approvals" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("response_draft_approvals")}
+    assert columns == {
+        "id",
+        "account_key",
+        "response_draft_id",
+        "gmail_message_id",
+        "decision",
+        "decision_note",
+        "pinned_subject",
+        "pinned_body",
+        "decided_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("response_draft_approvals")
+    assert any(uc["column_names"] == ["response_draft_id"] for uc in unique_constraints)
+
+    foreign_keys = inspector.get_foreign_keys("response_draft_approvals")
+    assert any(fk["referred_table"] == "response_drafts" for fk in foreign_keys)
+
+
+def test_response_draft_sends_table_shape(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_sends_shape.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "response_draft_sends" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("response_draft_sends")}
+    assert columns == {
+        "id",
+        "account_key",
+        "response_draft_id",
+        "approval_id",
+        "gmail_message_id",
+        "status",
+        "attempt_count",
+        "provider_message_id",
+        "last_error",
+        "sent_at",
+        "created_at",
+        "updated_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("response_draft_sends")
+    assert any(uc["column_names"] == ["response_draft_id"] for uc in unique_constraints)
+
+    foreign_keys = inspector.get_foreign_keys("response_draft_sends")
+    referred_tables = {fk["referred_table"] for fk in foreign_keys}
+    assert "response_drafts" in referred_tables
+    assert "response_draft_approvals" in referred_tables
+
+
+def test_response_draft_approvals_rejects_invalid_decision(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_approvals_invalid_decision.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_response_draft_approval(connection, decision="MAYBE")
+
+
+def test_response_draft_approvals_rejects_duplicate_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_approvals_duplicate.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_response_draft_approval(connection, decision="REJECTED")
+
+
+def test_response_draft_sends_rejects_invalid_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_sends_invalid_status.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_response_draft_send(connection, status="SENDING")
+
+
+def test_response_draft_sends_rejects_duplicate_identity(tmp_path: Path) -> None:
+    """UNIQUE(response_draft_id) — the DB-level atomic claim arbiter (see
+    ResponseDraftSendRecord's docstring) — must reject a second row for
+    the same draft outright, regardless of what status it would carry.
+    """
+    db_path = tmp_path / "migrations_response_draft_sends_duplicate.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+        _insert_response_draft_send(connection)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            _insert_response_draft_send(connection, status="PENDING")
+
+
+def test_response_draft_sends_cascade_deletes_with_response_draft(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_response_draft_sends_cascade.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(text("PRAGMA foreign_keys=ON"))
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+        _insert_response_draft_send(connection)
+
+    with engine.begin() as connection:
+        connection.execute(text("PRAGMA foreign_keys=ON"))
+        connection.execute(text("DELETE FROM response_drafts WHERE id = 1"))
+
+    with engine.connect() as connection:
+        approval_count = connection.execute(
+            text("SELECT COUNT(*) FROM response_draft_approvals")
+        ).scalar()
+        send_count = connection.execute(text("SELECT COUNT(*) FROM response_draft_sends")).scalar()
+    assert approval_count == 0
+    assert send_count == 0
+
+
+def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_response_draft_approvals_sends_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+        _insert_response_draft_send(connection, status="SENT")
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'cycle-fp-7d', 'test', 'Role', 'Co', '', 'https://co.example.com/jobs/33333',
+                    '', '[]', 1, 'SKIP', 'NEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    downgrade(cfg, "7147bc999415")
+    assert _alembic_current_revision(engine) == "7147bc999415"
+    inspector = inspect(engine)
+    assert "response_draft_sends" not in inspector.get_table_names()
+    assert "response_draft_approvals" not in inspector.get_table_names()
+    assert "response_drafts" in inspector.get_table_names()
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    with engine.connect() as connection:
+        draft_count = connection.execute(text("SELECT COUNT(*) FROM response_drafts")).scalar()
+        job_count = connection.execute(text("SELECT COUNT(*) FROM jobs")).scalar()
+    assert draft_count == 1  # sibling data untouched by the approvals/sends table drop
+    assert job_count == 1
+
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == "9daea6d21904"
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "response_draft_approvals" in inspector.get_table_names()
+    assert "response_draft_sends" in inspector.get_table_names()
