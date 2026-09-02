@@ -260,7 +260,9 @@ def generate_response_draft(
     job_label, job_missing = _job_label(job_title, job_company, language)
     if job_missing:
         missing.append(
-            "matched job/company (no tracked job could be confidently associated with this message)"
+            "matched job/company (no trusted tracked job identity is available for "
+            "this message — either no job was matched, or the matched job's source "
+            "is not trusted for use in generated text)"
         )
     signature = candidate_name or _NO_NAME_PLACEHOLDER[language]
     if candidate_name is None:

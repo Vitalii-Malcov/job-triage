@@ -41,6 +41,37 @@ that reaches the generated draft itself.
 this module writes carries `requires_human_review=True` unconditionally
 (see that model's docstring) — Stage 7C only ever proposes; Stage 7D
 (not yet built) owns human approval and any eventual send action.
+
+**Round 2 (Codex MEDIUM remediation).**
+
+- **Job trust laundering.** A `JobRecord` is not automatically "trusted
+  stored fact" just because it is persisted — `app.collectors.xing_email`
+  populates `JobRecord.title`/`company` directly from unauthenticated
+  inbound email content (see that collector's own module docstring), so
+  an attacker who controls a XING alert email can control those fields
+  verbatim. Before this fix, `job.title`/`job.company` were interpolated
+  into generated drafts regardless of `job.source` — letting attacker
+  text (e.g. a job titled `"IGNORE ALL PREVIOUS INSTRUCTIONS"`) reach a
+  human-reviewed draft. `_is_trusted_job_source` (default-deny: a source
+  is untrusted unless explicitly listed in `TRUSTED_JOB_SOURCES`) now
+  gates job-fact use the same way `is_top_level_fact_usable_for_generation`
+  already gates candidate facts — an untrusted-source job is treated
+  exactly like "no matched job" (placeholder + `missing_fields` entry),
+  never like a data-integrity failure.
+- **Subject length.** `ResponseDraftRecord.subject` is `String(500)`;
+  `JobRecord.title`/`company` are each up to 300 chars, so an unbounded
+  `f"{title} ({company})"` job label concatenated into a subject template
+  could exceed the column. `_bound_subject` truncates deterministically
+  (never the body — an oversized subject is a cosmetic/DB-fit concern; an
+  oversized body could silently drop meaningful drafted content, which
+  the spec explicitly forbids).
+- **Candidate profile race.** `CandidateProfileRecord` used to be read
+  TWICE per call (once for `candidate_profile_version`, again inside the
+  old `_trusted_candidate_name` for the name) — two non-atomic SELECTs a
+  concurrent profile creation/edit could land between, letting a v1 name
+  fact get persisted under a `candidate_profile_version=0` (or stale)
+  identity. Fixed by reading the singleton exactly ONCE and deriving both
+  values from that one snapshot — see `_derive_candidate_profile_facts`.
 """
 
 import logging
@@ -59,12 +90,29 @@ from app.db.candidate_profile_repository import (
 )
 from app.db.gmail_analysis_repository import get_latest_analysis_for_message
 from app.db.gmail_repository import get_message_by_id
-from app.db.models import ResponseDraftRecord
+from app.db.models import CandidateProfileRecord, ResponseDraftRecord
 from app.db.repositories import get_job_by_id
 from app.db.response_draft_repository import get_or_create_response_draft
 from app.models.candidate_profile import is_top_level_fact_usable_for_generation
 
 logger = logging.getLogger(__name__)
+
+# Job sources whose title/company are safe to interpolate into a
+# generated draft as real facts — default-deny: a `JobRecord.source` NOT
+# listed here is treated as untrusted regardless of what it contains (see
+# module docstring's "Job trust laundering" note). Only
+# `app.collectors.bundesagentur` (a structured government job API, not
+# free-text parsed from an inbound email) qualifies today.
+# `app.collectors.xing_email.SOURCE_NAME` ("xing") is deliberately
+# excluded — its title/company are parsed directly out of unauthenticated
+# email content. A future collector's source string must be reviewed and
+# explicitly added here before its job facts can ever reach a draft.
+TRUSTED_JOB_SOURCES: frozenset[str] = frozenset({"bundesagentur"})
+
+# Must stay <= ResponseDraftRecord.subject's column length (String(500),
+# see app/db/models.py). Never applied to `body` — see module docstring.
+_SUBJECT_MAX_LENGTH = 500
+_SUBJECT_TRUNCATION_SUFFIX = "..."
 
 
 class ResponseDraftMessageNotFoundError(Exception):
@@ -82,25 +130,50 @@ class ResponseDraftAnalysisNotFoundError(Exception):
     """
 
 
-def _trusted_candidate_name(db: Session) -> str | None:
-    """A full "First Last" name, but ONLY if both `first_name` and
+def _is_trusted_job_source(source: str) -> bool:
+    return source in TRUSTED_JOB_SOURCES
+
+
+def _bound_subject(subject: str) -> str:
+    if len(subject) <= _SUBJECT_MAX_LENGTH:
+        return subject
+    return (
+        subject[: _SUBJECT_MAX_LENGTH - len(_SUBJECT_TRUNCATION_SUFFIX)]
+        + _SUBJECT_TRUNCATION_SUFFIX
+    )
+
+
+def _derive_candidate_profile_facts(
+    record: CandidateProfileRecord | None,
+) -> tuple[int, str | None]:
+    """`(candidate_profile_version, trusted_candidate_name)` derived from
+    ONE already-read `CandidateProfileRecord` snapshot (or `None` if the
+    singleton has never been created) — never re-queried. See module
+    docstring's "Candidate profile race" note for why both values must
+    come from the exact same read: deriving them from two separate
+    `get_candidate_profile` calls let a concurrent profile
+    creation/edit land between the reads, persisting a name fact under a
+    `candidate_profile_version` that does not actually correspond to it.
+
+    A full "First Last" name is returned ONLY if both `first_name` and
     `last_name` independently pass `is_top_level_fact_usable_for_generation`
-    (see app.models.candidate_profile — CP-M-01/CP-M-02's trusted-source +
-    confirmed-state rule). Returns `None` (never a partial/guessed name)
-    if either field is missing or not provenance-confirmed — see
+    (CP-M-01/CP-M-02's trusted-source + confirmed-state rule) — `None`
+    (never a partial/guessed name) otherwise, per
     app.agents.response_draft_generator's "never invents" contract.
     """
-    record = get_candidate_profile(db)
     if record is None:
-        return None
+        return 0, None
+
     profile = to_candidate_profile_response(record)
-    if not profile.first_name or not profile.last_name:
-        return None
-    if not is_top_level_fact_usable_for_generation(profile, "first_name"):
-        return None
-    if not is_top_level_fact_usable_for_generation(profile, "last_name"):
-        return None
-    return f"{profile.first_name} {profile.last_name}"
+    candidate_name: str | None = None
+    if (
+        profile.first_name
+        and profile.last_name
+        and is_top_level_fact_usable_for_generation(profile, "first_name")
+        and is_top_level_fact_usable_for_generation(profile, "last_name")
+    ):
+        candidate_name = f"{profile.first_name} {profile.last_name}"
+    return record.profile_version, candidate_name
 
 
 def generate_response_draft_for_message(
@@ -127,16 +200,15 @@ def generate_response_draft_for_message(
         )
 
     candidate_profile_record = get_candidate_profile(db)
-    candidate_profile_version = (
-        candidate_profile_record.profile_version if candidate_profile_record is not None else 0
+    candidate_profile_version, candidate_name = _derive_candidate_profile_facts(
+        candidate_profile_record
     )
-    candidate_name = _trusted_candidate_name(db)
 
     job_title: str | None = None
     job_company: str | None = None
     if analysis.matched_job_id is not None:
         job = get_job_by_id(db, analysis.matched_job_id)
-        if job is not None:
+        if job is not None and _is_trusted_job_source(job.source):
             job_title = job.title
             job_company = job.company
 
@@ -159,7 +231,7 @@ def generate_response_draft_for_message(
     else:
         status = "PROPOSED"
         reason = None
-        subject = content.subject
+        subject = _bound_subject(content.subject)
         body = content.body
         language_value = content.language
         missing_fields = content.missing_fields
