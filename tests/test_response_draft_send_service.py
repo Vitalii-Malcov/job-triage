@@ -25,6 +25,7 @@ from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
     EmailSendConnectionError,
+    EmailSendOutcomeUnknownError,
     OutboundSendResult,
 )
 from app.services.gmail_message_analysis import analyze_gmail_message
@@ -38,6 +39,7 @@ from app.services.response_draft_send import (
     ResponseDraftNotFoundError,
     ResponseDraftSendFailedError,
     ResponseDraftSendInProgressError,
+    ResponseDraftSendOutcomeUncertainError,
     approve_or_reject_response_draft,
     get_response_draft_state,
     send_response_draft,
@@ -48,14 +50,26 @@ OTHER_ACCOUNT = "someone-else@example.com"
 
 
 class FakeOutboundProvider:
-    def __init__(self, *, fail: bool = False, provider_message_id: str | None = "msg-1"):
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        uncertain: bool = False,
+        provider_message_id: str | None = "msg-1",
+    ):
         self.fail = fail
+        self.uncertain = uncertain
         self.provider_message_id = provider_message_id
         self.sent_messages: list = []
         self.call_count = 0
 
     def send(self, message):
         self.call_count += 1
+        if self.uncertain:
+            # Simulates an exception raised AFTER transmission has
+            # already begun — the real GmailSmtpProvider maps this to
+            # EmailSendOutcomeUnknownError, never EmailSendConnectionError.
+            raise EmailSendOutcomeUnknownError("simulated ambiguous provider outcome")
         if self.fail:
             raise EmailSendConnectionError("simulated provider failure")
         self.sent_messages.append(message)
@@ -385,6 +399,104 @@ class TestDoubleSendRetryConcurrency:
 
         assert won_first is True
         assert won_second is False
+
+
+class TestUncertainOutcome:
+    """The fail-closed handling of an ambiguous SMTP outcome (transmission
+    attempted, delivery could be neither confirmed nor ruled out) — see
+    app.providers.email.outbound_base.EmailSendOutcomeUnknownError and
+    app.db.models.ResponseDraftSendRecord's UNCERTAIN status.
+    """
+
+    def test_ambiguous_provider_outcome_transitions_to_uncertain_not_failed(self, db):
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider(uncertain=True)
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        send_record = get_send_for_draft(db, ACCOUNT, draft.id)
+        assert send_record.status == "UNCERTAIN"
+        assert send_record.status != "FAILED"
+        assert send_record.sent_at is None
+        assert provider.call_count == 1
+        # The approval is untouched — this is a fail-closed refusal to
+        # act further, not a rejection of the approval itself.
+        approval_after = get_approval_for_draft(db, ACCOUNT, draft.id)
+        assert approval_after.id == approval.id
+        assert approval_after.decision == "APPROVED"
+
+    def test_subsequent_send_after_uncertain_does_not_call_provider_again(self, db):
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider(uncertain=True)
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+        assert provider.call_count == 1
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        # The provider must NEVER be called a second time — refused
+        # before reaching it.
+        assert provider.call_count == 1
+
+    def test_attempt_count_does_not_increase_on_the_refused_subsequent_send(self, db):
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider(uncertain=True)
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+        first_attempt_count = get_send_for_draft(db, ACCOUNT, draft.id).attempt_count
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+        second_attempt_count = get_send_for_draft(db, ACCOUNT, draft.id).attempt_count
+
+        assert first_attempt_count == 1
+        assert second_attempt_count == first_attempt_count
+
+    def test_uncertain_send_never_automatically_becomes_pending_again(self, db):
+        """Direct unit test of the CAS primitive itself: retry_send_attempt
+        (the ONLY function that ever transitions a row back to PENDING)
+        is scoped to WHERE status='FAILED' and must never match an
+        UNCERTAIN row.
+        """
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider(uncertain=True)
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        record = get_send_for_draft(db, ACCOUNT, draft.id)
+        assert record.status == "UNCERTAIN"
+
+        won = retry_send_attempt(db, record)
+
+        assert won is False
+        assert get_send_for_draft(db, ACCOUNT, draft.id).status == "UNCERTAIN"
+
+    def test_state_endpoint_exposes_uncertain_status(self, db):
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider(uncertain=True)
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        state = get_response_draft_state(db, ACCOUNT, draft.id)
+
+        assert state.send is not None
+        assert state.send.status == "UNCERTAIN"
 
 
 class TestCrossAccountAccess:

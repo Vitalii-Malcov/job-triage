@@ -198,6 +198,7 @@ from app.services.response_draft_send import (
     ResponseDraftNotFoundError,
     ResponseDraftSendFailedError,
     ResponseDraftSendInProgressError,
+    ResponseDraftSendOutcomeUncertainError,
     approve_or_reject_response_draft,
     get_response_draft_state,
     send_response_draft,
@@ -1970,11 +1971,26 @@ def send_response_draft_endpoint(
         # ResponseDraftSendFailedError already carries no upstream
         # exception text (see EmailSendError's docstring) — log only the
         # type, same GMAIL-003-style discipline as every other Gmail
-        # error path in this file.
+        # error path in this file. Only ever raised for a DEFINITE
+        # pre-transmission failure — see ResponseDraftSendOutcomeUncertainError
+        # for the separate, never-auto-retried ambiguous-outcome case.
         logger.warning("response_draft_send_endpoint_failed error_type=%s", type(exc).__name__)
         raise HTTPException(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
             detail="Sending the response draft failed",
+        ) from exc
+    except ResponseDraftSendOutcomeUncertainError as exc:
+        # Delivery could be neither confirmed nor ruled out — fail
+        # closed. This is NEVER auto-retried; a later POST here is
+        # refused before the provider is called again (see
+        # app.services.response_draft_send's module docstring).
+        logger.warning("response_draft_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "Response draft send outcome is uncertain; manual reconciliation is "
+                "required, not an automatic retry"
+            ),
         ) from exc
     except Exception as exc:
         db.rollback()

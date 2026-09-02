@@ -52,6 +52,23 @@ action anywhere in Stage 7D is the one explicitly-approved
 consume the approval.** See `app.db.response_draft_approval_repository`'s
 `mark_send_sent`/`mark_send_failed`/`retry_send_attempt` docstrings for
 the exact CAS state machine this module drives.
+
+**Honest concurrency/delivery contract (no false exactly-once claim).**
+This project's DB-level concurrency control (`ResponseDraftSendRecord`'s
+`UNIQUE(response_draft_id)` claim + CAS state machine) reliably prevents
+two concurrent/retried REQUESTS to this module from both attempting to
+send the same approval — that guarantee is real and unconditional. It
+does NOT, and cannot, prove that an ambiguous SMTP failure means the
+recruiter never received the reply: `app.providers.email.outbound_base
+.EmailSendOutcomeUnknownError` covers exactly that "transmission was
+attempted, acceptance cannot be proven either way" case, and this
+module's response is fail-closed, not exactly-once — see
+`ResponseDraftSendOutcomeUncertainError` and `ResponseDraftSendRecord`'s
+`UNCERTAIN` status: transmission is never automatically retried once
+ambiguous, and a later send request for the same draft is refused before
+the provider is ever called again. Resolving a genuinely `UNCERTAIN`
+outcome (confirming with the recruiter, deciding whether to manually
+follow up) is a human task this module deliberately does not attempt.
 """
 
 import json
@@ -69,12 +86,18 @@ from app.db.response_draft_approval_repository import (
     get_send_for_draft,
     mark_send_failed,
     mark_send_sent,
+    mark_send_uncertain,
     retry_send_attempt,
     to_response_draft_approval,
     to_response_draft_send_status,
 )
 from app.models.response_draft_approval import ResponseDraftState
-from app.providers.email.outbound_base import EmailSendError, OutboundEmailProvider, OutboundMessage
+from app.providers.email.outbound_base import (
+    EmailSendError,
+    EmailSendOutcomeUnknownError,
+    OutboundEmailProvider,
+    OutboundMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,12 +158,29 @@ class ResponseDraftSendInProgressError(Exception):
 
 
 class ResponseDraftSendFailedError(Exception):
-    """The outbound provider raised while attempting this send — the
-    underlying `response_draft_sends` row has already been transitioned
-    to `FAILED` (never left dangling in `PENDING`) and MAY be retried by
-    a later call. Mapped to 502. Carries no upstream exception text (see
-    app.providers.email.outbound_base.EmailSendError's docstring) — only
-    a fixed, generic message.
+    """The outbound provider raised a DEFINITE pre-transmission failure
+    (`EmailSendAuthError`/`EmailSendConnectionError`) while attempting
+    this send — the underlying `response_draft_sends` row has already
+    been transitioned to `FAILED` (never left dangling in `PENDING`) and
+    MAY be retried by a later call. Mapped to 502. Carries no upstream
+    exception text (see app.providers.email.outbound_base.EmailSendError's
+    docstring) — only a fixed, generic message. NEVER raised for an
+    ambiguous outcome — see `ResponseDraftSendOutcomeUncertainError`.
+    """
+
+
+class ResponseDraftSendOutcomeUncertainError(Exception):
+    """Raised in two situations, both mapped to 409 — either (a) THIS
+    send attempt just became ambiguous (the outbound provider raised
+    `EmailSendOutcomeUnknownError`: transmission was attempted but
+    delivery could not be confirmed OR ruled out — the underlying
+    `response_draft_sends` row has already been transitioned to the
+    terminal `UNCERTAIN` status), or (b) this draft's send was ALREADY
+    `UNCERTAIN` from a prior attempt, and this request is refused BEFORE
+    the outbound provider is ever called again — see
+    `_claim_or_retry_send`. Either way: NO automatic retry, ever;
+    resolving the ambiguity is a human task outside Stage 7D's scope
+    (see module docstring's "honest concurrency/delivery contract").
     """
 
 
@@ -215,7 +255,9 @@ def _claim_or_retry_send(
     """Wins (or refuses) the right to actually call the outbound
     provider for this draft — see module docstring's concurrency
     section. Raises `ResponseDraftAlreadySentError` /
-    `ResponseDraftSendInProgressError` when this call must NOT proceed.
+    `ResponseDraftSendInProgressError` /
+    `ResponseDraftSendOutcomeUncertainError` when this call must NOT
+    proceed.
     """
     record, claimed = claim_send_attempt(
         db,
@@ -232,6 +274,17 @@ def _claim_or_retry_send(
     if record.status == "PENDING":
         raise ResponseDraftSendInProgressError(
             f"A send attempt for response_draft_id={draft.id!r} is already in progress"
+        )
+    if record.status == "UNCERTAIN":
+        # Fail-closed and terminal — see ResponseDraftSendRecord's
+        # docstring. Refused BEFORE the provider is ever called again;
+        # never routed through retry_send_attempt (whose CAS only ever
+        # matches status='FAILED' and therefore could never touch this
+        # row anyway, but the explicit check here makes the refusal
+        # reason accurate rather than an incidental side effect).
+        raise ResponseDraftSendOutcomeUncertainError(
+            f"response_draft_id={draft.id!r} has an uncertain prior send outcome; "
+            "manual reconciliation is required, not an automatic retry"
         )
     # status == "FAILED": a legitimate retry — try to win the CAS back to
     # PENDING. If we lose (a concurrent retry got there first), the
@@ -252,7 +305,7 @@ def send_response_draft(
     `ResponseDraftNotFoundError` / `ResponseDraftNotApprovableError` /
     `ResponseDraftNotApprovedError` / `ResponseDraftMissingRecipientError`
     / `ResponseDraftAlreadySentError` / `ResponseDraftSendInProgressError`
-    / `ResponseDraftSendFailedError`.
+    / `ResponseDraftSendFailedError` / `ResponseDraftSendOutcomeUncertainError`.
     """
     draft = get_response_draft_by_id(db, account_key, draft_id)
     if draft is None:
@@ -287,7 +340,25 @@ def send_response_draft(
 
     try:
         result = provider.send(outbound_message)
+    except EmailSendOutcomeUnknownError as exc:
+        # Transmission was ATTEMPTED — delivery can be neither confirmed
+        # nor ruled out. This must NEVER be treated as FAILED (that would
+        # make it retryable and risk a duplicate send) — it transitions
+        # to the terminal UNCERTAIN state instead. Caught BEFORE the
+        # broader `EmailSendError` below (this is a subclass of it) —
+        # ordering matters.
+        mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
+        logger.warning(
+            "response_draft_send_outcome_uncertain response_draft_id=%s error_type=%s",
+            draft.id,
+            type(exc).__name__,
+        )
+        raise ResponseDraftSendOutcomeUncertainError(
+            f"Sending response_draft_id={draft_id!r} had an uncertain outcome"
+        ) from exc
     except EmailSendError as exc:
+        # A DEFINITE pre-transmission failure only — see
+        # EmailSendConnectionError/EmailSendAuthError's docstrings.
         # GMAIL-003-style: never persist/log the upstream exception's own
         # message text — only its type. mark_send_failed further bounds
         # this to 500 chars regardless.

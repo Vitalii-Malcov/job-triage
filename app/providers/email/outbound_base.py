@@ -26,6 +26,25 @@ to already have been resolved from TRUSTED, already-persisted data by
 Nothing under app/providers/email/ (inbound OR outbound) ever follows a
 URL/link found in email content, and this package makes no HTTP request
 of any kind — only SMTP, to the one configured account.
+
+**Honest delivery-outcome contract (no false exactly-once claim).** SMTP
+over an unreliable network has a well-known ambiguous-outcome window: an
+exception raised AFTER the provider has started transmitting the message
+to the server does NOT prove the server never accepted it — a dropped
+TCP connection, a timeout waiting for the final server reply, or similar
+can occur after the message was already fully accepted. This package
+does **not** claim exactly-once delivery and does not claim a raised
+exception proves non-delivery. What it DOES guarantee: (1) this project's
+own DB-level concurrency control (`ResponseDraftSendRecord`'s
+`UNIQUE(response_draft_id)` claim + CAS state machine — see that model's
+docstring) prevents two concurrent/retried REQUESTS from both attempting
+to send the same approval; (2) `EmailSendOutcomeUnknownError` (see below)
+is raised, distinctly from a definite pre-transmission failure, whenever
+transmission was attempted but acceptance cannot be proven either way —
+`app.services.response_draft_send` treats that as a terminal, fail-closed
+`UNCERTAIN` state that is never automatically retried (see that module's
+docstring for the full contract). Manual reconciliation of a genuinely
+`UNCERTAIN` send is out of scope for Stage 7D.
 """
 
 from dataclasses import dataclass, field
@@ -59,8 +78,40 @@ class EmailSendAuthError(EmailSendError):
 
 
 class EmailSendConnectionError(EmailSendError):
-    """The SMTP server could not be reached, or an SMTP command other
-    than login failed.
+    """A DEFINITE pre-transmission failure: the SMTP server could not be
+    reached, login failed, or the outbound message itself could not even
+    be constructed (e.g. a CRLF/header-injection attempt in `subject`
+    that `email.message` rejects). Raised only for failures that occur
+    strictly BEFORE `send_message()`/transmission is invoked — see
+    `EmailSendOutcomeUnknownError`'s docstring for the boundary. Safe to
+    treat as "definitely not sent"; `app.services.response_draft_send`
+    retries these via its `FAILED -> PENDING` CAS.
+    """
+
+
+class EmailSendOutcomeUnknownError(EmailSendError):
+    """Transmission to the SMTP server was ATTEMPTED (`send_message()`
+    was invoked) but an exception occurred before this package could
+    confirm the server accepted the message — delivery can be neither
+    confirmed NOR ruled out. This is deliberately a SEPARATE exception
+    from `EmailSendConnectionError`: the two must never be handled the
+    same way.
+
+    **Safest-acceptable rule (see module docstring's "honest
+    delivery-outcome contract").** Once `send_message()` has been called,
+    EVERY `smtplib.SMTPException`/`OSError` (including a dropped
+    connection mid-transmission) is treated as outcome-unknown — never as
+    a definite failure — because this package has no positive proof of
+    non-delivery for any of them. `app.providers.email.smtp.GmailSmtpProvider`
+    builds and validates the outbound message BEFORE calling
+    `send_message()` specifically so a message-construction failure (a
+    DEFINITE pre-send failure) can never be misclassified as this.
+
+    `app.services.response_draft_send` treats this as fail-closed and
+    terminal: the send transitions to `UNCERTAIN` (never `FAILED`), is
+    never automatically retried, and a later send attempt for the same
+    draft is refused before this provider is ever called again — see
+    that module's docstring.
     """
 
 
@@ -97,9 +148,13 @@ class OutboundEmailProvider(Protocol):
     read access — those all remain exclusively in the Stage 7A `ImapClient`
     Protocol (still fully read-only) or are simply not implemented at
     all. A concrete implementation (app.providers.email.smtp.
-    GmailSmtpProvider) may raise `EmailSendError`/subclasses; it must
-    never partially send (either the provider confirms success, or the
-    caller treats the attempt as failed).
+    GmailSmtpProvider) either returns `OutboundSendResult` (confirmed
+    success), or raises: `EmailSendAuthError`/`EmailSendConnectionError`
+    for a DEFINITE pre-transmission failure, or
+    `EmailSendOutcomeUnknownError` when transmission was attempted but
+    acceptance cannot be proven either way — see that exception's and the
+    module's own docstring. This project does NOT claim exactly-once
+    delivery or that a raised exception always proves non-delivery.
     """
 
     def send(self, message: OutboundMessage) -> OutboundSendResult: ...

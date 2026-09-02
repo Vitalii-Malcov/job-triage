@@ -2230,6 +2230,30 @@ def test_response_draft_sends_rejects_invalid_status(tmp_path: Path) -> None:
             _insert_response_draft_send(connection, status="SENDING")
 
 
+def test_response_draft_sends_accepts_uncertain_status(tmp_path: Path) -> None:
+    """UNCERTAIN is the fail-closed terminal state for an SMTP send whose
+    outcome could not be proven either way — see ResponseDraftSendRecord's
+    docstring.
+    """
+    db_path = tmp_path / "migrations_response_draft_sends_uncertain_status.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection)
+        _seed_response_draft_row(connection)
+        _insert_response_draft_approval(connection)
+        _insert_response_draft_send(connection, status="UNCERTAIN")
+
+    with engine.connect() as connection:
+        status = connection.execute(
+            text("SELECT status FROM response_draft_sends WHERE response_draft_id = 1")
+        ).scalar()
+    assert status == "UNCERTAIN"
+
+
 def test_response_draft_sends_rejects_duplicate_identity(tmp_path: Path) -> None:
     """UNIQUE(response_draft_id) — the DB-level atomic claim arbiter (see
     ResponseDraftSendRecord's docstring) — must reject a second row for

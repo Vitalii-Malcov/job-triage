@@ -6,8 +6,10 @@ gate — see app/db/models.py's `ResponseDraftApprovalRecord` /
 idempotency rationale (`UNIQUE(response_draft_id)` as the atomic claim
 arbiter on both tables, mirroring `GmailMessageIdClaimRecord`'s
 established pattern, plus `response_draft_sends.status`'s CAS-guarded
-PENDING/SENT/FAILED state machine, mirroring
-`ApplicationPackageReviewRecord`'s own precedent).
+PENDING/SENT/FAILED/UNCERTAIN state machine, mirroring
+`ApplicationPackageReviewRecord`'s own precedent — `UNCERTAIN` is the
+fail-closed terminal state for an SMTP send whose outcome could not be
+proven either way; see `ResponseDraftSendRecord`'s docstring).
 
 Revision ID: 9daea6d21904
 Revises: 7147bc999415
@@ -155,7 +157,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("response_draft_id", name="uq_response_draft_sends_response_draft"),
         sa.CheckConstraint(
-            "status IN ('PENDING', 'SENT', 'FAILED')",
+            "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
             name="ck_response_draft_sends_status_valid",
         ),
         sa.CheckConstraint(

@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 ApprovalDecision = Literal["APPROVED", "REJECTED"]
-SendStatus = Literal["PENDING", "SENT", "FAILED"]
+SendStatus = Literal["PENDING", "SENT", "FAILED", "UNCERTAIN"]
 
 
 class ResponseDraftApproval(BaseModel):
@@ -46,7 +46,10 @@ class ResponseDraftSendStatus(BaseModel):
     /response-drafts/{draft_id}/state's response — the outcome of the
     most recent send attempt for one response draft (see
     app.db.models.ResponseDraftSendRecord's docstring for the exact
-    PENDING/SENT/FAILED state machine).
+    PENDING/SENT/FAILED/UNCERTAIN state machine). `status == "UNCERTAIN"`
+    means transmission was attempted but delivery could not be confirmed
+    OR ruled out — it is terminal and never auto-retried; a further
+    POST .../send for the same draft is refused.
     """
 
     id: int

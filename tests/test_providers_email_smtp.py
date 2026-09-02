@@ -19,6 +19,7 @@ import app.providers.email.smtp as smtp_module
 from app.providers.email.outbound_base import (
     EmailSendAuthError,
     EmailSendConnectionError,
+    EmailSendOutcomeUnknownError,
     OutboundMessage,
 )
 from app.providers.email.smtp import GmailSmtpProvider
@@ -131,11 +132,27 @@ class TestSend:
         with pytest.raises(EmailSendAuthError):
             provider.send(_message())
 
-    def test_send_message_failure_raises_connection_error_and_still_disconnects(self):
+    def test_send_message_failure_after_transmission_starts_is_outcome_unknown(self):
+        """Transmission was ATTEMPTED (send_message was actually called) —
+        this must NEVER be classified as a definite failure (see
+        EmailSendOutcomeUnknownError's docstring): the server may have
+        already accepted the message before this exception occurred.
+        """
         client = FakeSmtpClient(send_error=smtplib.SMTPException("boom"))
         provider = _provider(client)
 
-        with pytest.raises(EmailSendConnectionError):
+        with pytest.raises(EmailSendOutcomeUnknownError):
+            provider.send(_message())
+
+    def test_os_error_during_transmission_is_also_outcome_unknown(self):
+        """Covers a dropped connection / disconnect mid-transmission —
+        OSError, not just smtplib.SMTPException, must be classified the
+        same way once send_message() has been invoked.
+        """
+        client = FakeSmtpClient(send_error=OSError("Connection reset by peer"))
+        provider = _provider(client)
+
+        with pytest.raises(EmailSendOutcomeUnknownError):
             provider.send(_message())
 
     def test_crlf_header_injection_attempt_in_subject_raises_email_send_error(self):
@@ -155,13 +172,21 @@ class TestSend:
 
 
 class TestErrorMessagesNeverLeakUpstreamText:
-    def test_connection_error_message_is_fixed_not_derived_from_exception(self):
+    def test_uncertain_outcome_message_is_fixed_not_derived_from_exception(self):
         client = FakeSmtpClient(send_error=smtplib.SMTPException("secret-server-detail"))
         provider = _provider(client)
 
-        with pytest.raises(EmailSendConnectionError) as exc_info:
+        with pytest.raises(EmailSendOutcomeUnknownError) as exc_info:
             provider.send(_message())
         assert "secret-server-detail" not in str(exc_info.value)
+
+    def test_crlf_injection_pre_send_error_message_is_fixed(self):
+        client = FakeSmtpClient()
+        provider = _provider(client)
+
+        with pytest.raises(EmailSendConnectionError) as exc_info:
+            provider.send(_message(subject="Legit\r\nBcc: attacker@evil.com"))
+        assert "attacker@evil.com" not in str(exc_info.value)
 
 
 class TestNoOutboundHttpOrImapCoupling:

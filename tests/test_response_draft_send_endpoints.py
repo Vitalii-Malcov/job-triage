@@ -24,7 +24,11 @@ from app.db.models import JobRecord
 from app.db.session import get_db
 from app.main import app
 from app.providers.email.base import ParsedGmailMessage
-from app.providers.email.outbound_base import EmailSendConnectionError, OutboundSendResult
+from app.providers.email.outbound_base import (
+    EmailSendConnectionError,
+    EmailSendOutcomeUnknownError,
+    OutboundSendResult,
+)
 from app.security import rate_limit as rate_limit_module
 from app.services.gmail_message_analysis import analyze_gmail_message
 from app.services.response_draft import generate_response_draft_for_message
@@ -35,14 +39,23 @@ OTHER_ACCOUNT = "someone-else@example.com"
 
 
 class FakeOutboundProvider:
-    def __init__(self, *, fail: bool = False, provider_message_id: str | None = "msg-1"):
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        uncertain: bool = False,
+        provider_message_id: str | None = "msg-1",
+    ):
         self.fail = fail
+        self.uncertain = uncertain
         self.provider_message_id = provider_message_id
         self.sent_messages: list = []
         self.call_count = 0
 
     def send(self, message):
         self.call_count += 1
+        if self.uncertain:
+            raise EmailSendOutcomeUnknownError("simulated ambiguous provider outcome")
         if self.fail:
             raise EmailSendConnectionError("simulated provider failure")
         self.sent_messages.append(message)
@@ -356,6 +369,33 @@ class TestDoubleSendRetryConcurrencyOverHttp:
         retried_response = _send(test_client, draft_id)
         assert retried_response.status_code == 200
         assert retried_response.json()["status"] == "SENT"
+
+    def test_ambiguous_outcome_returns_409_and_is_never_auto_retried(self, client):
+        test_client, session_factory, provider = client
+        provider.uncertain = True
+        draft_id = _seed_and_generate(session_factory, test_client)
+        _decide(test_client, draft_id)
+
+        first_response = _send(test_client, draft_id)
+        assert first_response.status_code == 409
+        assert provider.call_count == 1
+
+        state = _state(test_client, draft_id).json()
+        assert state["send"]["status"] == "UNCERTAIN"
+        assert state["send"]["status"] != "FAILED"
+
+        # A later send attempt is refused BEFORE the provider is called
+        # again — even after the ambiguity would, in principle, have
+        # resolved (e.g. the network recovered).
+        provider.uncertain = False
+        second_response = _send(test_client, draft_id)
+
+        assert second_response.status_code == 409
+        assert provider.call_count == 1  # never called a second time
+
+        state_after = _state(test_client, draft_id).json()
+        assert state_after["send"]["status"] == "UNCERTAIN"
+        assert state_after["send"]["attempt_count"] == 1
 
 
 class TestCrossAccountAccessOverHttp:

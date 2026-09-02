@@ -11,10 +11,17 @@ in this project:**
   `UNIQUE(response_draft_id)`, exactly like
   `app.db.gmail_repository`'s `GmailMessageIdClaimRecord` claim pattern.
 - `claim_send_attempt` / `retry_send_attempt` / `mark_send_sent` /
-  `mark_send_failed` — CAS (compare-and-swap) UPDATEs conditioned on
-  `id` + expected `status`, checking `rowcount == 1`, exactly like
-  `app.db.review_package_repository`'s `ApplicationPackageReviewRecord`
-  status transitions.
+  `mark_send_failed` / `mark_send_uncertain` — CAS (compare-and-swap)
+  UPDATEs conditioned on `id` + expected `status`, checking
+  `rowcount == 1`, exactly like `app.db.review_package_repository`'s
+  `ApplicationPackageReviewRecord` status transitions.
+
+`mark_send_uncertain`'s `PENDING -> UNCERTAIN` transition is terminal:
+no function in this module ever transitions a row OUT of `UNCERTAIN` —
+`retry_send_attempt`'s own CAS is scoped to `WHERE status='FAILED'`
+specifically so it can never match (and therefore never resurrect) an
+`UNCERTAIN` row. See `app.db.models.ResponseDraftSendRecord`'s docstring
+for the full rationale.
 """
 
 from datetime import UTC, datetime
@@ -243,6 +250,37 @@ def mark_send_failed(db: Session, record: ResponseDraftSendRecord, *, last_error
         )
         .values(
             status="FAILED",
+            last_error=last_error[:500],
+            updated_at=datetime.now(UTC),
+        )
+    )
+    db.commit()
+    won = result.rowcount == 1
+    if won:
+        db.refresh(record)
+    return won
+
+
+def mark_send_uncertain(db: Session, record: ResponseDraftSendRecord, *, last_error: str) -> bool:
+    """CAS `PENDING -> UNCERTAIN` — the fail-closed terminal transition
+    for a send whose outcome the outbound provider could not prove
+    either way (see `app.providers.email.outbound_base.
+    EmailSendOutcomeUnknownError` and `ResponseDraftSendRecord`'s own
+    docstring). Deliberately does NOT increment `attempt_count` — this is
+    not "a failed attempt to retry", it is a terminal, ambiguous outcome
+    that is never automatically retried; a later send request for this
+    same draft is refused before this table's claim logic even runs
+    again (see `app.services.response_draft_send`'s
+    `ResponseDraftSendOutcomeUncertainError`).
+    """
+    result = db.execute(
+        update(ResponseDraftSendRecord)
+        .where(
+            ResponseDraftSendRecord.id == record.id,
+            ResponseDraftSendRecord.status == "PENDING",
+        )
+        .values(
+            status="UNCERTAIN",
             last_error=last_error[:500],
             updated_at=datetime.now(UTC),
         )

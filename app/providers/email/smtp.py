@@ -18,6 +18,22 @@ module ever sees are `OutboundMessage`'s already-resolved, already-
 trusted fields (see outbound_base.py's module docstring) — this module
 does not parse MIME, does not read `body_plain`, and never touches
 `app.db.models.GmailMessageRecord` directly.
+
+**Ambiguous-outcome handling (see outbound_base.py's "honest
+delivery-outcome contract").** `send()` builds and validates the
+outbound `EmailMessage` BEFORE opening a connection or calling
+`send_message()` — a malformed message (e.g. a CRLF/header-injection
+attempt) is therefore always a DEFINITE pre-transmission failure
+(`EmailSendConnectionError`), never confused with a genuinely ambiguous
+outcome. Once `send_message()` is actually invoked, this provider makes
+NO claim that a raised exception proves the message was not delivered —
+`smtplib.SMTPException`/`OSError` raised during or after that call
+(including a dropped connection mid-transmission) is reported as
+`EmailSendOutcomeUnknownError`, distinctly from a pre-transmission
+failure. This is a deliberately conservative ("safest-acceptable")
+classification: this project does not attempt to distinguish
+"definitely rejected before send" from "possibly accepted, response
+never received" among post-`send_message()` exceptions.
 """
 
 import logging
@@ -29,6 +45,7 @@ from app.collectors.base import is_configured
 from app.providers.email.outbound_base import (
     EmailSendAuthError,
     EmailSendConnectionError,
+    EmailSendOutcomeUnknownError,
     OutboundMessage,
     OutboundSendResult,
 )
@@ -86,27 +103,38 @@ class GmailSmtpProvider:
         if not is_configured(self.username) or not is_configured(self.app_password):
             raise EmailSendAuthError("GMAIL_USERNAME / GMAIL_APP_PASSWORD is not configured")
 
+        # Build/validate the message BEFORE any connection/transmission
+        # attempt — a malformed header (e.g. a CRLF-header-injection
+        # attempt smuggled into subject, which Python's email.message
+        # rejects with ValueError) must remain a DEFINITE pre-send
+        # failure, never misclassified as an ambiguous outcome. No
+        # connection has been opened yet at this point, so "not sent" is
+        # provably true here.
+        try:
+            msg = self._build_message(message)
+        except ValueError as exc:
+            logger.warning("outbound_email_build_failed error_type=%s", type(exc).__name__)
+            raise EmailSendConnectionError("Building the outbound email failed") from exc
+
         client = self._injected_client
         owns_connection = client is None
         if client is None:
             client = self._connect()
 
         try:
-            msg = self._build_message(message)
             client.send_message(msg)
-        except (smtplib.SMTPException, ValueError) as exc:
-            # ValueError alongside SMTPException: Python's email.message
-            # rejects a header value containing '\r'/'\n' (e.g. a
-            # CRLF-header-injection attempt smuggled into subject) by
-            # raising ValueError from `_build_message`, not an SMTP
-            # error. Both must land in the SAME failed-attempt path —
-            # never an unhandled exception that would leave the caller's
-            # PENDING send claim stuck forever (see
-            # app.services.response_draft_send's retry contract) — and
-            # both are reported with this package's own fixed, generic
-            # message (see EmailSendError's docstring).
-            logger.warning("outbound_email_send_failed error_type=%s", type(exc).__name__)
-            raise EmailSendConnectionError("Sending the outbound email failed") from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            # Transmission was ATTEMPTED — the server may or may not have
+            # accepted the message before this exception occurred (a
+            # dropped connection, a timeout waiting for the final reply,
+            # etc.). This package has no positive proof of non-delivery
+            # for ANY exception raised past this point (safest-acceptable
+            # rule — see EmailSendOutcomeUnknownError's docstring), so
+            # this is NEVER reported as a definite failure.
+            logger.warning("outbound_email_send_outcome_unknown error_type=%s", type(exc).__name__)
+            raise EmailSendOutcomeUnknownError(
+                "Sending the outbound email had an uncertain outcome"
+            ) from exc
         finally:
             if owns_connection:
                 self._disconnect(client)

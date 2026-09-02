@@ -882,15 +882,37 @@ class ResponseDraftSendRecord(Base):
       AFTER `OutboundEmailProvider.send` returns without raising — never
       before (spec: "Do not mark SENT before provider success"). Once
       SENT, permanent: no code path ever transitions out of it.
-    - `FAILED` — the provider raised, or the attempt could not complete.
-      Set only by a PENDING -> FAILED CAS, alongside `last_error`. A
-      FAILED row does NOT consume the approval permanently — it may be
-      retried (FAILED -> PENDING, `attempt_count` incremented), so one
-      transient provider outage can never permanently block a legitimately
+    - `FAILED` — a DEFINITE pre-transmission failure only (auth/
+      connection/message-construction — see
+      `app.providers.email.outbound_base.EmailSendConnectionError`/
+      `EmailSendAuthError`) — `send_message()` was never actually
+      invoked, so "not sent" is provably true. Set only by a
+      PENDING -> FAILED CAS, alongside `last_error`. A FAILED row does
+      NOT consume the approval permanently — it may be retried
+      (FAILED -> PENDING, `attempt_count` incremented), so one transient
+      pre-send failure can never permanently block a legitimately
       approved reply from ever being sent, while still making it
       impossible for two concurrent retries to both win the same PENDING
       claim (the CAS `WHERE status='FAILED'` guard only ever lets one
       concurrent UPDATE affect a row).
+    - `UNCERTAIN` — transmission was ATTEMPTED (the provider's
+      `send_message()`-equivalent call was actually invoked) but an
+      exception occurred before delivery could be confirmed OR ruled
+      out — see `app.providers.email.outbound_base.EmailSendOutcomeUnknownError`'s
+      docstring for the "safest-acceptable" classification rule this
+      follows. Set only by a PENDING -> UNCERTAIN CAS, alongside
+      `last_error`; `attempt_count` is left untouched (this is not a
+      "failed attempt to be retried", it is a terminal, ambiguous
+      outcome). **Fail-closed and terminal: NO code path ever
+      transitions a row OUT of `UNCERTAIN`** — never automatically, and
+      never via a later send request for the same draft (which is
+      refused, provider never called again, before reaching this table's
+      claim logic — see `app.services.response_draft_send`'s
+      `ResponseDraftSendOutcomeUncertainError`). Manual reconciliation
+      (checking whether the recruiter actually received the reply, and
+      deciding what to do next) is intentionally out of scope for Stage
+      7D — this table's job is only to make the ambiguity visible and
+      prevent an automated duplicate-send risk, not to resolve it.
 
     Deliberately NOT linked to `GmailMessageAnalysisRecord`/`JobRecord`
     via a ForeignKey, same rationale as `ResponseDraftApprovalRecord`.
@@ -902,7 +924,7 @@ class ResponseDraftSendRecord(Base):
     __table_args__ = (
         UniqueConstraint("response_draft_id", name="uq_response_draft_sends_response_draft"),
         CheckConstraint(
-            "status IN ('PENDING', 'SENT', 'FAILED')",
+            "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
             name="ck_response_draft_sends_status_valid",
         ),
         CheckConstraint("attempt_count > 0", name="ck_response_draft_sends_attempt_count_positive"),
