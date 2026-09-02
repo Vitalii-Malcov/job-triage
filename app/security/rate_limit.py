@@ -232,6 +232,33 @@ def enforce_gmail_rate_limit(request: Request) -> None:
         bucket.append(now)
 
 
+# Separate bucket for Stage 7B analysis runs: like match/cv-draft/
+# review-write above, this is pure local computation (deterministic
+# regex-based matching/classification, zero network calls) with a DB
+# write on cache miss — sized identically to those buckets rather than
+# the stricter network-bound ones (XING/Gmail sync/Bewerbung).
+_gmail_analysis_requests: dict[str, deque[float]] = defaultdict(deque)
+GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS = 30
+GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_gmail_analysis_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _gmail_analysis_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Gmail message analysis rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_review_write_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()

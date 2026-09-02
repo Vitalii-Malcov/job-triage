@@ -45,6 +45,60 @@ class JobRecord(Base):
     )
 
 
+class JobReferenceTokenRecord(Base):
+    """Normalized job/application reference tokens for exact-equality
+    lookup (Stage 7B Codex remediation round 2, Blocker 3).
+
+    **Why this table exists.** Stage 7B's `get_job_candidates` used to
+    fall back to a `LIKE '%token%'` substring query over `jobs.url`/
+    `jobs.title` when a bounded recency scan missed a JobRecord matching
+    an email's explicit reference. A Codex review reproduced that with
+    enough OTHER jobs whose url/title happened to substring-contain
+    pieces of the searched token, that broad recall query's own
+    `REFERENCE_TARGETED_SCAN_LIMIT` cap filled up with false partial
+    collisions before the real exact match was ever retrieved — a larger
+    LIMIT only moves the same bug further out. This table replaces
+    substring recall with real indexed EQUALITY: tokens are extracted
+    deterministically (same `extract_reference_tokens` function used for
+    email-side extraction — see app/services/email_matching.py) once, at
+    write time, and an email's own extracted tokens are looked up via
+    `token IN (...)` — an index scan whose result size depends only on
+    how many jobs genuinely share that exact token (normally 0 or 1),
+    never on how many OTHER unrelated jobs happen to exist in the table.
+
+    **Synchronization.** Tokens are (re)computed in exactly one place —
+    `app.db.repositories.sync_job_reference_tokens` — called from
+    `upsert_job` after every JobRecord create/update, so this table can
+    never drift from the `JobRecord.title`/`JobRecord.url` it was derived
+    from. Never written to from any other call site.
+
+    `UNIQUE(job_id, token)` prevents duplicate rows on re-sync (delete +
+    reinsert, not update-in-place — there is no meaningful "identity" for
+    one token row beyond the (job_id, token) pair itself). Plain
+    `INDEX(token)` (not unique) is the actual query-performance target:
+    two different jobs CAN legitimately share one token (e.g. a reused
+    generic reference format), which is exactly the case
+    `get_job_candidates` must still surface as multiple candidates for
+    `match_email_to_job`'s own AMBIGUOUS handling — this table only
+    guarantees FAST exact lookup, never uniqueness of the token itself
+    across jobs.
+    """
+
+    __tablename__ = "job_reference_tokens"
+    __table_args__ = (
+        UniqueConstraint("job_id", "token", name="uq_job_reference_tokens_job_token"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class UserProfile(Base):
     __tablename__ = "user_profiles"
 
@@ -448,6 +502,143 @@ class GmailMessageIdClaimRecord(Base):
         Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
     )
     contested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class GmailMessageAnalysisRecord(Base):
+    """Immutable Stage 7B analysis result: deterministic, evidence-based
+    job/application matching + correspondence classification for one
+    already-persisted `GmailMessageRecord` — see
+    app/services/gmail_message_analysis.py for the orchestration and
+    app/agents/email_classifier.py / app/services/email_matching.py for
+    the pure-function classification/matching logic itself.
+
+    **INFORMATION ONLY.** Nothing that reads this table sends email,
+    creates a draft/reply, mutates mailbox state, mutates
+    `JobRecord.status`, or performs any other external action — see the
+    module docstrings above for the full hard boundary this whole
+    subsystem (and CLAUDE.md) enforces. `requires_human_review=False`
+    means "the deterministic evidence for THIS reading was strong", never
+    "authorized to act automatically".
+
+    **Immutable, versioned, never UPDATEd** — mirrors
+    CandidateCVDraftRecord's "immutable historical" convention elsewhere
+    in this file. Re-analyzing a message (a bumped `analysis_version`
+    after an algorithm change, a changed `input_fingerprint`, OR a
+    changed `context_fingerprint` — see below) inserts a NEW row; the
+    prior revision is never overwritten and stays queryable.
+    `(gmail_message_id, analysis_version, input_fingerprint,
+    context_fingerprint)` is the idempotency identity (UNIQUE
+    constraint): repeating the exact same analysis of the exact same
+    bounded input AND effective context under the exact same algorithm
+    version returns the existing row, never inserts a duplicate.
+
+    **`matched_job_id` is deliberately not a ForeignKey** — same
+    "traceability, not identity" rationale as
+    `CandidateJobMatchRecord.company_research_id`: this analysis result
+    must remain a legible historical record even if the referenced
+    `JobRecord` is later deleted; nothing here cascades from or is
+    blocked by a `JobRecord` deletion.
+
+    **`input_fingerprint`** is a SHA-256 hex digest over only the
+    message's own fields the classifier/matcher actually read (subject,
+    from_address, body_plain — see
+    app.services.gmail_message_analysis.compute_input_fingerprint).
+
+    **`context_fingerprint` (Codex remediation round 1, 7B-003/004)** is
+    a SHA-256 digest over the EFFECTIVE candidate `JobRecord` pool and
+    thread prior-match context an analysis run actually considered — see
+    app.db.gmail_analysis_repository.compute_context_fingerprint. This
+    column exists because `input_fingerprint` alone let a STALE analysis
+    silently masquerade as current: e.g. a message analyzed as UNMATCHED
+    before its correct `JobRecord` was ever tracked would keep returning
+    that same stale UNMATCHED row forever after the correct job was
+    added, since the message's OWN content (what `input_fingerprint`
+    covers) never changed. `context_fingerprint` makes such an
+    externally-changed-context re-analysis produce a genuinely NEW
+    revision instead of reusing a now-outdated cached result, while the
+    OLD revision remains queryable (never overwritten) — an accurate
+    historical record of what the evidence looked like at the time.
+
+    **Evidence is bounded, structured, and PII-minimal** — see
+    MATCH_EVIDENCE_MAX_ITEMS / EVIDENCE_FRAGMENT_MAX_LENGTH in
+    app/services/email_matching.py and
+    CLASSIFICATION_EVIDENCE_MAX_ITEMS in app/agents/email_classifier.py.
+    Never the full email body or full recipient/sender addresses.
+    """
+
+    __tablename__ = "gmail_message_analyses"
+    __table_args__ = (
+        UniqueConstraint(
+            "gmail_message_id",
+            "analysis_version",
+            "input_fingerprint",
+            "context_fingerprint",
+            name="uq_gmail_message_analyses_identity",
+        ),
+        CheckConstraint("analysis_version > 0", name="ck_gmail_message_analyses_version_positive"),
+        CheckConstraint(
+            "match_type IN ('APPLICATION', 'JOB_ONLY', 'AMBIGUOUS', 'UNMATCHED')",
+            name="ck_gmail_message_analyses_match_type_valid",
+        ),
+        CheckConstraint(
+            "match_confidence IN ('HIGH', 'MEDIUM', 'LOW')",
+            name="ck_gmail_message_analyses_match_confidence_valid",
+        ),
+        CheckConstraint(
+            "classification_confidence IN ('HIGH', 'MEDIUM', 'LOW')",
+            name="ck_gmail_message_analyses_classification_confidence_valid",
+        ),
+        CheckConstraint(
+            "classification IN ("
+            "'APPLICATION_RECEIVED', 'REQUEST_FOR_INFORMATION', 'INTERVIEW_INVITATION', "
+            "'INTERVIEW_RESCHEDULE', 'REJECTION', 'OFFER', "
+            "'WITHDRAWAL_OR_POSITION_CLOSED', 'GENERAL_RECRUITER_MESSAGE', "
+            "'AUTOMATED_NOTIFICATION', 'OTHER', 'UNKNOWN')",
+            name="ck_gmail_message_analyses_classification_valid",
+        ),
+        CheckConstraint("match_score >= 0", name="ck_gmail_message_analyses_match_score_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Denormalized from the parent gmail_messages row for scoping
+    # symmetry with every other Gmail table (GMAIL-002-style account
+    # isolation) — every read additionally filters by this, never trusted
+    # merely because a caller already holds a numeric gmail_message_id.
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    gmail_message_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    analysis_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+
+    match_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Not a ForeignKey — see class docstring.
+    matched_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    match_confidence: Mapped[str] = mapped_column(String(10), nullable=False)
+    match_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Bounded JSON list of {"kind", "value", "weight"} — see class docstring.
+    match_evidence_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # Bounded JSON list of {"job_id", "score"} — populated only for
+    # match_type == "AMBIGUOUS" (the tied top-scoring candidates).
+    candidate_matches_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    classification: Mapped[str] = mapped_column(String(40), nullable=False)
+    classification_confidence: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Bounded JSON list of {"kind", "value", "weight"}.
+    classification_evidence_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    is_automated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Safe-by-default: see app.services.gmail_message_analysis's
+    # determine_requires_human_review for the exact rule. Never read as
+    # authorization to act externally — see class docstring.
+    requires_human_review: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
