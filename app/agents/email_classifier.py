@@ -290,7 +290,16 @@ def _truncate(fragment: str) -> str:
 # interpunction dash like " - "/" – "/" — " counts). Originally
 # comma-only, which under-scoped negation for equally common German
 # recruiter punctuation ("Dies ist keine Absage; wir laden Sie ein.").
-_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,;:]|(?<=\s)[-–—](?=\s)")
+#
+# Round 2 (LOW 1): parentheses always count as clause boundaries too —
+# unlike a dash, "(" / ")" are never part of a word, so no
+# whitespace-surrounding guard is needed for them. Needed so "Dies ist
+# keine Absage (wir laden Sie zu einem Gespräch ein)." only suppresses
+# the parenthetical-EXCLUDED outer clause ("Dies ist keine Absage");
+# without this, the whole sentence (including the parenthesized genuine
+# invitation) was treated as one clause, and the invitation was wrongly
+# suppressed by a negation that doesn't apply to it.
+_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,;:()]|(?<=\s)[-–—](?=\s)")
 
 
 def _clause_span(sentence: str, match: re.Match[str]) -> tuple[int, int]:

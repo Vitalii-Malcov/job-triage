@@ -1283,15 +1283,17 @@ def test_gmail_account_scope_downgrade_preflight_blocks_message_conflict_from_he
     assert "Cannot downgrade" in str(exc_info.value)
     assert "account_key" in str(exc_info.value)
 
-    # Nothing must have changed — not even 847b7f5c87d8's own DDL
-    # (altering gmail_message_analyses), 813c9d5086d0's own DDL (dropping
+    # Nothing must have changed — not even 805108385946's own DDL
+    # (dropping job_reference_tokens), 847b7f5c87d8's own DDL (altering
+    # gmail_message_analyses), 813c9d5086d0's own DDL (dropping
     # gmail_message_analyses), or e6ccb9b4271b's OWN DDL (dropping
     # gmail_message_id_claims) may have run.
-    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    assert _alembic_current_revision(engine) == "805108385946"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
     assert "gmail_message_analyses" in tables
+    assert "job_reference_tokens" in tables
     assert not any(table.startswith("_alembic_tmp") for table in tables)
     assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_messages")}
     with engine.connect() as connection:
@@ -1320,11 +1322,12 @@ def test_gmail_account_scope_downgrade_preflight_blocks_thread_conflict_from_hea
     assert "Cannot downgrade" in str(exc_info.value)
     assert "thread_key" in str(exc_info.value)
 
-    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    assert _alembic_current_revision(engine) == "805108385946"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
     assert "gmail_message_analyses" in tables
+    assert "job_reference_tokens" in tables
     assert not any(table.startswith("_alembic_tmp") for table in tables)
     assert "account_key" in {col["name"] for col in inspector.get_columns("gmail_threads")}
     with engine.connect() as connection:
@@ -1356,10 +1359,11 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    assert _alembic_current_revision(engine) == "805108385946"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
+    assert "job_reference_tokens" in inspector.get_table_names()
     assert "context_fingerprint" in {
         col["name"] for col in inspector.get_columns("gmail_message_analyses")
     }
@@ -1467,9 +1471,10 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    assert _alembic_current_revision(engine) == "805108385946"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
+    assert "job_reference_tokens" in inspector.get_table_names()
     assert "context_fingerprint" in {
         col["name"] for col in inspector.get_columns("gmail_message_analyses")
     }
@@ -1545,3 +1550,99 @@ def test_gmail_message_analyses_context_fingerprint_upgrade_downgrade_upgrade_cy
 
     upgrade(cfg, "847b7f5c87d8")
     assert _alembic_current_revision(engine) == "847b7f5c87d8"
+
+
+# ---------------------------------------------------------------------------
+# 805108385946 (Stage 7B Codex remediation round 2, Blocker 3:
+# job_reference_tokens)
+# ---------------------------------------------------------------------------
+
+
+def test_job_reference_tokens_table_shape(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_job_reference_tokens_shape.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "job_reference_tokens" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("job_reference_tokens")}
+    assert columns == {"id", "job_id", "token", "created_at"}
+
+    unique_constraints = inspector.get_unique_constraints("job_reference_tokens")
+    assert any(set(uc["column_names"]) == {"job_id", "token"} for uc in unique_constraints)
+
+    foreign_keys = inspector.get_foreign_keys("job_reference_tokens")
+    assert any(fk["referred_table"] == "jobs" for fk in foreign_keys)
+
+
+def test_job_reference_tokens_backfills_existing_jobs(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_job_reference_tokens_backfill.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "847b7f5c87d8")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'backfill-fp', 'test', 'Python Developer', 'Acme GmbH', 'Berlin',
+                    'https://acme.example.com/jobs/482173', '', '[]', 80, 'APPLY', 'NEW',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT job_id, token FROM job_reference_tokens")).fetchall()
+    assert "482173" in {token for _job_id, token in rows}
+
+
+def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_job_reference_tokens_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="a@example.com", uid=1)
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'cycle-fp', 'test', 'Role', 'Co', '', 'https://co.example.com/jobs/11111',
+                    '', '[]', 1, 'SKIP', 'NEW', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    downgrade(cfg, "847b7f5c87d8")
+    assert _alembic_current_revision(engine) == "847b7f5c87d8"
+    inspector = inspect(engine)
+    assert "job_reference_tokens" not in inspector.get_table_names()
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    with engine.connect() as connection:
+        message_count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+        job_count = connection.execute(text("SELECT COUNT(*) FROM jobs")).scalar()
+    assert message_count == 1
+    assert job_count == 1  # sibling data untouched by the reference-tokens table drop
+
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == "805108385946"
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "job_reference_tokens" in inspector.get_table_names()

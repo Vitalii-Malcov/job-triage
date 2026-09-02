@@ -130,11 +130,13 @@ def test_unrelated_email_is_unmatched():
     assert result.score == 0
 
 
-def test_existing_trusted_thread_association_wins_over_composite_scoring():
-    """A corroborated thread association (sender domain matches the
-    associated job's own domain) wins outright at HIGH — see
-    test_uncorroborated_thread_association_is_low_confidence below for
-    the 7B-006 fix covering the NON-corroborated case.
+def test_thread_association_is_always_low_confidence_even_with_domain_match():
+    """Round 2 (Blocker 2): thread association is ALWAYS LOW — a matching
+    sender domain (the strongest of the old "corroboration" signals) no
+    longer grants HIGH, because domain equality is just as forgeable/
+    coincidental as any other untrusted correlation evidence. See
+    test_thread_spoof_* below for the adversarial version of this same
+    fix.
     """
     jobs = [
         _job(1, "Python Developer", "Acme GmbH", status="APPLIED"),
@@ -155,14 +157,14 @@ def test_existing_trusted_thread_association_wins_over_composite_scoring():
     )
     assert result.matched_job_id == 3
     assert result.match_type == "APPLICATION"
-    assert result.confidence == "HIGH"
+    assert result.confidence == "LOW"
     assert result.evidence[0].kind == "THREAD_ASSOCIATION"
 
 
-def test_uncorroborated_thread_association_is_low_confidence():
-    """7B-006: plain thread membership alone (no company/domain/title/
-    reference continuity signal in the CURRENT message) must not inherit
-    HIGH trust — demoted to LOW, which forces human review.
+def test_thread_association_is_low_confidence_with_no_continuity_signal():
+    """Plain thread membership alone (no company/domain/title/reference
+    continuity signal in the CURRENT message either) — demoted to LOW,
+    which forces human review.
     """
     jobs = [
         _job(
@@ -182,7 +184,7 @@ def test_uncorroborated_thread_association_is_low_confidence():
     )
     assert result.matched_job_id == 3  # still informative
     assert result.confidence == "LOW"  # but not trusted
-    assert result.evidence[0].kind == "THREAD_ASSOCIATION_UNCORROBORATED"
+    assert result.evidence[0].kind == "THREAD_ASSOCIATION"
 
 
 def test_ambiguous_thread_prior_matches_do_not_produce_false_association():
@@ -377,6 +379,109 @@ def test_unresolved_explicit_reference_does_not_fabricate_a_winner():
 
 
 # ---------------------------------------------------------------------------
+# Round 2, Blocker 1: CURRENT explicit reference vs. thread history —
+# explicit reference is evaluated BEFORE thread association; a genuine
+# disagreement between the two is a conflict, never silently resolved by
+# preferring stale thread history over current evidence.
+# ---------------------------------------------------------------------------
+
+
+def _thread_vs_reference_jobs():
+    return [
+        _job(1, "Role A", "Company A", url="https://a.example.com/A111", status="APPLIED"),
+        _job(2, "Role B", "Company B", url="https://b.example.com/B222", status="APPLIED"),
+    ]
+
+
+def test_thread_A_plus_current_job_id_B_is_ambiguous_not_silent_A():
+    jobs = _thread_vs_reference_jobs()
+    result = match_email_to_job(
+        subject="Job-ID: B222",
+        body_plain="hi",
+        from_address="hr@unrelated.com",
+        job_candidates=jobs,
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.match_type == "AMBIGUOUS"
+    assert result.matched_job_id is None
+    assert {c.job_id for c in result.candidates} == {1, 2}
+    kinds = {item.kind for c in result.candidates for item in c.evidence}
+    assert "CURRENT_EXPLICIT_REFERENCE" in kinds
+    assert "THREAD_ASSOCIATION_CONFLICT" in kinds
+
+
+def test_thread_A_plus_current_referenz_nr_B_is_ambiguous():
+    jobs = _thread_vs_reference_jobs()
+    result = match_email_to_job(
+        subject="Ihre Bewerbung",
+        body_plain="Referenz-Nr: B222",
+        from_address="hr@unrelated.com",
+        job_candidates=jobs,
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.match_type == "AMBIGUOUS"
+    assert result.matched_job_id is None
+    assert {c.job_id for c in result.candidates} == {1, 2}
+
+
+def test_thread_A_plus_current_reference_A_resolves_to_A_high():
+    jobs = _thread_vs_reference_jobs()
+    result = match_email_to_job(
+        subject="Job-ID: A111",
+        body_plain="hi",
+        from_address="hr@unrelated.com",
+        job_candidates=jobs,
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.match_type == "APPLICATION"
+    assert result.matched_job_id == 1
+    assert result.confidence == "HIGH"
+
+
+def test_thread_B_plus_current_reference_A_is_ambiguous_reverse_combination():
+    jobs = _thread_vs_reference_jobs()
+    result = match_email_to_job(
+        subject="Job-ID: A111",
+        body_plain="hi",
+        from_address="hr@unrelated.com",
+        job_candidates=jobs,
+        thread_prior_matches=[ThreadPriorMatch(job_id=2, match_type="APPLICATION")],
+    )
+    assert result.match_type == "AMBIGUOUS"
+    assert result.matched_job_id is None
+    assert {c.job_id for c in result.candidates} == {1, 2}
+
+
+def test_current_explicit_reference_still_beats_composite_even_with_thread_present():
+    """The explicit reference tier must remain decisive over composite
+    evidence even when thread history is ALSO present and agrees with a
+    DIFFERENT (weaker, composite-only) candidate — the explicit reference
+    always wins or conflicts; composite scoring for a non-reference
+    candidate must never quietly override it.
+    """
+    jobs = [
+        _job(1, "Role A", "Company A", url="https://a.example.com/A111", status="APPLIED"),
+        _job(
+            2,
+            "Alpha Beta Gamma Delta Specialist",
+            "StrongCo GmbH",
+            location="Berlin",
+            url="https://strongco.example.com",
+            status="APPLIED",
+        ),
+    ]
+    result = match_email_to_job(
+        subject="Job-ID: A111",
+        body_plain="StrongCo GmbH Alpha Beta Gamma Delta Specialist Berlin",
+        from_address="hr@strongco.example.com",
+        job_candidates=jobs,
+        thread_prior_matches=[],
+    )
+    assert result.matched_job_id == 1
+    assert result.confidence == "HIGH"
+
+
+# ---------------------------------------------------------------------------
 # 7B-002: URL-aware reference extraction — matched only via URL-shaped
 # substrings, never bare numbers.
 # ---------------------------------------------------------------------------
@@ -458,12 +563,17 @@ def test_date_like_number_is_not_treated_as_job_reference():
 
 
 # ---------------------------------------------------------------------------
-# 7B-006: thread trust must be corroborated — an attacker/unrelated sender
-# referencing a legitimate thread root must not inherit HIGH trust.
+# Round 2, Blocker 2: thread membership / email text is NOT authentication.
+# No SPF/DKIM/DMARC evidence exists anywhere in this pipeline — domain,
+# company name, job title, and quoted text are all untrusted correlation
+# evidence an attacker/unrelated sender can trivially forge or copy. A
+# thread-derived association must NEVER reach HIGH from any of them, only
+# from an independently-resolving CURRENT explicit reference (a different
+# tier entirely — see the Blocker 1 tests above).
 # ---------------------------------------------------------------------------
 
 
-def test_thread_spoof_attacker_does_not_inherit_high_trust():
+def test_thread_spoof_A_attacker_with_copied_company_name_stays_low():
     legitimate_job = _job(
         1,
         "Backend Engineer",
@@ -473,20 +583,77 @@ def test_thread_spoof_attacker_does_not_inherit_high_trust():
     )
     result = match_email_to_job(
         subject="Re: your application",
-        body_plain="Please see the attached documents regarding scheduling.",
+        body_plain="Following up regarding your application to TrustedCo GmbH.",
         from_address="attacker@evil.example",
         job_candidates=[legitimate_job],
         thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
     )
     assert result.matched_job_id == 1  # still surfaced as information
-    assert result.confidence == "LOW"  # never HIGH purely from thread membership
-    assert result.evidence[0].kind == "THREAD_ASSOCIATION_UNCORROBORATED"
+    assert result.confidence == "LOW"  # never HIGH purely from thread membership + copied text
+    assert result.evidence[0].kind == "THREAD_ASSOCIATION"
 
 
-def test_thread_spoof_with_genuine_corroboration_still_gets_high():
-    """A legitimate reply that genuinely continues the same conversation
-    (same company/domain) must still get HIGH — the fix must not
-    over-correct into distrusting every reply.
+def test_thread_spoof_B_attacker_with_copied_exact_job_title_stays_low():
+    legitimate_job = _job(
+        1,
+        "Backend Engineer",
+        "TrustedCo GmbH",
+        url="https://trustedco.example.com/jobs/1",
+        status="APPLIED",
+    )
+    result = match_email_to_job(
+        subject="Re: Backend Engineer",
+        body_plain="Following up on the Backend Engineer role we discussed.",
+        from_address="attacker@evil.example",
+        job_candidates=[legitimate_job],
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.matched_job_id == 1
+    assert result.confidence == "LOW"
+    assert result.evidence[0].kind == "THREAD_ASSOCIATION"
+
+
+def test_thread_spoof_C_attacker_with_quoted_recruiter_text_stays_low():
+    """Quoting the original recruiter's own words (company name AND job
+    title, no reference token) is still just untrusted correlation
+    evidence in an unauthenticated message body — must stay LOW, same as
+    tests A/B. (A quoted text that also happens to carry a genuinely
+    resolving reference token would legitimately reach HIGH via the
+    tier-1 explicit-reference path — that is a different, content-based
+    mechanism, not thread trust; see test E.)
+    """
+    legitimate_job = _job(
+        1,
+        "Backend Engineer",
+        "TrustedCo GmbH",
+        url="https://trustedco.example.com/jobs/1",
+        status="APPLIED",
+    )
+    result = match_email_to_job(
+        subject="Re: your application",
+        body_plain=(
+            "> Vielen Dank fuer Ihre Bewerbung als Backend Engineer bei TrustedCo GmbH.\n"
+            "> Wir melden uns in Kuerze.\n"
+            "See attached."
+        ),
+        from_address="attacker@evil.example",
+        job_candidates=[legitimate_job],
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.matched_job_id == 1
+    assert result.confidence == "LOW"
+    assert result.evidence[0].kind == "THREAD_ASSOCIATION"
+
+
+def test_thread_spoof_D_forged_references_with_legitimate_looking_sender_stays_low():
+    """From: hr@trustedco.example with a forged References header (this
+    module cannot know it's forged — Stage 7A grouped it) and NO
+    authenticated sender data anywhere in the pipeline — thread-only
+    association must still not be treated as cryptographically trusted;
+    it is LOW like any other thread-only association. (This scenario is
+    indistinguishable, from this module's point of view, from a genuine
+    reply — which is exactly the point: this module has no authentication
+    signal to tell them apart, so it never claims HIGH from thread alone.)
     """
     legitimate_job = _job(
         1,
@@ -503,8 +670,33 @@ def test_thread_spoof_with_genuine_corroboration_still_gets_high():
         thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
     )
     assert result.matched_job_id == 1
-    assert result.confidence == "HIGH"
+    assert result.confidence == "LOW"
     assert result.evidence[0].kind == "THREAD_ASSOCIATION"
+
+
+def test_thread_spoof_E_current_explicit_reference_can_still_confirm_high():
+    """A genuinely legitimate reply carrying its OWN current explicit
+    reference that independently resolves to the same job DOES reach
+    HIGH — but that HIGH comes from the tier-1 explicit-reference match,
+    never from thread trust itself (see module docstring precedence).
+    """
+    legitimate_job = _job(
+        1,
+        "Backend Engineer",
+        "TrustedCo GmbH",
+        url="https://trustedco.example.com/jobs/JOB1001",
+        status="APPLIED",
+    )
+    result = match_email_to_job(
+        subject="Re: your application — Referenz-Nr: JOB1001",
+        body_plain="Following up on your application.",
+        from_address="hr@trustedco.example.com",
+        job_candidates=[legitimate_job],
+        thread_prior_matches=[ThreadPriorMatch(job_id=1, match_type="APPLICATION")],
+    )
+    assert result.matched_job_id == 1
+    assert result.confidence == "HIGH"
+    assert result.evidence[0].kind == "JOB_REFERENCE"
 
 
 # ---------------------------------------------------------------------------

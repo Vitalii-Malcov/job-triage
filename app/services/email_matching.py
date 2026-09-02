@@ -1,10 +1,11 @@
 """Deterministic evidence-based matching of one inbound email to a
 tracked `JobRecord` (Stage 7B).
 
-**Codex remediation round 1 (7B-001/002/006/007/008, ambiguity margin).**
-This module was reworked after an independent review reproduced concrete
-defeats of the intended precedence contract. See each function's
-docstring for the specific fix; the high-level architecture is now:
+**Codex remediation round 1 (7B-001/002/006/007/008, ambiguity margin)
+and round 2 (precedence reorder, thread trust removal).** This module
+was reworked twice after independent reviews reproduced concrete defeats
+of the intended precedence contract. See each function's docstring for
+the specific fix; the high-level architecture is now:
 
 **Job vs. Application.** This project has no separate `ApplicationRecord`
 — `JobRecord` (app.db.models.JobRecord) carries both the job posting AND
@@ -22,34 +23,36 @@ returned — never a coin-flip (or single-noisy-token) pick among
 near-equals.
 
 **Precedence — three ordered, hard-stopping tiers, not weight-table
-comparison (7B-001 fix).** Composite score-table comparison alone could
-not GUARANTEE that an explicit reference always outranks composite
-evidence (a Codex review reproduced 93 > 90). Precedence is now
-structural:
+comparison (7B-001 fix, round 2 reorder).** Composite score-table
+comparison alone could not GUARANTEE that an explicit reference always
+outranks composite evidence (round 1: a Codex review reproduced 93 > 90).
+Round 1 also put thread association ahead of the explicit-reference tier,
+which a round-2 review reproduced as its OWN defeat: a CURRENT message's
+unique `Job-ID`/`Referenz-Nr` lost to stale thread history. Precedence is
+now, in order:
 
-1. **`_resolve_by_thread_association`** — if a single distinct job is
-   associated with prior (non-ambiguous) analyses in the same trusted
-   `GmailThreadRecord` thread, that decides `matched_job_id` outright;
-   nothing else runs. "Trusted" relies on Stage 7A's own
-   thread-membership guarantee (GMAIL-011) for GROUPING, but grouping
-   alone is no longer sufficient for HIGH confidence — see 7B-006's fix,
-   `_is_thread_corroborated`: an uncorroborated association (no
-   continuity signal in THIS message — company/domain/title/reference)
-   still names the associated job (useful information) but at `LOW`
-   confidence, which forces human review via
-   `determine_requires_human_review`'s existing LOW-confidence rule.
-   Composite scoring for other candidates never runs once this tier
-   fires.
-2. **`_resolve_by_explicit_reference`** — if the email's own extracted
-   reference tokens (see `extract_reference_tokens`) match exactly one
-   candidate's reference tokens, that candidate wins outright at `HIGH`
-   — a real precedence rule, not a weight comparison that composite
-   evidence could ever mathematically exceed. Matching more than one
-   candidate returns `AMBIGUOUS` (never an arbitrary pick). Matching
-   zero candidates does NOT fabricate a winner — it falls through to
-   composite scoring, carrying a `JOB_REFERENCE_UNRESOLVED` evidence
-   note (weight 0) so the response honestly records that an explicit
-   reference was present but didn't resolve.
+1. **`_resolve_by_explicit_reference`** — if the CURRENT email's own
+   extracted reference tokens (see `extract_reference_tokens`) match
+   exactly one candidate's reference tokens, that candidate wins outright
+   at `HIGH` — evaluated BEFORE thread history, so a current explicit
+   reference can never be silently shadowed by a stale association.
+   Matching more than one candidate returns `AMBIGUOUS`. Matching zero
+   candidates does NOT fabricate a winner — it falls through to the next
+   tier, carrying a `JOB_REFERENCE_UNRESOLVED` evidence note (weight 0).
+   If the CURRENT reference resolves to a DIFFERENT job than the
+   thread's own historical association, that is a genuine CONFLICT, not
+   a guessable precedence — see `_resolve_reference_thread_conflict`:
+   resolves to `AMBIGUOUS` naming both candidates, never silently
+   trusting either signal over the other.
+2. **`_resolve_by_thread_association`** — reached only when no current
+   explicit reference resolved decisively. If a single distinct job is
+   associated with prior (non-ambiguous) analyses in the same
+   `GmailThreadRecord` thread, that names `matched_job_id` — but ALWAYS
+   at `LOW` confidence (round 2 fix — see that function's own docstring
+   for why thread membership, sender domain, company name, job title,
+   and quoted/copied text are all untrusted correlation evidence, never
+   an authentication boundary). `LOW` unconditionally forces human
+   review via `determine_requires_human_review`'s existing rule.
 3. **Composite scoring** (`_score_candidate` + `AMBIGUITY_SCORE_MARGIN`)
    — company/domain/title/location evidence, only reached when neither
    tier above decided anything.
@@ -78,7 +81,7 @@ still produce an oversized persisted fragment).
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -260,10 +263,11 @@ class JobCandidate:
 @dataclass(frozen=True)
 class ThreadPriorMatch:
     """One prior analysis's match outcome for an earlier message in the
-    SAME (already Stage-7A-vetted) thread — see module docstring for why
-    this module trusts `thread_id` grouping for GROUPING, and
-    `_is_thread_corroborated` for why grouping alone is no longer
-    sufficient for HIGH confidence (7B-006).
+    SAME (already Stage-7A-vetted) thread — see module docstring and
+    `_resolve_by_thread_association` for why this module trusts
+    `thread_id` grouping for GROUPING only, never for confidence: a
+    thread-derived association is always `LOW` confidence (round 2 fix),
+    regardless of how the current message reads.
     """
 
     job_id: int
@@ -395,98 +399,54 @@ def extract_reference_tokens(text: str, url: str = "") -> frozenset[str]:
     return frozenset(sorted(tokens)[:MAX_REFERENCE_TOKENS])
 
 
-def _is_thread_corroborated(
-    job: JobCandidate,
-    *,
-    email_text: str,
-    email_tokens: set[str],
-    sender_domain: str | None,
-    email_reference_tokens: frozenset[str],
-) -> bool:
-    """7B-006: plain Stage-7A thread MEMBERSHIP is a transport/threading
-    heuristic, not proof that a new sender belongs to the same
-    recruitment conversation — an attacker/unrelated sender can set
-    `References` to a legitimate root and land in the same
-    `GmailThreadRecord` (Stage 7A groups by header value, not by sender
-    identity/authentication; RFC 5322 Message-ID is untrusted correlation
-    evidence, never cryptographically authenticated). A thread
-    association is only treated as strong (HIGH) when at least one
-    INDEPENDENT continuity signal is present in the CURRENT message:
-    normalized company name, sender domain matching the job's own domain
-    (excluding free-mail), a distinctive (non-generic) title token, or an
-    explicit reference match. Absent all four, the association is
-    demoted to LOW confidence by the caller — still informative, but
-    forcing human review rather than silently inheriting HIGH trust.
-    """
-    normalized_company = normalize_company_name(job.company)
-    normalized_email_text = normalize_company_name(email_text)
-    if len(normalized_company) >= 3 and f" {normalized_company} " in f" {normalized_email_text} ":
-        return True
-
-    job_domain = extract_company_domain(job.url)
-    if (
-        sender_domain
-        and job_domain
-        and sender_domain not in FREE_MAIL_DOMAINS
-        and sender_domain == job_domain
-    ):
-        return True
-
-    distinctive_job_tokens = {
-        token for token in _title_tokens(job.title) if token not in _GENERIC_TITLE_WORDS
-    }
-    if distinctive_job_tokens & email_tokens:
-        return True
-
-    job_reference_tokens = extract_reference_tokens(job.title, job.url)
-    if job_reference_tokens & email_reference_tokens:
-        return True
-
-    return False
-
-
 def _resolve_by_thread_association(
-    thread_prior_matches: list[ThreadPriorMatch],
-    job_candidates: list[JobCandidate],
-    *,
-    email_text: str,
-    email_tokens: set[str],
-    sender_domain: str | None,
-    email_reference_tokens: frozenset[str],
+    thread_prior_matches: list[ThreadPriorMatch], job_candidates: list[JobCandidate]
 ) -> EmailMatchResult | None:
+    """Tier 2 — only reached when no CURRENT explicit reference resolved
+    decisively (see `match_email_to_job`).
+
+    **Round 2 fix (thread trust removal).** Round 1 granted `HIGH`
+    confidence when the current message showed an "independent
+    continuity signal" — matching company name, sender domain, a
+    distinctive title token, or a reference. A follow-up review
+    reproduced that EVERY one of those signals is itself just as
+    forgeable as the thread membership it was meant to corroborate: an
+    attacker/unrelated sender can set `References` to a legitimate root
+    (Stage 7A groups by header VALUE, never by verified sender identity —
+    no SPF/DKIM/DMARC/Authentication-Results evidence exists anywhere in
+    this pipeline) and separately copy the company name, copy the exact
+    job title, or quote the original recruiter's text into their own
+    message — all four "corroboration" signals defeated in isolation.
+    None of these are an authentication boundary. A thread-derived
+    association is therefore now unconditionally `LOW` confidence — never
+    HIGH, regardless of how much the current message resembles the
+    historical conversation — which unconditionally forces human review
+    via `determine_requires_human_review`'s existing LOW-confidence rule.
+    It still surfaces `matched_job_id` as useful information; it is never
+    presented as authenticated/high-trust.
+    """
     distinct_thread_jobs = {m.job_id for m in thread_prior_matches}
     if len(distinct_thread_jobs) != 1:
         return None
 
     job_id = next(iter(distinct_thread_jobs))
     candidate = next((c for c in job_candidates if c.job_id == job_id), None)
-
-    if candidate is not None:
-        match_type = _match_type_for_status(candidate.status)
-        corroborated = _is_thread_corroborated(
-            candidate,
-            email_text=email_text,
-            email_tokens=email_tokens,
-            sender_domain=sender_domain,
-            email_reference_tokens=email_reference_tokens,
-        )
-    else:
+    match_type = (
+        _match_type_for_status(candidate.status)
+        if candidate is not None
         # The associated job fell outside the bounded candidate scan (or
         # no longer exists) — fall back to the trusted prior analysis's
-        # own recorded match_type rather than guessing, and treat as
-        # uncorroborated (nothing to corroborate against).
-        match_type = thread_prior_matches[0].match_type
-        corroborated = False
+        # own recorded match_type rather than guessing.
+        else thread_prior_matches[0].match_type
+    )
 
     weight = MATCH_EVIDENCE_WEIGHTS["THREAD_ASSOCIATION"]
-    kind = "THREAD_ASSOCIATION" if corroborated else "THREAD_ASSOCIATION_UNCORROBORATED"
-    confidence: Confidence = "HIGH" if corroborated else "LOW"
     return EmailMatchResult(
         match_type=match_type,
         matched_job_id=job_id,
-        confidence=confidence,
+        confidence="LOW",
         score=weight,
-        evidence=(MatchEvidenceItem(kind, _truncate(str(job_id)), weight),),
+        evidence=(MatchEvidenceItem("THREAD_ASSOCIATION", _truncate(str(job_id)), weight),),
         candidates=(),
     )
 
@@ -556,6 +516,65 @@ def _resolve_by_explicit_reference(
             candidates=(),
         ),
         (),
+    )
+
+
+def _distinct_thread_job_id(thread_prior_matches: list[ThreadPriorMatch]) -> int | None:
+    distinct = {m.job_id for m in thread_prior_matches}
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
+def _resolve_reference_thread_conflict(
+    reference_job_id: int, thread_job_id: int
+) -> EmailMatchResult:
+    """Round 2, Blocker 1: a CURRENT explicit reference that uniquely
+    resolves to a DIFFERENT job than the thread's own historical
+    association is a genuine conflict between two independently strong
+    signals — never resolved by silently preferring one over the other
+    (a Codex review reproduced the prior round returning the STALE
+    thread job at HIGH, hiding the current message's own explicit
+    evidence entirely). Resolves to `AMBIGUOUS`, naming both candidates
+    with the specific evidence that put each of them forward, so a human
+    reviewer sees exactly why the two signals disagree.
+    """
+    reference_weight = MATCH_EVIDENCE_WEIGHTS["JOB_REFERENCE"]
+    thread_weight = MATCH_EVIDENCE_WEIGHTS["THREAD_ASSOCIATION"]
+    candidates = tuple(
+        sorted(
+            (
+                CandidateMatch(
+                    job_id=reference_job_id,
+                    score=reference_weight,
+                    evidence=(
+                        MatchEvidenceItem(
+                            "CURRENT_EXPLICIT_REFERENCE",
+                            _truncate(str(reference_job_id)),
+                            reference_weight,
+                        ),
+                    ),
+                ),
+                CandidateMatch(
+                    job_id=thread_job_id,
+                    score=thread_weight,
+                    evidence=(
+                        MatchEvidenceItem(
+                            "THREAD_ASSOCIATION_CONFLICT",
+                            _truncate(str(thread_job_id)),
+                            thread_weight,
+                        ),
+                    ),
+                ),
+            ),
+            key=lambda c: c.job_id,
+        )
+    )
+    return EmailMatchResult(
+        match_type="AMBIGUOUS",
+        matched_job_id=None,
+        confidence="HIGH",
+        score=reference_weight,
+        evidence=(),
+        candidates=candidates,
     )
 
 
@@ -648,23 +667,39 @@ def match_email_to_job(
     email_reference_tokens = extract_reference_tokens(email_text)
     sender_domain = extract_sender_domain(from_address)
 
-    thread_result = _resolve_by_thread_association(
-        thread_prior_matches,
-        job_candidates,
-        email_text=email_text,
-        email_tokens=email_tokens,
-        sender_domain=sender_domain,
-        email_reference_tokens=email_reference_tokens,
-    )
-    if thread_result is not None:
-        return thread_result
-
+    # Tier 1: CURRENT explicit reference — evaluated BEFORE thread
+    # history (round 2 reorder) so a current message's own unique
+    # reference can never be silently shadowed by stale thread history.
     reference_result, carry_forward_evidence = _resolve_by_explicit_reference(
         job_candidates, email_reference_tokens
     )
+    thread_job_id = _distinct_thread_job_id(thread_prior_matches)
+
     if reference_result is not None:
+        if (
+            reference_result.match_type != "AMBIGUOUS"
+            and thread_job_id is not None
+            and thread_job_id != reference_result.matched_job_id
+        ):
+            return _resolve_reference_thread_conflict(
+                reference_result.matched_job_id, thread_job_id
+            )
         return reference_result
 
+    # Tier 2: thread association (always LOW — see that function's
+    # docstring). Only reached when tier 1 found nothing decisive.
+    thread_result = _resolve_by_thread_association(thread_prior_matches, job_candidates)
+    if thread_result is not None:
+        if carry_forward_evidence:
+            thread_result = replace(
+                thread_result,
+                evidence=(thread_result.evidence + carry_forward_evidence)[
+                    :MATCH_EVIDENCE_MAX_ITEMS
+                ],
+            )
+        return thread_result
+
+    # Tier 3: composite scoring.
     scored = [
         (
             job,

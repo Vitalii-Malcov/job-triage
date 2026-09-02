@@ -324,3 +324,50 @@ def test_compound_word_with_hyphen_is_not_treated_as_clause_boundary():
     )
     assert result.category == "APPLICATION_RECEIVED"
     assert result.is_automated is True
+
+
+# ---------------------------------------------------------------------------
+# Round 2, LOW 1: parentheses are clause boundaries too.
+# ---------------------------------------------------------------------------
+
+
+def test_negated_rejection_plus_invitation_inside_parentheses():
+    result = classify_email(
+        "Update",
+        "Dies ist keine Absage (wir laden Sie zu einem Gespräch ein).",
+        "hr@company.de",
+    )
+    assert result.category == "INTERVIEW_INVITATION"
+    assert all("REJECTION" not in item.kind for item in result.evidence)
+
+
+def test_negated_interview_inside_parentheses_does_not_suppress_later_signal():
+    result = classify_email(
+        "Update",
+        "Ein Vorstellungsgespräch ist nicht erforderlich (das entfällt). "
+        "Leider können wir Ihre Bewerbung nicht berücksichtigen.",
+        "hr@company.de",
+    )
+    assert result.category == "REJECTION"
+
+
+def test_parentheses_do_not_break_adjacent_comma_and_colon_boundaries():
+    """Nested/adjacent punctuation — a parenthetical aside sitting right
+    next to a comma/colon-delimited clause — must not confuse clause
+    scoping in either direction.
+    """
+    result = classify_email(
+        "Update",
+        "Kurzer Hinweis (bitte lesen): Dies ist keine Absage, wir laden Sie zu einem Gespräch ein.",
+        "hr@company.de",
+    )
+    assert result.category == "INTERVIEW_INVITATION"
+
+
+def test_parenthetical_aside_with_no_negation_still_classifies_correctly():
+    result = classify_email(
+        "Update",
+        "Vielen Dank fuer Ihre Bewerbung (Eingangsbestaetigung folgt).",
+        "hr@company.de",
+    )
+    assert result.category == "APPLICATION_RECEIVED"

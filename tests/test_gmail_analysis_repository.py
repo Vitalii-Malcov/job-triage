@@ -15,6 +15,7 @@ from app.db.base import Base
 from app.db.gmail_analysis_repository import (
     compute_context_fingerprint,
     get_job_candidates,
+    get_latest_analysis_for_message,
     get_or_create_analysis,
     get_thread_prior_matches,
     list_analyses,
@@ -700,6 +701,10 @@ def test_get_job_candidates_finds_old_job_beyond_recency_limit_via_reference(db)
         last_seen_at=base - timedelta(days=1000),
     )
     db.add(old_job)
+    db.commit()
+    from app.db.repositories import sync_job_reference_tokens
+
+    sync_job_reference_tokens(db, old_job)
     for i in range(30):
         db.add(
             JobRecord(
@@ -775,3 +780,320 @@ def test_compute_context_fingerprint_changes_when_candidate_pool_changes():
     fp_before = compute_context_fingerprint([a], [])
     fp_after = compute_context_fingerprint([a, b], [])
     assert fp_before != fp_after
+
+
+# ---------------------------------------------------------------------------
+# Round 2, Blocker 3: JobReferenceTokenRecord exact-equality lookup must
+# not be starved by any number of partial-substring collisions.
+# ---------------------------------------------------------------------------
+
+
+def _seed_old_job_and_collisions(db, *, collision_count: int):
+    """Bulk-inserts one real exact-referenced job plus `collision_count`
+    OTHER jobs whose url/title merely CONTAIN pieces of the same token
+    text in a different shape (the pattern that starved the old LIKE-based
+    targeted query) — bulk executemany, not per-row ORM commits, so this
+    stays fast even at collision_count=5000.
+    """
+    from app.db.models import JobReferenceTokenRecord
+
+    old_job = JobRecord(
+        fingerprint="old-exact",
+        source="test",
+        title="Old Role",
+        company="OldCo",
+        location="",
+        url="https://oldco.example.com/jobs/12345",
+        description="",
+        score=1,
+        recommendation="SKIP",
+        status="NEW",
+    )
+    db.add(old_job)
+    db.commit()
+    db.add(JobReferenceTokenRecord(job_id=old_job.id, token="12345"))
+
+    job_rows = [
+        {
+            "fingerprint": f"collision-{i}",
+            "source": "test",
+            "title": f"Role {i}",
+            "company": f"Co{i}",
+            "location": "",
+            "url": f"https://co{i}.example.com/jobs/A12345X{i}",
+            "description": "",
+            "skills_json": "[]",
+            "data_confidence": 0.0,
+            "must_have_skills_json": "[]",
+            "nice_to_have_skills_json": "[]",
+            "score": 1,
+            "recommendation": "SKIP",
+            "status": "NEW",
+            "first_seen_at": datetime.now(UTC),
+            "last_seen_at": datetime.now(UTC),
+        }
+        for i in range(collision_count)
+    ]
+    if job_rows:
+        db.execute(JobRecord.__table__.insert(), job_rows)
+    db.commit()
+
+    collision_job_ids = db.scalars(
+        select(JobRecord.id).where(JobRecord.fingerprint.like("collision-%"))
+    ).all()
+    token_rows = [
+        {"job_id": job_id, "token": f"A12345X{i}"}
+        for job_id, i in zip(collision_job_ids, range(collision_count), strict=True)
+    ]
+    if token_rows:
+        db.execute(JobReferenceTokenRecord.__table__.insert(), token_rows)
+    db.commit()
+    return old_job.id
+
+
+@pytest.mark.parametrize("collision_count", [50, 51, 100, 600, 5000])
+def test_exact_reference_found_regardless_of_partial_collision_count(db, collision_count):
+    old_job_id = _seed_old_job_and_collisions(db, collision_count=collision_count)
+
+    candidates = get_job_candidates(db, limit=10, reference_tokens=frozenset({"12345"}))
+    assert old_job_id in {c.job_id for c in candidates}
+
+
+def test_reference_token_equality_excludes_partial_matches(db):
+    from app.services.email_matching import extract_reference_tokens
+
+    assert extract_reference_tokens("", "https://x.example.com/A12345X") == frozenset({"A12345X"})
+    assert extract_reference_tokens("", "https://x.example.com/912345") == frozenset({"912345"})
+    assert extract_reference_tokens("", "https://x.example.com/123456") == frozenset({"123456"})
+    assert extract_reference_tokens("", "https://x.example.com/12345") == frozenset({"12345"})
+    # None of the "near miss" tokens equal the real one.
+    assert "A12345X" != "12345"
+    assert "912345" != "12345"
+    assert "123456" != "12345"
+
+
+def test_reference_lookup_query_count_is_o1_regardless_of_collision_count(db):
+    _seed_old_job_and_collisions(db, collision_count=600)
+
+    statements: list[str] = []
+
+    def _track(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _track)
+    try:
+        get_job_candidates(db, limit=10, reference_tokens=frozenset({"12345"}))
+    finally:
+        event.remove(engine, "before_cursor_execute", _track)
+
+    assert len(statements) == 2  # recency pool + one targeted join, never one-per-job
+
+
+def test_sync_job_reference_tokens_keeps_token_in_sync_with_job(db):
+    from app.db.models import JobReferenceTokenRecord
+    from app.db.repositories import sync_job_reference_tokens
+
+    job = JobRecord(
+        fingerprint="sync-test",
+        source="test",
+        title="Role",
+        company="Co",
+        location="",
+        url="https://co.example.com/jobs/55555",
+        description="",
+        score=1,
+        recommendation="SKIP",
+        status="NEW",
+    )
+    db.add(job)
+    db.commit()
+
+    sync_job_reference_tokens(db, job)
+    tokens = set(
+        db.scalars(
+            select(JobReferenceTokenRecord.token).where(JobReferenceTokenRecord.job_id == job.id)
+        ).all()
+    )
+    assert tokens == {"55555"}
+
+    # Re-sync with unchanged data is a no-op (idempotent).
+    sync_job_reference_tokens(db, job)
+    tokens_after = set(
+        db.scalars(
+            select(JobReferenceTokenRecord.token).where(JobReferenceTokenRecord.job_id == job.id)
+        ).all()
+    )
+    assert tokens_after == {"55555"}
+
+
+# ---------------------------------------------------------------------------
+# Round 2, LOW 2: latest revision must be version-aware, not plain MAX(id).
+# ---------------------------------------------------------------------------
+
+
+def _analysis_result(job_id):
+    return EmailMatchResult(
+        match_type="APPLICATION",
+        matched_job_id=job_id,
+        confidence="HIGH",
+        score=90,
+        evidence=(),
+        candidates=(),
+    )
+
+
+def test_latest_analysis_is_version_aware_not_max_id(db):
+    """v1(id1) -> v2(id2) -> v1(id3, inserted LATER but an OLDER version)
+    -- latest must remain v2/id2, never the higher-id-but-older-version
+    row.
+    """
+    _add_job(db)
+    msg, _ = upsert_message(db, _parsed())
+
+    r1, _ = get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp",
+        context_fingerprint="c1",
+        match_result=_analysis_result(1),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    r2, _ = get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=2,
+        input_fingerprint="fp",
+        context_fingerprint="c2",
+        match_result=_analysis_result(2),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    r3, _ = get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp",
+        context_fingerprint="c3",
+        match_result=_analysis_result(1),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    assert r3.id > r2.id  # id3 genuinely has the highest id
+
+    latest = get_latest_analysis_for_message(db, ACCOUNT_A, msg.id)
+    assert latest.id == r2.id
+    assert latest.analysis_version == 2
+    assert latest.matched_job_id == 2
+
+
+def test_latest_analysis_within_same_version_uses_highest_id(db):
+    """A later context-triggered revision under the SAME analysis_version
+    must still be recognized as latest (id tiebreak within a version).
+    """
+    _add_job(db)
+    msg, _ = upsert_message(db, _parsed())
+
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=2,
+        input_fingerprint="fp",
+        context_fingerprint="c1",
+        match_result=_analysis_result(1),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    r4, _ = get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=2,
+        input_fingerprint="fp",
+        context_fingerprint="c4",
+        match_result=_analysis_result(3),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+
+    latest = get_latest_analysis_for_message(db, ACCOUNT_A, msg.id)
+    assert latest.id == r4.id
+    assert latest.matched_job_id == 3
+
+
+def test_thread_prior_matches_is_also_version_aware(db):
+    """Thread-context selection must use the same version-aware "latest"
+    rule as get_latest_analysis_for_message.
+    """
+    _add_job(db)
+    msg, _ = upsert_message(db, _parsed())
+
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp",
+        context_fingerprint="c1",
+        match_result=_analysis_result(1),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=2,
+        input_fingerprint="fp",
+        context_fingerprint="c2",
+        match_result=_analysis_result(2),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+    get_or_create_analysis(
+        db,
+        account_key=ACCOUNT_A,
+        gmail_message_id=msg.id,
+        analysis_version=1,
+        input_fingerprint="fp",
+        context_fingerprint="c3",
+        match_result=_analysis_result(1),
+        classification_category="UNKNOWN",
+        classification_confidence="LOW",
+        classification_evidence=(),
+        is_automated=False,
+        requires_human_review=True,
+    )
+
+    prior = get_thread_prior_matches(
+        db, account_key=ACCOUNT_A, thread_id=msg.thread_id, exclude_gmail_message_id=999999
+    )
+    assert prior == [ThreadPriorMatch(job_id=2, match_type="APPLICATION")]

@@ -4,25 +4,19 @@ and read/list access. Mirrors app.db.gmail_repository's conventions
 (plain functions, `db: Session` first arg, INSERT + IntegrityError-catch
 + reload for idempotency, account_key scoping on every read).
 
-**Codex remediation round 1.** Two concrete defects were reproduced and
-fixed here:
-
-- **7B-005**: `get_thread_prior_matches` used to filter to
-  `match_type IN ('APPLICATION','JOB_ONLY')` in the SQL WHERE clause
-  BEFORE picking "the latest row per message" — which meant an older
-  DECISIVE revision could outrank a newer, correct UNMATCHED/AMBIGUOUS
-  revision merely because the newer row got filtered out before the
-  "latest" comparison ever happened. Fixed by first finding each prior
-  message's truly latest revision (via `MAX(id)` — this table is
-  INSERT-only, so `id` order is creation order), THEN checking whether
-  THAT (and only that) row is decisive.
-- **7B-007**: a fixed `LIMIT 500` recency-ordered scan could hide an
-  exact reference match older than the 500 most-recently-seen jobs.
-  `get_job_candidates` now also runs a second, small, targeted query for
-  candidates whose own `url`/`title` contains a caller-supplied reference
-  token, merged with the recency pool (deduplicated). Still bounded — at
-  most 2 SQL statements total, never one query per candidate, regardless
-  of table size.
+**Codex remediation round 1** fixed two defects (7B-005, 7B-007 — see
+git history for the full round-1 note). **Round 2, Blocker 3** replaced
+7B-007's `LIKE '%token%'` substring recall with real indexed EQUALITY
+lookup: a Codex review reproduced that enough OTHER jobs' url/title
+merely CONTAINING pieces of a searched token could fill
+`REFERENCE_TARGETED_SCAN_LIMIT` with false partial collisions before the
+real exact match was ever retrieved — a larger LIMIT only moves the same
+bug. `get_job_candidates` now joins against `JobReferenceTokenRecord`
+(see that model's own docstring in app/db/models.py) and matches via
+`token IN (...)` — exact string equality, never substring — so the
+result size depends only on how many jobs genuinely share that exact
+token, never on how many unrelated jobs' url/title happen to contain a
+matching substring.
 
 **Bounded, always.** `get_job_candidates` and `get_thread_prior_matches`
 are the only two queries app/services/gmail_message_analysis.py issues
@@ -40,12 +34,17 @@ import hashlib
 import json
 from collections.abc import Sequence
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.agents.email_classifier import ClassificationEvidenceItem
-from app.db.models import GmailMessageAnalysisRecord, GmailMessageRecord, JobRecord
+from app.db.models import (
+    GmailMessageAnalysisRecord,
+    GmailMessageRecord,
+    JobRecord,
+    JobReferenceTokenRecord,
+)
 from app.models.gmail_analysis import CandidateMatch as CandidateMatchModel
 from app.models.gmail_analysis import EvidenceItem, GmailMessageAnalysis
 from app.services.email_matching import (
@@ -88,16 +87,18 @@ def get_job_candidates(
 ) -> list[JobCandidate]:
     """The bounded candidate `JobRecord` pool matching scores against.
 
-    Two bounded queries, merged and deduplicated by job id (7B-007):
+    Two bounded queries, merged and deduplicated by job id:
 
     1. A recency-ordered pool (most-recently-seen first), capped at
        `limit` (spec: "Bound: candidate jobs/applications considered",
        "Avoid: full-table application scan").
     2. If `reference_tokens` is non-empty (the email carried an explicit
        reference — see app.services.email_matching.extract_reference_tokens),
-       a SECOND small query for any `JobRecord` whose own `url`/`title`
-       contains one of those tokens, capped at
-       `REFERENCE_TARGETED_SCAN_LIMIT` — so an exact reference match
+       a SECOND query joined against `JobReferenceTokenRecord` matching
+       via `token IN (...)` — exact equality, not substring (round 2,
+       Blocker 3 — see module docstring) — capped at
+       `REFERENCE_TARGETED_SCAN_LIMIT` purely as a defensive ceiling
+       (normal results are 0-1 jobs per token); an exact reference match
        older than the `limit` most-recently-seen jobs is still
        discoverable, without ever scanning the whole table or issuing
        one query per candidate.
@@ -118,21 +119,42 @@ def get_job_candidates(
     }
 
     if reference_tokens:
-        conditions = [
-            condition
-            for token in reference_tokens
-            for condition in (
-                func.upper(JobRecord.url).contains(token),
-                func.upper(JobRecord.title).contains(token),
-            )
-        ]
         targeted_rows = db.execute(
-            select(*columns).where(or_(*conditions)).limit(REFERENCE_TARGETED_SCAN_LIMIT)
+            select(*columns)
+            .join(JobReferenceTokenRecord, JobReferenceTokenRecord.job_id == JobRecord.id)
+            .where(JobReferenceTokenRecord.token.in_(reference_tokens))
+            .limit(REFERENCE_TARGETED_SCAN_LIMIT)
         ).all()
         for row in targeted_rows:
             candidates.setdefault(row.id, _job_candidate_from_row(row))
 
     return list(candidates.values())
+
+
+def _latest_id_subquery():
+    """Correlated scalar subquery: the `id` of the truly latest revision
+    for whatever `gmail_message_id` the correlated outer query row
+    belongs to — "latest" meaning highest `analysis_version` FIRST, `id`
+    only as the tiebreak within that version (round 2, LOW 2). Plain
+    `MAX(id)` alone is not sufficient: a row inserted LATER using an
+    OLDER algorithm version (e.g. `analysis_version=1` re-inserted after
+    `analysis_version=2` already exists — not reachable through today's
+    single public `analyze_gmail_message` entry point, which always
+    writes `ANALYSIS_VERSION`, but the query-level semantics must still
+    be correct independent of that call-site guarantee) must never
+    outrank the genuinely newer, higher-version revision. Used by both
+    `get_thread_prior_matches` (correlated across many messages) and
+    `get_latest_analysis_for_message`.
+    """
+    latest = aliased(GmailMessageAnalysisRecord)
+    return (
+        select(latest.id)
+        .where(latest.gmail_message_id == GmailMessageAnalysisRecord.gmail_message_id)
+        .order_by(latest.analysis_version.desc(), latest.id.desc())
+        .limit(1)
+        .correlate(GmailMessageAnalysisRecord)
+        .scalar_subquery()
+    )
 
 
 def get_thread_prior_matches(
@@ -149,21 +171,26 @@ def get_thread_prior_matches(
     (APPLICATION/JOB_ONLY — AMBIGUOUS/UNMATCHED prior results carry no
     trustworthy association and are excluded).
 
-    **7B-005 fix.** "Latest" is determined FIRST (via `MAX(id)` per
-    `gmail_message_id` — this table is INSERT-only, so `id` order is
-    creation order — a correlated-subquery / one round-trip, not N
-    queries), and only THEN is that (and only that) row checked for
-    decisiveness. The previous version filtered to decisive rows in the
-    same WHERE clause used to pick "the latest" — which let an OLDER
-    decisive revision win over a NEWER, correct UNMATCHED/AMBIGUOUS
-    revision, because the newer row was filtered out of contention before
-    "latest" was ever evaluated. A message whose latest revision is
+    **7B-005 fix.** "Latest" is determined FIRST — see `_latest_id_subquery`
+    — and only THEN is that (and only that) row checked for decisiveness.
+    The original version filtered to decisive rows in the same WHERE
+    clause used to pick "the latest" — which let an OLDER decisive
+    revision win over a NEWER, correct UNMATCHED/AMBIGUOUS revision,
+    because the newer row was filtered out of contention before "latest"
+    was ever evaluated. A message whose latest revision is
     UNMATCHED/AMBIGUOUS now correctly contributes NOTHING to thread
     association, even if an earlier revision of that same message was
     once decisive.
+
+    **Round 2, LOW 2 fix.** "Latest" is version-aware: highest
+    `analysis_version` first, `id` only as the tiebreak WITHIN that
+    version — never plain `MAX(id)` alone, which could let a
+    later-inserted row using an OLDER algorithm version (analysis_version
+    1) outrank a genuinely newer revision (analysis_version 2) inserted
+    earlier. See `_latest_id_subquery`.
     """
-    latest_id_per_message = (
-        select(func.max(GmailMessageAnalysisRecord.id).label("latest_id"))
+    rows = db.execute(
+        select(GmailMessageAnalysisRecord.match_type, GmailMessageAnalysisRecord.matched_job_id)
         .join(
             GmailMessageRecord, GmailMessageRecord.id == GmailMessageAnalysisRecord.gmail_message_id
         )
@@ -172,13 +199,8 @@ def get_thread_prior_matches(
             GmailMessageRecord.account_key == account_key,
             GmailMessageAnalysisRecord.account_key == account_key,
             GmailMessageAnalysisRecord.gmail_message_id != exclude_gmail_message_id,
+            GmailMessageAnalysisRecord.id == _latest_id_subquery(),
         )
-        .group_by(GmailMessageAnalysisRecord.gmail_message_id)
-        .subquery()
-    )
-    rows = db.execute(
-        select(GmailMessageAnalysisRecord.match_type, GmailMessageAnalysisRecord.matched_job_id)
-        .where(GmailMessageAnalysisRecord.id.in_(select(latest_id_per_message.c.latest_id)))
         .order_by(GmailMessageAnalysisRecord.id.desc())
         .limit(limit)
     ).all()
@@ -361,8 +383,9 @@ def get_latest_analysis_for_message(
     """The most recent analysis revision for one message — GET
     /gmail/messages/{id}/analysis. Account-scoped (GMAIL-002-style
     isolation, consistent with every other Gmail read in this project).
-    Ordered by `id` (insertion order — this table is INSERT-only), the
-    same "latest" rule `get_thread_prior_matches` uses (7B-005).
+    Ordered by (`analysis_version` DESC, `id` DESC) — version-aware
+    (round 2, LOW 2), the same "latest" rule `get_thread_prior_matches`
+    uses via `_latest_id_subquery` (7B-005 + LOW 2).
     """
     return db.scalar(
         select(GmailMessageAnalysisRecord)
@@ -370,7 +393,9 @@ def get_latest_analysis_for_message(
             GmailMessageAnalysisRecord.gmail_message_id == gmail_message_id,
             GmailMessageAnalysisRecord.account_key == account_key,
         )
-        .order_by(GmailMessageAnalysisRecord.id.desc())
+        .order_by(
+            GmailMessageAnalysisRecord.analysis_version.desc(), GmailMessageAnalysisRecord.id.desc()
+        )
         .limit(1)
     )
 

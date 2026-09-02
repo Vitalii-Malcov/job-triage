@@ -45,6 +45,60 @@ class JobRecord(Base):
     )
 
 
+class JobReferenceTokenRecord(Base):
+    """Normalized job/application reference tokens for exact-equality
+    lookup (Stage 7B Codex remediation round 2, Blocker 3).
+
+    **Why this table exists.** Stage 7B's `get_job_candidates` used to
+    fall back to a `LIKE '%token%'` substring query over `jobs.url`/
+    `jobs.title` when a bounded recency scan missed a JobRecord matching
+    an email's explicit reference. A Codex review reproduced that with
+    enough OTHER jobs whose url/title happened to substring-contain
+    pieces of the searched token, that broad recall query's own
+    `REFERENCE_TARGETED_SCAN_LIMIT` cap filled up with false partial
+    collisions before the real exact match was ever retrieved — a larger
+    LIMIT only moves the same bug further out. This table replaces
+    substring recall with real indexed EQUALITY: tokens are extracted
+    deterministically (same `extract_reference_tokens` function used for
+    email-side extraction — see app/services/email_matching.py) once, at
+    write time, and an email's own extracted tokens are looked up via
+    `token IN (...)` — an index scan whose result size depends only on
+    how many jobs genuinely share that exact token (normally 0 or 1),
+    never on how many OTHER unrelated jobs happen to exist in the table.
+
+    **Synchronization.** Tokens are (re)computed in exactly one place —
+    `app.db.repositories.sync_job_reference_tokens` — called from
+    `upsert_job` after every JobRecord create/update, so this table can
+    never drift from the `JobRecord.title`/`JobRecord.url` it was derived
+    from. Never written to from any other call site.
+
+    `UNIQUE(job_id, token)` prevents duplicate rows on re-sync (delete +
+    reinsert, not update-in-place — there is no meaningful "identity" for
+    one token row beyond the (job_id, token) pair itself). Plain
+    `INDEX(token)` (not unique) is the actual query-performance target:
+    two different jobs CAN legitimately share one token (e.g. a reused
+    generic reference format), which is exactly the case
+    `get_job_candidates` must still surface as multiple candidates for
+    `match_email_to_job`'s own AMBIGUOUS handling — this table only
+    guarantees FAST exact lookup, never uniqueness of the token itself
+    across jobs.
+    """
+
+    __tablename__ = "job_reference_tokens"
+    __table_args__ = (
+        UniqueConstraint("job_id", "token", name="uq_job_reference_tokens_job_token"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class UserProfile(Base):
     __tablename__ = "user_profiles"
 

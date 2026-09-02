@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from urllib.parse import urlsplit
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,7 @@ from app.db.models import (
     CompanyResearchIdentityAlias,
     CompanyResearchRecord,
     JobRecord,
+    JobReferenceTokenRecord,
     ProcessedEmailMessage,
     UserProfile,
 )
@@ -21,6 +22,7 @@ from app.domain.status_transitions import validate_transition
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchData
 from app.models.job import Job, JobScore
+from app.services.email_matching import extract_reference_tokens
 
 DEFAULT_PROFILE_SKILLS = [
     "python",
@@ -84,6 +86,28 @@ def profile_skills(profile: UserProfile) -> set[str]:
     return set(json.loads(profile.skills_json))
 
 
+def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
+    """The ONE place `job_reference_tokens` is written (Stage 7B Codex
+    remediation round 2, Blocker 3) — see `JobReferenceTokenRecord`'s own
+    docstring for the exact-lookup rationale. Called from `upsert_job`
+    after every create/update so this table can never drift from
+    `record.title`/`record.url`. Idempotent no-op when the derived token
+    set hasn't changed (delete+reinsert only on an actual difference).
+    """
+    tokens = extract_reference_tokens(record.title, record.url)
+    existing_tokens = set(
+        db.scalars(
+            select(JobReferenceTokenRecord.token).where(JobReferenceTokenRecord.job_id == record.id)
+        ).all()
+    )
+    if tokens == existing_tokens:
+        return
+    db.execute(delete(JobReferenceTokenRecord).where(JobReferenceTokenRecord.job_id == record.id))
+    for token in tokens:
+        db.add(JobReferenceTokenRecord(job_id=record.id, token=token))
+    db.commit()
+
+
 def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
     fingerprint = _fingerprint(job)
     existing = get_job_by_fingerprint(db, job)
@@ -101,6 +125,7 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
             existing.description = job.description
         db.commit()
         db.refresh(existing)
+        sync_job_reference_tokens(db, existing)
         return existing, False
 
     record = JobRecord(
@@ -125,6 +150,7 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
     db.add(record)
     db.commit()
     db.refresh(record)
+    sync_job_reference_tokens(db, record)
     return record, True
 
 
