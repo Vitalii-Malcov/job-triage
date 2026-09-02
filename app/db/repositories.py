@@ -93,6 +93,16 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
     after every create/update so this table can never drift from
     `record.title`/`record.url`. Idempotent no-op when the derived token
     set hasn't changed (delete+reinsert only on an actual difference).
+
+    **Round 3 (Blocker R3-001): this helper does NOT own commit/rollback.**
+    It only mutates the current `Session` (SELECT existing tokens, DELETE
+    stale ones, add new ones, flush) so it can be composed into the SAME
+    transaction as the `JobRecord` write it derives from. A Codex review
+    reproduced the previous version (which committed here, separately from
+    `upsert_job`'s own commit) leaving a durable `JobRecord` with an empty
+    `job_reference_tokens` after an injected failure mid-token-write — two
+    commits meant two chances to half-apply. The caller (`upsert_job`) owns
+    the single commit/rollback boundary for both writes together.
     """
     tokens = extract_reference_tokens(record.title, record.url)
     existing_tokens = set(
@@ -105,7 +115,28 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
     db.execute(delete(JobReferenceTokenRecord).where(JobReferenceTokenRecord.job_id == record.id))
     for token in tokens:
         db.add(JobReferenceTokenRecord(job_id=record.id, token=token))
+    db.flush()
+
+
+def _finalize_job_write(db: Session, record: JobRecord) -> JobRecord:
+    """Single transaction boundary for a `JobRecord` write and its derived
+    `job_reference_tokens` sync (Stage 7B Codex remediation round 3,
+    Blocker R3-001) — flushes the already-staged `JobRecord` mutation,
+    syncs reference tokens in the SAME uncommitted transaction, then
+    commits ONCE. Any token-sync failure rolls back so neither the
+    `JobRecord` mutation nor the token mutation becomes durable — the
+    derived-data invariant (job_reference_tokens always reflects the
+    committed JobRecord) can never observe a half-applied state.
+    """
+    db.flush()
+    try:
+        sync_job_reference_tokens(db, record)
+    except Exception:
+        db.rollback()
+        raise
     db.commit()
+    db.refresh(record)
+    return record
 
 
 def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
@@ -123,9 +154,7 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         existing.nice_to_have_skills_json = json.dumps(job.nice_to_have_skills)
         if job.description.strip():
             existing.description = job.description
-        db.commit()
-        db.refresh(existing)
-        sync_job_reference_tokens(db, existing)
+        _finalize_job_write(db, existing)
         return existing, False
 
     record = JobRecord(
@@ -148,9 +177,7 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         last_seen_at=now,
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
-    sync_job_reference_tokens(db, record)
+    _finalize_job_write(db, record)
     return record, True
 
 

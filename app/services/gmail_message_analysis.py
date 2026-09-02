@@ -28,6 +28,23 @@ purely an informational signal that this reading had strong deterministic
 evidence. Every consequential classification (OFFER, INTERVIEW_*,
 REJECTION, WITHDRAWAL_OR_POSITION_CLOSED) is force-flagged regardless of
 confidence — see `determine_requires_human_review`.
+
+**Round 3 (Blocker R3-002): semantic match confidence is NOT
+correspondence trust.** A Codex review reproduced an attacker-controlled
+email body — a valid `Referenz-Nr:` plus copied "Vielen Dank für Ihre
+Bewerbung" acknowledgement text — resolving to `APPLICATION_RECEIVED` /
+`HIGH` match confidence / `HIGH` classification confidence with
+`requires_human_review=False`. Stage 7A has NO SPF/DKIM/DMARC/
+Authentication-Results evidence anywhere in this pipeline (see
+`app.services.email_matching`'s own module docstring on thread trust for
+the same point) — `from_address`, subject, and body are all
+attacker-controlled, unauthenticated strings. A deterministic matcher
+finding strong TEXTUAL evidence that an email is "about" a tracked job
+says nothing about who actually sent it. `determine_requires_human_review`
+therefore now requires review for every message this pipeline associates
+with ANY tracked job/application (`match_type != "UNMATCHED"`), regardless
+of how confidently it was classified — see that function's own docstring
+for the exact, narrow case where `False` is still returned.
 """
 
 import hashlib
@@ -59,6 +76,19 @@ ANALYSIS_VERSION = 1
 # be confused with a field's own content when concatenated for hashing.
 _FINGERPRINT_FIELD_SEPARATOR = "\x1f"
 
+# Round 3 (Blocker R3-002): every classification with a real job/application
+# consequence always requires review, regardless of confidence —
+# CONSEQUENTIAL_CLASSIFICATIONS plus APPLICATION_RECEIVED, which a Codex
+# review reproduced as the exploited gap (see module docstring). Not
+# included: AUTOMATED_NOTIFICATION and UNKNOWN — both are still forced to
+# require review whenever the message is associated with a tracked job at
+# all, via `determine_requires_human_review`'s own `match_type !=
+# "UNMATCHED"` check; only an UNMATCHED + UNKNOWN message (no job
+# association AND no recognized actionable phrase) can ever return False.
+_ALWAYS_REVIEW_CLASSIFICATIONS: frozenset[str] = CONSEQUENTIAL_CLASSIFICATIONS | frozenset(
+    {"APPLICATION_RECEIVED"}
+)
+
 
 class GmailMessageNotFoundError(Exception):
     """Raised by `analyze_gmail_message` when no `gmail_messages` row
@@ -87,19 +117,40 @@ def determine_requires_human_review(
     classification_confidence: str,
 ) -> bool:
     """Safe-by-default human-review gate (spec "HUMAN REVIEW FLAG"
-    section) — True unless the match is decisive AND non-consequential:
+    section, hardened by Round 3 Blocker R3-002 — see module docstring).
+
+    **`requires_human_review=False` exact semantics.** It means, and ONLY
+    means: this message could not be associated with any tracked
+    job/application AND contains no recognized actionable phrase — i.e.
+    it is irrelevant noise as far as this pipeline can tell. It never
+    means "the sender is trusted", "safe to act on", or "safe to ignore".
+    Classification/match confidence may inform DISPLAY PRIORITY once a
+    human is looking at flagged mail; they are never authorization to
+    suppress review for correspondence this pipeline believes concerns a
+    real job or application.
+
+    Ordered checks:
 
     - `AMBIGUOUS` matches always require review (no arbitrary winner).
     - Either confidence dimension being LOW always requires review.
     - A consequential classification (OFFER/INTERVIEW_*/REJECTION/
-      WITHDRAWAL_OR_POSITION_CLOSED/OTHER — see
-      app.agents.email_classifier.CONSEQUENTIAL_CLASSIFICATIONS) always
-      requires review, regardless of confidence — "consequential
-      correspondence should remain visible to the user even if
-      confidence is high".
+      WITHDRAWAL_OR_POSITION_CLOSED/REQUEST_FOR_INFORMATION/
+      GENERAL_RECRUITER_MESSAGE/APPLICATION_RECEIVED/OTHER — see
+      `_ALWAYS_REVIEW_CLASSIFICATIONS`) always requires review, regardless
+      of confidence.
+    - Any message associated with a tracked job/application at all
+      (`match_type != "UNMATCHED"`) always requires review (R3-002): this
+      pipeline has no cryptographic sender authentication, so a confident
+      SEMANTIC match is never grounds to treat inbound correspondence
+      about that job/application as safe to leave unreviewed —
+      classification may still determine priority once reviewed, never
+      whether review happens at all.
     - `UNMATCHED` with any classification other than UNKNOWN (i.e. an
       "actionable" classification with nowhere to route it) requires
       review.
+    - Otherwise (UNMATCHED + UNKNOWN, i.e. no job/application association
+      AND no recognized actionable phrase — genuinely non-actionable,
+      no-consequence noise): review is not required.
     """
     if match_type == "AMBIGUOUS":
         return True
@@ -107,9 +158,11 @@ def determine_requires_human_review(
         return True
     if classification_confidence == "LOW":
         return True
-    if classification in CONSEQUENTIAL_CLASSIFICATIONS:
+    if classification in _ALWAYS_REVIEW_CLASSIFICATIONS:
         return True
-    if match_type == "UNMATCHED" and classification != "UNKNOWN":
+    if match_type != "UNMATCHED":
+        return True
+    if classification != "UNKNOWN":
         return True
     return False
 

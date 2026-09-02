@@ -6,6 +6,7 @@ from app.services.email_matching import (
     JobCandidate,
     ThreadPriorMatch,
     extract_company_domain,
+    extract_reference_tokens,
     extract_sender_domain,
     match_email_to_job,
     normalize_company_name,
@@ -560,6 +561,120 @@ def test_date_like_number_is_not_treated_as_job_reference():
         thread_prior_matches=[],
     )
     assert result.match_type == "UNMATCHED"
+
+
+# ---------------------------------------------------------------------------
+# Round 3, Blocker R3-004: a real reference label must have a complete
+# label boundary + a real separator before its value — the old pattern
+# let the bare "ref" alternative match as a PREFIX of ordinary words
+# ("reference") and swallow the rest of that word as a fabricated token
+# ("ERENCE"). See app.services.email_matching's _REFERENCE_PATTERN
+# comment for the exact mechanism of the fix.
+# ---------------------------------------------------------------------------
+
+
+def test_no_reference_produces_zero_tokens():
+    assert extract_reference_tokens("No reference", "") == frozenset()
+
+
+def test_reference_unavailable_produces_zero_tokens():
+    assert extract_reference_tokens("Reference unavailable", "") == frozenset()
+
+
+def test_no_job_reference_produces_zero_tokens():
+    assert extract_reference_tokens("No job reference", "") == frozenset()
+
+
+def test_conference_produces_zero_tokens():
+    assert extract_reference_tokens("conference", "") == frozenset()
+
+
+def test_preference_produces_zero_tokens():
+    assert extract_reference_tokens("preference", "") == frozenset()
+
+
+def test_difference_produces_zero_tokens():
+    assert extract_reference_tokens("difference", "") == frozenset()
+
+
+def test_referencecheck_produces_zero_tokens():
+    assert extract_reference_tokens("referencecheck", "") == frozenset()
+
+
+def test_nonreference_produces_zero_tokens():
+    assert extract_reference_tokens("nonreference", "") == frozenset()
+
+
+def test_preferencenumber_produces_zero_tokens():
+    assert extract_reference_tokens("preferencenumber", "") == frozenset()
+
+
+def test_jobidentification_produces_zero_tokens():
+    assert extract_reference_tokens("JOBIDENTIFICATION", "") == frozenset()
+
+
+def test_ordinary_number_and_date_and_phone_produce_zero_tokens_from_prose():
+    assert extract_reference_tokens("2026", "") == frozenset()
+    assert extract_reference_tokens("60311", "") == frozenset()
+    assert extract_reference_tokens("+49 30 1234567", "") == frozenset()
+
+
+def test_job_id_colon_space_variant_parses():
+    assert extract_reference_tokens("Job-ID: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_job_id_space_only_variant_parses():
+    assert extract_reference_tokens("Job ID: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_job_id_no_colon_variant_parses():
+    assert extract_reference_tokens("Job-ID ABC123", "") == frozenset({"ABC123"})
+
+
+def test_referenz_nr_variant_parses():
+    assert extract_reference_tokens("Referenz-Nr: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_referenznummer_variant_parses():
+    assert extract_reference_tokens("Referenznummer: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_stellen_nr_with_dot_variant_parses():
+    assert extract_reference_tokens("Stellen-Nr.: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_stellen_nr_without_dot_variant_parses():
+    assert extract_reference_tokens("Stellen-Nr: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_kennziffer_variant_parses():
+    assert extract_reference_tokens("Kennziffer: ABC123", "") == frozenset({"ABC123"})
+
+
+def test_url_path_extraction_still_works_after_r3_004_fix():
+    assert extract_reference_tokens("", "https://x.example.com/jobs/12345") == frozenset({"12345"})
+    assert extract_reference_tokens("", "https://x.example.com/jobs/ABC123") == frozenset(
+        {"ABC123"}
+    )
+
+
+def test_job_id_erence_does_not_match_unrelated_no_reference_job():
+    """R3-004 end-to-end regression: a job whose title/url would previously
+    have backfilled a false "ERENCE" token (from "No reference") must never
+    be matched by an attacker email containing "Job-ID: ERENCE" — the fixed
+    parser extracts zero tokens from "No reference" in the first place, so
+    no such token exists to collide with.
+    """
+    unrelated_job = _job(1, "No reference", "Unrelated Co", url="https://jobs.example/roles/999")
+    result = match_email_to_job(
+        subject="Following up",
+        body_plain="Job-ID: ERENCE",
+        from_address="attacker@evil.example",
+        job_candidates=[unrelated_job],
+        thread_prior_matches=[],
+    )
+    assert result.matched_job_id != unrelated_job.job_id
+    assert result.match_type in ("UNMATCHED", "AMBIGUOUS")
 
 
 # ---------------------------------------------------------------------------

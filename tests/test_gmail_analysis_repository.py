@@ -424,13 +424,157 @@ def test_determine_requires_human_review_matches_spec_bullets():
         classification="INTERVIEW_INVITATION",
         classification_confidence="HIGH",
     )
-    # Clean, non-consequential, well-matched case does not force review
-    assert not determine_requires_human_review(
+    # Round 3 (Blocker R3-002): a confident match to a real job/application
+    # is NOT correspondence trust — no SPF/DKIM/DMARC evidence exists
+    # anywhere in this pipeline, so APPLICATION_RECEIVED at HIGH/HIGH still
+    # requires review (this was the exact combination Codex reproduced as
+    # an unsafe bypass — see module docstring).
+    assert determine_requires_human_review(
         match_type="APPLICATION",
         match_confidence="HIGH",
         classification="APPLICATION_RECEIVED",
         classification_confidence="HIGH",
     )
+    # Any match to a tracked job/application at all forces review,
+    # regardless of classification — including AUTOMATED_NOTIFICATION,
+    # which the conservative personal-agent policy never lets suppress
+    # review once a job/application association exists.
+    assert determine_requires_human_review(
+        match_type="JOB_ONLY",
+        match_confidence="HIGH",
+        classification="AUTOMATED_NOTIFICATION",
+        classification_confidence="MEDIUM",
+    )
+    # The only remaining False path: no job/application association AND
+    # no recognized actionable phrase — genuinely non-actionable noise.
+    assert not determine_requires_human_review(
+        match_type="UNMATCHED",
+        match_confidence="MEDIUM",
+        classification="UNKNOWN",
+        classification_confidence="MEDIUM",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 3, Blocker R3-002: quoted/unauthenticated content must not bypass
+# human review merely because it semantically matches a tracked job at
+# HIGH confidence. See app.services.gmail_message_analysis's module
+# docstring for the Codex-reproduced exploit this closes.
+# ---------------------------------------------------------------------------
+
+
+def _job_with_synced_reference_token(db, *, fingerprint, url):
+    job = JobRecord(
+        fingerprint=fingerprint,
+        source="test",
+        title="Backend Engineer",
+        company="TrustedCo",
+        location="Berlin",
+        url=url,
+        description="",
+        score=1,
+        recommendation="APPLY",
+        status="APPLIED",
+    )
+    db.add(job)
+    db.commit()
+    from app.db.repositories import sync_job_reference_tokens
+
+    sync_job_reference_tokens(db, job)
+    db.commit()
+    return job
+
+
+def test_r3_002_attacker_reference_plus_acknowledgement_still_requires_review(db):
+    job = _job_with_synced_reference_token(
+        db, fingerprint="r3-002-job1001", url="https://trustedco.example.com/jobs/JOB1001"
+    )
+
+    msg, _ = upsert_message(
+        db,
+        _parsed(
+            uid=901,
+            message_id="<r3-002-a@example.com>",
+            from_address="attacker@evil.example",
+            subject="Re: your application",
+            body_plain="Referenz-Nr: JOB1001\nVielen Dank für Ihre Bewerbung",
+        ),
+    )
+
+    record, _created = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+
+    assert record.match_type in ("APPLICATION", "JOB_ONLY")
+    assert record.matched_job_id == job.id
+    assert record.classification == "APPLICATION_RECEIVED"
+    assert record.requires_human_review is True
+
+
+def test_r3_002_job_id_label_variant_still_requires_review(db):
+    job = _job_with_synced_reference_token(
+        db, fingerprint="r3-002-job1002", url="https://trustedco.example.com/jobs/JOB1002"
+    )
+
+    msg, _ = upsert_message(
+        db,
+        _parsed(
+            uid=902,
+            message_id="<r3-002-b@example.com>",
+            from_address="attacker@evil.example",
+            subject="Re: your application",
+            body_plain="Job-ID: JOB1002\nVielen Dank für Ihre Bewerbung",
+        ),
+    )
+
+    record, _created = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+
+    assert record.matched_job_id == job.id
+    assert record.classification == "APPLICATION_RECEIVED"
+    assert record.requires_human_review is True
+
+
+def test_r3_002_quoted_reference_and_acknowledgement_still_requires_review(db):
+    job = _job_with_synced_reference_token(
+        db, fingerprint="r3-002-job1003", url="https://trustedco.example.com/jobs/JOB1003"
+    )
+
+    msg, _ = upsert_message(
+        db,
+        _parsed(
+            uid=903,
+            message_id="<r3-002-c@example.com>",
+            from_address="attacker@evil.example",
+            subject="Re: your application",
+            body_plain="> Referenz-Nr: JOB1003\n> Vielen Dank für Ihre Bewerbung",
+        ),
+    )
+
+    record, _created = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+
+    assert record.matched_job_id == job.id
+    assert record.classification == "APPLICATION_RECEIVED"
+    assert record.requires_human_review is True
+
+
+def test_r3_002_legitimate_looking_sender_without_authentication_still_requires_review(db):
+    job = _job_with_synced_reference_token(
+        db, fingerprint="r3-002-job1004", url="https://trustedco.example.com/jobs/JOB1004"
+    )
+
+    msg, _ = upsert_message(
+        db,
+        _parsed(
+            uid=904,
+            message_id="<r3-002-d@example.com>",
+            from_address="hr@trustedco.example",
+            subject="Re: your application",
+            body_plain="Job-ID: JOB1004\nVielen Dank für Ihre Bewerbung",
+        ),
+    )
+
+    record, _created = analyze_gmail_message(db, ACCOUNT_A, msg.id)
+
+    assert record.matched_job_id == job.id
+    assert record.requires_human_review is True
 
 
 def test_analysis_version_constant_is_positive():

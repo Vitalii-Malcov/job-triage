@@ -12,11 +12,26 @@ and app.db.repositories.sync_job_reference_tokens for the full rationale
 and the single write path.
 
 **Backfill.** Existing `JobRecord` rows are backfilled by computing
-tokens with the SAME `extract_reference_tokens` function used for
-email-side extraction (app.services.email_matching) — no job needs to be
-manually reimported. Purely additive/derived data; if this migration is
-ever re-run against the same `jobs` data it recomputes identical tokens
-(deterministic function, no randomness).
+tokens with a extraction routine DUPLICATED (not imported) from
+`app.services.email_matching.extract_reference_tokens` as it existed at
+this revision — see `_extract_reference_tokens` below and Round 3
+(Blocker R3-003)'s note on why. Purely additive/derived data; if this
+migration is ever re-run against the same `jobs` data it recomputes
+identical tokens (deterministic function, no randomness).
+
+**Round 3 (Blocker R3-003): this migration must not import mutable
+runtime business code.** An earlier version of this file imported
+`app.services.email_matching.extract_reference_tokens` directly inside
+`upgrade()`. A Codex review flagged this as unsafe for an immutable
+historical migration: a future change to that runtime module's matching
+logic (a bug fix, a behavior change, or even just a rename/refactor)
+would silently change what a REPLAY of this already-shipped migration
+produces, or break the replay outright. Migrations must stay
+self-contained and deterministic forever, independent of how the live
+application evolves. The small extraction routine this backfill needs is
+therefore duplicated verbatim (as of this revision) below, using only
+stable infrastructure (`re`, stdlib) — never `app.services.*` or any
+other mutable application import.
 
 **Downgrade still runs e6ccb9b4271b/7058c097a542's account-scope
 preflight first anyway (duplicated here — same GMAIL-013 rationale as
@@ -33,6 +48,7 @@ Create Date: 2026-09-02
 
 """
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
@@ -45,6 +61,58 @@ revision: str = "805108385946"
 down_revision: str | Sequence[str] | None = "847b7f5c87d8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Self-contained reference-token extraction (Round 3, Blocker R3-003).
+#
+# This logic intentionally duplicates the Stage 7B reference-token
+# extraction semantics as of revision 805108385946 so historical migration
+# replay remains deterministic if runtime code later changes. Do NOT import
+# app.services.email_matching (or any other app.* module) here — see the
+# module docstring above for the full rationale. Keep this block a
+# self-contained, frozen snapshot; if the runtime extraction semantics
+# change later, that is a NEW behavior for NEW code, not a retroactive
+# change to what this migration computed when it ran.
+# ---------------------------------------------------------------------------
+
+_MAX_REFERENCE_TOKENS = 10
+
+_REFERENCE_PATTERN = re.compile(
+    r"\b(?:referenz(?:nummer)?|kennziffer|ref(?:erenz)?(?:[-\s]?nr\.?)?|job[-\s]?id|"
+    r"stellen[-\s]?(?:nr\.?|id)|vacancy[-\s]?id|requisition[-\s]?id)"
+    r"[:\s#]+([A-Za-z0-9][A-Za-z0-9\-/]{2,19})",
+    re.IGNORECASE,
+)
+_URL_ID_PATTERN = re.compile(r"/([A-Za-z0-9][A-Za-z0-9\-]{2,19})(?=[/?]|$)")
+_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[\w.\-/?=&%]*)?", re.IGNORECASE
+)
+
+
+def _extract_url_ids(url_text: str) -> set[str]:
+    return {
+        match.group(1).upper()
+        for match in _URL_ID_PATTERN.finditer(url_text)
+        if any(char.isdigit() for char in match.group(1))
+    }
+
+
+def _extract_urls(text: str) -> list[str]:
+    return _URL_PATTERN.findall(text)[:_MAX_REFERENCE_TOKENS]
+
+
+def _extract_reference_tokens(text: str, url: str = "") -> frozenset[str]:
+    """Frozen duplicate of `app.services.email_matching.extract_reference_tokens`
+    as of revision 805108385946 — see module docstring and the block
+    comment above for why this is duplicated rather than imported.
+    """
+    tokens = {match.group(1).upper() for match in _REFERENCE_PATTERN.finditer(text)}
+    for found_url in _extract_urls(text):
+        tokens.update(_extract_url_ids(found_url))
+    if url:
+        tokens.update(_extract_url_ids(url))
+    return frozenset(sorted(tokens)[:_MAX_REFERENCE_TOKENS])
 
 
 class GmailAccountScopeDowngradeConflict(RuntimeError):
@@ -125,17 +193,18 @@ def upgrade() -> None:
         op.f("ix_job_reference_tokens_token"), "job_reference_tokens", ["token"], unique=False
     )
 
-    # Backfill: derive tokens for every existing JobRecord using the same
-    # deterministic extraction function email-side matching uses.
-    from app.services.email_matching import extract_reference_tokens
-
+    # Backfill: derive tokens for every existing JobRecord using this
+    # migration's own self-contained `_extract_reference_tokens` (Round 3,
+    # Blocker R3-003) — never the runtime `app.services.email_matching`
+    # module, see this file's module docstring and the block comment above
+    # `_extract_reference_tokens`.
     connection = op.get_bind()
     existing_jobs = connection.execute(sa.text("SELECT id, title, url FROM jobs")).fetchall()
     now = datetime.now(UTC)
     rows_to_insert = [
         {"job_id": job_id, "token": token, "created_at": now}
         for job_id, title, url in existing_jobs
-        for token in extract_reference_tokens(title or "", url or "")
+        for token in _extract_reference_tokens(title or "", url or "")
     ]
     if rows_to_insert:
         job_reference_tokens_table = sa.table(

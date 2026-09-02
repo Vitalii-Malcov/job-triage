@@ -1646,3 +1646,178 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert _alembic_current_revision(engine) == "805108385946"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
+
+
+# ---------------------------------------------------------------------------
+# Round 3 remediation: R3-003 (migration must not import mutable runtime
+# business code) and R3-004 (false "ERENCE" reference token from "No
+# reference").
+# ---------------------------------------------------------------------------
+
+
+def _load_job_reference_tokens_migration_module():
+    """Loads `805108385946_job_reference_tokens.py` as a standalone module
+    by file path (its filename isn't a valid dotted import path) so tests
+    can exercise its self-contained `_extract_reference_tokens` directly —
+    used to prove migration/runtime extraction parity (R3-003's
+    "MIGRATION BACKFILL CONSISTENCY" requirement) without ever importing
+    it FROM the migration file itself (that's the exact thing R3-003
+    forbids the other direction).
+    """
+    import importlib.util
+
+    path = PROJECT_ROOT / "alembic" / "versions" / "805108385946_job_reference_tokens.py"
+    spec = importlib.util.spec_from_file_location("_migration_805108385946", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_job_reference_tokens_migration_does_not_import_runtime_matching_module() -> None:
+    """R3-003: the migration file must never contain an `import`/`from`
+    statement referencing `app.*` (mentioning the module NAME in prose,
+    to explain why it's deliberately not imported, is fine and expected)
+    — it must be self-contained, using only stable infrastructure
+    (alembic, sqlalchemy, stdlib).
+    """
+    import ast
+
+    path = PROJECT_ROOT / "alembic" / "versions" / "805108385946_job_reference_tokens.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported_modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.append(node.module)
+
+    assert not any(name == "app" or name.startswith("app.") for name in imported_modules), (
+        f"migration must not import runtime app.* code, found: {imported_modules}"
+    )
+
+
+def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R3-003 required replay test: even if the RUNTIME extractor
+    (`app.services.email_matching.extract_reference_tokens`) is broken,
+    the migration's own backfill must still succeed — proving it never
+    actually depends on that runtime function at all.
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("runtime extractor is broken (simulated)")
+
+    monkeypatch.setattr("app.services.email_matching.extract_reference_tokens", _boom)
+
+    db_path = tmp_path / "migrations_job_reference_tokens_runtime_broken.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "847b7f5c87d8")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'runtime-broken-fp', 'test', 'Job-ID: ABC123', 'Acme GmbH', 'Berlin',
+                    'https://acme.example.com/jobs/482173', '', '[]', 80, 'APPLY', 'NEW',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    # Must NOT raise, despite the runtime extractor being broken above.
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == "805108385946"
+
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
+    tokens = {token for (token,) in rows}
+    assert "ABC123" in tokens
+    assert "482173" in tokens
+
+
+def test_job_reference_tokens_backfill_produces_zero_tokens_for_no_reference(
+    tmp_path: Path,
+) -> None:
+    """R3-004: the migration backfill must agree with the fixed parser —
+    a job titled literally "No reference" must never backfill a false
+    "ERENCE" token.
+    """
+    db_path = tmp_path / "migrations_job_reference_tokens_no_reference.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "847b7f5c87d8")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO jobs (
+                    fingerprint, source, title, company, location, url, description,
+                    skills_json, score, recommendation, status, first_seen_at, last_seen_at
+                ) VALUES (
+                    'no-reference-fp', 'test', 'No reference', 'Acme GmbH', 'Berlin',
+                    'https://acme.example.com/jobs', '', '[]', 80, 'APPLY', 'NEW',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    upgrade(cfg, "head")
+
+    with engine.connect() as connection:
+        job_id = connection.execute(
+            text("SELECT id FROM jobs WHERE fingerprint = 'no-reference-fp'")
+        ).scalar_one()
+        rows = connection.execute(
+            text("SELECT token FROM job_reference_tokens WHERE job_id = :job_id"),
+            {"job_id": job_id},
+        ).fetchall()
+    assert rows == []
+
+
+def test_job_reference_tokens_migration_local_extractor_matches_runtime_on_corpus() -> None:
+    """R3-003's "MIGRATION BACKFILL CONSISTENCY" requirement: the
+    migration-local `_extract_reference_tokens` and the runtime
+    `app.services.email_matching.extract_reference_tokens` must produce
+    IDENTICAL results across a corpus covering every Stage 7B-supported
+    case, so the self-contained duplication in the migration (R3-003)
+    hasn't silently drifted from the runtime semantics it was frozen from.
+    """
+    from app.services.email_matching import extract_reference_tokens as runtime_extract
+
+    migration_module = _load_job_reference_tokens_migration_module()
+    migration_extract = migration_module._extract_reference_tokens
+
+    corpus = [
+        ("", "https://acme.example.com/jobs/12345"),  # valid numeric path
+        ("", "https://acme.example.com/jobs/ABC123"),  # valid alphanumeric path
+        ("Job-ID: ABC123", ""),  # valid labelled reference
+        ("No reference", ""),  # invalid normal prose
+        ("conference", ""),
+        ("preference", ""),
+        ("referencecheck", ""),
+        ("Referenznummer: XYZ999", ""),
+        ("Stellen-Nr.: QRS777", ""),
+        ("Kennziffer: 42424242", ""),
+        (
+            "Job-ID: ABC123 and also Referenz-Nr: ABC123 again",
+            "",
+        ),  # duplicates collapse to one token
+        (
+            "Job-ID: ABC123, Referenz-Nr: XYZ999, see https://acme.example.com/jobs/12345",
+            "https://acme.example.com/jobs/12345",
+        ),  # multiple valid tokens across text + url
+    ]
+
+    for text_value, url_value in corpus:
+        assert migration_extract(text_value, url_value) == runtime_extract(text_value, url_value), (
+            f"mismatch for text={text_value!r} url={url_value!r}"
+        )

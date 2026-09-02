@@ -211,10 +211,36 @@ _LEGAL_SUFFIX_PATTERN = re.compile(
 )
 _WORD_PATTERN = re.compile(r"[a-zA-ZäöüÄÖÜß0-9+#.]+")
 
+# Round 3 (Blocker R3-004): a Codex review reproduced "No reference"
+# extracting a false token "ERENCE" — the bare "ref" alternative (meant to
+# catch short forms like "Ref: ABC123") matched the "ref" PREFIX of the
+# ordinary English word "reference", and the old trailing `[:\s#]*` (ZERO
+# or more separator characters) then let the capture group swallow the
+# rest of that same word ("erence") as if it were the reference value,
+# with nothing requiring an actual label/value boundary between them.
+# Fixed two ways:
+#   1. `[:\s#]*` -> `[:\s#]+` — a real reference label is ALWAYS followed
+#      by at least one separator character (colon, whitespace, or "#")
+#      before its value in every supported format ("Job-ID: X", "Job ID
+#      X", "Kennziffer: X", ...). Requiring at least one forces the
+#      match to fail on a label that's actually a prefix of a longer
+#      ordinary word ("reference", "referencecheck", "JOBIDENTIFICATION")
+#      immediately followed by more letters, not a separator — the
+#      regex engine backtracks through the alternation (Python `re` is a
+#      backtracking engine) to find a differently-bounded label match if
+#      one exists, and fails outright if none does.
+#   2. `referenz` -> `referenz(?:nummer)?` — explicitly recognizes
+#      "Referenznummer" as its own complete label (rather than relying on
+#      "referenz" matching as a prefix, which requirement (1) above would
+#      now correctly reject, since "nummer" isn't a separator).
+# "preference"/"difference"/"conference" were already excluded by the
+# leading `\b` (none of them have a word boundary immediately before a
+# "ref" substring); this fix closes the remaining prefix-swallowing gap
+# for words that DO start at a word boundary with "ref"/"referenz".
 _REFERENCE_PATTERN = re.compile(
-    r"\b(?:referenz|kennziffer|ref(?:erenz)?(?:[-\s]?nr\.?)?|job[-\s]?id|"
+    r"\b(?:referenz(?:nummer)?|kennziffer|ref(?:erenz)?(?:[-\s]?nr\.?)?|job[-\s]?id|"
     r"stellen[-\s]?(?:nr\.?|id)|vacancy[-\s]?id|requisition[-\s]?id)"
-    r"[:\s#]*([A-Za-z0-9][A-Za-z0-9\-/]{2,19})",
+    r"[:\s#]+([A-Za-z0-9][A-Za-z0-9\-/]{2,19})",
     re.IGNORECASE,
 )
 # Path-segment ID pattern — alphanumeric (not numeric-only: real-world
