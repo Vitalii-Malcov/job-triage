@@ -259,6 +259,33 @@ def enforce_gmail_analysis_rate_limit(request: Request) -> None:
         bucket.append(now)
 
 
+# Separate bucket for Stage 7C response-draft generation: like the Stage
+# 7B analysis bucket above, this is pure local computation (deterministic
+# template lookup, zero network calls) with a DB write on cache miss —
+# sized identically to GMAIL_ANALYSIS_RATE_LIMIT rather than the
+# stricter network-bound buckets (XING/Gmail sync/Bewerbung).
+_response_draft_requests: dict[str, deque[float]] = defaultdict(deque)
+RESPONSE_DRAFT_RATE_LIMIT_REQUESTS = 30
+RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_response_draft_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _response_draft_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= RESPONSE_DRAFT_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Response draft rate limit exceeded",
+            )
+        bucket.append(now)
+
+
 def enforce_review_write_rate_limit(request: Request) -> None:
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()
