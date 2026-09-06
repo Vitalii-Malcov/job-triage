@@ -971,6 +971,201 @@ class ResponseDraftSendRecord(Base):
     )
 
 
+class FollowUpProposalRecord(Base):
+    """An immutable, auditable Stage 7E follow-up PROPOSAL for one tracked
+    `JobRecord` — see app/services/follow_up.py for the eligibility engine
+    and app/agents/follow_up_generator.py for the deterministic,
+    template-based content generation.
+
+    **INFORMATION ONLY — a stored suggestion, never an action.** Creating
+    a row here never sends email, never mutates `JobRecord.status`, and
+    never mutates mailbox state — same hard boundary as
+    `ResponseDraftRecord` (see that model's docstring), applied to a
+    candidate-initiated follow-up instead of a reply. `requires_human_review`
+    is always `True` for every row this stage writes — approval/send are
+    owned by `FollowUpApprovalRecord`/`FollowUpSendRecord` below, exactly
+    mirroring the Stage 7C/7D split.
+
+    **`anchor_gmail_message_id` is the correspondence anchor** — the
+    latest real `OUTBOUND` `GmailMessageRecord` in the job's matched
+    thread this follow-up is chasing (see
+    app.services.follow_up_eligibility's eligibility rule for exactly how
+    it is chosen — never `JobRecord.first_seen_at`/`last_seen_at`, per
+    CLAUDE.md). `UNIQUE(account_key, anchor_gmail_message_id)` is the
+    dedup identity: at most one follow-up proposal can ever exist per
+    correspondence anchor, so re-running the eligibility scan is
+    idempotent (a second evaluation of the same still-due anchor returns
+    the existing row, never a duplicate) — mirrors
+    `ResponseDraftRecord`'s own idempotent-revision convention, except a
+    follow-up has exactly one anchor-scoped identity rather than a
+    version-bumped one, since nothing about a follow-up's own inputs is
+    expected to change between evaluations the way a re-analyzed message
+    or edited candidate profile can for Stage 7C.
+
+    **`job_id`/`gmail_thread_id` are deliberately not ForeignKeys** — same
+    "traceability, not identity" rationale as
+    `GmailMessageAnalysisRecord.matched_job_id`'s own docstring.
+    `anchor_gmail_message_id` IS a real ForeignKey (`ondelete="CASCADE"`)
+    — a follow-up proposal has no meaning independent of the message it
+    anchors to.
+
+    **Never invents facts.** Generated `subject`/`body` are built
+    exclusively from already-trusted stored facts (candidate name only if
+    provenance-confirmed, job title/company only from a trusted
+    `JobRecord.source` — see app.services.follow_up.TRUSTED job-source
+    reuse of app.services.response_draft.TRUSTED_JOB_SOURCES) — never from
+    email content itself, which is only ever used to pick a DE/EN
+    template set (mirrors app.agents.response_draft_generator's own
+    trust boundary).
+    """
+
+    __tablename__ = "follow_up_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key", "anchor_gmail_message_id", name="uq_follow_up_proposals_anchor"
+        ),
+        CheckConstraint("language IN ('de', 'en')", name="ck_follow_up_proposals_language_valid"),
+        CheckConstraint("status IN ('PROPOSED')", name="ck_follow_up_proposals_status_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    # Not a ForeignKey — see class docstring.
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Denormalized traceability copy (derivable from anchor_gmail_message_id
+    # via gmail_messages.thread_id) — kept for cheap querying without a
+    # join, not part of this row's identity. Not a ForeignKey — see class
+    # docstring.
+    gmail_thread_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    anchor_gmail_message_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("gmail_messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    eligibility_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str] = mapped_column(String(5), nullable=False)
+    missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    generator_version: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PROPOSED")
+    # Always True for every row this stage writes — see class docstring.
+    # Not DB-CHECK-enforced (mirrors ResponseDraftRecord.requires_human_review's
+    # own convention) — enforced by construction in app/services/follow_up.py.
+    requires_human_review: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class FollowUpApprovalRecord(Base):
+    """An immutable human APPROVE/REJECT decision on one exact
+    `FollowUpProposalRecord` (Stage 7E) — mirrors
+    `ResponseDraftApprovalRecord` exactly (see that model's docstring for
+    the full "pins the exact content" / "one decision per revision, ever"
+    rationale, both of which apply here unchanged). `HUMAN APPROVAL = NO
+    FOLLOW-UP SEND` is enforced the same way: see
+    app/services/follow_up_send.py.
+    """
+
+    __tablename__ = "follow_up_approvals"
+    __table_args__ = (
+        UniqueConstraint("follow_up_proposal_id", name="uq_follow_up_approvals_follow_up_proposal"),
+        CheckConstraint(
+            "decision IN ('APPROVED', 'REJECTED')", name="ck_follow_up_approvals_decision_valid"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    follow_up_proposal_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("follow_up_proposals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalized traceability only (the proposal's own anchor_gmail_message_id)
+    # — same convention as ResponseDraftApprovalRecord.gmail_message_id.
+    gmail_message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    pinned_subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    pinned_body: Mapped[str] = mapped_column(Text, nullable=False)
+
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class FollowUpSendRecord(Base):
+    """The DB-enforced atomic arbiter of "has this approved follow-up
+    already been sent, or is a send currently in flight" (Stage 7E) —
+    mirrors `ResponseDraftSendRecord` exactly, including the CAS-guarded
+    PENDING/SENT/FAILED/UNCERTAIN state machine and the fail-closed,
+    never-auto-retried `UNCERTAIN` terminal state for an ambiguous SMTP
+    outcome — see that model's docstring for the full rationale, which
+    applies here unchanged. See app/services/follow_up_send.py for the
+    orchestration that drives these transitions.
+    """
+
+    __tablename__ = "follow_up_sends"
+    __table_args__ = (
+        UniqueConstraint("follow_up_proposal_id", name="uq_follow_up_sends_follow_up_proposal"),
+        CheckConstraint(
+            "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
+            name="ck_follow_up_sends_status_valid",
+        ),
+        CheckConstraint("attempt_count > 0", name="ck_follow_up_sends_attempt_count_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(
+        String(320), nullable=False, server_default="", index=True
+    )
+    follow_up_proposal_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("follow_up_proposals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    approval_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("follow_up_approvals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalized traceability only — see FollowUpApprovalRecord's own
+    # convention.
+    gmail_message_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    provider_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+
 class CandidateProfileRecord(Base):
     """The single, canonical Candidate Profile — the factual authority for
     every candidate-side claim a future CV/Bewerbung agent (Stage 6B+) may

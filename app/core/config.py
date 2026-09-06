@@ -91,6 +91,14 @@ class Settings(BaseSettings):
     gmail_smtp_host: str = "smtp.gmail.com"
     gmail_smtp_port: int = Field(default=465, ge=1, le=65535)
 
+    # Stage 7E follow-up agent. How long to wait, after the latest real
+    # OUTBOUND message in a job's matched Gmail thread, before a follow-up
+    # becomes eligible — see app/services/follow_up_eligibility.py. Bounded
+    # (1-90 days): 0 would mean "always immediately due" (never a
+    # meaningful wait), and an unbounded value defeats the point of a
+    # configurable delay entirely.
+    follow_up_delay_days: int = Field(default=7, ge=1, le=90)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
