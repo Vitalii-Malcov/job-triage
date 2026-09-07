@@ -86,7 +86,7 @@ def _seed_job(session_factory, **overrides) -> int:
 
 class _FakeService:
     """Stand-in for CompanyResearchService, installed via
-    `monkeypatch.setattr("app.api.routes.CompanyResearchService", ...)` so a
+    `monkeypatch.setattr("app.services.collector_runner.CompanyResearchService", ...)` so a
     test can control exactly what get_or_run does without touching the real
     provider/DB logic already covered by tests/test_company_research_service.py.
     """
@@ -246,7 +246,7 @@ class TestPostResearch:
         job_id = _seed_job(session_factory)
 
         monkeypatch.setattr(
-            "app.api.routes.CompanyResearchService",
+            "app.services.collector_runner.CompanyResearchService",
             lambda *a, **k: _FakeService(error=ProviderNotConfiguredError("needs an API key")),
         )
 
@@ -271,7 +271,8 @@ class TestPostResearch:
                 )
 
         monkeypatch.setattr(
-            "app.api.routes.CompanyResearchService", lambda *a, **k: _FailingService()
+            "app.services.collector_runner.CompanyResearchService",
+            lambda *a, **k: _FailingService(),
         )
 
         response = client_.post(f"/api/v1/jobs/{job_id}/research", headers=_auth_headers())
@@ -302,7 +303,8 @@ class TestPostResearch:
                 )
 
         monkeypatch.setattr(
-            "app.api.routes.CompanyResearchService", lambda *a, **k: _AlwaysFailingService()
+            "app.services.collector_runner.CompanyResearchService",
+            lambda *a, **k: _AlwaysFailingService(),
         )
 
         first = client_.post(f"/api/v1/jobs/{job_id}/research", headers=_auth_headers())
@@ -344,7 +346,8 @@ class TestPostResearch:
                 )
 
         monkeypatch.setattr(
-            "app.api.routes.CompanyResearchService", lambda *a, **k: _SupersededService()
+            "app.services.collector_runner.CompanyResearchService",
+            lambda *a, **k: _SupersededService(),
         )
 
         response = client_.post(f"/api/v1/jobs/{job_id}/research", headers=_auth_headers())
@@ -388,7 +391,7 @@ class TestPostResearch:
                 )
 
         monkeypatch.setattr(
-            "app.api.routes.CompanyResearchService", lambda *a, **k: _StaleService()
+            "app.services.collector_runner.CompanyResearchService", lambda *a, **k: _StaleService()
         )
 
         response = client_.post(f"/api/v1/jobs/{job_id}/research", headers=_auth_headers())

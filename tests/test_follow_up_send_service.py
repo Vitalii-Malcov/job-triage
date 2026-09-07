@@ -842,13 +842,52 @@ class TestLeaseRenewalHeartbeat:
     the entire time, not merely "probably long enough".
     """
 
-    def test_slow_send_keeps_the_guard_via_heartbeat_renewal(self, db):
+    def test_slow_send_keeps_the_guard_via_heartbeat_renewal(self, db, monkeypatch):
         proposal, outbound, _approval = _seed_and_approve(db)
         thread_id = outbound.thread_id
         session_b = sessionmaker(bind=db.get_bind())()
 
         acquire_attempts = {"total": 0, "succeeded": 0}
+        successful_claims_after_original_release: list[bool] = []
         stop_polling = threading.Event()
+
+        # A SELECT-then-acquire pre-read is a TOCTOU race: the original
+        # sender can legitimately release the guard in the gap between
+        # the read and session B's own acquire attempt, showing a stale
+        # "still held" pre-image for what is actually a valid
+        # post-release claim. Instead of inferring the release from a
+        # separate read, get an unambiguous signal directly from the one
+        # real release call send_follow_up itself makes: wrap
+        # app.services.follow_up_send's OWN release_thread_lock
+        # reference (and ONLY that reference -- the poller below keeps
+        # calling the real, unpatched repository function) so the event
+        # is set the instant that specific call actually completes.
+        #
+        # A second, narrower race remains even with that signal: session
+        # B's own acquire_thread_lock() and its subsequent read of
+        # original_release_completed are two separate statements, so a
+        # scheduler switch between them could let the original sender's
+        # release-and-set happen strictly BETWEEN B's successful acquire
+        # and B's Event read -- misclassifying a genuine pre-release
+        # steal as a legitimate post-release acquisition (the Event
+        # would already read True by the time B checks it, even though
+        # it was NOT true at the moment the acquire actually succeeded).
+        # ordering_lock closes this: the original sender's
+        # release-then-set and session B's acquire-then-classify are
+        # each done as one atomic unit under the same mutex, so the two
+        # can never interleave.
+        original_release_completed = threading.Event()
+        ordering_lock = threading.Lock()
+
+        def _release_and_signal_original_sender(db_, thread_id_, *, holder):
+            with ordering_lock:
+                release_thread_lock(db_, thread_id_, holder=holder)
+                original_release_completed.set()
+
+        monkeypatch.setattr(
+            "app.services.follow_up_send.release_thread_lock",
+            _release_and_signal_original_sender,
+        )
 
         def _poll_session_b():
             # Give send_follow_up time to get past its own pre-lock setup
@@ -857,13 +896,21 @@ class TestLeaseRenewalHeartbeat:
             # during that brief setup window the thread is legitimately
             # unguarded (no send is "in flight" yet), so polling from
             # t=0 would race that harmless window instead of testing
-            # what this test is actually about. 2.0s of provider "send
+            # what this test is actually about. 3.0s of provider "send
             # time" leaves ample margin for this.
             time.sleep(0.3)
             while not stop_polling.is_set():
                 acquire_attempts["total"] += 1
-                if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
+                with ordering_lock:
+                    acquired = acquire_thread_lock(session_b, thread_id, holder="session-B-writer")
+                    released_before_or_at_acquire = original_release_completed.is_set()
+                if acquired:
                     acquire_attempts["succeeded"] += 1
+                    successful_claims_after_original_release.append(released_before_or_at_acquire)
+                    # The real, unpatched repository release -- outside
+                    # the ordering mutex, since B's own follow-up release
+                    # of its own probe claim has no ordering requirement
+                    # against the original sender's release.
                     release_thread_lock(session_b, thread_id, holder="session-B-writer")
                 time.sleep(0.03)
 
@@ -877,10 +924,13 @@ class TestLeaseRenewalHeartbeat:
                 time.sleep(3.0)
                 # Stop Session B's polling right as send() is about to
                 # return, strictly BEFORE send_follow_up releases the
-                # guard in its own `finally` -- keeps the "must never
-                # acquire while the heartbeat is alive" assertion below
-                # free of a race against the guard's own, legitimate,
-                # post-send release.
+                # guard in its own `finally` -- trims the number of
+                # attempts that land in the legitimate post-release
+                # window. Not required for correctness (the
+                # original_release_completed check below tolerates a
+                # claim landing right after release regardless of
+                # exactly when polling stops), but keeps the attempt log
+                # focused on the window this test actually cares about.
                 self._stop_event.set()
                 return OutboundSendResult(provider_message_id="msg-1")
 
@@ -917,10 +967,27 @@ class TestLeaseRenewalHeartbeat:
             assert record.status == "SENT"
             assert provider.call_count == 1
             assert acquire_attempts["total"] > 5, "the poller must have gotten several tries in"
-            assert acquire_attempts["succeeded"] == 0, (
-                "Session B must NEVER acquire the guard while the heartbeat is alive "
-                "and renewing on the original sender's behalf"
-            )
+
+            # A queued session-B write can legitimately land the instant
+            # AFTER send_follow_up's own release commits (SQLite
+            # serializes writers, so that write is provably ordered
+            # after the release -- not a steal). What must never happen
+            # is session B actually reconciling/stealing the guard while
+            # it was still visibly held by the original sender. Judge
+            # this against the unambiguous original_release_completed
+            # signal (set only once the ORIGINAL sender's own real
+            # release_thread_lock call has actually returned) rather
+            # than a separate pre-read, which would be a TOCTOU race of
+            # its own: the original sender could release in the gap
+            # between a read and session B's own acquire attempt,
+            # making a valid post-release claim look like a stale
+            # "still held" pre-image.
+            for claimed_after_release in successful_claims_after_original_release:
+                assert claimed_after_release, (
+                    "session B must only ever succeed once the ORIGINAL sender's guard "
+                    "was already released -- never by reconciling/stealing a still-held "
+                    "lease out from under an active heartbeat"
+                )
 
             # After send_follow_up has fully finished (guard released),
             # the SAME independent session succeeds immediately.

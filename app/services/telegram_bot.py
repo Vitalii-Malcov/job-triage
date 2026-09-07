@@ -36,7 +36,6 @@ import logging
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from app.api.routes import _run_bundesagentur, _run_company_research, _run_xing
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.core.config import Settings, get_settings
 from app.db.repositories import get_job_by_id, list_jobs, update_job_status
@@ -45,6 +44,11 @@ from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
 from app.providers.base import ProviderNotConfiguredError
+from app.services.collector_runner import (
+    run_bundesagentur,
+    run_company_research_for_job,
+    run_xing,
+)
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
 
 logger = logging.getLogger(__name__)
@@ -314,7 +318,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db = SessionLocal()
     try:
         try:
-            run = await _run_company_research(db, settings, job_id, force_refresh=False)
+            run = await run_company_research_for_job(db, settings, job_id, force_refresh=False)
         except ProviderNotConfiguredError as exc:
             await update.message.reply_text(str(exc))
             return
@@ -348,9 +352,9 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         try:
             if collector_name == "bundesagentur":
-                stats = await _run_bundesagentur(db, settings)
+                stats = await run_bundesagentur(db, settings)
             else:
-                stats = await _run_xing(db, settings)
+                stats = await run_xing(db, settings)
         except CollectorNotConfiguredError as exc:
             await update.message.reply_text(str(exc))
             return

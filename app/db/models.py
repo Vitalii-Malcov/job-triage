@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -1838,6 +1839,118 @@ class ApplicationPackageReviewRevisionRecord(Base):
     # 14) for cheap inspection without deserializing either blob.
     manual_override_paths_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     edit_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class AutomationRunRecord(Base):
+    """Stage 8A: one persisted, end-to-end orchestrated job-search cycle
+    for one account — the audit trail of WHEN an automation run happened,
+    WHICH existing steps (collectors) it coordinated, and what each one's
+    outcome was. This table owns none of the actual collection/scoring
+    logic — `app.services.automation.run_automation_cycle` orchestrates
+    the SAME `app.api.routes._run_bundesagentur`/`_run_xing` helpers the
+    individual `/collectors/*/run` endpoints and the Telegram control
+    center already call, so this is coordination bookkeeping only, never
+    a second implementation of collection/dedup/scoring.
+
+    **`account_key` (mirrors GMAIL-002's convention elsewhere).** The
+    normalized `GMAIL_USERNAME` this run was scoped to — every read is
+    filtered by it, so a later account change can never leak or mix a
+    previous account's run history, exactly like Gmail/follow-up records.
+
+    **`status`** is one of `RUNNING` / `COMPLETED` / `PARTIAL` / `FAILED`:
+    `RUNNING` from creation until the orchestrator finishes; `COMPLETED`
+    if every coordinated step succeeded; `PARTIAL` if at least one
+    succeeded and at least one did not; `FAILED` if none did. Terminal
+    states are never left ambiguous — the caller always ends the run in
+    exactly one of these three.
+
+    **`results_json`** is a JSON object keyed by step name (e.g.
+    `"bundesagentur"`, `"xing"`), each value shaped like
+    `{"status": "ok"|"not_configured"|"failed", "counters": {...} |
+    null, "error_type": str | null}` — `counters` is the step's own
+    already-existing return shape (e.g. `{"fetched":.., "created":..,
+    ...}`), never re-derived or duplicated here. `error_summary` is a
+    short, human-readable, SANITIZED string built only from step names
+    and `type(exc).__name__` — mirrors this project's GMAIL-003
+    convention (app/providers/email/base.py's `GmailProviderError`
+    docstring) of never persisting/returning raw upstream exception text,
+    which could otherwise carry back a server-echoed detail.
+
+    **Concurrency (fail-closed, not serialized).** `uq_automation_runs_one_running_per_account`
+    is a PARTIAL unique index — `UNIQUE(account_key) WHERE status =
+    'RUNNING'` — the sole arbiter of "at most one RUNNING run per
+    account at a time", enforced by the database, not a Python
+    check-then-act read. S8A-001 (Codex re-review): declared with BOTH
+    `sqlite_where` and `postgresql_where` (identical predicate) so this
+    project's SQLite deployment and a future PostgreSQL one describe the
+    exact same semantics — see
+    tests/test_automation_run_index_dialects.py for the dialect-level
+    proof (both compile the same `WHERE status = 'RUNNING'` clause).
+    `app.db.automation_repository.create_running_run` always attempts a
+    plain INSERT first and lets a concurrent duplicate fail on this
+    constraint (caught and translated into
+    `AutomationRunAlreadyInProgressError`, mapped to 409) — the same
+    INSERT + IntegrityError-catch idiom used throughout this project
+    (e.g. `app.db.follow_up_approval_repository.claim_send_attempt`).
+
+    **Crash recovery via an ownership-aware lease (S8A-002, Codex
+    re-review).** `lease_holder`/`lease_expires_at` mirror Stage 7E's
+    per-Gmail-thread lock (`GmailThreadRecord.lock_holder`/
+    `lock_expires_at`, see that model's docstring) — a generic,
+    time-bounded "who currently owns this RUNNING row, until when"
+    primitive. `app.db.automation_repository.create_running_run` claims
+    both atomically on INSERT; `app.services.automation`'s
+    `_RunLeaseHeartbeat` renews `lease_expires_at` periodically for as
+    long as `run_automation_cycle` is executing, via the DEDICATED
+    `renew_run_lease` CAS (never `create_running_run`'s own claim path —
+    a renewal must fail the instant the lease has expired, even if
+    nobody else has taken it over yet; it must never silently resume as
+    though ownership had been continuous — see `renew_run_lease`'s
+    docstring). A process that crashes (or whose heartbeat otherwise
+    stops) leaves the lease to expire on its own schedule rather than
+    blocking that account's automation forever: the NEXT request to
+    start a run finds a stale RUNNING row (`lease_expires_at` in the
+    past) and atomically reconciles it to `FAILED` before claiming a
+    fresh run — a LIVE lease (not yet expired) still fails closed
+    (`AutomationRunAlreadyInProgressError`, 409), exactly like before;
+    only a genuinely expired one is ever reclaimed, and never silently —
+    the reconciliation itself is a CAS, so at most one concurrent
+    requester ever wins it.
+    """
+
+    __tablename__ = "automation_runs"
+    __table_args__ = (
+        Index(
+            "uq_automation_runs_one_running_per_account",
+            "account_key",
+            unique=True,
+            sqlite_where=text("status = 'RUNNING'"),
+            postgresql_where=text("status = 'RUNNING'"),
+        ),
+        CheckConstraint(
+            "status IN ('RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED')",
+            name="ck_automation_runs_status_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    results_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # S8A-002: ownership-aware lease — see class docstring's "Crash
+    # recovery via an ownership-aware lease" section.
+    lease_holder: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False

@@ -137,13 +137,16 @@ def test_auto_research_is_bounded_by_budget_per_collector_run(client, monkeypatc
         for i in range(100)
     ]
     monkeypatch.setattr(
-        "app.api.routes.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
+        "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.api.routes.JobScorer", lambda profile_skills: FakeJobScorer(profile_skills)
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
     )
     CountingResearchService.call_count = 0
-    monkeypatch.setattr("app.api.routes.CompanyResearchService", CountingResearchService)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", CountingResearchService
+    )
 
     response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -169,10 +172,11 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
         )
     ]
     monkeypatch.setattr(
-        "app.api.routes.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
+        "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.api.routes.JobScorer", lambda profile_skills: FakeJobScorer(profile_skills)
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
     )
     disabled_settings = Settings(
         api_key=API_KEY,
@@ -183,9 +187,63 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
     )
     monkeypatch.setattr("app.api.routes.get_settings", lambda: disabled_settings)
     CountingResearchService.call_count = 0
-    monkeypatch.setattr("app.api.routes.CompanyResearchService", CountingResearchService)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", CountingResearchService
+    )
 
     response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
     assert response.status_code == 200
     assert CountingResearchService.call_count == 0
+
+
+SECRET_TEXT = "secret-upstream-detail-must-not-leak"
+
+
+class _FailingResearchService:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def get_or_run(self, db, job, settings, *, force_refresh=False):
+        raise RuntimeError(SECRET_TEXT)
+
+
+def test_auto_research_failure_does_not_leak_exception_text(client, monkeypatch, caplog):
+    """S8A-004R (Codex re-review, MEDIUM): an unexpected exception from
+    the auto-research hook must never surface raw exception text in
+    logs, and must remain best-effort — it must not affect the
+    collector run's counts/response.
+    """
+    job = Job(
+        source="bundesagentur",
+        title="Python Developer",
+        company="Solo Company",
+        url="https://www.arbeitsagentur.de/jobsuche/jobdetail/solo",
+        description="",
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.BundesagenturCollector",
+        lambda **kwargs: FakeCollector([job]),
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _FailingResearchService
+    )
+
+    with caplog.at_level("DEBUG"):
+        response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "fetched": 1,
+        "created": 1,
+        "updated": 0,
+        "skipped_invalid": 0,
+        "failed": 0,
+    }
+    assert SECRET_TEXT not in caplog.text
+    assert SECRET_TEXT not in response.text
+    assert "RuntimeError" in caplog.text

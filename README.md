@@ -35,9 +35,12 @@ AI-система для сбора, оценки и трекинга вакан
 7. Gmail Response + Follow-up Agent — по подэтапам, см. "Gmail Inbox Foundation" ниже:
    - [x] 7A Gmail Inbox Foundation — read-only, idempotent IMAP-приём и хранение переписки, см. "Gmail Inbox Foundation" ниже.
    - [x] 7B Job/Application ↔ Email matching + classification — детерминированный evidence-first матчинг писем к вакансиям/заявкам и классификация переписки, см. "Email Matching + Classification" ниже.
-   - [ ] 7C Response Draft Agent
-   - [ ] 7D Human approval + Gmail reply
-   - [ ] 7E Follow-up Agent
+   - [x] 7C Response Draft Agent — детерминированный template-driven черновик ответа на входящее письмо (требует human approval перед отправкой).
+   - [x] 7D Human approval + Gmail reply — approve/reject черновика и SMTP-отправка ответа строго после явного approval.
+   - [x] 7E Follow-up Agent — eligibility только по real Gmail-подтверждённой хронологии (IMAP INTERNALDATE, никогда не sender-controlled `Date`/sync-order-зависимый `received_at`), approve/reject + отправка, per-Gmail-thread lock с lease-renewal heartbeat против гонки с Gmail sync.
+8. Autonomous Orchestrator — по подэтапам:
+   - [x] 8A Orchestrator Foundation — persisted `AutomationRun` + сервис-оркестратор, координирующий существующие Bundesagentur/XING коллекторы в один ручной/синхронный цикл (`POST /api/v1/automation/runs`); без scheduler/cron, без auto-send заявок или email, без обхода существующих approval-gate'ов.
+   - [ ] 8B Scheduler/cron (будущий этап)
 
 ## Запуск
 ```bash

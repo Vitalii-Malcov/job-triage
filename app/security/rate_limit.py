@@ -430,3 +430,33 @@ def enforce_follow_up_send_rate_limit(request: Request) -> None:
                 detail="Follow-up send rate limit exceeded",
             )
         bucket.append(now)
+
+
+# Stage 8A: POST /automation/runs coordinates BOTH the Bundesagentur and
+# XING collectors in one call — sized at least as strict as the
+# stricter of the two per-collector buckets it triggers
+# (XING_RATE_LIMIT above), since one orchestrated run costs at least as
+# much as one XING run plus one Bundesagentur run. Kept in its own
+# bucket rather than sharing either collector's so a manual single-
+# collector run and an orchestrated run never compete for the same
+# budget.
+_automation_run_requests: dict[str, deque[float]] = defaultdict(deque)
+AUTOMATION_RUN_RATE_LIMIT_REQUESTS = 3
+AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS = 600
+
+
+def enforce_automation_run_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _automation_run_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= AUTOMATION_RUN_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Automation run rate limit exceeded",
+            )
+        bucket.append(now)
