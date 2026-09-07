@@ -6,6 +6,7 @@ GMAIL-008 grouped thread-count query.
 
 import json
 import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -14,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.gmail_repository import (
+    acquire_thread_lock,
     get_known_uids,
     get_message_by_identity,
     get_or_create_thread,
@@ -22,6 +24,7 @@ from app.db.gmail_repository import (
     list_messages,
     list_messages_for_thread,
     list_threads_with_counts,
+    release_thread_lock,
     resolve_thread_anchor,
     to_gmail_thread,
     upsert_message,
@@ -833,3 +836,259 @@ def test_attachments_and_addresses_round_trip_through_json(db):
         {"filename": "cv.pdf", "content_type": "application/pdf", "size": 1024}
     ]
     assert json.loads(record.to_addresses_json) == ["me@example.com"]
+
+
+# ---------------------------------------------------------------------------
+# S7E-013/014: real per-Gmail-thread lock - cross-session concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_thread_guard_blocks_concurrent_persistence_across_real_sessions(tmp_path):
+    """S7E-013 (Codex re-review) + S7E-014 (final lock hardening): the
+    per-Gmail-thread guard app.services.follow_up_send holds across its
+    revalidate-then-dispatch window must genuinely block a DIFFERENT,
+    INDEPENDENT SQLAlchemy Session/connection Gmail message persistence -
+    not just a same-Session simulation (see
+    tests/test_follow_up_send_service.py::TestThreadGuardSharedWithGmailSync
+    for that same-Session proof, which this complements rather than
+    replaces). Session A acquires and holds the guard; Session B (a real,
+    separate connection against the same database file) attempts
+    upsert_message for a new message in the SAME thread and must be
+    unable to commit until A releases; once released, B succeeds.
+    """
+    db_path = tmp_path / "gmail_repository_thread_guard_cross_session.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        anchor, _created = upsert_message(session_a, _parsed(uid=1, message_id="<out@example.com>"))
+        thread_id = anchor.thread_id
+
+        holder_a = "session-A-send"
+        assert acquire_thread_lock(session_a, thread_id, holder=holder_a) is True
+
+        timeline: dict[str, float] = {}
+
+        def _hold_then_release():
+            time.sleep(0.4)
+            timeline["released_at"] = time.monotonic()
+            release_thread_lock(session_a, thread_id, holder=holder_a)
+
+        releaser = threading.Thread(target=_hold_then_release, daemon=True)
+        releaser.start()
+
+        race_parsed = _parsed(
+            uid=2,
+            message_id="<reply@example.com>",
+            in_reply_to="<out@example.com>",
+            references=("<out@example.com>",),
+        )
+
+        start = time.monotonic()
+        # Session B: a fully independent connection, attempting real
+        # Gmail message persistence while Session A still holds the
+        # guard at the start of this call.
+        record, created = upsert_message(session_b, race_parsed, lock_wait_seconds=3.0)
+        timeline["committed_at"] = time.monotonic()
+        elapsed = timeline["committed_at"] - start
+
+        releaser.join(timeout=3)
+
+        assert created is True
+        assert record.thread_id == thread_id
+        # B could only have succeeded strictly AFTER A actually released
+        # - proven by real wall-clock ordering across two independent
+        # threads/connections, not by call order within a single Session.
+        assert timeline["committed_at"] >= timeline["released_at"]
+        assert elapsed >= 0.35, "B must have genuinely waited on the lock, not won immediately"
+    finally:
+        session_a.close()
+        session_b.close()
+
+
+def test_thread_guard_lease_expires_for_a_holder_that_never_releases(tmp_path):
+    """S7E-014 (final lock hardening): the lock TTL-based expiry is the
+    crash-recovery property the real SMTP hard timeout
+    (app.providers.email.smtp.SMTP_OPERATION_TIMEOUT_SECONDS, far below
+    THREAD_LOCK_TTL_SECONDS) exists to make UNREACHABLE in production -
+    this test proves the expiry mechanism itself, independent of that
+    production safeguard. A holder that never releases (standing in for a
+    sender stuck past its own lease, e.g. a deliberately slow/hung
+    provider) must not be able to block everyone else forever: a
+    different, fully independent Session acquire attempt succeeds once
+    the lease own (tiny, test-scoped) TTL has elapsed.
+    """
+    db_path = tmp_path / "gmail_repository_thread_guard_lease_expiry.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        anchor, _created = upsert_message(session_a, _parsed(uid=1, message_id="<out@example.com>"))
+        thread_id = anchor.thread_id
+
+        holder_a = "session-A-slow-sender"
+        assert acquire_thread_lock(session_a, thread_id, holder=holder_a, ttl_seconds=0.1) is True
+
+        time.sleep(0.2)  # let the tiny lease actually expire; A never releases
+
+        # Session B, a fully independent connection, can now acquire the
+        # SAME thread guard - a stale lease from a holder that never
+        # released does not block it forever.
+        acquired = acquire_thread_lock(session_b, thread_id, holder="session-B-recovers")
+        assert acquired is True
+    finally:
+        session_a.close()
+        session_b.close()
+
+
+def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path):
+    """S7E-015 (supersedes the S7E-014 framing of this same test):
+    end-to-end send_follow_up call with a deliberately slow fake provider
+    whose send() outlasts a tiny, test-scoped lock_ttl_seconds. Before the
+    S7E-015 lease-renewal heartbeat existed, this scenario relied on the
+    lease simply expiring mid-send and being silently "gotten away with"
+    (the historical hazard this whole lock exists to prevent); now the
+    heartbeat keeps renewing lock_ttl_seconds throughout the slow send, so
+    the lease never actually lapses while genuinely still held - the send
+    completes as SENT through NORMAL exclusive ownership, not through a
+    stale-lease loophole. See TestLeaseRenewalHeartbeat in
+    tests/test_follow_up_send_service.py for the direct, real-two-Session
+    proof that a concurrent writer is blocked THE WHOLE TIME the heartbeat
+    is alive. This test's remaining, still-true assertion is simpler: a
+    different session can always acquire the SAME thread's guard once
+    send_follow_up has actually finished and released it.
+    """
+    from datetime import timedelta
+
+    from app.core.config import Settings
+    from app.db.follow_up_approval_repository import get_send_for_proposal
+    from app.db.models import GmailMessageAnalysisRecord, JobRecord
+    from app.providers.email.outbound_base import OutboundSendResult
+    from app.services.follow_up import evaluate_follow_up_for_job
+    from app.services.follow_up_send import approve_or_reject_follow_up, send_follow_up
+
+    account_key = ACCOUNT_A
+    now = datetime(2026, 9, 6, tzinfo=UTC)
+    settings = Settings(follow_up_delay_days=7)
+
+    db_path = tmp_path / "gmail_repository_slow_provider_lease.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    db = session_factory()
+    other_session = session_factory()
+    try:
+        job = JobRecord(
+            fingerprint="fp-slow-provider",
+            source="bundesagentur",
+            title="Backend Engineer",
+            company="Globex",
+            location="Berlin",
+            url="https://example.com/jobs/1",
+            description="",
+            score=80,
+            recommendation="APPLY",
+            status="APPLIED",
+        )
+        db.add(job)
+        db.commit()
+
+        outbound, _created = upsert_message(
+            db,
+            ParsedGmailMessage(
+                account_key=account_key,
+                mailbox="INBOX",
+                uid=1,
+                uid_validity=100,
+                message_id_header="<out@example.com>",
+                in_reply_to=None,
+                references=(),
+                from_address=account_key,
+                from_display_name=None,
+                to_addresses=("hr@acme.example.com",),
+                cc_addresses=(),
+                subject="My application at Globex",
+                sent_at=now - timedelta(days=10),
+                direction="OUTBOUND",
+                body_plain="I am applying for the Backend Engineer role at Globex.",
+                body_truncated=False,
+                has_html=False,
+                attachments=(),
+            ),
+        )
+        outbound.received_at = now - timedelta(days=10)
+        outbound.provider_arrival_at = now - timedelta(days=10)
+        outbound.provider_arrival_is_trusted = True
+        db.commit()
+        db.add(
+            GmailMessageAnalysisRecord(
+                account_key=account_key,
+                gmail_message_id=outbound.id,
+                analysis_version=1,
+                input_fingerprint="fp",
+                context_fingerprint="ctx",
+                match_type="APPLICATION",
+                matched_job_id=job.id,
+                match_confidence="HIGH",
+                match_score=90,
+                classification="OTHER",
+                classification_confidence="HIGH",
+                is_automated=False,
+                requires_human_review=True,
+            )
+        )
+        db.commit()
+
+        result = evaluate_follow_up_for_job(db, account_key, job.id, settings=settings, now=now)
+        assert result.eligibility == "ELIGIBLE"
+        approve_or_reject_follow_up(db, account_key, result.proposal.id, "APPROVED", None)
+
+        class SlowProvider:
+            def __init__(self):
+                self.call_count = 0
+
+            def send(self, message):
+                self.call_count += 1
+                time.sleep(0.2)  # deliberately outlasts the tiny TTL below
+                return OutboundSendResult(provider_message_id="msg-1")
+
+        provider = SlowProvider()
+
+        record = send_follow_up(
+            db,
+            account_key,
+            result.proposal.id,
+            provider,
+            lock_ttl_seconds=0.05,
+        )
+
+        assert record.status == "SENT"
+        assert provider.call_count == 1
+        assert get_send_for_proposal(db, account_key, result.proposal.id).status == "SENT"
+
+        # The lease (TTL=0.05s) expired long before the 0.2s send
+        # finished - proving the documented residual-risk boundary: a
+        # different, fully independent session CAN now acquire the same
+        # thread guard. This is exactly why production relies on the
+        # real SMTP hard timeout staying safely below the lock own TTL
+        # (see app/providers/email/smtp.py SMTP_OPERATION_TIMEOUT_SECONDS),
+        # not on this margin alone.
+        acquired = acquire_thread_lock(
+            other_session, outbound.thread_id, holder="concurrent-writer"
+        )
+        assert acquired is True
+    finally:
+        db.close()
+        other_session.close()

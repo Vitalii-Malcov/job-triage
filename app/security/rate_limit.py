@@ -354,3 +354,79 @@ def enforce_response_draft_send_rate_limit(request: Request) -> None:
                 detail="Response draft send rate limit exceeded",
             )
         bucket.append(now)
+
+
+# Bucket for Stage 7E follow-up evaluation: unlike a single-message Stage
+# 7B analysis, one call scans up to FOLLOW_UP_JOB_SCAN_LIMIT tracked jobs
+# (pure local computation + a DB write per newly-eligible one) — sized
+# tighter than GMAIL_ANALYSIS_RATE_LIMIT to reflect that bulk-scan cost.
+_follow_up_evaluate_requests: dict[str, deque[float]] = defaultdict(deque)
+FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS = 10
+FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_follow_up_evaluate_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _follow_up_evaluate_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Follow-up evaluation rate limit exceeded",
+            )
+        bucket.append(now)
+
+
+# Bucket for Stage 7E follow-up approve/reject decisions: pure local DB
+# read+write, zero network cost — sized like
+# RESPONSE_DRAFT_DECISION_RATE_LIMIT.
+_follow_up_decision_requests: dict[str, deque[float]] = defaultdict(deque)
+FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS = 30
+FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_follow_up_decision_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _follow_up_decision_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Follow-up decision rate limit exceeded",
+            )
+        bucket.append(now)
+
+
+# Separate, stricter bucket for Stage 7E follow-up SEND — same rationale
+# as RESPONSE_DRAFT_SEND_RATE_LIMIT: this transmits a real outbound email
+# over the same account's SMTP credentials.
+_follow_up_send_requests: dict[str, deque[float]] = defaultdict(deque)
+FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS = 5
+FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_follow_up_send_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS
+
+    with _lock:
+        bucket = _follow_up_send_requests[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Follow-up send rate limit exceeded",
+            )
+        bucket.append(now)

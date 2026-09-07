@@ -149,11 +149,27 @@ class TestRunGmailSync:
 
         assert response.status_code == 503
 
+    def _inbox_only_provider_factory(self, messages):
+        """S7E-001 (Codex remediation): `_run_gmail_sync` now constructs a
+        `GmailImapProvider` TWICE per run — once for the primary mailbox,
+        once for the real Sent-mail folder (see
+        app.api.routes._run_gmail_sync). This factory returns `messages`
+        only for the primary mailbox call, an empty result for the Sent
+        one, so single-mailbox-focused tests keep their expected counts.
+        """
+
+        def factory(**kwargs):
+            if kwargs.get("mailbox") == "INBOX":
+                return FakeProvider(messages=messages)
+            return FakeProvider(messages=[])
+
+        return factory
+
     def test_successful_run_reports_counts(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
             "app.api.routes.GmailImapProvider",
-            lambda **kwargs: FakeProvider(messages=[_parsed(1), _parsed(2)]),
+            self._inbox_only_provider_factory([_parsed(1), _parsed(2)]),
         )
 
         response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
@@ -171,7 +187,7 @@ class TestRunGmailSync:
         test_client, _ = client
         monkeypatch.setattr(
             "app.api.routes.GmailImapProvider",
-            lambda **kwargs: FakeProvider(messages=[_parsed(1), _parsed(2)]),
+            self._inbox_only_provider_factory([_parsed(1), _parsed(2)]),
         )
 
         first = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
@@ -185,6 +201,27 @@ class TestRunGmailSync:
             "skipped": 0,
             "failed": 0,
         }
+
+    def test_sent_mailbox_is_synced_alongside_the_primary_mailbox(self, client, monkeypatch):
+        """S7E-001 (Codex remediation, HIGH): both mailboxes are synced
+        every run, and their counts are aggregated."""
+        test_client, _ = client
+        seen_mailboxes: list[str] = []
+
+        def factory(**kwargs):
+            mailbox = kwargs.get("mailbox")
+            seen_mailboxes.append(mailbox)
+            uid = 1 if mailbox == "INBOX" else 2
+            return FakeProvider(messages=[_parsed(uid, mailbox=mailbox)])
+
+        monkeypatch.setattr("app.api.routes.GmailImapProvider", factory)
+
+        response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
+
+        assert response.status_code == 200
+        assert response.json()["fetched"] == 2
+        assert response.json()["created"] == 2
+        assert set(seen_mailboxes) == {"INBOX", "[Gmail]/Sent Mail"}
 
     def test_auth_error_returns_502(self, client, monkeypatch):
         test_client, _ = client

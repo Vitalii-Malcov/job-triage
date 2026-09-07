@@ -19,6 +19,13 @@ trusted fields (see outbound_base.py's module docstring) — this module
 does not parse MIME, does not read `body_plain`, and never touches
 `app.db.models.GmailMessageRecord` directly.
 
+**Hard connection timeout (S7E-014, Codex re-review).** `_connect()`
+always opens the underlying socket with `timeout=SMTP_OPERATION_TIMEOUT_SECONDS`
+(see that constant's own docstring) — a hung/black-holed SMTP peer raises
+within a bounded time instead of blocking indefinitely, which is what
+lets `app.services.follow_up_send` safely hold a per-Gmail-thread lock
+across the whole `send()` call without that lease expiring mid-send.
+
 **Ambiguous-outcome handling (see outbound_base.py's "honest
 delivery-outcome contract").** `send()` builds and validates the
 outbound `EmailMessage` BEFORE opening a connection or calling
@@ -51,6 +58,42 @@ from app.providers.email.outbound_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# S7E-014 (Codex re-review, final lock hardening): a hard socket-level
+# timeout applied to EVERY blocking operation on this provider's SMTP
+# connection (connect, TLS handshake, login, send_message, quit — all
+# share the SAME underlying socket once opened, so a single
+# `timeout=` at construction covers the whole session uniformly; see
+# `_connect`). Exists so `app.services.follow_up_send.send_follow_up`
+# (and app.services.response_draft_send, which shares this provider) can
+# safely hold a per-Gmail-thread guard
+# (`app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS`, currently 30s)
+# across the ENTIRE `provider.send()` call without that lease expiring
+# out from under a still-running send — a hung/black-holed SMTP peer must
+# raise well before the lease can lapse, never rely on "it should
+# probably finish in time".
+#
+# Sized with a large safety margin below THREAD_LOCK_TTL_SECONDS (not
+# imported here — this provider module stays DB-free; the safety
+# relationship between the two constants is asserted directly by
+# tests/test_providers_email_smtp.py::test_operation_timeout_is_safely_below_thread_lock_ttl,
+# which is the actual proof that this margin holds, not just prose).
+#
+# **Honest limitation (documented, not overclaimed — mirrors this
+# project's other honestly-scoped fallbacks, e.g. GMAIL-005's
+# RFC822.SIZE gap).** This bounds each INDIVIDUAL blocking socket
+# operation, not the CUMULATIVE wall-clock time of the whole `send()`
+# call: Python's socket timeout has no "total deadline for this
+# connection" primitive, and a hard preemptive per-call deadline (e.g.
+# `signal.alarm`) is main-thread-only and unusable here — Stage 7E's
+# HTTP handlers run in FastAPI's worker thread pool. A pathological peer
+# that responds just under this timeout on EVERY one of the several SMTP
+# round trips (EHLO/AUTH/MAIL FROM/RCPT TO/DATA) could in principle still
+# exceed THREAD_LOCK_TTL_SECONDS in total. THREAD_LOCK_TTL_SECONDS (30s)
+# leaves a 22-second margin above this timeout specifically to absorb
+# that worst-realistic case; a peer malicious/degraded enough to hit the
+# cap on every single round trip is far outside normal SMTP behavior.
+SMTP_OPERATION_TIMEOUT_SECONDS = 8.0
 
 
 class SmtpClient(Protocol):
@@ -86,6 +129,7 @@ class GmailSmtpProvider:
         app_password: str,
         from_address: str | None = None,
         smtp_client: SmtpClient | None = None,
+        timeout_seconds: float = SMTP_OPERATION_TIMEOUT_SECONDS,
     ) -> None:
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
@@ -98,6 +142,10 @@ class GmailSmtpProvider:
         # Injected only by tests, to avoid a real SMTP connection —
         # mirrors GmailImapProvider._injected_client.
         self._injected_client = smtp_client
+        # S7E-014: overridable only for tests that need a much smaller
+        # bound to keep a real-socket timeout proof fast — production
+        # callers (app/api/routes.py) always use the safe module default.
+        self.timeout_seconds = timeout_seconds
 
     def send(self, message: OutboundMessage) -> OutboundSendResult:
         if not is_configured(self.username) or not is_configured(self.app_password):
@@ -155,11 +203,23 @@ class GmailSmtpProvider:
 
     def _connect(self) -> smtplib.SMTP_SSL:
         try:
-            client = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+            # S7E-014: `timeout` bounds connect + the TLS handshake + the
+            # initial greeting read — and, since it is set on the
+            # underlying socket for the lifetime of the connection,
+            # every later blocking call on this SAME client (login,
+            # send_message, quit) inherits it too. A hung/black-holed
+            # peer raises `socket.timeout` (an `OSError` subclass) here
+            # rather than blocking indefinitely — see this module's
+            # `SMTP_OPERATION_TIMEOUT_SECONDS` docstring for the full
+            # rationale and its honest limitation.
+            client = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=self.timeout_seconds)
         except OSError as exc:
             # Never interpolate the underlying OSError/host/port into the
             # raised message — same GMAIL-003-style rationale as
-            # GmailImapProvider._connect.
+            # GmailImapProvider._connect. Covers a connect-phase timeout
+            # exactly like any other connection failure: no transmission
+            # was ever attempted, so this is safely a DEFINITE pre-send
+            # failure.
             logger.warning("outbound_smtp_connect_failed error_type=%s", type(exc).__name__)
             raise EmailSendConnectionError(
                 "Could not connect to the configured outbound SMTP host"
@@ -170,6 +230,18 @@ class GmailSmtpProvider:
         except smtplib.SMTPException as exc:
             logger.warning("outbound_smtp_login_failed error_type=%s", type(exc).__name__)
             raise EmailSendAuthError("Outbound SMTP login was rejected") from exc
+        except OSError as exc:
+            # A timeout (or any other socket-level failure) waiting for
+            # the login exchange — NOT an `smtplib.SMTPException`, so it
+            # needs its own handler (previously unhandled here, which
+            # would have leaked a raw OSError/TimeoutError instead of an
+            # `EmailSendError` — see this module's test suite). Still
+            # strictly pre-`send_message()`, so still a DEFINITE
+            # pre-transmission failure, not an ambiguous one; distinct
+            # from `EmailSendAuthError` because this is not a proven
+            # credential rejection.
+            logger.warning("outbound_smtp_login_failed error_type=%s", type(exc).__name__)
+            raise EmailSendConnectionError("Could not complete outbound SMTP login") from exc
         return client
 
     def _disconnect(self, client: SmtpClient) -> None:

@@ -72,6 +72,14 @@ from app.db.candidate_profile_repository import (
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
+from app.db.follow_up_approval_repository import to_follow_up_approval, to_follow_up_send_status
+from app.db.follow_up_repository import (
+    FOLLOW_UP_LIST_DEFAULT_LIMIT,
+    FOLLOW_UP_LIST_MAX_LIMIT,
+    get_follow_up_proposal_by_id,
+    list_follow_up_proposals,
+    to_follow_up_proposal,
+)
 from app.db.gmail_analysis_repository import (
     get_latest_analysis_for_message,
     list_analyses,
@@ -132,6 +140,15 @@ from app.models.company_research import (
     ResearchRequest,
 )
 from app.models.cv_draft import CVDraftRequest, TailoredCVDraft
+from app.models.follow_up import (
+    FollowUpApproval,
+    FollowUpApprovalRequest,
+    FollowUpEvaluationResult,
+    FollowUpProposal,
+    FollowUpScanSummary,
+    FollowUpSendStatus,
+    FollowUpState,
+)
 from app.models.gmail import (
     GmailMessage,
     GmailMessageSummary,
@@ -166,6 +183,9 @@ from app.security.rate_limit import (
     enforce_collector_rate_limit,
     enforce_company_research_rate_limit,
     enforce_cv_draft_rate_limit,
+    enforce_follow_up_decision_rate_limit,
+    enforce_follow_up_evaluate_rate_limit,
+    enforce_follow_up_send_rate_limit,
     enforce_gmail_analysis_rate_limit,
     enforce_gmail_rate_limit,
     enforce_match_rate_limit,
@@ -181,6 +201,25 @@ from app.services.company_research import (
     AmbiguousCompanyIdentityError,
     CompanyResearchService,
     InvalidCompanyIdentityError,
+)
+from app.services.follow_up import (
+    FollowUpJobNotFoundError,
+    evaluate_follow_up_for_job,
+    list_due_follow_ups,
+)
+from app.services.follow_up_send import (
+    FollowUpAlreadyDecidedError,
+    FollowUpAlreadySentError,
+    FollowUpMissingRecipientError,
+    FollowUpNotApprovedError,
+    FollowUpProposalNotFoundError,
+    FollowUpProposalStaleAtSendTimeError,
+    FollowUpSendFailedError,
+    FollowUpSendInProgressError,
+    FollowUpSendOutcomeUncertainError,
+    approve_or_reject_follow_up,
+    get_follow_up_state,
+    send_follow_up,
 )
 from app.services.gmail_inbox import GmailInboxService
 from app.services.gmail_message_analysis import GmailMessageNotFoundError, analyze_gmail_message
@@ -1511,6 +1550,16 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
         ) from exc
 
 
+def _sum_gmail_sync_results(a: GmailSyncResult, b: GmailSyncResult) -> GmailSyncResult:
+    return GmailSyncResult(
+        fetched=a.fetched + b.fetched,
+        created=a.created + b.created,
+        duplicates=a.duplicates + b.duplicates,
+        skipped=a.skipped + b.skipped,
+        failed=a.failed + b.failed,
+    )
+
+
 async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
     """Fetch (read-only IMAP) + persist one Gmail Inbox Foundation sync run.
 
@@ -1520,6 +1569,17 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
     failure" (502) — GmailInboxService itself never fails closed on
     missing credentials, it just orchestrates fetch+persist for an
     already-constructed provider.
+
+    S7E-001 (Codex remediation, HIGH): syncs BOTH the primary mailbox
+    (gmail_mailbox, INBOUND — `trusted_outbound=False`) and the real
+    Sent-mail folder (gmail_sent_mailbox, `trusted_outbound=True`) every
+    run. Only messages fetched from the Sent folder are ever trusted as
+    OUTBOUND — see app/providers/email/imap.py's `_direction` docstring for
+    why a message's own `From` header is no longer used to decide
+    direction. Both mailboxes share the same account_key/dedup namespace
+    (their (mailbox, uid_validity, uid) identities are independent, so no
+    collision risk), and one mailbox's sync failure/persistence errors
+    never block the other's.
     """
     if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
         raise CollectorNotConfiguredError(
@@ -1527,22 +1587,33 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
         )
 
     account_key = normalize_account_key(settings.gmail_username)
-    provider = GmailImapProvider(
-        imap_host=settings.gmail_imap_host,
-        imap_port=settings.gmail_imap_port,
-        username=settings.gmail_username,
-        app_password=settings.gmail_app_password,
-        mailbox=settings.gmail_mailbox,
-        lookback_days=settings.gmail_lookback_days,
-        # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound to
-        # this request's db.Session via closure — lets the provider skip
-        # already-persisted UIDs before applying its MAX_MESSAGES_PER_SYNC
-        # cap, in one query per chunk rather than one query per UID.
-        get_known_uids=lambda uid_validity, candidate_uids: get_known_uids(
-            db, account_key, settings.gmail_mailbox, uid_validity, candidate_uids
-        ),
+
+    def _make_provider(mailbox: str, *, trusted_outbound: bool) -> GmailImapProvider:
+        return GmailImapProvider(
+            imap_host=settings.gmail_imap_host,
+            imap_port=settings.gmail_imap_port,
+            username=settings.gmail_username,
+            app_password=settings.gmail_app_password,
+            mailbox=mailbox,
+            lookback_days=settings.gmail_lookback_days,
+            # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound
+            # to this request's db.Session via closure — lets the provider
+            # skip already-persisted UIDs before applying its
+            # MAX_MESSAGES_PER_SYNC cap, in one query per chunk rather than
+            # one query per UID.
+            get_known_uids=lambda uid_validity, candidate_uids, _mailbox=mailbox: get_known_uids(
+                db, account_key, _mailbox, uid_validity, candidate_uids
+            ),
+            trusted_outbound=trusted_outbound,
+        )
+
+    inbox_result = await GmailInboxService().sync(
+        db, _make_provider(settings.gmail_mailbox, trusted_outbound=False)
     )
-    return await GmailInboxService().sync(db, provider)
+    sent_result = await GmailInboxService().sync(
+        db, _make_provider(settings.gmail_sent_mailbox, trusted_outbound=True)
+    )
+    return _sum_gmail_sync_results(inbox_result, sent_result)
 
 
 @router.post(
@@ -2019,4 +2090,228 @@ def get_response_draft_state_endpoint(
     except ResponseDraftNotFoundError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
+        ) from exc
+
+
+@router.post(
+    "/follow-ups/evaluate",
+    response_model=FollowUpScanSummary,
+    dependencies=[Depends(require_api_key), Depends(enforce_follow_up_evaluate_rate_limit)],
+)
+def evaluate_follow_ups(
+    after_job_id: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "S7E-006: resume a keyset-paginated scan after this job id "
+            "(pass back a prior call's next_cursor); omit to start from "
+            "the oldest tracked APPLIED job."
+        ),
+    ),
+    db: Session = Depends(get_db),
+) -> FollowUpScanSummary:
+    """Stage 7E: the only way follow-up eligibility is ever evaluated —
+    there is no background scheduler/cron (spec requirement), so this
+    must be triggered manually. Runs one bounded, KEYSET-paginated scan
+    across tracked APPLIED jobs (see app.services.follow_up.FOLLOW_UP_JOB_SCAN_LIMIT),
+    persisting a new `FollowUpProposalRecord` for every newly-eligible
+    correspondence anchor. Idempotent: re-running this with the same
+    `after_job_id` never duplicates a proposal for an anchor whose trusted
+    inputs are unchanged. A backlog larger than one scan's limit is
+    drained by repeatedly passing the response's `next_cursor` back in as
+    `after_job_id` — see app.services.follow_up.list_due_follow_ups.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    return list_due_follow_ups(db, account_key, after_job_id=after_job_id)
+
+
+@router.post(
+    "/jobs/{job_id}/follow-up/evaluate",
+    response_model=FollowUpEvaluationResult,
+    dependencies=[Depends(require_api_key), Depends(enforce_follow_up_evaluate_rate_limit)],
+)
+def evaluate_follow_up_for_single_job(
+    job_id: int, db: Session = Depends(get_db)
+) -> FollowUpEvaluationResult:
+    """Evaluate follow-up eligibility for exactly one job — the
+    single-job counterpart to `POST /follow-ups/evaluate`'s bounded scan.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        return evaluate_follow_up_for_job(db, account_key, job_id)
+    except FollowUpJobNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found"
+        ) from exc
+
+
+@router.get(
+    "/follow-ups",
+    response_model=list[FollowUpProposal],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_follow_ups(
+    limit: int = Query(default=FOLLOW_UP_LIST_DEFAULT_LIMIT, ge=1, le=FOLLOW_UP_LIST_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[FollowUpProposal]:
+    """Pure read of already-persisted follow-up proposals — never
+    triggers evaluation itself (mirrors GET /gmail/messages not
+    triggering a sync — see POST /follow-ups/evaluate for that).
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    records = list_follow_up_proposals(db, account_key, limit=limit, offset=offset)
+    return [to_follow_up_proposal(record) for record in records]
+
+
+@router.get(
+    "/follow-ups/{follow_up_id}",
+    response_model=FollowUpProposal,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_follow_up(follow_up_id: int, db: Session = Depends(get_db)) -> FollowUpProposal:
+    account_key = _current_gmail_account_key(get_settings())
+    record = get_follow_up_proposal_by_id(db, account_key, follow_up_id)
+    if record is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
+        )
+    return to_follow_up_proposal(record)
+
+
+@router.post(
+    "/follow-ups/{follow_up_id}/decision",
+    response_model=FollowUpApproval,
+    dependencies=[Depends(require_api_key), Depends(enforce_follow_up_decision_rate_limit)],
+)
+def decide_follow_up(
+    follow_up_id: int, body: FollowUpApprovalRequest, db: Session = Depends(get_db)
+) -> FollowUpApproval:
+    """Record one immutable APPROVE/REJECT human decision on an exact
+    Stage 7E follow-up proposal. A decision is permanent: approving/
+    rejecting an already-decided proposal fails (409). This endpoint
+    NEVER sends anything — see POST /follow-ups/{id}/send for the only
+    endpoint that does, and only once this decision is APPROVED.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        record = approve_or_reject_follow_up(
+            db, account_key, follow_up_id, body.decision, body.note
+        )
+    except FollowUpProposalNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
+        ) from exc
+    except FollowUpAlreadyDecidedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Follow-up proposal already has a recorded decision",
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.warning("follow_up_decision_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Follow-up decision failed",
+        ) from exc
+    return to_follow_up_approval(record)
+
+
+@router.post(
+    "/follow-ups/{follow_up_id}/send",
+    response_model=FollowUpSendStatus,
+    dependencies=[Depends(require_api_key), Depends(enforce_follow_up_send_rate_limit)],
+)
+def send_follow_up_endpoint(follow_up_id: int, db: Session = Depends(get_db)) -> FollowUpSendStatus:
+    """Send an APPROVED Stage 7E follow-up as a real Gmail message — the
+    only endpoint in this project (besides POST /response-drafts/{id}/send)
+    that transmits outbound email. NO APPROVAL = NO FOLLOW-UP SEND — see
+    app/services/follow_up_send.py's module docstring for the exact gate.
+    """
+    settings = get_settings()
+    if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outbound email sending is not configured",
+        )
+
+    account_key = _current_gmail_account_key(settings)
+    provider = GmailSmtpProvider(
+        smtp_host=settings.gmail_smtp_host,
+        smtp_port=settings.gmail_smtp_port,
+        username=settings.gmail_username,
+        app_password=settings.gmail_app_password,
+    )
+    try:
+        record = send_follow_up(db, account_key, follow_up_id, provider)
+    except FollowUpProposalNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
+        ) from exc
+    except FollowUpNotApprovedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Follow-up proposal has not been approved",
+        ) from exc
+    except FollowUpMissingRecipientError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No recipient address is available for this follow-up",
+        ) from exc
+    except FollowUpAlreadySentError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Follow-up proposal has already been sent",
+        ) from exc
+    except FollowUpSendInProgressError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="A send attempt for this follow-up proposal is already in progress",
+        ) from exc
+    except FollowUpProposalStaleAtSendTimeError as exc:
+        logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="This follow-up proposal is no longer eligible to send",
+        ) from exc
+    except FollowUpSendFailedError as exc:
+        logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="Sending the follow-up failed",
+        ) from exc
+    except FollowUpSendOutcomeUncertainError as exc:
+        logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "Follow-up send outcome is uncertain; manual reconciliation is "
+                "required, not an automatic retry"
+            ),
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Follow-up send failed",
+        ) from exc
+    return to_follow_up_send_status(record)
+
+
+@router.get(
+    "/follow-ups/{follow_up_id}/state",
+    response_model=FollowUpState,
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def get_follow_up_state_endpoint(follow_up_id: int, db: Session = Depends(get_db)) -> FollowUpState:
+    """Pure read of the combined approval/send state for one follow-up
+    proposal — never triggers a decision or a send.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    try:
+        return get_follow_up_state(db, account_key, follow_up_id)
+    except FollowUpProposalNotFoundError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
         ) from exc

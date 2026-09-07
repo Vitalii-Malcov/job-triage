@@ -77,6 +77,16 @@ class Settings(BaseSettings):
     gmail_username: str = ""
     gmail_app_password: str = ""
     gmail_mailbox: str = "INBOX"
+    # S7E-001 (Codex remediation, HIGH): the real Gmail "Sent Mail" folder —
+    # synced in ADDITION to gmail_mailbox (never instead of it). Messages
+    # fetched from THIS mailbox are the only ones ever trusted as
+    # OUTBOUND — see app/providers/email/imap.py's `trusted_outbound`
+    # parameter and its module docstring for why a message's own `From`
+    # header (trivially spoofable by anyone who can send us mail) is no
+    # longer used to decide direction. Gmail's default English label is
+    # used as the default; a non-English/renamed mailbox must be
+    # configured explicitly.
+    gmail_sent_mailbox: str = "[Gmail]/Sent Mail"
     # Bounded so a misconfigured value can't turn a sync into an
     # effectively-unbounded full-mailbox-history fetch (upper bound ~3
     # years) or a no-op (must fetch at least 1 day back).
@@ -90,6 +100,14 @@ class Settings(BaseSettings):
     # SMTPS endpoint; kept configurable only for tests/future flexibility.
     gmail_smtp_host: str = "smtp.gmail.com"
     gmail_smtp_port: int = Field(default=465, ge=1, le=65535)
+
+    # Stage 7E follow-up agent. How long to wait, after the latest real
+    # OUTBOUND message in a job's matched Gmail thread, before a follow-up
+    # becomes eligible — see app/services/follow_up_eligibility.py. Bounded
+    # (1-90 days): 0 would mean "always immediately due" (never a
+    # meaningful wait), and an unbounded value defeats the point of a
+    # configurable delay entirely.
+    follow_up_delay_days: int = Field(default=7, ge=1, le=90)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -117,7 +135,7 @@ class Settings(BaseSettings):
             raise ValueError(f"must not exceed {MAX_ADDRESS_LENGTH} characters")
         return stripped
 
-    @field_validator("gmail_mailbox")
+    @field_validator("gmail_mailbox", "gmail_sent_mailbox")
     @classmethod
     def _validate_gmail_mailbox(cls, value: str) -> str:
         stripped = value.strip()
