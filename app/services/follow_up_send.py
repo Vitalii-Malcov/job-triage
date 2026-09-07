@@ -121,15 +121,22 @@ than assume "send always finishes well within one TTL window",
 ENTIRE guarded section (revalidation through `provider.send()`): every
 `heartbeat_interval_seconds` (a fraction of the lease's own TTL, so
 several renewal attempts happen per lease window), it calls
-`acquire_thread_lock` AGAIN for the SAME `holder` token — which, by that
-function's own CAS semantics, succeeds if-and-only-if we STILL hold the
-lease (unexpired, same holder) or it happens to still be free, and pushes
-`lock_expires_at` back out another full TTL. A renewal that fails (some
-other holder now owns it — only possible if our lease had ALREADY lapsed
-despite the heartbeat, e.g. an unexpected multi-second stall on the
-heartbeat's own DB round trip) sets a `lock_lost` flag and the heartbeat
-stops trying — it never keeps renewing on the assumption ownership might
-somehow come back.
+`app.db.gmail_repository.renew_thread_lock` for the SAME `holder` token —
+a DEDICATED CAS, deliberately NOT `acquire_thread_lock` (S7E-016, Codex
+re-review, correctness fix — see that function's own docstring for the
+full rationale): `acquire_thread_lock` treats an EXPIRED lease as
+free-for-the-taking, which is exactly right for INITIAL/recovery
+acquisition but WRONG for a renewal — a heartbeat that "renewed" via that
+function could silently succeed on a lease that had already lapsed
+(nobody else happening to have grabbed it yet is not proof anyone was
+protected during the gap). `renew_thread_lock` instead requires the
+lease to still be LIVE (`lock_expires_at >= now`) at the moment of
+renewal, on top of `lock_holder == holder` — it fails the instant the
+lease has expired, even if no other holder ever took it. A renewal that
+fails sets a `lock_lost` flag and the heartbeat stops immediately — it
+never falls back to `acquire_thread_lock` to "reacquire", and never
+keeps renewing on the assumption ownership might somehow still be
+intact.
 
 `send_follow_up` checks `lock_lost` immediately after `provider.send()`
 returns SUCCESSFULLY (the only path where silently trusting exclusivity
@@ -204,10 +211,10 @@ from app.db.gmail_repository import (
     THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
     THREAD_LOCK_TTL_SECONDS,
     GmailThreadLockTimeoutError,
-    acquire_thread_lock,
     get_message_by_id,
     new_thread_lock_holder_token,
     release_thread_lock,
+    renew_thread_lock,
     wait_for_thread_lock,
 )
 from app.db.models import FollowUpApprovalRecord, FollowUpProposalRecord, FollowUpSendRecord
@@ -567,9 +574,11 @@ class _ThreadLockHeartbeat:
     the same engine as the caller's `db`, in its own daemon thread.
 
     `lock_lost` (a `threading.Event`) is set the moment a renewal attempt
-    fails — i.e. `app.db.gmail_repository.acquire_thread_lock` reports
-    `holder` no longer owns (or never regained) the lease — and the
-    heartbeat stops trying immediately afterward. The caller MUST check
+    fails — i.e. `app.db.gmail_repository.renew_thread_lock` reports the
+    lease was no longer live for `holder` at renewal time (S7E-016: NOT
+    `acquire_thread_lock`, which would wrongly treat an already-expired
+    lease as free-for-the-taking) — and the heartbeat stops trying
+    immediately afterward. The caller MUST check
     `lock_lost` after `provider.send()` returns and must never treat a
     successful send as trustworthy exclusivity-wise if it is set.
     """
@@ -605,7 +614,13 @@ class _ThreadLockHeartbeat:
             # thread never outlives the guarded section by more than a
             # single wait tick.
             while not self._stop_event.wait(self._interval_seconds):
-                renewed = acquire_thread_lock(
+                # S7E-016: `renew_thread_lock`, NEVER `acquire_thread_lock`
+                # — see that function's docstring for exactly why the two
+                # are not interchangeable here. A renewal must fail the
+                # instant the lease has expired, even if nobody else has
+                # taken it yet; it must never silently resume as though
+                # ownership had been continuous.
+                renewed = renew_thread_lock(
                     session, self._thread_id, holder=self._holder, ttl_seconds=self._ttl_seconds
                 )
                 if not renewed:

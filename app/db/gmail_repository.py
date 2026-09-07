@@ -147,6 +147,55 @@ def acquire_thread_lock(
     return result.rowcount == 1
 
 
+def renew_thread_lock(
+    db: Session, thread_id: int, *, holder: str, ttl_seconds: float = THREAD_LOCK_TTL_SECONDS
+) -> bool:
+    """S7E-016 (Codex re-review, correctness fix): the DEDICATED CAS a
+    lease-renewal heartbeat (`app.services.follow_up_send._ThreadLockHeartbeat`)
+    must use instead of `acquire_thread_lock` — the two are deliberately
+    NOT interchangeable.
+
+    `acquire_thread_lock` treats an EXPIRED lease as free-for-the-taking
+    by design (`lock_expires_at < now` is one of its success conditions)
+    — that is exactly the crash-recovery property initial/recovery
+    acquisition needs (see its own docstring). A heartbeat calling THAT
+    function to "renew" would, on an expired lease, silently succeed and
+    resume as if ownership had been continuous — but it was NOT: the
+    lease lapsed, and for however long that gap lasted, NOTHING actually
+    protected the thread (a Gmail sync's `upsert_message` could freely
+    have acquired and released it in between, entirely unnoticed). A
+    renewal proving continuous ownership must therefore REQUIRE the
+    lease to still be live at the moment of renewal — this function's
+    WHERE clause adds `lock_expires_at >= now` on top of `lock_holder ==
+    holder`, so it returns False the instant the lease has expired, even
+    if no one else has acquired it yet. `app.services.follow_up_send`
+    treats any False return as an unrecoverable loss of exclusivity —
+    the heartbeat stops immediately and never falls back to calling
+    `acquire_thread_lock` to "reacquire"; a gap once opened is a gap,
+    regardless of whether anyone else happened to walk through it.
+
+    Returns True only if EXACTLY one row was updated.
+    """
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    result = db.execute(
+        update(GmailThreadRecord)
+        .where(
+            GmailThreadRecord.id == thread_id,
+            GmailThreadRecord.lock_holder == holder,
+            GmailThreadRecord.lock_expires_at >= now,
+        )
+        .values(lock_expires_at=expires_at)
+        # See acquire_thread_lock's identical execution_options comment —
+        # this is the second CAS UPDATE in this project filtering on a
+        # DateTime column, subject to the same SQLite naive/aware
+        # in-session-evaluator hazard.
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
+
+
 def release_thread_lock(db: Session, thread_id: int, *, holder: str) -> None:
     """Release `thread_id`'s guard — a no-op (never raises) if `holder`
     doesn't currently hold it (e.g. it already expired and was reclaimed

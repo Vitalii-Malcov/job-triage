@@ -859,7 +859,7 @@ class TestLeaseRenewalHeartbeat:
             # t=0 would race that harmless window instead of testing
             # what this test is actually about. 2.0s of provider "send
             # time" leaves ample margin for this.
-            time.sleep(0.2)
+            time.sleep(0.3)
             while not stop_polling.is_set():
                 acquire_attempts["total"] += 1
                 if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
@@ -874,7 +874,7 @@ class TestLeaseRenewalHeartbeat:
 
             def send(self, message):
                 self.call_count += 1
-                time.sleep(2.0)
+                time.sleep(3.0)
                 # Stop Session B's polling right as send() is about to
                 # return, strictly BEFORE send_follow_up releases the
                 # guard in its own `finally` -- keeps the "must never
@@ -888,20 +888,26 @@ class TestLeaseRenewalHeartbeat:
         poller = threading.Thread(target=_poll_session_b, daemon=True)
         poller.start()
         try:
-            # lock_ttl_seconds (1.0s) is far shorter than the provider's
-            # own 2.0s "send time" -- without the heartbeat, the lease
+            # lock_ttl_seconds (2.0s) is far shorter than the provider's
+            # own 3.0s "send time" -- without the heartbeat, the lease
             # would lapse partway through. heartbeat_interval_seconds is
-            # set explicitly (well below the ttl/3 default) so a single
-            # delayed renewal tick under real OS thread-scheduling jitter
-            # still leaves a wide safety margin before the lease's own
-            # TTL could actually elapse.
+            # set explicitly, well under a tenth of the TTL, so even a
+            # heavily delayed renewal tick under real (sandboxed) OS
+            # thread-scheduling jitter still leaves a wide safety margin
+            # before the lease's own TTL could actually elapse -- since
+            # S7E-016, a renewal that runs even slightly past that
+            # deadline now correctly reports ownership lost (see
+            # test_renewal_reports_ownership_lost_when_lease_expires_with_nobody_else_acquiring
+            # below), so this test's margin must stay generous to remain
+            # a stable proof of the HAPPY path rather than incidentally
+            # re-testing that boundary.
             record = send_follow_up(
                 db,
                 ACCOUNT,
                 proposal.id,
                 provider,
-                lock_ttl_seconds=1.0,
-                heartbeat_interval_seconds=0.1,
+                lock_ttl_seconds=2.0,
+                heartbeat_interval_seconds=0.15,
             )
         finally:
             stop_polling.set()
@@ -964,3 +970,48 @@ class TestLeaseRenewalHeartbeat:
             assert acquire_thread_lock(session_b, thread_id, holder="session-B") is True
         finally:
             session_b.close()
+
+    def test_renewal_reports_ownership_lost_when_lease_expires_with_nobody_else_acquiring(self, db):
+        """S7E-016 (Codex re-review, correctness fix): the heartbeat's
+        renewal must fail the instant the lease has expired -- even when
+        NO OTHER writer ever touched the lock. Before this fix, the
+        heartbeat used `acquire_thread_lock` for renewal, which trivially
+        succeeds for the SAME holder regardless of expiry (one of that
+        function's own reentrant-acquire success conditions) -- silently
+        masking a real ownership gap whenever the heartbeat's own tick
+        happened to run late. This proves the dedicated
+        `renew_thread_lock` CAS instead correctly reports the gap, and
+        the send result becomes UNCERTAIN, never SENT.
+        """
+        proposal, _outbound, _approval = _seed_and_approve(db)
+
+        class SlowProvider:
+            def __init__(self):
+                self.call_count = 0
+
+            def send(self, message):
+                self.call_count += 1
+                # Sleeps well past BOTH the tiny TTL and the
+                # (deliberately even longer) heartbeat interval below, so
+                # the heartbeat's first renewal attempt fires only AFTER
+                # the lease has already, genuinely expired -- with nobody
+                # else ever attempting to touch the lock in the meantime.
+                time.sleep(0.4)
+                return OutboundSendResult(provider_message_id="msg-1")
+
+        provider = SlowProvider()
+
+        with pytest.raises(FollowUpSendOutcomeUncertainError):
+            send_follow_up(
+                db,
+                ACCOUNT,
+                proposal.id,
+                provider,
+                lock_ttl_seconds=0.05,
+                heartbeat_interval_seconds=0.2,
+            )
+
+        assert provider.call_count == 1
+        send_record = get_send_for_proposal(db, ACCOUNT, proposal.id)
+        assert send_record.status == "UNCERTAIN"
+        assert send_record.last_error == "ThreadLockOwnershipLost"
