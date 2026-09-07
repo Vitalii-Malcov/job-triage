@@ -6,6 +6,8 @@ tests/test_response_draft_send_service.py's coverage for Stage 7D.
 """
 
 import json
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -825,3 +827,140 @@ class TestThreadGuardSharedWithGmailSync:
         )
         assert created is True
         assert reply.thread_id == outbound.thread_id
+
+
+class TestLeaseRenewalHeartbeat:
+    """S7E-015 (Codex re-review, final lock hardening):
+    SMTP_OPERATION_TIMEOUT_SECONDS only bounds EACH socket operation, not
+    the CUMULATIVE wall-clock time of provider.send() as a whole -- a
+    fixed lock_ttl_seconds lease could still lapse under a legitimately
+    slow (not hung) send. send_follow_up now runs a background heartbeat
+    that renews the lease every heartbeat_interval_seconds for as long as
+    the guarded section is running. These tests use TWO fully
+    independent SQLAlchemy Sessions/connections (never a single shared
+    Session simulating both sides) to prove the guard is genuinely held
+    the entire time, not merely "probably long enough".
+    """
+
+    def test_slow_send_keeps_the_guard_via_heartbeat_renewal(self, db):
+        proposal, outbound, _approval = _seed_and_approve(db)
+        thread_id = outbound.thread_id
+        session_b = sessionmaker(bind=db.get_bind())()
+
+        acquire_attempts = {"total": 0, "succeeded": 0}
+        stop_polling = threading.Event()
+
+        def _poll_session_b():
+            # Give send_follow_up time to get past its own pre-lock setup
+            # (proposal/approval lookups, claim_send_attempt,
+            # begin_transmission) and actually acquire the guard first --
+            # during that brief setup window the thread is legitimately
+            # unguarded (no send is "in flight" yet), so polling from
+            # t=0 would race that harmless window instead of testing
+            # what this test is actually about. 2.0s of provider "send
+            # time" leaves ample margin for this.
+            time.sleep(0.2)
+            while not stop_polling.is_set():
+                acquire_attempts["total"] += 1
+                if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
+                    acquire_attempts["succeeded"] += 1
+                    release_thread_lock(session_b, thread_id, holder="session-B-writer")
+                time.sleep(0.03)
+
+        class SlowProvider:
+            def __init__(self, stop_event):
+                self.call_count = 0
+                self._stop_event = stop_event
+
+            def send(self, message):
+                self.call_count += 1
+                time.sleep(2.0)
+                # Stop Session B's polling right as send() is about to
+                # return, strictly BEFORE send_follow_up releases the
+                # guard in its own `finally` -- keeps the "must never
+                # acquire while the heartbeat is alive" assertion below
+                # free of a race against the guard's own, legitimate,
+                # post-send release.
+                self._stop_event.set()
+                return OutboundSendResult(provider_message_id="msg-1")
+
+        provider = SlowProvider(stop_polling)
+        poller = threading.Thread(target=_poll_session_b, daemon=True)
+        poller.start()
+        try:
+            # lock_ttl_seconds (1.0s) is far shorter than the provider's
+            # own 2.0s "send time" -- without the heartbeat, the lease
+            # would lapse partway through. heartbeat_interval_seconds is
+            # set explicitly (well below the ttl/3 default) so a single
+            # delayed renewal tick under real OS thread-scheduling jitter
+            # still leaves a wide safety margin before the lease's own
+            # TTL could actually elapse.
+            record = send_follow_up(
+                db,
+                ACCOUNT,
+                proposal.id,
+                provider,
+                lock_ttl_seconds=1.0,
+                heartbeat_interval_seconds=0.1,
+            )
+        finally:
+            stop_polling.set()
+            poller.join(timeout=3)
+
+        try:
+            assert record.status == "SENT"
+            assert provider.call_count == 1
+            assert acquire_attempts["total"] > 5, "the poller must have gotten several tries in"
+            assert acquire_attempts["succeeded"] == 0, (
+                "Session B must NEVER acquire the guard while the heartbeat is alive "
+                "and renewing on the original sender's behalf"
+            )
+
+            # After send_follow_up has fully finished (guard released),
+            # the SAME independent session succeeds immediately.
+            assert acquire_thread_lock(session_b, thread_id, holder="session-B-writer") is True
+        finally:
+            session_b.close()
+
+    def test_heartbeat_stopping_lets_the_lease_expire_and_be_recovered(self, db):
+        """If the heartbeat stops renewing (a clean stop() here stands in
+        for a crashed process -- identical from the lock's point of view:
+        no more renewals either way) BEFORE the lease's own TTL has
+        elapsed, the lease still becomes acquirable strictly once that
+        TTL actually elapses, and not a moment before -- proving
+        TTL-based recovery does not depend on anyone explicitly
+        releasing.
+        """
+        proposal, outbound, _approval = _seed_and_approve(db)
+        thread_id = outbound.thread_id
+        session_b = sessionmaker(bind=db.get_bind())()
+        try:
+            import app.services.follow_up_send as send_module
+
+            holder = "sender-that-crashes"
+            assert acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=0.15) is True
+
+            heartbeat = send_module._ThreadLockHeartbeat(
+                db, thread_id, holder=holder, ttl_seconds=0.15, interval_seconds=0.05
+            )
+            heartbeat.start()
+            time.sleep(0.12)  # a couple of real renewals happen here
+
+            # While the heartbeat is alive and renewing, B cannot acquire.
+            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is False
+
+            # Simulate the heartbeat (and, by extension, its owning
+            # process) dying: stop it WITHOUT releasing the lock.
+            heartbeat.stop()
+
+            # Immediately after stopping, the lease is still technically
+            # live (the TTL hasn't elapsed since the last renewal) -- B
+            # still cannot acquire yet.
+            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is False
+
+            # Once the TTL has actually elapsed with no further renewal,
+            # B recovers the lock.
+            time.sleep(0.2)
+            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is True
+        finally:
+            session_b.close()

@@ -109,6 +109,55 @@ Stage 7A's own code never imports anything from `app.services.follow_up*`
 (see app/services/gmail_inbox.py's "zero job/application linkage"
 constraint, which this fix does not touch).
 
+**Lease renewal / heartbeat — the lock must never expire under a still-
+live sender (S7E-015, Codex re-review, final lock hardening).**
+`app.providers.email.smtp.SMTP_OPERATION_TIMEOUT_SECONDS` bounds each
+INDIVIDUAL blocking socket call, not the CUMULATIVE wall-clock time of
+`provider.send()` as a whole (see that constant's own honestly-documented
+limitation) — so a fixed `THREAD_LOCK_TTL_SECONDS` lease could still, in
+principle, lapse while a legitimately still-running send holds it. Rather
+than assume "send always finishes well within one TTL window",
+`send_follow_up` runs a `_ThreadLockHeartbeat` background thread for the
+ENTIRE guarded section (revalidation through `provider.send()`): every
+`heartbeat_interval_seconds` (a fraction of the lease's own TTL, so
+several renewal attempts happen per lease window), it calls
+`acquire_thread_lock` AGAIN for the SAME `holder` token — which, by that
+function's own CAS semantics, succeeds if-and-only-if we STILL hold the
+lease (unexpired, same holder) or it happens to still be free, and pushes
+`lock_expires_at` back out another full TTL. A renewal that fails (some
+other holder now owns it — only possible if our lease had ALREADY lapsed
+despite the heartbeat, e.g. an unexpected multi-second stall on the
+heartbeat's own DB round trip) sets a `lock_lost` flag and the heartbeat
+stops trying — it never keeps renewing on the assumption ownership might
+somehow come back.
+
+`send_follow_up` checks `lock_lost` immediately after `provider.send()`
+returns SUCCESSFULLY (the only path where silently trusting exclusivity
+would matter — see below) and, if set, does NOT call `mark_send_sent`:
+it calls `mark_send_uncertain` and raises `FollowUpSendOutcomeUncertainError`
+instead. This is deliberate, not paranoid: if the lease genuinely lapsed
+while the provider call was still in flight, a concurrent Gmail sync
+could have committed a new INBOUND reply for this exact thread during
+that gap, unnoticed — the message may well have been delivered
+correctly, but this project can no longer PROVE the correspondence state
+it was approved against stayed exclusive for the whole window, so it
+fails closed exactly like a genuinely ambiguous provider outcome would.
+A `provider.send()` that raises `EmailSendConnectionError`/`EmailSendAuthError`
+(a DEFINITE pre-transmission failure) is unaffected by `lock_lost` either
+way — no transmission was ever attempted, so whether exclusivity lapsed
+during that failed attempt is moot; `EmailSendOutcomeUnknownError` is
+already the fail-closed terminal state regardless.
+
+The heartbeat runs on its OWN `Session` (bound to the same engine as the
+caller's `db` via `sessionmaker(bind=db.get_bind())`) in its OWN
+background thread — SQLAlchemy Sessions are not safe to share across
+threads. It is always a daemon thread and is always `stop()`-ped in the
+outer `finally` alongside `release_thread_lock`, so it can never outlive
+`send_follow_up` itself; if the whole process dies mid-send, the
+heartbeat thread dies with it, nothing renews, and the lease simply
+expires on its own schedule — exactly the crash-recovery behavior
+`THREAD_LOCK_TTL_SECONDS` was already designed around.
+
 **Crash/CAS recovery (S7E-010, Codex remediation).** `send_attempted`
 durably distinguishes "transmission was never attempted for this claim"
 (safe to hand to a later request) from "transmission may already be
@@ -130,9 +179,10 @@ one explicitly-approved `OutboundEmailProvider.send` call in
 
 import json
 import logging
+import threading
 from datetime import UTC, datetime
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.db.follow_up_approval_repository import (
@@ -154,6 +204,7 @@ from app.db.gmail_repository import (
     THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
     THREAD_LOCK_TTL_SECONDS,
     GmailThreadLockTimeoutError,
+    acquire_thread_lock,
     get_message_by_id,
     new_thread_lock_holder_token,
     release_thread_lock,
@@ -507,6 +558,75 @@ def _fail_closed_if_reply_raced_dispatch(
         )
 
 
+class _ThreadLockHeartbeat:
+    """S7E-015 (Codex re-review, final lock hardening): periodically
+    renews `thread_id`'s guard on `holder`'s behalf for as long as
+    `provider.send()` is running — see module docstring's "Lease renewal
+    / heartbeat" section for the full rationale. Runs on its OWN Session
+    (SQLAlchemy Sessions are never safe to share across threads) bound to
+    the same engine as the caller's `db`, in its own daemon thread.
+
+    `lock_lost` (a `threading.Event`) is set the moment a renewal attempt
+    fails — i.e. `app.db.gmail_repository.acquire_thread_lock` reports
+    `holder` no longer owns (or never regained) the lease — and the
+    heartbeat stops trying immediately afterward. The caller MUST check
+    `lock_lost` after `provider.send()` returns and must never treat a
+    successful send as trustworthy exclusivity-wise if it is set.
+    """
+
+    def __init__(
+        self,
+        db: Session,
+        thread_id: int,
+        *,
+        holder: str,
+        ttl_seconds: float,
+        interval_seconds: float,
+    ) -> None:
+        self._session_factory = sessionmaker(bind=db.get_bind())
+        self._thread_id = thread_id
+        self._holder = holder
+        self._ttl_seconds = ttl_seconds
+        self._interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self.lock_lost = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="follow-up-send-lock-heartbeat")
+        self._thread.daemon = True
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        session = self._session_factory()
+        try:
+            # `Event.wait(timeout)` both sleeps AND doubles as the stop
+            # signal check — returns True (skips the renewal below and
+            # exits the loop) the instant `stop()` sets it, so this
+            # thread never outlives the guarded section by more than a
+            # single wait tick.
+            while not self._stop_event.wait(self._interval_seconds):
+                renewed = acquire_thread_lock(
+                    session, self._thread_id, holder=self._holder, ttl_seconds=self._ttl_seconds
+                )
+                if not renewed:
+                    # Ownership is gone — never keep renewing on the
+                    # assumption it might come back; the caller's
+                    # exclusivity guarantee for this send is already
+                    # broken and must be reported, not silently retried.
+                    logger.warning(
+                        "follow_up_send_lock_heartbeat_lost_ownership gmail_thread_id=%s",
+                        self._thread_id,
+                    )
+                    self.lock_lost.set()
+                    return
+        finally:
+            session.close()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=self._interval_seconds + 1.0)
+
+
 def send_follow_up(
     db: Session,
     account_key: str,
@@ -517,17 +637,22 @@ def send_follow_up(
     now: datetime | None = None,
     lock_wait_seconds: float = THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
     lock_ttl_seconds: float = THREAD_LOCK_TTL_SECONDS,
+    heartbeat_interval_seconds: float | None = None,
 ) -> FollowUpSendRecord:
     """Send an APPROVED follow-up as a real Gmail message. See module
-    docstring for the full send-gate contract. `lock_ttl_seconds`
-    defaults to the safe production value
-    (`app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS`) — overridable
-    only so tests can exercise the lease-expiry boundary quickly (see
-    tests/test_gmail_repository.py's
+    docstring for the full send-gate contract, including the S7E-015
+    lease-renewal heartbeat that runs for the ENTIRE guarded section so
+    `lock_ttl_seconds` never has to be gambled against `provider.send()`'s
+    actual duration. `lock_ttl_seconds` defaults to the safe production
+    value (`app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS`) —
+    overridable only so tests can exercise the lease-expiry boundary
+    quickly (see tests/test_gmail_repository.py's
     `test_deliberately_slow_provider_still_completes_and_lease_recovers`);
     production callers should never lower it below what
     `app.providers.email.smtp.SMTP_OPERATION_TIMEOUT_SECONDS` needs as
-    margin. Raises one of
+    margin. `heartbeat_interval_seconds` defaults to a third of
+    `lock_ttl_seconds` (several renewals per lease window) — overridable
+    for the same test-speed reason. Raises one of
     `FollowUpProposalNotFoundError` / `FollowUpNotApprovedError` /
     `FollowUpMissingRecipientError` / `FollowUpAlreadySentError` /
     `FollowUpSendInProgressError` / `FollowUpProposalStaleAtSendTimeError`
@@ -595,6 +720,26 @@ def send_follow_up(
             f"{proposal.id!r}; a Gmail sync or another send is currently using it"
         ) from exc
 
+    # S7E-015: renew the lease periodically for as long as the guarded
+    # section runs — see module docstring's "Lease renewal / heartbeat"
+    # section. `heartbeat_interval_seconds` intentionally derives from
+    # whatever `lock_ttl_seconds` THIS call actually uses (not the
+    # module default) so a test overriding `lock_ttl_seconds` to
+    # something tiny gets a correspondingly fast heartbeat unless it
+    # ALSO overrides `heartbeat_interval_seconds` explicitly.
+    effective_heartbeat_interval = (
+        heartbeat_interval_seconds
+        if heartbeat_interval_seconds is not None
+        else lock_ttl_seconds / 3
+    )
+    heartbeat = _ThreadLockHeartbeat(
+        db,
+        proposal.gmail_thread_id,
+        holder=lock_holder,
+        ttl_seconds=lock_ttl_seconds,
+        interval_seconds=effective_heartbeat_interval,
+    )
+    heartbeat.start()
     try:
         settings = settings or get_settings()
         now = now or datetime.now(UTC)
@@ -639,10 +784,32 @@ def send_follow_up(
                 f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
             ) from exc
 
+        # S7E-015: the outbound provider reported success, but if the
+        # heartbeat ever lost ownership of the lease WHILE provider.send
+        # was still in flight, exclusivity for this guarded window is no
+        # longer provable — a concurrent Gmail sync could have committed
+        # a new reply for this thread unnoticed during that gap. Fail
+        # closed to UNCERTAIN rather than silently trusting SENT; a
+        # DEFINITE pre-transmission failure above is unaffected (no
+        # transmission was ever attempted either way).
+        if heartbeat.lock_lost.is_set():
+            mark_send_uncertain(db, send_record, last_error="ThreadLockOwnershipLost")
+            logger.warning(
+                "follow_up_send_lock_lost_during_dispatch follow_up_proposal_id=%s",
+                proposal.id,
+            )
+            raise FollowUpSendOutcomeUncertainError(
+                f"follow_up_proposal_id={follow_up_proposal_id!r}: lost exclusive "
+                "ownership of the Gmail thread guard while the outbound provider was "
+                "still running; the message may have been sent but exclusivity "
+                "cannot be proven"
+            )
+
         mark_send_sent(db, send_record, provider_message_id=result.provider_message_id)
         logger.info("follow_up_sent follow_up_proposal_id=%s", proposal.id)
         return send_record
     finally:
+        heartbeat.stop()
         release_thread_lock(db, proposal.gmail_thread_id, holder=lock_holder)
 
 

@@ -952,15 +952,21 @@ def test_thread_guard_lease_expires_for_a_holder_that_never_releases(tmp_path):
 
 
 def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path):
-    """S7E-014: end-to-end version of the lease-expiry boundary using a
-    real send_follow_up call with a deliberately slow fake provider whose
-    send() outlasts a tiny, test-scoped lock_ttl_seconds. The send itself
-    must still complete correctly (a stale lease does not corrupt the
-    ORIGINAL holder own outcome); separately, a different session can
-    acquire the same thread guard once the lease has expired - the exact
-    residual-risk boundary app/providers/email/smtp.py real, production
-    hard timeout (safely below THREAD_LOCK_TTL_SECONDS) is designed to
-    keep unreachable.
+    """S7E-015 (supersedes the S7E-014 framing of this same test):
+    end-to-end send_follow_up call with a deliberately slow fake provider
+    whose send() outlasts a tiny, test-scoped lock_ttl_seconds. Before the
+    S7E-015 lease-renewal heartbeat existed, this scenario relied on the
+    lease simply expiring mid-send and being silently "gotten away with"
+    (the historical hazard this whole lock exists to prevent); now the
+    heartbeat keeps renewing lock_ttl_seconds throughout the slow send, so
+    the lease never actually lapses while genuinely still held - the send
+    completes as SENT through NORMAL exclusive ownership, not through a
+    stale-lease loophole. See TestLeaseRenewalHeartbeat in
+    tests/test_follow_up_send_service.py for the direct, real-two-Session
+    proof that a concurrent writer is blocked THE WHOLE TIME the heartbeat
+    is alive. This test's remaining, still-true assertion is simpler: a
+    different session can always acquire the SAME thread's guard once
+    send_follow_up has actually finished and released it.
     """
     from datetime import timedelta
 
