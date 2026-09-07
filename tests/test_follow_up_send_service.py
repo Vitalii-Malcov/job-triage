@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -30,7 +30,12 @@ from app.db.gmail_repository import (
     release_thread_lock,
     upsert_message,
 )
-from app.db.models import GmailMessageAnalysisRecord, GmailMessageRecord, JobRecord
+from app.db.models import (
+    GmailMessageAnalysisRecord,
+    GmailMessageRecord,
+    GmailThreadRecord,
+    JobRecord,
+)
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
     EmailSendConnectionError,
@@ -848,6 +853,17 @@ class TestLeaseRenewalHeartbeat:
         session_b = sessionmaker(bind=db.get_bind())()
 
         acquire_attempts = {"total": 0, "succeeded": 0}
+        # Records (pre_lock_holder, pre_lock_expires_at) read IMMEDIATELY
+        # before every successful claim -- the real invariant this test
+        # proves is not "session B can never succeed" (a queued write can
+        # legitimately land the instant AFTER send_follow_up's own
+        # release commits -- SQLite serializes writers, so that write is
+        # provably ordered after the release, not a steal), but "session
+        # B can never succeed while the guard was still visibly held by
+        # the original sender (pre_lock_holder not None) at the moment
+        # just before the claim". A plain Core select bypasses the ORM
+        # identity map so this read is never stale.
+        successful_claim_preimages: list[tuple[str | None, object]] = []
         stop_polling = threading.Event()
 
         def _poll_session_b():
@@ -857,13 +873,19 @@ class TestLeaseRenewalHeartbeat:
             # during that brief setup window the thread is legitimately
             # unguarded (no send is "in flight" yet), so polling from
             # t=0 would race that harmless window instead of testing
-            # what this test is actually about. 2.0s of provider "send
+            # what this test is actually about. 3.0s of provider "send
             # time" leaves ample margin for this.
             time.sleep(0.3)
             while not stop_polling.is_set():
                 acquire_attempts["total"] += 1
+                pre_holder, pre_expires_at = session_b.execute(
+                    select(GmailThreadRecord.lock_holder, GmailThreadRecord.lock_expires_at).where(
+                        GmailThreadRecord.id == thread_id
+                    )
+                ).one()
                 if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
                     acquire_attempts["succeeded"] += 1
+                    successful_claim_preimages.append((pre_holder, pre_expires_at))
                     release_thread_lock(session_b, thread_id, holder="session-B-writer")
                 time.sleep(0.03)
 
@@ -877,10 +899,13 @@ class TestLeaseRenewalHeartbeat:
                 time.sleep(3.0)
                 # Stop Session B's polling right as send() is about to
                 # return, strictly BEFORE send_follow_up releases the
-                # guard in its own `finally` -- keeps the "must never
-                # acquire while the heartbeat is alive" assertion below
-                # free of a race against the guard's own, legitimate,
-                # post-send release.
+                # guard in its own `finally` -- trims the number of
+                # attempts that land in the legitimate post-release
+                # window. Not required for correctness (the pre-image
+                # check below tolerates a claim landing right after
+                # release regardless of exactly when polling stops), but
+                # keeps the attempt log focused on the window this test
+                # actually cares about.
                 self._stop_event.set()
                 return OutboundSendResult(provider_message_id="msg-1")
 
@@ -917,10 +942,23 @@ class TestLeaseRenewalHeartbeat:
             assert record.status == "SENT"
             assert provider.call_count == 1
             assert acquire_attempts["total"] > 5, "the poller must have gotten several tries in"
-            assert acquire_attempts["succeeded"] == 0, (
-                "Session B must NEVER acquire the guard while the heartbeat is alive "
-                "and renewing on the original sender's behalf"
-            )
+
+            # A queued session-B write can legitimately land the instant
+            # AFTER send_follow_up's own release commits (SQLite
+            # serializes writers, so that write is provably ordered
+            # after the release -- not a steal). What must never happen
+            # is session B actually reconciling/stealing the guard while
+            # it was still visibly held by the original sender. Every
+            # successful claim's pre-image must therefore show the guard
+            # already released (lock_holder None) at the moment just
+            # before that claim -- never the original holder's token,
+            # expired lease or not.
+            for pre_holder, _pre_expires_at in successful_claim_preimages:
+                assert pre_holder is None, (
+                    "session B must only ever succeed once the ORIGINAL sender's guard "
+                    "was already released -- never by reconciling/stealing a still-held "
+                    "lease out from under an active heartbeat"
+                )
 
             # After send_follow_up has fully finished (guard released),
             # the SAME independent session succeeds immediately.

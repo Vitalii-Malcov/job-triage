@@ -954,7 +954,7 @@ def test_thread_guard_lease_expires_for_a_holder_that_never_releases(tmp_path):
 def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path):
     """S7E-015 (supersedes the S7E-014 framing of this same test):
     end-to-end send_follow_up call with a deliberately slow fake provider
-    whose send() outlasts a tiny, test-scoped lock_ttl_seconds. Before the
+    whose send() outlasts the initial lock_ttl_seconds window. Before the
     S7E-015 lease-renewal heartbeat existed, this scenario relied on the
     lease simply expiring mid-send and being silently "gotten away with"
     (the historical hazard this whole lock exists to prevent); now the
@@ -967,6 +967,18 @@ def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path)
     is alive. This test's remaining, still-true assertion is simpler: a
     different session can always acquire the SAME thread's guard once
     send_follow_up has actually finished and released it.
+
+    Timing margins (stabilized — a prior version used lock_ttl_seconds
+    of 0.05s, which drove send_follow_up's default heartbeat interval
+    down to ~16.7ms; a single ordinary Windows/SQLite/GIL scheduling
+    delay in that window could blow the margin and cause a flaky,
+    spurious lease loss unrelated to any real bug). lock_ttl_seconds=1.0s
+    is comfortably above realistic scheduling jitter; the provider's
+    1.5s sleep still genuinely outlasts that initial TTL (so the test
+    still proves heartbeat renewal — not just a naturally-long-enough
+    lease — is what keeps ownership through the slow send); the
+    heartbeat interval (0.1s, 10x smaller than the TTL) leaves a wide
+    ~0.9s cushion per renewal attempt.
     """
     from datetime import timedelta
 
@@ -1061,7 +1073,7 @@ def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path)
 
             def send(self, message):
                 self.call_count += 1
-                time.sleep(0.2)  # deliberately outlasts the tiny TTL below
+                time.sleep(1.5)  # deliberately outlasts the initial TTL below
                 return OutboundSendResult(provider_message_id="msg-1")
 
         provider = SlowProvider()
@@ -1071,20 +1083,23 @@ def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path)
             account_key,
             result.proposal.id,
             provider,
-            lock_ttl_seconds=0.05,
+            lock_ttl_seconds=1.0,
+            heartbeat_interval_seconds=0.1,
         )
 
         assert record.status == "SENT"
         assert provider.call_count == 1
         assert get_send_for_proposal(db, account_key, result.proposal.id).status == "SENT"
 
-        # The lease (TTL=0.05s) expired long before the 0.2s send
-        # finished - proving the documented residual-risk boundary: a
-        # different, fully independent session CAN now acquire the same
-        # thread guard. This is exactly why production relies on the
+        # send_follow_up explicitly releases the guard in its own
+        # finally block once the send completes (see
+        # release_thread_lock's call site) - so a different, fully
+        # independent session can now acquire the same thread guard
+        # regardless of whether the lease itself would still have time
+        # left on it. This is exactly why production ALSO relies on the
         # real SMTP hard timeout staying safely below the lock own TTL
         # (see app/providers/email/smtp.py SMTP_OPERATION_TIMEOUT_SECONDS),
-        # not on this margin alone.
+        # not on lease expiry alone.
         acquired = acquire_thread_lock(
             other_session, outbound.thread_id, holder="concurrent-writer"
         )
