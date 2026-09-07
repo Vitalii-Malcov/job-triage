@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -1838,6 +1839,89 @@ class ApplicationPackageReviewRevisionRecord(Base):
     # 14) for cheap inspection without deserializing either blob.
     manual_override_paths_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     edit_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class AutomationRunRecord(Base):
+    """Stage 8A: one persisted, end-to-end orchestrated job-search cycle
+    for one account — the audit trail of WHEN an automation run happened,
+    WHICH existing steps (collectors) it coordinated, and what each one's
+    outcome was. This table owns none of the actual collection/scoring
+    logic — `app.services.automation.run_automation_cycle` orchestrates
+    the SAME `app.api.routes._run_bundesagentur`/`_run_xing` helpers the
+    individual `/collectors/*/run` endpoints and the Telegram control
+    center already call, so this is coordination bookkeeping only, never
+    a second implementation of collection/dedup/scoring.
+
+    **`account_key` (mirrors GMAIL-002's convention elsewhere).** The
+    normalized `GMAIL_USERNAME` this run was scoped to — every read is
+    filtered by it, so a later account change can never leak or mix a
+    previous account's run history, exactly like Gmail/follow-up records.
+
+    **`status`** is one of `RUNNING` / `COMPLETED` / `PARTIAL` / `FAILED`:
+    `RUNNING` from creation until the orchestrator finishes; `COMPLETED`
+    if every coordinated step succeeded; `PARTIAL` if at least one
+    succeeded and at least one did not; `FAILED` if none did. Terminal
+    states are never left ambiguous — the caller always ends the run in
+    exactly one of these three.
+
+    **`results_json`** is a JSON object keyed by step name (e.g.
+    `"bundesagentur"`, `"xing"`), each value shaped like
+    `{"status": "ok"|"not_configured"|"failed", "counters": {...} |
+    null, "error_type": str | null}` — `counters` is the step's own
+    already-existing return shape (e.g. `{"fetched":.., "created":..,
+    ...}`), never re-derived or duplicated here. `error_summary` is a
+    short, human-readable, SANITIZED string built only from step names
+    and `type(exc).__name__` — mirrors this project's GMAIL-003
+    convention (app/providers/email/base.py's `GmailProviderError`
+    docstring) of never persisting/returning raw upstream exception text,
+    which could otherwise carry back a server-echoed detail.
+
+    **Concurrency (fail-closed, not serialized).** `uq_automation_runs_one_running_per_account`
+    is a PARTIAL unique index — `UNIQUE(account_key) WHERE status =
+    'RUNNING'` — the sole arbiter of "at most one RUNNING run per
+    account at a time", enforced by the database, not a Python
+    check-then-act read. `app.db.automation_repository.create_running_run`
+    always attempts a plain INSERT first and lets a concurrent duplicate
+    fail on this constraint (caught and translated into
+    `AutomationRunAlreadyInProgressError`, mapped to 409) — the same
+    INSERT + IntegrityError-catch idiom used throughout this project
+    (e.g. `app.db.follow_up_approval_repository.claim_send_attempt`).
+
+    **Stage 8A scope note (honest limitation, not silently overclaimed):
+    no crash-recovery TTL exists for `RUNNING` yet** — unlike Stage 7E's
+    time-bounded Gmail thread lock, a process that crashes mid-run
+    leaves this row `RUNNING` forever, permanently blocking new runs for
+    that account until manually resolved. Deliberately out of scope for
+    this foundational stage (no scheduler/cron exists yet either); a
+    later stage introducing background/scheduled runs should revisit
+    this alongside that work.
+    """
+
+    __tablename__ = "automation_runs"
+    __table_args__ = (
+        Index(
+            "uq_automation_runs_one_running_per_account",
+            "account_key",
+            unique=True,
+            sqlite_where=text("status = 'RUNNING'"),
+        ),
+        CheckConstraint(
+            "status IN ('RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED')",
+            name="ck_automation_runs_status_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    results_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
