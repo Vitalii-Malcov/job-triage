@@ -252,7 +252,7 @@ class TestRunCommand:
     @pytest.mark.asyncio
     async def test_bundesagentur_success(self, monkeypatch):
         stats = {"fetched": 3, "created": 2, "updated": 1, "skipped_invalid": 0, "failed": 0}
-        monkeypatch.setattr(bot, "_run_bundesagentur", AsyncMock(return_value=stats))
+        monkeypatch.setattr(bot, "run_bundesagentur", AsyncMock(return_value=stats))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_run(update, _make_context(["bundesagentur"]))
@@ -266,7 +266,7 @@ class TestRunCommand:
     async def test_xing_not_configured(self, monkeypatch):
         monkeypatch.setattr(
             bot,
-            "_run_xing",
+            "run_xing",
             AsyncMock(side_effect=CollectorNotConfiguredError("XING mailbox not configured")),
         )
 
@@ -277,9 +277,7 @@ class TestRunCommand:
 
     @pytest.mark.asyncio
     async def test_upstream_failure(self, monkeypatch):
-        monkeypatch.setattr(
-            bot, "_run_bundesagentur", AsyncMock(side_effect=CollectorError("boom"))
-        )
+        monkeypatch.setattr(bot, "run_bundesagentur", AsyncMock(side_effect=CollectorError("boom")))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_run(update, _make_context(["bundesagentur"]))
@@ -365,7 +363,7 @@ class TestResearchCommand:
 
     @pytest.mark.asyncio
     async def test_not_found(self, monkeypatch):
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=None))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=None))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["999"]))
@@ -375,7 +373,7 @@ class TestResearchCommand:
     @pytest.mark.asyncio
     async def test_success_shows_compact_summary(self, monkeypatch):
         run = _sample_run_response()
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))
@@ -391,7 +389,7 @@ class TestResearchCommand:
             served_stale=True,
             error="transient failure",
         )
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))
@@ -409,7 +407,7 @@ class TestResearchCommand:
             served_stale=False,
             error="Refresh result was superseded by a newer concurrent refresh.",
         )
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))
@@ -434,7 +432,7 @@ class TestResearchCommand:
             served_stale=False,
             error="provider exploded",
         )
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))
@@ -453,7 +451,7 @@ class TestResearchCommand:
             served_stale=False,
             error="provider exploded",
         )
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))
@@ -466,7 +464,7 @@ class TestResearchCommand:
     async def test_provider_not_configured(self, monkeypatch):
         monkeypatch.setattr(
             bot,
-            "_run_company_research",
+            "run_company_research_for_job",
             AsyncMock(side_effect=ProviderNotConfiguredError("needs an API key")),
         )
 
@@ -479,7 +477,7 @@ class TestResearchCommand:
     async def test_invalid_company_identity(self, monkeypatch):
         monkeypatch.setattr(
             bot,
-            "_run_company_research",
+            "run_company_research_for_job",
             AsyncMock(side_effect=InvalidCompanyIdentityError("Job 1 has no usable company name.")),
         )
 
@@ -494,7 +492,7 @@ class TestResearchCommand:
         when the name is ambiguous across multiple known domains."""
         monkeypatch.setattr(
             bot,
-            "_run_company_research",
+            "run_company_research_for_job",
             AsyncMock(
                 side_effect=AmbiguousCompanyIdentityError(
                     "Company identity is ambiguous: multiple known companies share this "
@@ -520,7 +518,7 @@ class TestResearchCommand:
                 "short_summary": "S" * 1000,
             }
         )
-        monkeypatch.setattr(bot, "_run_company_research", AsyncMock(return_value=run))
+        monkeypatch.setattr(bot, "run_company_research_for_job", AsyncMock(return_value=run))
 
         update = _make_update(AUTHORIZED_CHAT_ID)
         await bot.cmd_research(update, _make_context(["1"]))

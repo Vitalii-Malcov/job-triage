@@ -1884,21 +1884,42 @@ class AutomationRunRecord(Base):
     is a PARTIAL unique index — `UNIQUE(account_key) WHERE status =
     'RUNNING'` — the sole arbiter of "at most one RUNNING run per
     account at a time", enforced by the database, not a Python
-    check-then-act read. `app.db.automation_repository.create_running_run`
-    always attempts a plain INSERT first and lets a concurrent duplicate
-    fail on this constraint (caught and translated into
+    check-then-act read. S8A-001 (Codex re-review): declared with BOTH
+    `sqlite_where` and `postgresql_where` (identical predicate) so this
+    project's SQLite deployment and a future PostgreSQL one describe the
+    exact same semantics — see
+    tests/test_automation_run_index_dialects.py for the dialect-level
+    proof (both compile the same `WHERE status = 'RUNNING'` clause).
+    `app.db.automation_repository.create_running_run` always attempts a
+    plain INSERT first and lets a concurrent duplicate fail on this
+    constraint (caught and translated into
     `AutomationRunAlreadyInProgressError`, mapped to 409) — the same
     INSERT + IntegrityError-catch idiom used throughout this project
     (e.g. `app.db.follow_up_approval_repository.claim_send_attempt`).
 
-    **Stage 8A scope note (honest limitation, not silently overclaimed):
-    no crash-recovery TTL exists for `RUNNING` yet** — unlike Stage 7E's
-    time-bounded Gmail thread lock, a process that crashes mid-run
-    leaves this row `RUNNING` forever, permanently blocking new runs for
-    that account until manually resolved. Deliberately out of scope for
-    this foundational stage (no scheduler/cron exists yet either); a
-    later stage introducing background/scheduled runs should revisit
-    this alongside that work.
+    **Crash recovery via an ownership-aware lease (S8A-002, Codex
+    re-review).** `lease_holder`/`lease_expires_at` mirror Stage 7E's
+    per-Gmail-thread lock (`GmailThreadRecord.lock_holder`/
+    `lock_expires_at`, see that model's docstring) — a generic,
+    time-bounded "who currently owns this RUNNING row, until when"
+    primitive. `app.db.automation_repository.create_running_run` claims
+    both atomically on INSERT; `app.services.automation`'s
+    `_RunLeaseHeartbeat` renews `lease_expires_at` periodically for as
+    long as `run_automation_cycle` is executing, via the DEDICATED
+    `renew_run_lease` CAS (never `create_running_run`'s own claim path —
+    a renewal must fail the instant the lease has expired, even if
+    nobody else has taken it over yet; it must never silently resume as
+    though ownership had been continuous — see `renew_run_lease`'s
+    docstring). A process that crashes (or whose heartbeat otherwise
+    stops) leaves the lease to expire on its own schedule rather than
+    blocking that account's automation forever: the NEXT request to
+    start a run finds a stale RUNNING row (`lease_expires_at` in the
+    past) and atomically reconciles it to `FAILED` before claiming a
+    fresh run — a LIVE lease (not yet expired) still fails closed
+    (`AutomationRunAlreadyInProgressError`, 409), exactly like before;
+    only a genuinely expired one is ever reclaimed, and never silently —
+    the reconciliation itself is a CAS, so at most one concurrent
+    requester ever wins it.
     """
 
     __tablename__ = "automation_runs"
@@ -1908,6 +1929,7 @@ class AutomationRunRecord(Base):
             "account_key",
             unique=True,
             sqlite_where=text("status = 'RUNNING'"),
+            postgresql_where=text("status = 'RUNNING'"),
         ),
         CheckConstraint(
             "status IN ('RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED')",
@@ -1922,6 +1944,13 @@ class AutomationRunRecord(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     results_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # S8A-002: ownership-aware lease — see class docstring's "Crash
+    # recovery via an ownership-aware lease" section.
+    lease_holder: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False

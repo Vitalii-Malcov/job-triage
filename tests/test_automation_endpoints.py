@@ -147,9 +147,13 @@ def client(tmp_path, monkeypatch):
     # Default happy-path fakes — individual tests override these via
     # monkeypatch as needed.
     monkeypatch.setattr(
-        "app.api.routes.BundesagenturCollector", lambda **kwargs: FakeBundesagenturCollector()
+        "app.services.collector_runner.BundesagenturCollector",
+        lambda **kwargs: FakeBundesagenturCollector(),
     )
-    monkeypatch.setattr("app.api.routes.XingEmailCollector", lambda **kwargs: FakeXingCollector())
+    monkeypatch.setattr(
+        "app.services.collector_runner.XingEmailCollector",
+        lambda **kwargs: FakeXingCollector(),
+    )
 
     with TestClient(app) as test_client:
         yield test_client, session_factory
@@ -169,11 +173,11 @@ class TestSuccessfulCycle:
     def test_both_collectors_succeed_marks_completed(self, client, monkeypatch):
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()]),
         )
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
         )
 
@@ -200,11 +204,11 @@ class TestPartialAndFailedOutcomes:
     def test_one_collector_fails_other_succeeds_is_partial(self, client, monkeypatch):
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()]),
         )
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(error=XingConnectionError("boom")),
         )
 
@@ -225,7 +229,7 @@ class TestPartialAndFailedOutcomes:
         unconfigured = _settings_for(ACCOUNT, bundesagentur_api_key="")
         monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
         )
 
@@ -240,11 +244,11 @@ class TestPartialAndFailedOutcomes:
     def test_both_collectors_fail_is_failed(self, client, monkeypatch):
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(error=BundesagenturAPIError("boom")),
         )
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(error=XingConnectionError("boom")),
         )
 
@@ -282,13 +286,13 @@ class TestPartialAndFailedOutcomes:
         server-echoed/sensitive detail."""
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(
                 error=BundesagenturAPIError("secret-upstream-detail")
             ),
         )
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(error=XingConnectionError("secret-upstream-detail")),
         )
 
@@ -301,7 +305,7 @@ class TestDedupRemainsCorrect:
     def test_second_run_deduplicates_bundesagentur_job_via_fingerprint(self, client, monkeypatch):
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()]),
         )
 
@@ -364,7 +368,7 @@ class TestConcurrentDuplicateRunProtection:
         test_client, session_factory = client
         db = session_factory()
         try:
-            create_running_run(db, account_key=ACCOUNT)
+            create_running_run(db, account_key=ACCOUNT, holder="pre-existing-holder")
         finally:
             db.close()
 
@@ -379,7 +383,7 @@ class TestConcurrentDuplicateRunProtection:
         not just application-level luck, is what serializes this."""
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()], delay=0.5),
         )
 
@@ -407,8 +411,8 @@ class TestGetEndpointsHaveNoSideEffects:
         def _boom(**kwargs):
             raise AssertionError("GET must never construct a collector")
 
-        monkeypatch.setattr("app.api.routes.BundesagenturCollector", _boom)
-        monkeypatch.setattr("app.api.routes.XingEmailCollector", _boom)
+        monkeypatch.setattr("app.services.collector_runner.BundesagenturCollector", _boom)
+        monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _boom)
 
         first = test_client.get("/api/v1/automation/runs", headers=_auth_headers())
         second = test_client.get("/api/v1/automation/runs", headers=_auth_headers())
@@ -420,7 +424,7 @@ class TestGetEndpointsHaveNoSideEffects:
     def test_repeated_get_by_id_returns_identical_unchanged_state(self, client, monkeypatch):
         test_client, _session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()]),
         )
         created = test_client.post("/api/v1/automation/runs", headers=_auth_headers()).json()
@@ -428,8 +432,8 @@ class TestGetEndpointsHaveNoSideEffects:
         def _boom(**kwargs):
             raise AssertionError("GET must never construct a collector")
 
-        monkeypatch.setattr("app.api.routes.BundesagenturCollector", _boom)
-        monkeypatch.setattr("app.api.routes.XingEmailCollector", _boom)
+        monkeypatch.setattr("app.services.collector_runner.BundesagenturCollector", _boom)
+        monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _boom)
 
         first = test_client.get(f"/api/v1/automation/runs/{created['id']}", headers=_auth_headers())
         second = test_client.get(
@@ -454,3 +458,49 @@ class TestGetEndpointsHaveNoSideEffects:
 
         assert first.status_code == 201
         assert second.status_code == 429
+
+
+class TestSanitizedStepFailureLogging:
+    """S8A-004 (Codex re-review, sanitized logging): an UNEXPECTED
+    (non-CollectorError) step failure must never leak the raw exception
+    text into logs or the persisted/returned result -- only the step name
+    and type(exc).__name__ are ever recorded. Before this fix,
+    app.services.automation used logger.exception(...), which attaches
+    exc_info=True and logs the full traceback INCLUDING the exception's
+    own str(exc) message.
+    """
+
+    def test_secret_bearing_exception_never_appears_in_logs_or_response(
+        self, client, monkeypatch, caplog
+    ):
+        test_client, _session_factory = client
+
+        def _boom(db, settings):
+            raise RuntimeError("secret-upstream-detail-should-never-leak")
+
+        # A raw callable, not a CollectorError subclass -- exercises the
+        # "truly unexpected failure" branch in app.services.automation._run_step.
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _boom)
+        monkeypatch.setattr(
+            "app.services.collector_runner.XingEmailCollector",
+            lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
+        )
+
+        with caplog.at_level("DEBUG"):
+            response = test_client.post("/api/v1/automation/runs", headers=_auth_headers())
+
+        assert "secret-upstream-detail-should-never-leak" not in response.text
+        assert "secret-upstream-detail-should-never-leak" not in caplog.text
+
+        body = response.json()
+        assert body["results"]["bundesagentur"]["status"] == "failed"
+        assert body["results"]["bundesagentur"]["error_type"] == "RuntimeError"
+        assert body["results"]["bundesagentur"]["counters"] is None
+        assert "RuntimeError" in body["error_summary"]
+        assert "secret-upstream-detail-should-never-leak" not in body["error_summary"]
+
+        # Persisted state (not just the immediate HTTP response) is
+        # equally sanitized.
+        run_id = body["id"]
+        fetched = test_client.get(f"/api/v1/automation/runs/{run_id}", headers=_auth_headers())
+        assert "secret-upstream-detail-should-never-leak" not in fetched.text

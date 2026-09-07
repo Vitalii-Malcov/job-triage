@@ -163,7 +163,7 @@ class TestRunBundesagenturCollector:
 
     def test_successful_run_reports_created_count(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
 
@@ -180,7 +180,7 @@ class TestRunBundesagenturCollector:
 
     def test_second_run_deduplicates_via_fingerprint(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
 
@@ -204,7 +204,7 @@ class TestRunBundesagenturCollector:
 
     def test_upstream_failure_returns_502(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(error=BundesagenturAPIError("boom")),
         )
 
@@ -214,7 +214,7 @@ class TestRunBundesagenturCollector:
 
     def test_collector_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
         monkeypatch.setattr("app.security.rate_limit.COLLECTOR_RATE_LIMIT_REQUESTS", 1)
@@ -244,18 +244,18 @@ class TestRunBundesagenturCollector:
             ),
         ]
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
 
         # Fail only the 2nd persistence call via the real upsert_job (not a
-        # full mock of _score_and_persist), so jobs 1 and 3 go through the
+        # full mock of score_and_persist), so jobs 1 and 3 go through the
         # actual DB session. This proves the session recovers via
         # db.rollback() after job 2's failure rather than being left in an
         # unusable state that would also break job 3.
-        import app.api.routes as routes_module
+        import app.services.collector_runner as collector_runner_module
 
-        original_upsert_job = routes_module.upsert_job
+        original_upsert_job = collector_runner_module.upsert_job
         call_count = {"n": 0}
 
         def flaky_upsert_job(db, job, score):
@@ -264,7 +264,7 @@ class TestRunBundesagenturCollector:
                 raise RuntimeError("simulated persistence failure")
             return original_upsert_job(db, job, score)
 
-        monkeypatch.setattr("app.api.routes.upsert_job", flaky_upsert_job)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job", flaky_upsert_job)
 
         response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -308,7 +308,7 @@ class TestRunBundesagenturCollector:
             details={rich_ref: rich_description, missing_ref: None},
         )
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: fake_collector,
         )
 
@@ -353,7 +353,7 @@ class TestRunBundesagenturCollector:
             details={referenznummer: description},
         )
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: fake_collector,
         )
 
@@ -376,14 +376,16 @@ class TestRunBundesagenturCollector:
 class TestBundesagenturCollectorNotifications:
     def _run(self, client, monkeypatch, jobs, scores_by_title, notifier):
         monkeypatch.setattr(
-            "app.api.routes.BundesagenturCollector",
+            "app.services.collector_runner.BundesagenturCollector",
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
         monkeypatch.setattr(
-            "app.api.routes.JobScorer",
+            "app.services.collector_runner.JobScorer",
             lambda profile_skills: FakeJobScorer(scores_by_title),
         )
-        monkeypatch.setattr("app.api.routes.TelegramNotifier", lambda **kwargs: notifier)
+        monkeypatch.setattr(
+            "app.services.collector_runner.TelegramNotifier", lambda **kwargs: notifier
+        )
         return client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
     def test_sends_notification_for_apply_job_above_threshold(self, client, monkeypatch):
@@ -462,7 +464,7 @@ class TestBundesagenturCollectorNotifications:
         async def fake_sleep(seconds):
             sleep_calls.append(seconds)
 
-        monkeypatch.setattr("app.api.routes.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
 
         response = self._run(
             client, monkeypatch, jobs=jobs, scores_by_title=scores, notifier=notifier
@@ -483,7 +485,7 @@ class TestBundesagenturCollectorNotifications:
         async def fake_sleep(seconds):
             sleep_calls.append(seconds)
 
-        monkeypatch.setattr("app.api.routes.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
 
         response = self._run(
             client,

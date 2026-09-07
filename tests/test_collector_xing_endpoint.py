@@ -165,7 +165,7 @@ class TestRunXingCollector:
 
     def test_successful_run_reports_created_count(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
 
@@ -182,7 +182,7 @@ class TestRunXingCollector:
 
     def test_second_run_deduplicates_via_fingerprint(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
 
@@ -216,7 +216,7 @@ class TestRunXingCollector:
             ]
         )
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=next(calls)),
         )
 
@@ -234,7 +234,7 @@ class TestRunXingCollector:
 
     def test_upstream_failure_returns_502(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(error=XingConnectionError("boom")),
         )
 
@@ -244,7 +244,7 @@ class TestRunXingCollector:
 
     def test_xing_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=[_sample_job()]),
         )
         monkeypatch.setattr("app.security.rate_limit.XING_RATE_LIMIT_REQUESTS", 1)
@@ -265,13 +265,13 @@ class TestRunXingCollector:
             _sample_job(title="Job Three", url="https://www.xing.com/m/3"),
         ]
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
 
-        import app.api.routes as routes_module
+        import app.services.collector_runner as collector_runner_module
 
-        original_upsert_job = routes_module.upsert_job
+        original_upsert_job = collector_runner_module.upsert_job
         call_count = {"n": 0}
 
         def flaky_upsert_job(db, job, score):
@@ -280,11 +280,11 @@ class TestRunXingCollector:
                 raise RuntimeError("simulated persistence failure")
             return original_upsert_job(db, job, score)
 
-        monkeypatch.setattr("app.api.routes.upsert_job", flaky_upsert_job)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job", flaky_upsert_job)
 
         acknowledged: set[str] = set()
         monkeypatch.setattr(
-            "app.api.routes.mark_message_processed",
+            "app.services.collector_runner.mark_message_processed",
             lambda db, source, message_id: acknowledged.add(message_id),
         )
 
@@ -323,14 +323,16 @@ class TestRunXingCollector:
 class TestXingCollectorNotifications:
     def _run(self, client, monkeypatch, jobs, scores_by_title, notifier):
         monkeypatch.setattr(
-            "app.api.routes.XingEmailCollector",
+            "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
         monkeypatch.setattr(
-            "app.api.routes.JobScorer",
+            "app.services.collector_runner.JobScorer",
             lambda profile_skills: FakeJobScorer(scores_by_title),
         )
-        monkeypatch.setattr("app.api.routes.TelegramNotifier", lambda **kwargs: notifier)
+        monkeypatch.setattr(
+            "app.services.collector_runner.TelegramNotifier", lambda **kwargs: notifier
+        )
         return client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
 
     def test_sends_notification_for_apply_job_above_threshold(self, client, monkeypatch):
@@ -407,7 +409,7 @@ class TestXingCollectorNotifications:
         async def fake_sleep(seconds):
             sleep_calls.append(seconds)
 
-        monkeypatch.setattr("app.api.routes.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
 
         response = self._run(
             client, monkeypatch, jobs=jobs, scores_by_title=scores, notifier=notifier
@@ -428,7 +430,7 @@ class TestXingCollectorNotifications:
         async def fake_sleep(seconds):
             sleep_calls.append(seconds)
 
-        monkeypatch.setattr("app.api.routes.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
 
         response = self._run(
             client,

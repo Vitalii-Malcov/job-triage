@@ -1,0 +1,426 @@
+"""S8A-003 (Codex re-review, layering fix): the shared fetch + score +
+persist logic for every job collector, plus the company-research lookup
+helper — previously embedded in `app.api.routes` and reached into from
+`app.services.telegram_bot` via a private cross-layer import
+(`from app.api.routes import _run_bundesagentur, ...`). That direction is
+backwards: a SERVICE (telegram_bot.py) depending on the API layer for
+its own core logic, and — once Stage 8A's orchestrator
+(`app.services.automation`) needed the SAME functions — would have
+forced either duplicating this logic a third time or introducing a
+circular import between `app.api.routes` and `app.services.automation`.
+
+This module is the single, lower-layer home for that logic. All three
+callers now depend on IT, never on each other:
+
+- `app.api.routes` (`POST /collectors/bundesagentur/run`,
+  `POST /collectors/xing/run`, `POST /jobs/{id}/research`,
+  `POST /jobs/score`)
+- `app.services.telegram_bot` (`/run bundesagentur`, `/run xing`,
+  `/research <id>`)
+- `app.services.automation` (Stage 8A's orchestrator)
+
+**Hard layering rule this module upholds:** nothing under `app.services`
+may import from `app.api.routes`. This module (and every other
+`app.services.*` module) imports only from `app.collectors.*`,
+`app.db.*`, `app.agents.*`, and sibling `app.services.*` modules —
+never from `app.api.routes`. `app.api.routes` is the one layer allowed
+to import FROM here (the normal, correct direction).
+
+**Zero behavior change.** Every function below is a verbatim relocation
+of what `app.api.routes` used to define privately — same scoring, same
+fingerprint-based dedup (`app.db.repositories.upsert_job`), same
+per-job failure isolation (`db.rollback()` + continue, never aborting
+the rest of a run), same best-effort Telegram notification and
+auto-research budget. Renamed from private (`_run_bundesagentur`) to
+public (`run_bundesagentur`) since this is now the module's actual
+public contract, not an implementation detail of routes.py.
+"""
+
+import asyncio
+import logging
+
+from sqlalchemy.orm import Session
+
+from app.agents.job_scorer import JobScorer
+from app.agents.skill_extractor import extract_skills
+from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_configured
+from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
+from app.collectors.xing_email import XingEmailCollector
+from app.db.models import JobRecord, UserProfile
+from app.db.repositories import (
+    get_job_by_fingerprint,
+    get_job_by_id,
+    get_or_create_default_profile,
+    is_message_processed,
+    mark_message_processed,
+    profile_skills,
+    upsert_job,
+)
+from app.models.company_research import CompanyResearchRunResponse
+from app.models.job import Job, JobScore
+from app.services.company_research import CompanyResearchService
+from app.services.telegram import TelegramNotifier
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "CollectorError",
+    "CollectorNotConfiguredError",
+    "run_bundesagentur",
+    "run_company_research_for_job",
+    "run_xing",
+    "score_and_persist",
+]
+
+
+def score_and_persist(
+    db: Session, profile: UserProfile, job: Job
+) -> tuple[JobRecord, JobScore, bool]:
+    """Score a Job against the given profile and persist it.
+
+    Shared by POST /jobs/score and every collector run below so scoring +
+    deduplication logic lives in exactly one place.
+    """
+    result = JobScorer(profile_skills(profile)).score(job)
+    record, created = upsert_job(db, job, result)
+    result.is_duplicate = not created
+    return record, result, created
+
+
+async def run_company_research_for_job(
+    db: Session, settings, job_id: int, *, force_refresh: bool
+) -> CompanyResearchRunResponse | None:
+    """Fetch (or reuse cached) company research for one job.
+
+    Shared by POST /jobs/{id}/research and the Telegram control center's
+    `/research <id>` command. Returns None if the job doesn't exist —
+    callers translate that into their own presentation (404 vs. a chat
+    message). Raises ProviderNotConfiguredError if the active provider
+    needs configuration that isn't set, InvalidCompanyIdentityError if
+    the job has no usable company name, or AmbiguousCompanyIdentityError
+    (FR-M-01) if the job's normalized company name is shared by 2+
+    distinct known-domain companies on file — no other provider failure
+    propagates here, see CompanyResearchService.get_or_run's
+    failure-isolation contract and CompanyResearchRunResponse's
+    refresh-outcome fields.
+    """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+    return await CompanyResearchService().get_or_run(db, job, settings, force_refresh=force_refresh)
+
+
+async def _maybe_auto_research(
+    db: Session,
+    settings,
+    record: JobRecord,
+    result: JobScore,
+    budget: dict[str, int],
+) -> None:
+    """Best-effort, opt-in company research for a just-persisted high-score job.
+
+    Off by default (settings.company_research_auto_enabled) — see
+    app/core/config.py. Shared by run_bundesagentur/run_xing so the
+    "research automatically for APPLY-recommended jobs" rule lives in one
+    place. Failures here must never affect a collector run's
+    created/updated/failed counts, same best-effort contract as the
+    Telegram notification block right below each call site.
+
+    `budget` is a per-collector-run mutable counter
+    (`{"remaining": settings.company_research_auto_max_per_run}`, created
+    once by the caller before its loop starts) — bounds how many automatic
+    research runs a single collector run can trigger regardless of how many
+    APPLY jobs it produces, so a large batch can't silently fan out into an
+    unbounded number of research runs. Manual triggers (POST
+    /jobs/{id}/research, Telegram /research) are unaffected by this budget.
+    """
+    if not settings.company_research_auto_enabled or result.recommendation != "APPLY":
+        return
+    if budget["remaining"] <= 0:
+        return
+    budget["remaining"] -= 1
+    try:
+        await CompanyResearchService().get_or_run(db, record, settings)
+    except Exception:
+        logger.warning(
+            "company_research_auto_run_failed job_id=%s company=%s",
+            record.id,
+            record.company,
+            exc_info=True,
+        )
+
+
+async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
+    """Fetch + score + persist one Bundesagentur collector run.
+
+    Shared by POST /collectors/bundesagentur/run, the Telegram control
+    center's `/run bundesagentur` command, and Stage 8A's automation
+    orchestrator (`app.services.automation`) so this logic lives in
+    exactly one place. Raises CollectorNotConfiguredError if
+    BUNDESAGENTUR_API_KEY isn't set, or a CollectorError subclass if the
+    upstream fetch ultimately fails — callers translate these into their
+    own presentation (HTTP status code, chat message, or
+    AutomationRunStepResult).
+    """
+    if not is_api_key_configured(settings.bundesagentur_api_key):
+        raise CollectorNotConfiguredError(
+            "Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY."
+        )
+
+    collector = BundesagenturCollector(
+        api_key=settings.bundesagentur_api_key,
+        keywords=settings.bundesagentur_search_keywords,
+        location=settings.bundesagentur_search_location,
+        radius_km=settings.bundesagentur_search_radius_km,
+    )
+
+    jobs = await collector.fetch()
+
+    profile = get_or_create_default_profile(db)
+    # One notifier per collector run (not per job): send_job() opens its own
+    # httpx.AsyncClient per call, so this only avoids repeated construction
+    # overhead, but it also keeps the flood-limit pacing below scoped to a
+    # single run via one shared notified_count counter.
+    notifier = TelegramNotifier(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        timeout_seconds=settings.telegram_timeout_seconds,
+        max_retries=settings.telegram_max_retries,
+    )
+    created_count = 0
+    updated_count = 0
+    failed_count = 0
+    notified_count = 0
+    auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
+    for job in jobs:
+        try:
+            existing = get_job_by_fingerprint(db, job)
+            description = job.description
+            if not description.strip() and existing is not None and existing.description.strip():
+                # Search responses currently contain no description. A
+                # persisted non-empty BA description therefore means detail
+                # enrichment already succeeded on an earlier run. Reuse it
+                # and re-run the deterministic extractor locally; requiring
+                # saved skills too would repeatedly call detail for valid
+                # non-technical descriptions where zero matches is expected.
+                description = existing.description
+                logger.debug(
+                    "bundesagentur_detail_reused referenznummer=%s",
+                    job.source_reference,
+                )
+            elif not description.strip() and job.source_reference:
+                detail_description = await collector.fetch_detail(job.source_reference)
+                if detail_description is not None:
+                    description = detail_description
+            elif not description.strip():
+                logger.warning(
+                    "bundesagentur_detail_skipped reason=missing_referenznummer url=%s",
+                    job.url,
+                )
+
+            extraction = extract_skills(job.title, description)
+            all_skills = sorted(
+                set(job.skills)
+                | set(extraction.must_have_skills)
+                | set(extraction.nice_to_have_skills)
+            )
+            job = job.model_copy(
+                update={
+                    "description": description,
+                    "skills": all_skills,
+                    "must_have_skills": extraction.must_have_skills,
+                    "nice_to_have_skills": extraction.nice_to_have_skills,
+                    "skill_source": extraction.skill_source,
+                }
+            )
+            if existing is not None and description.strip():
+                # Stage the BA-only enrichment update in the same transaction
+                # committed by upsert_job. If scoring/persistence fails, the
+                # surrounding rollback also restores the previous description.
+                existing.description = description
+            job_record, result, created = score_and_persist(db, profile, job)
+        except Exception:
+            # A failure scoring/persisting one job (JobScorer bug, DB
+            # constraint violation, etc.) must not abort the whole run and
+            # lose the jobs already committed before it. db.rollback() is
+            # required here: SQLAlchemy leaves the Session unusable after a
+            # failed flush/commit until it's rolled back, so without this
+            # every job after the first failure would also fail.
+            db.rollback()
+            failed_count += 1
+            logger.exception(
+                "bundesagentur_collector_job_persist_failed title=%s company=%s url=%s",
+                job.title,
+                job.company,
+                job.url,
+            )
+            continue
+
+        if created:
+            created_count += 1
+        else:
+            updated_count += 1
+
+        await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+
+        if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
+            # Notification delivery is best-effort orchestration on top of
+            # already-committed persistence: a failed/slow send must not
+            # affect created/updated/failed counts or abort the run.
+            if notified_count > 0:
+                await asyncio.sleep(1)
+            try:
+                sent = await notifier.send_job(job, result)
+            except Exception:
+                logger.warning(
+                    "bundesagentur_notification_error title=%s company=%s",
+                    job.title,
+                    job.company,
+                    exc_info=True,
+                )
+            else:
+                if not sent:
+                    logger.warning(
+                        "bundesagentur_notification_failed title=%s company=%s",
+                        job.title,
+                        job.company,
+                    )
+            notified_count += 1
+
+    logger.info(
+        "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        len(jobs),
+        created_count,
+        updated_count,
+        collector.skipped_invalid_count,
+        failed_count,
+    )
+
+    return {
+        "fetched": len(jobs),
+        "created": created_count,
+        "updated": updated_count,
+        "skipped_invalid": collector.skipped_invalid_count,
+        "failed": failed_count,
+    }
+
+
+async def run_xing(db: Session, settings) -> dict[str, int]:
+    """Fetch + score + persist one XING mailbox collector run.
+
+    Shared by POST /collectors/xing/run, the Telegram control center's
+    `/run xing` command, and Stage 8A's automation orchestrator — see
+    `run_bundesagentur` above for the same rationale.
+    """
+    if not is_configured(settings.xing_mailbox_username) or not is_configured(
+        settings.xing_mailbox_app_password
+    ):
+        raise CollectorNotConfiguredError(
+            "XING mailbox collector is not configured: set "
+            "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
+        )
+
+    collector = XingEmailCollector(
+        imap_host=settings.xing_mailbox_imap_host,
+        imap_port=settings.xing_mailbox_imap_port,
+        username=settings.xing_mailbox_username,
+        app_password=settings.xing_mailbox_app_password,
+        lookback_days=settings.xing_lookback_days,
+        # Bound to this request's db.Session via closures rather than
+        # passed as a constructor `db` param, so the collector itself stays
+        # decoupled from SQLAlchemy — see XingEmailCollector's docstring.
+        is_message_processed=lambda message_id: is_message_processed(db, "xing", message_id),
+    )
+
+    message_batches = await collector.fetch_message_batches()
+    jobs = [job for batch in message_batches for job in batch.jobs]
+
+    profile = get_or_create_default_profile(db)
+    # One notifier for the whole run (all batches), so the flood-limit pacing
+    # via notified_count below is scoped per collector run, not per message.
+    notifier = TelegramNotifier(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        timeout_seconds=settings.telegram_timeout_seconds,
+        max_retries=settings.telegram_max_retries,
+    )
+    created_count = 0
+    updated_count = 0
+    failed_count = 0
+    notified_count = 0
+    auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
+    for batch in message_batches:
+        batch_failed = False
+        for job in batch.jobs:
+            try:
+                job_record, result, created = score_and_persist(db, profile, job)
+            except Exception:
+                # One bad job must not abort the run, but its source message
+                # must remain unacknowledged. A later run will parse the whole
+                # message again; jobs already committed from this batch are
+                # safely deduplicated by fingerprint. Reprocessing is preferred
+                # to silently losing the failed job forever.
+                db.rollback()
+                batch_failed = True
+                failed_count += 1
+                logger.exception(
+                    "xing_collector_job_persist_failed title=%s company=%s url=%s",
+                    job.title,
+                    job.company,
+                    job.url,
+                )
+                continue
+
+            if created:
+                created_count += 1
+            else:
+                updated_count += 1
+
+            await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+
+            if (
+                result.recommendation == "APPLY"
+                and result.score >= settings.min_job_score_to_notify
+            ):
+                # Same best-effort contract as run_bundesagentur: notification
+                # failures are orchestration on top of already-committed
+                # persistence and must not affect counts or abort the run.
+                if notified_count > 0:
+                    await asyncio.sleep(1)
+                try:
+                    sent = await notifier.send_job(job, result)
+                except Exception:
+                    logger.warning(
+                        "xing_notification_error title=%s company=%s",
+                        job.title,
+                        job.company,
+                        exc_info=True,
+                    )
+                else:
+                    if not sent:
+                        logger.warning(
+                            "xing_notification_failed title=%s company=%s",
+                            job.title,
+                            job.company,
+                        )
+                notified_count += 1
+
+        if not batch_failed:
+            mark_message_processed(db, "xing", batch.message_id)
+
+    logger.info(
+        "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        len(jobs),
+        created_count,
+        updated_count,
+        collector.skipped_invalid_count,
+        failed_count,
+    )
+
+    return {
+        "fetched": len(jobs),
+        "created": created_count,
+        "updated": updated_count,
+        "skipped_invalid": collector.skipped_invalid_count,
+        "failed": failed_count,
+    }

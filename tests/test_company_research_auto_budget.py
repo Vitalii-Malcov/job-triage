@@ -137,13 +137,16 @@ def test_auto_research_is_bounded_by_budget_per_collector_run(client, monkeypatc
         for i in range(100)
     ]
     monkeypatch.setattr(
-        "app.api.routes.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
+        "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.api.routes.JobScorer", lambda profile_skills: FakeJobScorer(profile_skills)
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
     )
     CountingResearchService.call_count = 0
-    monkeypatch.setattr("app.api.routes.CompanyResearchService", CountingResearchService)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", CountingResearchService
+    )
 
     response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -169,10 +172,11 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
         )
     ]
     monkeypatch.setattr(
-        "app.api.routes.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
+        "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.api.routes.JobScorer", lambda profile_skills: FakeJobScorer(profile_skills)
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
     )
     disabled_settings = Settings(
         api_key=API_KEY,
@@ -183,7 +187,9 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
     )
     monkeypatch.setattr("app.api.routes.get_settings", lambda: disabled_settings)
     CountingResearchService.call_count = 0
-    monkeypatch.setattr("app.api.routes.CompanyResearchService", CountingResearchService)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", CountingResearchService
+    )
 
     response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
