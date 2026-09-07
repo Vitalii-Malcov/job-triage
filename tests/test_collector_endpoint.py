@@ -525,3 +525,77 @@ class TestBundesagenturCollectorNotifications:
             "failed": 0,
         }
         assert len(notifier.calls) == 3
+
+
+SECRET_TEXT = "secret-upstream-detail-must-not-leak"
+
+
+class TestSanitizedFailureLogging:
+    """S8A-004R (Codex re-review, MEDIUM): app.services.collector_runner
+    must never log raw exception text/tracebacks for unexpected
+    per-job or notification failures — only a safe event name plus
+    type(exc).__name__ (see collector_runner.py's own logging calls).
+    Proves this for both categories that can fire during a
+    Bundesagentur run: per-job persistence failure and the Telegram
+    notification exception path.
+    """
+
+    def test_persistence_failure_does_not_leak_exception_text(self, client, monkeypatch, caplog):
+        jobs = [_sample_job(title="Job One")]
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeCollector(jobs=jobs),
+        )
+
+        def _boom(db, job, score):
+            raise RuntimeError(SECRET_TEXT)
+
+        monkeypatch.setattr("app.services.collector_runner.upsert_job", _boom)
+
+        with caplog.at_level("DEBUG"):
+            response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "fetched": 1,
+            "created": 0,
+            "updated": 0,
+            "skipped_invalid": 0,
+            "failed": 1,
+        }
+        assert SECRET_TEXT not in caplog.text
+        assert SECRET_TEXT not in response.text
+        assert "RuntimeError" in caplog.text
+
+    def test_notification_exception_does_not_leak_exception_text(self, client, monkeypatch, caplog):
+        job = _sample_job(title="Senior Python Dev")
+        notifier = FakeTelegramNotifier(results=[RuntimeError(SECRET_TEXT)])
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeCollector(jobs=[job]),
+        )
+        monkeypatch.setattr(
+            "app.services.collector_runner.JobScorer",
+            lambda profile_skills: FakeJobScorer(
+                {"Senior Python Dev": _job_score(score=90, recommendation="APPLY")}
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.collector_runner.TelegramNotifier", lambda **kwargs: notifier
+        )
+
+        with caplog.at_level("DEBUG"):
+            response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "fetched": 1,
+            "created": 1,
+            "updated": 0,
+            "skipped_invalid": 0,
+            "failed": 0,
+        }
+        assert len(notifier.calls) == 1
+        assert SECRET_TEXT not in caplog.text
+        assert SECRET_TEXT not in response.text
+        assert "RuntimeError" in caplog.text

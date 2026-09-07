@@ -141,12 +141,12 @@ async def _maybe_auto_research(
     budget["remaining"] -= 1
     try:
         await CompanyResearchService().get_or_run(db, record, settings)
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "company_research_auto_run_failed job_id=%s company=%s",
+            "company_research_auto_run_failed job_id=%s company=%s error_type=%s",
             record.id,
             record.company,
-            exc_info=True,
+            type(exc).__name__,
         )
 
 
@@ -239,7 +239,7 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
                 # surrounding rollback also restores the previous description.
                 existing.description = description
             job_record, result, created = score_and_persist(db, profile, job)
-        except Exception:
+        except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and
             # lose the jobs already committed before it. db.rollback() is
@@ -248,11 +248,13 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
             # every job after the first failure would also fail.
             db.rollback()
             failed_count += 1
-            logger.exception(
-                "bundesagentur_collector_job_persist_failed title=%s company=%s url=%s",
+            logger.warning(
+                "bundesagentur_collector_job_persist_failed title=%s company=%s url=%s "
+                "error_type=%s",
                 job.title,
                 job.company,
                 job.url,
+                type(exc).__name__,
             )
             continue
 
@@ -271,12 +273,12 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
                 await asyncio.sleep(1)
             try:
                 sent = await notifier.send_job(job, result)
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "bundesagentur_notification_error title=%s company=%s",
+                    "bundesagentur_notification_error title=%s company=%s error_type=%s",
                     job.title,
                     job.company,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
             else:
                 if not sent:
@@ -354,7 +356,7 @@ async def run_xing(db: Session, settings) -> dict[str, int]:
         for job in batch.jobs:
             try:
                 job_record, result, created = score_and_persist(db, profile, job)
-            except Exception:
+            except Exception as exc:
                 # One bad job must not abort the run, but its source message
                 # must remain unacknowledged. A later run will parse the whole
                 # message again; jobs already committed from this batch are
@@ -363,11 +365,12 @@ async def run_xing(db: Session, settings) -> dict[str, int]:
                 db.rollback()
                 batch_failed = True
                 failed_count += 1
-                logger.exception(
-                    "xing_collector_job_persist_failed title=%s company=%s url=%s",
+                logger.warning(
+                    "xing_collector_job_persist_failed title=%s company=%s url=%s error_type=%s",
                     job.title,
                     job.company,
                     job.url,
+                    type(exc).__name__,
                 )
                 continue
 
@@ -389,12 +392,12 @@ async def run_xing(db: Session, settings) -> dict[str, int]:
                     await asyncio.sleep(1)
                 try:
                     sent = await notifier.send_job(job, result)
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "xing_notification_error title=%s company=%s",
+                        "xing_notification_error title=%s company=%s error_type=%s",
                         job.title,
                         job.company,
-                        exc_info=True,
+                        type(exc).__name__,
                     )
                 else:
                     if not sent:
