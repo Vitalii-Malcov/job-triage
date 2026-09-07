@@ -862,11 +862,27 @@ class TestLeaseRenewalHeartbeat:
         # reference (and ONLY that reference -- the poller below keeps
         # calling the real, unpatched repository function) so the event
         # is set the instant that specific call actually completes.
+        #
+        # A second, narrower race remains even with that signal: session
+        # B's own acquire_thread_lock() and its subsequent read of
+        # original_release_completed are two separate statements, so a
+        # scheduler switch between them could let the original sender's
+        # release-and-set happen strictly BETWEEN B's successful acquire
+        # and B's Event read -- misclassifying a genuine pre-release
+        # steal as a legitimate post-release acquisition (the Event
+        # would already read True by the time B checks it, even though
+        # it was NOT true at the moment the acquire actually succeeded).
+        # ordering_lock closes this: the original sender's
+        # release-then-set and session B's acquire-then-classify are
+        # each done as one atomic unit under the same mutex, so the two
+        # can never interleave.
         original_release_completed = threading.Event()
+        ordering_lock = threading.Lock()
 
         def _release_and_signal_original_sender(db_, thread_id_, *, holder):
-            release_thread_lock(db_, thread_id_, holder=holder)
-            original_release_completed.set()
+            with ordering_lock:
+                release_thread_lock(db_, thread_id_, holder=holder)
+                original_release_completed.set()
 
         monkeypatch.setattr(
             "app.services.follow_up_send.release_thread_lock",
@@ -885,11 +901,16 @@ class TestLeaseRenewalHeartbeat:
             time.sleep(0.3)
             while not stop_polling.is_set():
                 acquire_attempts["total"] += 1
-                if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
+                with ordering_lock:
+                    acquired = acquire_thread_lock(session_b, thread_id, holder="session-B-writer")
+                    released_before_or_at_acquire = original_release_completed.is_set()
+                if acquired:
                     acquire_attempts["succeeded"] += 1
-                    successful_claims_after_original_release.append(
-                        original_release_completed.is_set()
-                    )
+                    successful_claims_after_original_release.append(released_before_or_at_acquire)
+                    # The real, unpatched repository release -- outside
+                    # the ordering mutex, since B's own follow-up release
+                    # of its own probe claim has no ordering requirement
+                    # against the original sender's release.
                     release_thread_lock(session_b, thread_id, holder="session-B-writer")
                 time.sleep(0.03)
 
