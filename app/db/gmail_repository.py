@@ -36,6 +36,7 @@ privacy-safe logging.
 
 import json
 from collections.abc import Collection
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -419,6 +420,15 @@ def upsert_message(db: Session, parsed: ParsedGmailMessage) -> tuple[GmailMessag
 
     thread = _resolve_thread_for_message(db, parsed)
 
+    # S7E-011 (Codex re-review): a single `now` shared by both
+    # `received_at`'s fallback default and `provider_arrival_at`'s
+    # fallback below — when the IMAP layer couldn't determine a real
+    # INTERNALDATE (see ParsedGmailMessage.provider_arrival_at's
+    # docstring), `provider_arrival_at` degrades to EXACTLY this
+    # project's pre-S7E-011 behavior (this sync's own wall-clock write
+    # time) rather than a separately-computed, microseconds-divergent
+    # "now".
+    now = datetime.now(UTC)
     record = GmailMessageRecord(
         thread_id=thread.id,
         account_key=parsed.account_key,
@@ -434,6 +444,8 @@ def upsert_message(db: Session, parsed: ParsedGmailMessage) -> tuple[GmailMessag
         cc_addresses_json=json.dumps(list(parsed.cc_addresses)),
         subject=parsed.subject,
         sent_at=parsed.sent_at,
+        received_at=now,
+        provider_arrival_at=parsed.provider_arrival_at or now,
         direction=parsed.direction,
         body_plain=parsed.body_plain,
         body_truncated=parsed.body_truncated,
@@ -541,6 +553,13 @@ def list_messages_for_thread(
     """Bounded message list for one thread (GET /gmail/threads/{id},
     section 13 "thread detail API readiness") — never unbounded, and
     always account-scoped.
+
+    S7E-011 (Codex re-review): ordered by `provider_arrival_at` (Gmail's
+    own IMAP INTERNALDATE), not `received_at` — see
+    app.db.follow_up_repository.get_thread_message_infos's docstring for
+    why `received_at` (this project's own sync wall-clock write time) can
+    misorder messages first imported together in one INBOX-then-Sent sync
+    run.
     """
     stmt = (
         select(GmailMessageRecord)
@@ -548,7 +567,7 @@ def list_messages_for_thread(
             GmailMessageRecord.thread_id == thread_id,
             GmailMessageRecord.account_key == account_key,
         )
-        .order_by(GmailMessageRecord.received_at.asc(), GmailMessageRecord.id.asc())
+        .order_by(GmailMessageRecord.provider_arrival_at.asc(), GmailMessageRecord.id.asc())
         .limit(limit)
     )
     return list(db.scalars(stmt).all())

@@ -77,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 _UIDVALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)")
 _RFC822_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
+_INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 
 
 def _decode_mime_words(raw: str) -> str:
@@ -146,6 +147,33 @@ def _parse_date(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _parse_internal_date(fetch_header: bytes) -> datetime | None:
+    """S7E-011 (Codex re-review): extract the server-assigned IMAP
+    INTERNALDATE from a `(INTERNALDATE BODY.PEEK[])` fetch response's
+    header line (e.g. `1 (UID 1 INTERNALDATE "07-Sep-2026 12:34:56 +0000"
+    BODY[] {123}`), per RFC 3501's `"dd-Mon-yyyy hh:mm:ss +zzzz"` format —
+    NEVER the sender-controlled RFC 5322 `Date` header (see `_parse_date`
+    above, used only for the separate, still-untrusted `sent_at` field).
+
+    Returns None (an honestly documented gap, same shape as
+    `_read_message_size`'s RFC822.SIZE fallback) if the server's response
+    omitted INTERNALDATE entirely or the value doesn't match the RFC 3501
+    format — real Gmail IMAP always answers INTERNALDATE, so this is not
+    expected to be reachable against Gmail itself. The caller
+    (app.db.gmail_repository.upsert_message) falls back to its own
+    wall-clock persist time in that case.
+    """
+    match = _INTERNALDATE_RE.search(fetch_header)
+    if not match:
+        return None
+    raw_value = match.group(1).decode("ascii", errors="replace")
+    try:
+        parsed = datetime.strptime(raw_value, "%d-%b-%Y %H:%M:%S %z")
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def _decode_part(part: Message) -> str:
@@ -529,8 +557,13 @@ class GmailImapProvider:
         try:
             # GMAIL-001: BODY.PEEK[] fetches the full message without
             # setting \Seen — a bare RFC822/BODY[] fetch would mutate the
-            # mailbox as a side effect of this "read".
-            typ, msg_data = client.uid("fetch", uid_bytes, "(BODY.PEEK[])")
+            # mailbox as a side effect of this "read". INTERNALDATE is
+            # requested in the SAME fetch (S7E-011, Codex re-review): it
+            # costs nothing extra over BODY.PEEK[] (one round trip either
+            # way) and is the server-assigned arrival timestamp this
+            # project's Gmail correspondence chronology now trusts — see
+            # `_parse_internal_date` and ParsedGmailMessage.provider_arrival_at.
+            typ, msg_data = client.uid("fetch", uid_bytes, "(INTERNALDATE BODY.PEEK[])")
         except Exception as exc:
             logger.warning("gmail_message_fetch_error error_type=%s", type(exc).__name__)
             return None
@@ -558,8 +591,20 @@ class GmailImapProvider:
                 logger.warning("gmail_message_fetch_response_malformed")
                 return None
 
+            fetch_header = item[0]
+            provider_arrival_at = (
+                _parse_internal_date(fetch_header)
+                if isinstance(fetch_header, bytes | bytearray)
+                else None
+            )
+
             msg = email.message_from_bytes(bytes(raw_email))
-            return self._parse_message(msg, uid=uid, uid_validity=uid_validity)
+            return self._parse_message(
+                msg,
+                uid=uid,
+                uid_validity=uid_validity,
+                provider_arrival_at=provider_arrival_at,
+            )
         except Exception as exc:
             # Any malformed-MIME/parse failure is a skip, never a crash of
             # the whole sync — one bad message must not stop the rest of
@@ -567,7 +612,14 @@ class GmailImapProvider:
             logger.warning("gmail_message_parse_failed error_type=%s", type(exc).__name__)
             return None
 
-    def _parse_message(self, msg: Message, *, uid: int, uid_validity: int) -> ParsedGmailMessage:
+    def _parse_message(
+        self,
+        msg: Message,
+        *,
+        uid: int,
+        uid_validity: int,
+        provider_arrival_at: datetime | None,
+    ) -> ParsedGmailMessage:
         message_id = _clean_header(msg.get("Message-ID"))
         in_reply_to = _clean_header(msg.get("In-Reply-To"))
         references = _parse_references(msg.get("References"))
@@ -597,5 +649,6 @@ class GmailImapProvider:
             body_plain=body_plain,
             body_truncated=body_truncated,
             has_html=has_html,
+            provider_arrival_at=provider_arrival_at,
             attachments=attachments,
         )

@@ -136,15 +136,34 @@ def get_thread_message_infos(
     `limit` parameter is gone because it is no longer meaningful: these
     two queries are always complete.)
 
-    **S7E-004 (Codex remediation, temporal order).** Ordered by
-    `received_at` (this project's own sync process's wall-clock write
-    time — see GmailMessageRecord's docstring) and `id` (insertion order)
-    as tiebreak — NEVER `sent_at` (the message's own, sender-controlled
-    RFC 5322 `Date` header). `sent_at` can be missing, arbitrarily
-    skewed, backdated, or postdated by whoever sent the message; trusting
-    it for "is this reply newer than our outbound message" would let a
-    sender suppress (or wrongly trigger) a follow-up merely by setting an
-    old/future Date header. `received_at` is never attacker-influenced.
+    **S7E-004 (Codex remediation, temporal order) — SUPERSEDED by S7E-011
+    below for the actual ordering column, rationale otherwise unchanged.**
+    NEVER `sent_at` (the message's own, sender-controlled RFC 5322 `Date`
+    header). `sent_at` can be missing, arbitrarily skewed, backdated, or
+    postdated by whoever sent the message; trusting it for "is this reply
+    newer than our outbound message" would let a sender suppress (or
+    wrongly trigger) a follow-up merely by setting an old/future Date
+    header.
+
+    **S7E-011 (Codex re-review, Gmail chronology).** Ordered by
+    `provider_arrival_at` (the mail server's own IMAP INTERNALDATE — see
+    app/providers/email/imap.py's `_parse_internal_date`), NOT
+    `received_at` (this project's own sync wall-clock write time) as
+    S7E-004 originally used. `received_at` shares `sent_at`'s problem in a
+    different guise: it is trustworthy (never sender-controlled) but not
+    ORDER-preserving across a single sync run, because
+    `app.api.routes._run_gmail_sync` always syncs INBOX, THEN Sent
+    (S7E-001) as two independent persist passes. On a first-time/
+    historical sync — or any run that imports a whole thread's backlog at
+    once — a real OUTBOUND message and a chronologically LATER recruiter
+    INBOUND reply can both be new to that one run; because INBOX is
+    persisted first, the reply's `received_at` ends up EARLIER than the
+    outbound message's, reversing their true order and letting a
+    follow-up fire despite an already-received reply. `provider_arrival_at`
+    is immune to this because it is assigned by Gmail at real arrival
+    time, independent of which mailbox this project's sync happened to
+    fetch first. `id` (insertion order) remains the tiebreak for two
+    messages sharing the same `provider_arrival_at`.
     """
     infos: list[ThreadMessageInfo] = []
     for direction in ("OUTBOUND", "INBOUND"):
@@ -155,7 +174,7 @@ def get_thread_message_infos(
                 GmailMessageRecord.thread_id == thread_id,
                 GmailMessageRecord.direction == direction,
             )
-            .order_by(GmailMessageRecord.received_at.desc(), GmailMessageRecord.id.desc())
+            .order_by(GmailMessageRecord.provider_arrival_at.desc(), GmailMessageRecord.id.desc())
             .limit(1)
         )
         if record is not None:
@@ -163,7 +182,7 @@ def get_thread_message_infos(
                 ThreadMessageInfo(
                     gmail_message_id=record.id,
                     direction=record.direction,
-                    timestamp=_ensure_utc(record.received_at),
+                    timestamp=_ensure_utc(record.provider_arrival_at),
                 )
             )
     return infos

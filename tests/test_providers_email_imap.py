@@ -9,6 +9,7 @@ test asserting this package has no means to make an HTTP request at all.
 import email.errors
 import imaplib
 import inspect
+from datetime import UTC, datetime
 from email import encoders
 from email.header import Header
 from email.mime.base import MIMEBase
@@ -45,6 +46,7 @@ class FakeImapClient:
         search_typ: str = "OK",
         search_uids: list[int] | None = None,
         size_override: dict[int, int] | None = None,
+        internal_dates: dict[int, str] | None = None,
     ) -> None:
         self._messages = messages or {}
         self._uid_validity = uid_validity
@@ -53,6 +55,7 @@ class FakeImapClient:
         self._search_typ = search_typ
         self._search_uids = search_uids
         self._size_override = size_override or {}
+        self._internal_dates = internal_dates or {}
         self.select_calls: list[tuple[str, bool]] = []
         self.uid_calls: list[tuple[str, tuple]] = []
         self.closed = False
@@ -87,7 +90,17 @@ class FakeImapClient:
             if "RFC822.SIZE" in item_spec:
                 size = self._size_override.get(uid, len(raw))
                 return ("OK", [f"{uid} (UID {uid} RFC822.SIZE {size})".encode()])
-            return ("OK", [(b"%d (UID %d BODY[] {%d}" % (uid, uid, len(raw)), raw)])
+            internal_date = self._internal_dates.get(uid)
+            if internal_date is not None:
+                header = b'%d (UID %d INTERNALDATE "%s" BODY[] {%d}' % (
+                    uid,
+                    uid,
+                    internal_date.encode(),
+                    len(raw),
+                )
+            else:
+                header = b"%d (UID %d BODY[] {%d}" % (uid, uid, len(raw))
+            return ("OK", [(header, raw)])
         raise AssertionError(f"unexpected uid command {command!r}")
 
     def close(self) -> tuple[str, list[bytes]]:
@@ -362,9 +375,50 @@ async def test_fetch_issues_body_peek_command_not_rfc822():
     await provider.fetch()
 
     fetch_items = [args[1] for cmd, args in client.uid_calls if cmd == "fetch" and len(args) > 1]
-    assert "(BODY.PEEK[])" in fetch_items
+    # S7E-011: INTERNALDATE is requested in the SAME fetch as BODY.PEEK[]
+    # (one round trip, not two) — never a bare RFC822/BODY[] fetch.
+    assert "(INTERNALDATE BODY.PEEK[])" in fetch_items
     assert "(RFC822)" not in fetch_items
     assert "(BODY[])" not in fetch_items
+
+
+# ---------------------------------------------------------------------------
+# S7E-011 (Codex re-review): trusted Gmail-assigned arrival chronology
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_internaldate_is_parsed_into_provider_arrival_at():
+    raw = _build_email(date="Mon, 5 Jan 2026 08:00:00 +0000")
+    client = FakeImapClient(messages={1: raw}, internal_dates={1: "07-Sep-2026 12:34:56 +0000"})
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert len(result.messages) == 1
+    message = result.messages[0]
+    # The server-assigned INTERNALDATE, NOT the sender-controlled Date
+    # header (which claims a much earlier date here) — proves the two are
+    # parsed and kept independently.
+    assert message.provider_arrival_at == datetime(2026, 9, 7, 12, 34, 56, tzinfo=UTC)
+    assert message.sent_at == datetime(2026, 1, 5, 8, 0, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_missing_internaldate_falls_back_to_none():
+    """Honest, documented gap (mirrors `_read_message_size`'s RFC822.SIZE
+    fallback): a server response with no parseable INTERNALDATE leaves
+    `provider_arrival_at` as None rather than guessing — the persistence
+    layer (app.db.gmail_repository.upsert_message) supplies its own
+    wall-clock fallback in that case."""
+    raw = _build_email()
+    client = FakeImapClient(messages={1: raw})  # no internal_dates override
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert len(result.messages) == 1
+    assert result.messages[0].provider_arrival_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +439,7 @@ async def test_oversized_message_is_skipped_before_body_fetch():
     body_fetch_calls = [
         args
         for cmd, args in client.uid_calls
-        if cmd == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])"
+        if cmd == "fetch" and len(args) > 1 and args[1] == "(INTERNALDATE BODY.PEEK[])"
     ]
     assert body_fetch_calls == [], "an oversized message's body must never be fetched at all"
 
@@ -576,7 +630,7 @@ async def test_malformed_fetch_response_shapes_are_skipped(broken_response):
     original_uid = client.uid
 
     def uid_with_broken_body(command, *args):
-        if command == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])":
+        if command == "fetch" and len(args) > 1 and args[1] == "(INTERNALDATE BODY.PEEK[])":
             return broken_response
         return original_uid(command, *args)
 
@@ -602,7 +656,12 @@ async def test_valid_malformed_valid_sequence_all_processed():
     original_uid = client.uid
 
     def uid_break_middle(command, *args):
-        if command == "fetch" and len(args) > 1 and args[1] == "(BODY.PEEK[])" and args[0] == b"2":
+        if (
+            command == "fetch"
+            and len(args) > 1
+            and args[1] == "(INTERNALDATE BODY.PEEK[])"
+            and args[0] == b"2"
+        ):
             return ("OK", [None])
         return original_uid(command, *args)
 

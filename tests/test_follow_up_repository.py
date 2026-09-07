@@ -293,6 +293,46 @@ class TestThreadMessageInfos:
         # confirm it is NOT the (much older) sent_at value.
         assert by_direction["INBOUND"].timestamp.replace(tzinfo=None) != datetime(2020, 1, 1)
 
+    def test_uses_provider_arrival_at_not_received_at_for_ordering(self, db):
+        """S7E-011 (Codex re-review): a dual INBOX-then-Sent sync run can
+        persist an INBOUND reply BEFORE the OUTBOUND message it actually
+        replies to (see app.api.routes._run_gmail_sync, S7E-001), giving
+        the reply an earlier `received_at` despite arriving later in
+        reality. `provider_arrival_at` (Gmail's own IMAP INTERNALDATE)
+        must be what ordering trusts, not `received_at`.
+        """
+        out_msg = _add_message(
+            db,
+            uid=1,
+            message_id="<root@example.com>",
+            direction="OUTBOUND",
+            sent_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        in_msg = _add_message(
+            db,
+            uid=2,
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references=("<root@example.com>",),
+            direction="INBOUND",
+            sent_at=datetime(2026, 1, 5, tzinfo=UTC),
+        )
+        # Real IMAP INTERNALDATE — the true arrival order (outbound, then
+        # the later reply).
+        out_msg.provider_arrival_at = datetime(2026, 1, 1, tzinfo=UTC)
+        in_msg.provider_arrival_at = datetime(2026, 1, 5, tzinfo=UTC)
+        # This project's own sync wall-clock write time — REVERSED, as if
+        # INBOX (the reply) was persisted before Sent (the outbound
+        # message) in one sync run.
+        out_msg.received_at = datetime(2026, 6, 1, tzinfo=UTC)
+        in_msg.received_at = datetime(2026, 1, 2, tzinfo=UTC)
+        db.commit()
+
+        infos = get_thread_message_infos(db, ACCOUNT_A, out_msg.thread_id)
+        by_direction = {info.direction: info for info in infos}
+
+        assert by_direction["INBOUND"].timestamp > by_direction["OUTBOUND"].timestamp
+
     def test_missing_sent_at_still_resolves_via_received_at(self, db):
         message = _add_message(db, uid=1, message_id="<a@example.com>", sent_at=None)
         infos = get_thread_message_infos(db, ACCOUNT_A, message.thread_id)

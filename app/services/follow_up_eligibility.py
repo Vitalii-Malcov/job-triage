@@ -4,9 +4,10 @@ input supplied by the caller" style.
 
 **Never infers application age from `JobRecord.first_seen_at`/
 `last_seen_at` (CLAUDE.md hard requirement).** Every timestamp this module
-reasons about is a real Gmail correspondence timestamp
-(`GmailMessageRecord.sent_at`/`received_at`, see `ThreadMessageInfo`) —
-`JobRecord` itself is never even passed in beyond its `status` string.
+reasons about is a real, Gmail-assigned correspondence timestamp
+(`GmailMessageRecord.provider_arrival_at`, S7E-011 — see
+`ThreadMessageInfo`) — `JobRecord` itself is never even passed in beyond
+its `status` string.
 
 **If correspondence is missing or ambiguous, this returns NOT_ELIGIBLE —
 it never guesses.** See `evaluate_follow_up_eligibility`'s docstring for
@@ -32,9 +33,10 @@ _ELIGIBLE_JOB_STATUS = "APPLIED"
 class ThreadMessageInfo:
     """One already-persisted `GmailMessageRecord` from the job's matched
     Gmail thread — direction/timestamp only, the minimum this module
-    needs. `timestamp` is the message's own `sent_at` if known, else the
-    sync's `received_at` (see app.db.follow_up_repository for how this is
-    derived) — never `JobRecord.first_seen_at`/`last_seen_at`.
+    needs. `timestamp` is the trusted Gmail-assigned `provider_arrival_at`
+    (IMAP INTERNALDATE, S7E-011 — see app.db.follow_up_repository for how
+    this is derived) — never `sent_at` (sender-controlled) and never
+    `JobRecord.first_seen_at`/`last_seen_at`.
     """
 
     gmail_message_id: int

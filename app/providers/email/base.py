@@ -223,6 +223,23 @@ class ParsedGmailMessage:
     body_plain: str
     body_truncated: bool
     has_html: bool
+    # S7E-011 (Codex re-review, Gmail chronology): the mail server's own
+    # IMAP INTERNALDATE for this message — assigned by Gmail itself at
+    # the moment the message actually arrived/was appended to the
+    # mailbox, never by the sender (unlike `sent_at`/the RFC 5322 `Date`
+    # header) and never by which order THIS sync run happened to fetch
+    # mailboxes in (unlike `received_at`, this project's own wall-clock
+    # persist time — see GmailMessageRecord's docstring for why a dual
+    # INBOX-then-Sent sync run can persist an OLDER real message AFTER a
+    # NEWER one, reversing `received_at` order for messages first
+    # imported together). `None` here means the IMAP server's response
+    # didn't include a parseable INTERNALDATE (see
+    # app/providers/email/imap.py's `_parse_internal_date` — an honestly
+    # documented gap, same shape as `_read_message_size`'s RFC822.SIZE
+    # fallback); the persistence layer (app.db.gmail_repository.upsert_message)
+    # falls back to its own wall-clock write time in that case, exactly
+    # matching this field's pre-S7E-011 absence.
+    provider_arrival_at: datetime | None = None
     attachments: tuple[ParsedAttachment, ...] = field(default_factory=tuple)
 
 

@@ -115,11 +115,15 @@ def _add_message(
     sent_at=None,
     **overrides,
 ):
-    """`received_at` (S7E-004: the trusted ordering timestamp) defaults to
-    `NOW - 10 days` (well past the 7-day follow_up_delay) so existing
-    call sites keep behaving as before without needing to pass it
-    explicitly — see tests/test_follow_up_service.py's identical helper
-    for why this must be set directly on the persisted row.
+    """`received_at` defaults to `NOW - 10 days` (well past the 7-day
+    follow_up_delay) so existing call sites keep behaving as before
+    without needing to pass it explicitly — see
+    tests/test_follow_up_service.py's identical helper for why this must
+    be set directly on the persisted row. `provider_arrival_at` (S7E-011:
+    the actual trusted ordering timestamp — see
+    app.db.follow_up_repository.get_thread_message_infos) is set to the
+    SAME value here so this fixture controls eligibility timing exactly
+    as before S7E-011.
     """
     data = dict(
         account_key=ACCOUNT,
@@ -146,6 +150,7 @@ def _add_message(
     effective_received_at = (NOW - timedelta(days=10)) if received_at is _UNSET else received_at
     if effective_received_at is not None:
         record.received_at = effective_received_at
+        record.provider_arrival_at = effective_received_at
         db.commit()
         db.refresh(record)
     return record
@@ -584,3 +589,88 @@ class TestSendTimeRevalidation:
 
         assert record.status == "SENT"
         assert provider.call_count == 1
+
+
+class TestReplyRaceAtDispatch:
+    """S7E-012 (Codex re-review, MEDIUM): `begin_transmission`'s CAS only
+    protects against ANOTHER CONCURRENT SEND REQUEST for this exact
+    proposal — it says nothing about, and is never touched by, a Gmail
+    sync (`app.services.gmail_inbox.GmailInboxService`), which persists
+    new `GmailMessageRecord` rows on its own independent
+    schedule/connection. A recruiter reply can legitimately land in the
+    window between `_revalidate_or_fail_closed` passing and
+    `provider.send` actually being invoked. This adversarial regression
+    proves the LAST gate (`_fail_closed_if_reply_raced_dispatch`) catches
+    exactly that: revalidation passes, a reply is committed immediately
+    afterward (simulating the concurrent Gmail sync), and the outbound
+    provider must NEVER be called.
+    """
+
+    def test_reply_landing_after_revalidation_blocks_dispatch(self, db, monkeypatch):
+        proposal, outbound, _approval = _seed_and_approve(db)
+        provider = FakeOutboundProvider()
+
+        import app.services.follow_up_send as send_module
+
+        real_revalidate = send_module._revalidate_or_fail_closed
+
+        def _revalidate_then_race_a_reply(*args, **kwargs):
+            # Revalidation genuinely passes here: at this instant, no
+            # reply exists yet.
+            real_revalidate(*args, **kwargs)
+            # Immediately afterward — the exact critical window S7E-012
+            # closes — a concurrent Gmail sync commits a brand-new
+            # INBOUND reply for this same thread.
+            _add_message(
+                db,
+                uid=99,
+                message_id="<race-reply@example.com>",
+                in_reply_to=outbound.message_id_header,
+                references=(outbound.message_id_header,),
+                direction="INBOUND",
+                received_at=NOW,
+            )
+
+        monkeypatch.setattr(
+            send_module, "_revalidate_or_fail_closed", _revalidate_then_race_a_reply
+        )
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_anchor_superseded_immediately_before_dispatch_also_blocks(self, db, monkeypatch):
+        """Same critical window, different race: a newer OUTBOUND message
+        (not a reply) becomes the thread's true latest anchor immediately
+        after revalidation passed — the pinned content would no longer
+        correspond to the current correspondence state."""
+        proposal, outbound, _approval = _seed_and_approve(db)
+        provider = FakeOutboundProvider()
+
+        import app.services.follow_up_send as send_module
+
+        real_revalidate = send_module._revalidate_or_fail_closed
+
+        def _revalidate_then_race_a_newer_outbound(*args, **kwargs):
+            real_revalidate(*args, **kwargs)
+            _add_message(
+                db,
+                uid=98,
+                message_id="<race-out@example.com>",
+                in_reply_to=outbound.message_id_header,
+                references=(outbound.message_id_header,),
+                direction="OUTBOUND",
+                received_at=NOW,
+            )
+
+        monkeypatch.setattr(
+            send_module, "_revalidate_or_fail_closed", _revalidate_then_race_a_newer_outbound
+        )
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"

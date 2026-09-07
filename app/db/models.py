@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -403,6 +404,28 @@ class GmailMessageRecord(Base):
     # (the email's own Date header, which may be absent/malformed).
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    # S7E-011 (Codex re-review, Gmail chronology): the mail server's own
+    # IMAP INTERNALDATE — assigned by Gmail itself at real arrival time,
+    # trusted for correspondence ORDERING in place of `received_at` (see
+    # app.db.follow_up_repository.get_thread_message_infos). Distinct from
+    # BOTH other timestamps on this row: unlike `sent_at`, it is never
+    # sender-controlled; unlike `received_at`, it does not depend on which
+    # order (INBOX vs. Sent) THIS project's own sync run happened to fetch
+    # mailboxes in — a dual-mailbox sync that persists an OLDER real
+    # message strictly after a NEWER one (e.g. a first-time historical
+    # sync importing a whole thread in one run) would otherwise reverse
+    # `received_at` order for messages imported together. `server_default`
+    # (never relied on by application code, which always passes an
+    # explicit value — see app.db.gmail_repository.upsert_message) exists
+    # only so a raw INSERT that omits this column (e.g. a pre-S7E-011
+    # migration/test fixture) still gets a value instead of failing NOT
+    # NULL; historical rows backfilled by this column's own migration are
+    # necessarily an honest best-effort (see that migration's docstring),
+    # not a retroactively-accurate INTERNALDATE this project never
+    # recorded for them.
+    provider_arrival_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
     # "INBOUND" | "OUTBOUND" — derived purely from comparing the From
     # address against the configured mailbox account address (see

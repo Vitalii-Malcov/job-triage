@@ -61,9 +61,41 @@ and the provider call are only ever performed by the request that won
 mutually exclusive across concurrent requests for the same proposal (see
 `app.db.follow_up_approval_repository.begin_transmission`'s docstring).
 This closes the TOCTOU window a plain "revalidate, then send" sequence
-would otherwise have: two concurrent requests can no longer both pass
-revalidation and then both call the provider, because only one of them
-ever reaches the revalidation step at all for a given proposal.
+would otherwise have BETWEEN TWO SEND REQUESTS: two concurrent requests
+can no longer both pass revalidation and then both call the provider,
+because only one of them ever reaches the revalidation step at all for a
+given proposal.
+
+**`begin_transmission` does NOT protect against a Gmail sync writer
+(S7E-012, Codex re-review, MEDIUM).** The CAS above is scoped entirely to
+`follow_up_sends` rows — it says nothing about, and is never touched by,
+`POST /gmail/sync` (`app.services.gmail_inbox.GmailInboxService`), which
+persists new `GmailMessageRecord` rows on its own, completely independent
+schedule/connection. A Gmail sync can legitimately commit a brand-new
+INBOUND reply for this exact thread in the window between
+`_revalidate_or_fail_closed` reading "no reply yet" and `provider.send`
+actually being invoked — `send_follow_up` cannot lock the mailbox, and a
+message, once sent, cannot be unsent, so this must be caught BEFORE the
+provider call, not after. `_fail_closed_if_reply_raced_dispatch` is a
+second, deliberately minimal re-check — not a repeat of the full
+revalidation — positioned as the LITERAL LAST statement before
+`provider.send`, specifically for this one remaining risk: it re-reads
+only the thread's current latest-OUTBOUND/latest-INBOUND state (the same
+bounded, direct queries `app.db.follow_up_repository.get_thread_message_infos`
+always uses) and fails closed (marks the send `FAILED`, never calls the
+provider) if a reply has landed since the main revalidation ran. Kept
+intentionally tiny — one bounded read, no job/thread-ambiguity/recipient
+re-derivation — so it adds as little of its own latency (and therefore as
+little of its own residual race window) as possible between itself and
+the call it guards. This narrows, rather than mathematically eliminates,
+the window: a Gmail sync commit landing in the sub-millisecond gap
+between THIS check's read returning and `provider.send` actually starting
+is not mechanically prevented (this project holds no lock spanning an
+outbound network call across process/connection boundaries) — accepted
+because closing it further would require Gmail sync itself to
+participate in a Stage-7E-specific lock, which app.db.gmail_repository.py
+deliberately never does (Stage 7A's "zero job/application linkage" — see
+app/services/gmail_inbox.py's module docstring).
 
 **Crash/CAS recovery (S7E-010, Codex remediation).** `send_attempted`
 durably distinguishes "transmission was never attempted for this claim"
@@ -105,6 +137,7 @@ from app.db.follow_up_approval_repository import (
     to_follow_up_approval,
     to_follow_up_send_status,
 )
+from app.db.follow_up_repository import get_thread_message_infos
 from app.db.gmail_repository import get_message_by_id
 from app.db.models import FollowUpApprovalRecord, FollowUpProposalRecord, FollowUpSendRecord
 from app.db.repositories import get_job_by_id
@@ -410,6 +443,50 @@ def _revalidate_or_fail_closed(
         )
 
 
+def _fail_closed_if_reply_raced_dispatch(
+    db: Session,
+    *,
+    account_key: str,
+    proposal: FollowUpProposalRecord,
+    send_record: FollowUpSendRecord,
+) -> None:
+    """S7E-012 (Codex re-review, MEDIUM): the LAST check before
+    `provider.send` — see module docstring's "`begin_transmission` does
+    NOT protect against a Gmail sync writer" section for the full
+    rationale. Re-reads the thread's current latest-OUTBOUND/latest-
+    INBOUND state ONE more time (the same bounded query
+    `_revalidate_or_fail_closed` uses via `compute_fresh_follow_up_state`)
+    and fails closed if either the anchor is no longer the latest
+    OUTBOUND message or a reply has arrived since — never silently
+    proceeds. Deliberately does NOT re-check job status/thread ambiguity/
+    recipient (already covered by `_revalidate_or_fail_closed` moments
+    earlier); re-deriving those again here would only add latency to the
+    exact window this function exists to shrink.
+    """
+    infos = get_thread_message_infos(db, account_key, proposal.gmail_thread_id)
+    outbound = next((info for info in infos if info.direction == "OUTBOUND"), None)
+    inbound = next((info for info in infos if info.direction == "INBOUND"), None)
+
+    stale_reason: str | None = None
+    if outbound is None or outbound.gmail_message_id != proposal.anchor_gmail_message_id:
+        stale_reason = "the thread's correspondence anchor changed immediately before dispatch"
+    elif inbound is not None and inbound.timestamp > outbound.timestamp:
+        stale_reason = (
+            "a reply was received immediately before dispatch "
+            f"(gmail_message_id={inbound.gmail_message_id}); follow-up send aborted"
+        )
+
+    if stale_reason is not None:
+        mark_send_failed(db, send_record, last_error="ReplyRacedDispatch")
+        logger.warning(
+            "follow_up_send_reply_raced_dispatch follow_up_proposal_id=%s",
+            proposal.id,
+        )
+        raise FollowUpProposalStaleAtSendTimeError(
+            f"follow_up_proposal_id={proposal.id!r} is no longer eligible to send: {stale_reason}"
+        )
+
+
 def send_follow_up(
     db: Session,
     account_key: str,
@@ -470,6 +547,15 @@ def send_follow_up(
         send_record=send_record,
         settings=settings,
         now=now,
+    )
+
+    # S7E-012: the LAST gate before the outbound provider is ever called
+    # — see module docstring and `_fail_closed_if_reply_raced_dispatch`'s
+    # own docstring for why this is a distinct, separately-positioned
+    # check from `_revalidate_or_fail_closed` above rather than the same
+    # call repeated.
+    _fail_closed_if_reply_raced_dispatch(
+        db, account_key=account_key, proposal=proposal, send_record=send_record
     )
 
     try:

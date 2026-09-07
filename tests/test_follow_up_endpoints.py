@@ -136,13 +136,16 @@ def _seed_eligible_job(session_factory, *, account_key: str = ACCOUNT, uid: int 
                 attachments=(),
             ),
         )
-        # S7E-004 (Codex remediation): eligibility now orders by the
-        # trusted `received_at` (real sync write time), never the
+        # S7E-011 (Codex re-review): eligibility now orders by the
+        # trusted `provider_arrival_at` (Gmail's own IMAP INTERNALDATE),
+        # never `received_at` (this project's own sync write time, which
+        # a dual INBOX-then-Sent sync run can misorder) or the
         # sender-controlled `sent_at` RFC Date header — see
-        # app.db.follow_up_repository.get_thread_message_infos. Set
+        # app.db.follow_up_repository.get_thread_message_infos. Set both
         # directly so this fixture stays "always ELIGIBLE regardless of
         # wall-clock time the test happens to run at" as documented above.
         outbound.received_at = datetime.now(UTC) - timedelta(days=30)
+        outbound.provider_arrival_at = datetime.now(UTC) - timedelta(days=30)
         db.commit()
         db.add(
             GmailMessageAnalysisRecord(

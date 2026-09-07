@@ -64,16 +64,18 @@ _UNSET = object()
 
 
 def _add_message(db, *, uid, message_id, direction, sent_at, received_at=_UNSET, **overrides):
-    """`received_at` (S7E-004: the trusted ordering timestamp — see
-    app.db.follow_up_repository.get_thread_message_infos) defaults to
-    `sent_at` here so existing test call sites that only pass `sent_at`
-    keep controlling eligibility timing as before. `received_at` is not
-    part of `ParsedGmailMessage` (it is always server-set to real
-    wall-clock time at persist time in production — see
+    """`received_at` defaults to `sent_at` here so existing test call
+    sites that only pass `sent_at` keep controlling eligibility timing as
+    before. Neither `received_at` nor `provider_arrival_at` (S7E-011: the
+    actual trusted ordering timestamp — see
+    app.db.follow_up_repository.get_thread_message_infos) is part of
+    `ParsedGmailMessage` (both are always server-set to real wall-clock/
+    IMAP-INTERNALDATE values at persist time in production — see
     GmailMessageRecord's docstring); tests that need a specific historical
-    `received_at` set it directly on the persisted row afterwards, which
-    is the only way to simulate "synced N days ago" since real sync time
-    is never attacker/test-input-controlled in production.
+    value set BOTH directly on the persisted row afterwards (kept in sync
+    with each other here), which is the only way to simulate "synced N
+    days ago" since real sync/arrival time is never attacker/test-input-
+    controlled in production.
     """
     data = dict(
         account_key=ACCOUNT,
@@ -100,6 +102,7 @@ def _add_message(db, *, uid, message_id, direction, sent_at, received_at=_UNSET,
     effective_received_at = sent_at if received_at is _UNSET else received_at
     if effective_received_at is not None:
         record.received_at = effective_received_at
+        record.provider_arrival_at = effective_received_at
         db.commit()
         db.refresh(record)
     return record
@@ -227,6 +230,64 @@ class TestLaterInboundReplySuppressed:
 
         assert result.eligibility == "NOT_ELIGIBLE"
         assert result.proposal is None
+
+
+class TestGmailChronologySyncOrderRegression:
+    """S7E-011 (Codex re-review, MEDIUM): a dual INBOX-then-Sent sync run
+    (see app.api.routes._run_gmail_sync, S7E-001) must never let THIS
+    PROJECT'S OWN persistence order reverse real Gmail chronology for
+    messages first imported together — e.g. a first-time/historical sync
+    of a whole thread's backlog. Before S7E-011, eligibility trusted
+    `received_at` (this project's own sync wall-clock write time); this
+    regression pins the exact scenario that broke: a real outbound
+    message followed by a later recruiter reply, both first synced in ONE
+    run, with INBOX (the reply) persisted strictly BEFORE Sent (the
+    outbound message) — which would give the reply an EARLIER
+    `received_at` than the outbound message despite arriving after it in
+    reality.
+    """
+
+    def test_reply_still_suppresses_follow_up_when_inbox_persisted_before_sent(self, db):
+        job = _add_job(db)
+        real_outbound_arrival = NOW - timedelta(days=10)
+        real_reply_arrival = NOW - timedelta(days=9)  # LATER than the outbound message, in reality
+
+        outbound = _add_message(
+            db,
+            uid=1,
+            message_id="<out@example.com>",
+            direction="OUTBOUND",
+            sent_at=real_outbound_arrival,
+        )
+        reply = _add_message(
+            db,
+            uid=2,
+            message_id="<reply@example.com>",
+            in_reply_to="<out@example.com>",
+            references=("<out@example.com>",),
+            direction="INBOUND",
+            sent_at=real_reply_arrival,
+        )
+        assert reply.thread_id == outbound.thread_id
+
+        # Simulate the dual-sync persistence order that reverses
+        # `received_at`: INBOX (the reply) is written to the DB FIRST,
+        # Sent (the outbound message) SECOND — even though the reply
+        # arrived at Gmail LATER. `provider_arrival_at` (already set
+        # correctly above, by `_add_message`, to each message's real
+        # arrival time) is deliberately left untouched: it is the one
+        # timestamp that must NOT depend on this sync-order accident.
+        reply.received_at = NOW - timedelta(days=20)
+        outbound.received_at = NOW - timedelta(days=1)
+        db.commit()
+
+        _add_analysis(db, gmail_message_id=outbound.id, matched_job_id=job.id)
+
+        result = evaluate_follow_up_for_job(db, ACCOUNT, job.id, settings=SETTINGS, now=NOW)
+
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert result.proposal is None
+        assert "reply was received" in result.reason
 
 
 class TestEligibleProposalCreation:
