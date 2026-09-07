@@ -66,36 +66,48 @@ can no longer both pass revalidation and then both call the provider,
 because only one of them ever reaches the revalidation step at all for a
 given proposal.
 
-**`begin_transmission` does NOT protect against a Gmail sync writer
-(S7E-012, Codex re-review, MEDIUM).** The CAS above is scoped entirely to
-`follow_up_sends` rows — it says nothing about, and is never touched by,
-`POST /gmail/sync` (`app.services.gmail_inbox.GmailInboxService`), which
-persists new `GmailMessageRecord` rows on its own, completely independent
-schedule/connection. A Gmail sync can legitimately commit a brand-new
-INBOUND reply for this exact thread in the window between
-`_revalidate_or_fail_closed` reading "no reply yet" and `provider.send`
-actually being invoked — `send_follow_up` cannot lock the mailbox, and a
-message, once sent, cannot be unsent, so this must be caught BEFORE the
-provider call, not after. `_fail_closed_if_reply_raced_dispatch` is a
-second, deliberately minimal re-check — not a repeat of the full
-revalidation — positioned as the LITERAL LAST statement before
-`provider.send`, specifically for this one remaining risk: it re-reads
-only the thread's current latest-OUTBOUND/latest-INBOUND state (the same
-bounded, direct queries `app.db.follow_up_repository.get_thread_message_infos`
-always uses) and fails closed (marks the send `FAILED`, never calls the
-provider) if a reply has landed since the main revalidation ran. Kept
-intentionally tiny — one bounded read, no job/thread-ambiguity/recipient
-re-derivation — so it adds as little of its own latency (and therefore as
-little of its own residual race window) as possible between itself and
-the call it guards. This narrows, rather than mathematically eliminates,
-the window: a Gmail sync commit landing in the sub-millisecond gap
-between THIS check's read returning and `provider.send` actually starting
-is not mechanically prevented (this project holds no lock spanning an
-outbound network call across process/connection boundaries) — accepted
-because closing it further would require Gmail sync itself to
-participate in a Stage-7E-specific lock, which app.db.gmail_repository.py
-deliberately never does (Stage 7A's "zero job/application linkage" — see
-app/services/gmail_inbox.py's module docstring).
+**`begin_transmission` does NOT protect against a Gmail sync writer —
+closed for real by a shared thread guard (S7E-013, Codex re-review, final
+safety fix).** The CAS above is scoped entirely to `follow_up_sends` rows
+— it says nothing about, and is never touched by, `POST /gmail/sync`
+(`app.services.gmail_inbox.GmailInboxService`), which persists new
+`GmailMessageRecord` rows on its own, completely independent
+schedule/connection. An earlier remediation round (S7E-012) tried to
+close this with a second, minimal re-check positioned right before
+`provider.send` — that only NARROWED the window to the gap between that
+read returning and the provider call starting; it could never
+mathematically close it, because nothing actually stopped a Gmail sync
+from committing in that gap.
+
+`send_follow_up` now acquires `proposal.gmail_thread_id`'s guard (
+`app.db.gmail_repository.acquire_thread_lock`/`wait_for_thread_lock` — a
+generic, Gmail-thread-scoped mutual-exclusion primitive that knows
+nothing about follow-ups or jobs) BEFORE revalidating, holds it across
+revalidation AND the provider call, and releases it in a `finally` no
+matter how the guarded section exits. `app.db.gmail_repository.upsert_message`
+acquires the SAME lock (on the same `GmailThreadRecord.id`) before its
+own INSERT + commit of a new message. The two are therefore mutually
+exclusive by construction: a Gmail sync that reaches the lock first
+blocks this request from ever starting its guarded window (fails closed
+to `FollowUpSendInProgressError` after `lock_wait_seconds` — see
+`begin_transmission`'s own crash-recovery discussion below for why a
+timeout here safely resolves to `FAILED`, not `UNCERTAIN`: no
+transmission was ever attempted); a send that reaches it first makes any
+concurrent Gmail sync's INSERT for this thread block (bounded by the
+lock's own TTL, so a crashed holder can never deadlock the mailbox
+forever) until the send releases it, by which point the send has already
+either transmitted or failed closed. `_fail_closed_if_reply_raced_dispatch`
+(S7E-012) is kept as cheap, redundant defense-in-depth inside the guarded
+section — no longer the primary defense.
+
+**Generic, layer-respecting primitive — no job/application logic in
+Stage 7A.** The lock lives on `GmailThreadRecord` and is implemented in
+`app.db.gmail_repository` (Stage 7A) purely as "who currently holds this
+thread, until when" — it has no concept of follow-ups, approvals, or
+jobs. Stage 7E imports and uses it exactly like any other consumer would;
+Stage 7A's own code never imports anything from `app.services.follow_up*`
+(see app/services/gmail_inbox.py's "zero job/application linkage"
+constraint, which this fix does not touch).
 
 **Crash/CAS recovery (S7E-010, Codex remediation).** `send_attempted`
 durably distinguishes "transmission was never attempted for this claim"
@@ -138,7 +150,14 @@ from app.db.follow_up_approval_repository import (
     to_follow_up_send_status,
 )
 from app.db.follow_up_repository import get_thread_message_infos
-from app.db.gmail_repository import get_message_by_id
+from app.db.gmail_repository import (
+    THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
+    GmailThreadLockTimeoutError,
+    get_message_by_id,
+    new_thread_lock_holder_token,
+    release_thread_lock,
+    wait_for_thread_lock,
+)
 from app.db.models import FollowUpApprovalRecord, FollowUpProposalRecord, FollowUpSendRecord
 from app.db.repositories import get_job_by_id
 from app.models.follow_up import FollowUpState
@@ -495,6 +514,7 @@ def send_follow_up(
     *,
     settings: Settings | None = None,
     now: datetime | None = None,
+    lock_wait_seconds: float = THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
 ) -> FollowUpSendRecord:
     """Send an APPROVED follow-up as a real Gmail message. See module
     docstring for the full send-gate contract. Raises one of
@@ -536,54 +556,80 @@ def send_follow_up(
             "already in progress"
         )
 
-    settings = settings or get_settings()
-    now = now or datetime.now(UTC)
-    _revalidate_or_fail_closed(
-        db,
-        account_key=account_key,
-        proposal=proposal,
-        approval=approval,
-        anchor_message=anchor_message,
-        send_record=send_record,
-        settings=settings,
-        now=now,
-    )
-
-    # S7E-012: the LAST gate before the outbound provider is ever called
-    # — see module docstring and `_fail_closed_if_reply_raced_dispatch`'s
-    # own docstring for why this is a distinct, separately-positioned
-    # check from `_revalidate_or_fail_closed` above rather than the same
-    # call repeated.
-    _fail_closed_if_reply_raced_dispatch(
-        db, account_key=account_key, proposal=proposal, send_record=send_record
-    )
+    # S7E-013 (Codex re-review, final safety fix): acquire the SAME
+    # generic per-thread guard app.db.gmail_repository.upsert_message
+    # holds while persisting a new message — see module docstring's
+    # "begin_transmission does NOT protect against a Gmail sync writer"
+    # section. Held across the ENTIRE revalidate-then-dispatch window
+    # below (released in the `finally`), so a Gmail sync cannot commit a
+    # new message for this thread until this request is done with it,
+    # and a Gmail sync already mid-persist for this thread blocks this
+    # request from ever starting its guarded window.
+    lock_holder = new_thread_lock_holder_token(f"follow_up_send:{send_record.id}")
+    try:
+        wait_for_thread_lock(
+            db, proposal.gmail_thread_id, holder=lock_holder, max_wait_seconds=lock_wait_seconds
+        )
+    except GmailThreadLockTimeoutError as exc:
+        mark_send_failed(db, send_record, last_error="ThreadLockTimeout")
+        logger.warning(
+            "follow_up_send_thread_lock_timeout follow_up_proposal_id=%s",
+            proposal.id,
+        )
+        raise FollowUpSendInProgressError(
+            f"Could not acquire the Gmail thread guard for follow_up_proposal_id="
+            f"{proposal.id!r}; a Gmail sync or another send is currently using it"
+        ) from exc
 
     try:
-        result = provider.send(outbound_message)
-    except EmailSendOutcomeUnknownError as exc:
-        mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
-        logger.warning(
-            "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
-            proposal.id,
-            type(exc).__name__,
+        settings = settings or get_settings()
+        now = now or datetime.now(UTC)
+        _revalidate_or_fail_closed(
+            db,
+            account_key=account_key,
+            proposal=proposal,
+            approval=approval,
+            anchor_message=anchor_message,
+            send_record=send_record,
+            settings=settings,
+            now=now,
         )
-        raise FollowUpSendOutcomeUncertainError(
-            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
-        ) from exc
-    except EmailSendError as exc:
-        mark_send_failed(db, send_record, last_error=type(exc).__name__)
-        logger.warning(
-            "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
-            proposal.id,
-            type(exc).__name__,
-        )
-        raise FollowUpSendFailedError(
-            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
-        ) from exc
 
-    mark_send_sent(db, send_record, provider_message_id=result.provider_message_id)
-    logger.info("follow_up_sent follow_up_proposal_id=%s", proposal.id)
-    return send_record
+        # S7E-012: a cheap, redundant last check kept as defense-in-depth
+        # alongside the S7E-013 thread guard above — see module docstring
+        # and `_fail_closed_if_reply_raced_dispatch`'s own docstring.
+        _fail_closed_if_reply_raced_dispatch(
+            db, account_key=account_key, proposal=proposal, send_record=send_record
+        )
+
+        try:
+            result = provider.send(outbound_message)
+        except EmailSendOutcomeUnknownError as exc:
+            mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
+            logger.warning(
+                "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
+                proposal.id,
+                type(exc).__name__,
+            )
+            raise FollowUpSendOutcomeUncertainError(
+                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
+            ) from exc
+        except EmailSendError as exc:
+            mark_send_failed(db, send_record, last_error=type(exc).__name__)
+            logger.warning(
+                "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
+                proposal.id,
+                type(exc).__name__,
+            )
+            raise FollowUpSendFailedError(
+                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
+            ) from exc
+
+        mark_send_sent(db, send_record, provider_message_id=result.provider_message_id)
+        logger.info("follow_up_sent follow_up_proposal_id=%s", proposal.id)
+        return send_record
+    finally:
+        release_thread_lock(db, proposal.gmail_thread_id, holder=lock_holder)
 
 
 def get_follow_up_state(db: Session, account_key: str, follow_up_proposal_id: int) -> FollowUpState:

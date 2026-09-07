@@ -11,12 +11,16 @@ DELAY = timedelta(days=7)
 NOW = datetime(2026, 9, 6, tzinfo=UTC)
 
 
-def _outbound(msg_id: int, when: datetime) -> ThreadMessageInfo:
-    return ThreadMessageInfo(gmail_message_id=msg_id, direction="OUTBOUND", timestamp=when)
+def _outbound(msg_id: int, when: datetime, *, trusted: bool = True) -> ThreadMessageInfo:
+    return ThreadMessageInfo(
+        gmail_message_id=msg_id, direction="OUTBOUND", timestamp=when, timestamp_is_trusted=trusted
+    )
 
 
-def _inbound(msg_id: int, when: datetime) -> ThreadMessageInfo:
-    return ThreadMessageInfo(gmail_message_id=msg_id, direction="INBOUND", timestamp=when)
+def _inbound(msg_id: int, when: datetime, *, trusted: bool = True) -> ThreadMessageInfo:
+    return ThreadMessageInfo(
+        gmail_message_id=msg_id, direction="INBOUND", timestamp=when, timestamp_is_trusted=trusted
+    )
 
 
 class TestJobStatusGate:
@@ -148,6 +152,63 @@ class TestLaterInboundReplySuppresses:
             thread_messages=[
                 _outbound(1, NOW - timedelta(days=30)),
                 _outbound(2, NOW - timedelta(days=10)),
+            ],
+            follow_up_delay=DELAY,
+            now=NOW,
+        )
+        assert result.eligibility == "ELIGIBLE"
+        assert result.anchor_gmail_message_id == 2
+
+
+class TestUntrustedChronologyFailsClosed:
+    """S7E-013 (Codex re-review, final safety fix): `timestamp` alone is
+    not enough to trust — a legacy/backfilled row or a message whose IMAP
+    fetch never returned a parseable INTERNALDATE must never become
+    ELIGIBLE just because its (untrustworthy) timestamp happens to look
+    old enough / early enough.
+    """
+
+    def test_untrusted_anchor_is_not_eligible(self):
+        result = evaluate_follow_up_eligibility(
+            job_status="APPLIED",
+            matched_thread_count=1,
+            thread_messages=[_outbound(1, NOW - timedelta(days=10), trusted=False)],
+            follow_up_delay=DELAY,
+            now=NOW,
+        )
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert "not a provider-verified" in result.reason
+        assert result.anchor_gmail_message_id == 1
+        assert result.due_at is None
+
+    def test_untrusted_inbound_suppresses_even_though_it_looks_earlier(self):
+        """An untrusted inbound message that LOOKS like it predates the
+        (trusted) outbound anchor must still fail closed — its real
+        arrival order relative to the anchor cannot be verified at all,
+        so this must never be treated as safely "before" it."""
+        result = evaluate_follow_up_eligibility(
+            job_status="APPLIED",
+            matched_thread_count=1,
+            thread_messages=[
+                _inbound(1, NOW - timedelta(days=20), trusted=False),
+                _outbound(2, NOW - timedelta(days=10), trusted=True),
+            ],
+            follow_up_delay=DELAY,
+            now=NOW,
+        )
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert "not a provider-verified" in result.reason
+        assert result.anchor_gmail_message_id == 2
+
+    def test_trusted_anchor_and_trusted_inbound_reach_normal_eligibility(self):
+        """Sanity check: once both are trusted, normal eligibility logic
+        (not the trust gate) decides the outcome."""
+        result = evaluate_follow_up_eligibility(
+            job_status="APPLIED",
+            matched_thread_count=1,
+            thread_messages=[
+                _inbound(1, NOW - timedelta(days=20), trusted=True),
+                _outbound(2, NOW - timedelta(days=10), trusted=True),
             ],
             follow_up_delay=DELAY,
             now=NOW,

@@ -880,6 +880,8 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
         "subject",
         "created_at",
         "updated_at",
+        "lock_holder",
+        "lock_expires_at",
     }
 
     message_columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
@@ -901,6 +903,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
         "sent_at",
         "received_at",
         "provider_arrival_at",
+        "provider_arrival_is_trusted",
         "direction",
         "body_plain",
         "body_truncated",
@@ -1360,7 +1363,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1472,7 +1475,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1644,7 +1647,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1734,7 +1737,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2023,7 +2026,7 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
 
@@ -2346,7 +2349,7 @@ def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_pres
     assert job_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_draft_approvals" in inspector.get_table_names()
     assert "response_draft_sends" in inspector.get_table_names()
@@ -2494,7 +2497,7 @@ def test_follow_up_remediation_downgrade_clean_cycle(tmp_path: Path) -> None:
     assert proposal_count == 1  # sibling data untouched by the column drops
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "b3f1c9a7d5e2"
+    assert _alembic_current_revision(engine) == "c9e2a4f7b1d6"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
     assert "recipient" in proposal_columns

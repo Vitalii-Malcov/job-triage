@@ -183,6 +183,7 @@ def get_thread_message_infos(
                     gmail_message_id=record.id,
                     direction=record.direction,
                     timestamp=_ensure_utc(record.provider_arrival_at),
+                    timestamp_is_trusted=record.provider_arrival_is_trusted,
                 )
             )
     return infos

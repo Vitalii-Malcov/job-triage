@@ -13,6 +13,9 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy import (
+    false as sa_false,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -316,6 +319,21 @@ class GmailThreadRecord(Base):
         nullable=False,
     )
 
+    # S7E-013 (Codex re-review, final safety fix): a generic, Gmail-thread-
+    # scoped mutual-exclusion primitive — see
+    # app.db.gmail_repository.acquire_thread_lock/wait_for_thread_lock for
+    # the CAS mechanics. Deliberately just "who currently holds this
+    # thread, until when" with NO knowledge of WHY (Stage 7A's
+    # `upsert_message` and Stage 7E's `send_follow_up` are its only two
+    # callers today, but neither this table nor gmail_repository.py
+    # imports or reasons about job/application concepts — see
+    # app/services/gmail_inbox.py's "zero job/application linkage"
+    # constraint). `lock_expires_at` bounds how long a crashed holder can
+    # block everyone else — a lock past its expiry is treated as free by
+    # `acquire_thread_lock`, never held forever.
+    lock_holder: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     messages: Mapped[list["GmailMessageRecord"]] = relationship(back_populates="thread")
 
 
@@ -426,6 +444,23 @@ class GmailMessageRecord(Base):
     # recorded for them.
     provider_arrival_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    # S7E-013 (Codex re-review, final safety fix): True ONLY when
+    # `provider_arrival_at` above came from a real, successfully-parsed
+    # IMAP INTERNALDATE (see app/providers/email/imap.py's
+    # `_parse_internal_date`) — False for BOTH of `provider_arrival_at`'s
+    # own fallback cases: a server response with no parseable
+    # INTERNALDATE (app.db.gmail_repository.upsert_message's wall-clock
+    # fallback), and every row that predates this column's migration
+    # (backfilled from the OLD `received_at`-based behavior, never a real
+    # INTERNALDATE this project ever recorded for them). Defaults to
+    # False (fail-closed by construction — a raw INSERT that omits this
+    # column, or a future call site that forgets to set it, is never
+    # silently trusted). `app.services.follow_up_eligibility` refuses to
+    # determine follow-up eligibility from any message whose chronology
+    # isn't True here — see `ThreadMessageInfo.timestamp_is_trusted`.
+    provider_arrival_is_trusted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_false()
     )
     # "INBOUND" | "OUTBOUND" — derived purely from comparing the From
     # address against the configured mailbox account address (see

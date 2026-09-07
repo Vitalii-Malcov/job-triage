@@ -21,8 +21,14 @@ from app.db.follow_up_approval_repository import (
     get_send_for_proposal,
     retry_send_attempt,
 )
-from app.db.gmail_repository import get_message_by_id, upsert_message
-from app.db.models import GmailMessageAnalysisRecord, JobRecord
+from app.db.gmail_repository import (
+    GmailThreadLockTimeoutError,
+    acquire_thread_lock,
+    get_message_by_id,
+    release_thread_lock,
+    upsert_message,
+)
+from app.db.models import GmailMessageAnalysisRecord, GmailMessageRecord, JobRecord
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
     EmailSendConnectionError,
@@ -38,6 +44,7 @@ from app.services.follow_up_send import (
     FollowUpProposalNotFoundError,
     FollowUpProposalStaleAtSendTimeError,
     FollowUpSendFailedError,
+    FollowUpSendInProgressError,
     FollowUpSendOutcomeUncertainError,
     approve_or_reject_follow_up,
     get_follow_up_state,
@@ -151,6 +158,9 @@ def _add_message(
     if effective_received_at is not None:
         record.received_at = effective_received_at
         record.provider_arrival_at = effective_received_at
+        # S7E-013: this fixture simulates a REAL sync with a real IMAP
+        # INTERNALDATE, not legacy/backfilled data.
+        record.provider_arrival_is_trusted = True
         db.commit()
         db.refresh(record)
     return record
@@ -591,19 +601,47 @@ class TestSendTimeRevalidation:
         assert provider.call_count == 1
 
 
+def _insert_message_bypassing_lock(
+    db, *, thread_id, uid, message_id, direction, when
+) -> GmailMessageRecord:
+    """Directly commits a `GmailMessageRecord` WITHOUT going through
+    `app.db.gmail_repository.upsert_message` — i.e. bypassing the S7E-013
+    thread guard entirely. Simulates a hypothetical writer that, for
+    whatever reason, never participates in the shared per-thread lock
+    (upsert_message is the only such writer this project has TODAY — see
+    its own docstring — but `_fail_closed_if_reply_raced_dispatch`
+    (S7E-012) exists precisely as defense-in-depth against exactly this
+    class of writer, present or future, real or hypothetical).
+    """
+    record = GmailMessageRecord(
+        thread_id=thread_id,
+        account_key=ACCOUNT,
+        mailbox="INBOX",
+        uid_validity=100,
+        uid=uid,
+        message_id_header=message_id,
+        direction=direction,
+        received_at=when,
+        provider_arrival_at=when,
+        provider_arrival_is_trusted=True,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
 class TestReplyRaceAtDispatch:
-    """S7E-012 (Codex re-review, MEDIUM): `begin_transmission`'s CAS only
-    protects against ANOTHER CONCURRENT SEND REQUEST for this exact
-    proposal — it says nothing about, and is never touched by, a Gmail
-    sync (`app.services.gmail_inbox.GmailInboxService`), which persists
-    new `GmailMessageRecord` rows on its own independent
-    schedule/connection. A recruiter reply can legitimately land in the
-    window between `_revalidate_or_fail_closed` passing and
-    `provider.send` actually being invoked. This adversarial regression
-    proves the LAST gate (`_fail_closed_if_reply_raced_dispatch`) catches
-    exactly that: revalidation passes, a reply is committed immediately
-    afterward (simulating the concurrent Gmail sync), and the outbound
-    provider must NEVER be called.
+    """S7E-012 (Codex re-review, MEDIUM) — kept as defense-in-depth
+    alongside the S7E-013 thread guard (see
+    tests/test_follow_up_send_service.py::TestThreadGuardSharedWithGmailSync
+    for the real, lock-based mutual-exclusion proof against
+    `upsert_message` specifically). This class proves
+    `_fail_closed_if_reply_raced_dispatch` still catches a race from a
+    writer that does NOT participate in the shared guard at all —
+    bypassing `upsert_message` entirely via `_insert_message_bypassing_lock`
+    — since the S7E-013 lock can only ever protect writers that
+    cooperate with it.
     """
 
     def test_reply_landing_after_revalidation_blocks_dispatch(self, db, monkeypatch):
@@ -618,17 +656,16 @@ class TestReplyRaceAtDispatch:
             # Revalidation genuinely passes here: at this instant, no
             # reply exists yet.
             real_revalidate(*args, **kwargs)
-            # Immediately afterward — the exact critical window S7E-012
-            # closes — a concurrent Gmail sync commits a brand-new
-            # INBOUND reply for this same thread.
-            _add_message(
+            # Immediately afterward — simulating a writer that bypasses
+            # the shared thread guard entirely — a brand-new INBOUND
+            # reply is committed for this same thread.
+            _insert_message_bypassing_lock(
                 db,
+                thread_id=outbound.thread_id,
                 uid=99,
                 message_id="<race-reply@example.com>",
-                in_reply_to=outbound.message_id_header,
-                references=(outbound.message_id_header,),
                 direction="INBOUND",
-                received_at=NOW,
+                when=NOW,
             )
 
         monkeypatch.setattr(
@@ -655,14 +692,13 @@ class TestReplyRaceAtDispatch:
 
         def _revalidate_then_race_a_newer_outbound(*args, **kwargs):
             real_revalidate(*args, **kwargs)
-            _add_message(
+            _insert_message_bypassing_lock(
                 db,
+                thread_id=outbound.thread_id,
                 uid=98,
                 message_id="<race-out@example.com>",
-                in_reply_to=outbound.message_id_header,
-                references=(outbound.message_id_header,),
                 direction="OUTBOUND",
-                received_at=NOW,
+                when=NOW,
             )
 
         monkeypatch.setattr(
@@ -674,3 +710,118 @@ class TestReplyRaceAtDispatch:
 
         assert provider.call_count == 0
         assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+
+class TestThreadGuardSharedWithGmailSync:
+    """S7E-013 (Codex re-review, final safety fix): `send_follow_up` now
+    holds the SAME per-thread guard `app.db.gmail_repository.upsert_message`
+    acquires before persisting any new message — a real, DB-enforced
+    mutual exclusion, not just the narrowed re-check window S7E-012 added.
+    These tests exercise the real lock primitive on both sides (never
+    monkeypatching the lock itself), proving genuine two-way exclusion.
+    """
+
+    def test_gmail_sync_cannot_persist_a_reply_while_send_holds_the_guard(self, db):
+        proposal, outbound, _approval = _seed_and_approve(db)
+        race_attempted = {}
+
+        def fake_send(message):
+            # A "concurrent Gmail sync" attempts to persist a brand-new
+            # INBOUND reply for the SAME thread WHILE send_follow_up's
+            # guard is held (we are inside provider.send, deep within the
+            # guarded revalidate-then-dispatch section). This must be
+            # unable to commit — proven by a real GmailThreadLockTimeoutError
+            # from the real upsert_message/wait_for_thread_lock code path,
+            # not a simulated/mocked one.
+            race_parsed = ParsedGmailMessage(
+                account_key=ACCOUNT,
+                mailbox="INBOX",
+                uid=999,
+                uid_validity=100,
+                message_id_header="<race-reply@example.com>",
+                in_reply_to=outbound.message_id_header,
+                references=(outbound.message_id_header,),
+                from_address="hr@acme.example.com",
+                from_display_name=None,
+                to_addresses=(ACCOUNT,),
+                cc_addresses=(),
+                subject="Re: My application at Globex",
+                sent_at=NOW,
+                direction="INBOUND",
+                body_plain="Thanks for applying.",
+                body_truncated=False,
+                has_html=False,
+                attachments=(),
+            )
+            with pytest.raises(GmailThreadLockTimeoutError):
+                upsert_message(db, race_parsed, lock_wait_seconds=0.1)
+            race_attempted["done"] = True
+            return OutboundSendResult(provider_message_id="msg-1")
+
+        provider = FakeOutboundProvider()
+        provider.send = fake_send
+
+        record = send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert record.status == "SENT"
+        assert race_attempted.get("done") is True
+        # The race message was never actually persisted.
+        from app.db.gmail_repository import get_message_by_identity
+
+        assert get_message_by_identity(db, ACCOUNT, "INBOX", 100, 999) is None, (
+            "the racing Gmail sync must never have been able to commit its message"
+        )
+
+    def test_send_fails_closed_when_a_gmail_sync_currently_holds_the_guard(self, db):
+        proposal, outbound, _approval = _seed_and_approve(db)
+        acquire_thread_lock(db, outbound.thread_id, holder="simulated-gmail-sync")
+        provider = FakeOutboundProvider()
+
+        try:
+            with pytest.raises(FollowUpSendInProgressError):
+                send_follow_up(db, ACCOUNT, proposal.id, provider, lock_wait_seconds=0.1)
+        finally:
+            release_thread_lock(db, outbound.thread_id, holder="simulated-gmail-sync")
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_guard_is_released_after_a_successful_send(self, db):
+        """The guard must not leak — a second, independent proposal on a
+        DIFFERENT thread must never be blocked by a prior send's
+        already-released guard, and Gmail sync must be able to persist to
+        the FIRST thread again immediately afterward."""
+        proposal, outbound, _approval = _seed_and_approve(db)
+        provider = FakeOutboundProvider()
+
+        record = send_follow_up(db, ACCOUNT, proposal.id, provider)
+        assert record.status == "SENT"
+
+        # Now that the send is done, Gmail sync must be able to persist a
+        # new message to the SAME thread without any lock contention.
+        reply, created = upsert_message(
+            db,
+            ParsedGmailMessage(
+                account_key=ACCOUNT,
+                mailbox="INBOX",
+                uid=1000,
+                uid_validity=100,
+                message_id_header="<after-send-reply@example.com>",
+                in_reply_to=outbound.message_id_header,
+                references=(outbound.message_id_header,),
+                from_address="hr@acme.example.com",
+                from_display_name=None,
+                to_addresses=(ACCOUNT,),
+                cc_addresses=(),
+                subject="Re: My application at Globex",
+                sent_at=NOW,
+                direction="INBOUND",
+                body_plain="Thanks for applying.",
+                body_truncated=False,
+                has_html=False,
+                attachments=(),
+            ),
+            lock_wait_seconds=0.1,
+        )
+        assert created is True
+        assert reply.thread_id == outbound.thread_id

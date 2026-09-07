@@ -42,6 +42,17 @@ class ThreadMessageInfo:
     gmail_message_id: int
     direction: Direction
     timestamp: datetime
+    # S7E-013 (Codex re-review, final safety fix): True ONLY if
+    # `timestamp` came from a real, successfully-parsed IMAP INTERNALDATE
+    # (`GmailMessageRecord.provider_arrival_is_trusted`) — False for a
+    # legacy/pre-migration row or a message whose IMAP fetch didn't
+    # return a parseable INTERNALDATE (both cases fall back to this
+    # project's own wall-clock persist time, which is NOT safe to use for
+    # correspondence-ordering decisions — see GmailMessageRecord's
+    # docstring). `evaluate_follow_up_eligibility` fails closed
+    # (NOT_ELIGIBLE) rather than reason about a `timestamp` that isn't
+    # True here.
+    timestamp_is_trusted: bool
 
 
 @dataclass(frozen=True)
@@ -73,13 +84,24 @@ def evaluate_follow_up_eligibility(
     3. No `OUTBOUND` message in `thread_messages` — spec: "a real prior
        OUTBOUND message" is a hard precondition; a job with only inbound
        correspondence (or none at all) is never eligible.
-    4. A later `INBOUND` message exists (`timestamp` strictly after the
+    4. S7E-013 (Codex re-review): the anchor's `timestamp_is_trusted` is
+       False — a legacy/backfilled row or a message whose IMAP fetch
+       never returned a parseable INTERNALDATE. Its chronology cannot be
+       safely reasoned about at all, so this fails closed rather than
+       risk computing a wrong `due_at` or a wrong reply comparison from
+       it.
+    5. S7E-013: an `INBOUND` message in `thread_messages` has
+       `timestamp_is_trusted` False — whether it is a reply received
+       after the (trusted) anchor cannot be safely determined, so the
+       follow-up is suppressed rather than risk sending despite an
+       unverifiable-timing reply.
+    6. A later `INBOUND` message exists (`timestamp` strictly after the
        latest `OUTBOUND` message's own `timestamp`) — a reply was already
        received; the follow-up is suppressed.
-    5. `now < due_at` (`due_at` = latest outbound message's `timestamp` +
+    7. `now < due_at` (`due_at` = latest outbound message's `timestamp` +
        `follow_up_delay`) — the configured delay has not elapsed yet.
 
-    Only when all five pass is the result `ELIGIBLE`, naming the latest
+    Only when all seven pass is the result `ELIGIBLE`, naming the latest
     outbound message as `anchor_gmail_message_id` — the correspondence
     anchor app.db.models.FollowUpProposalRecord's `UNIQUE(account_key,
     anchor_gmail_message_id)` dedups on. This function never checks
@@ -127,6 +149,41 @@ def evaluate_follow_up_eligibility(
         )
 
     anchor = outbound_messages[-1]
+
+    # S7E-013 (Codex re-review, final safety fix): the anchor's own
+    # arrival time must be provider-trusted before it's used for
+    # anything below (due_at, reply comparison) — a legacy/backfilled or
+    # INTERNALDATE-less timestamp is never safe to reason about.
+    if not anchor.timestamp_is_trusted:
+        return FollowUpEligibilityResult(
+            eligibility="NOT_ELIGIBLE",
+            reason=(
+                "The latest outbound message's arrival time "
+                f"(id={anchor.gmail_message_id}) is not a provider-verified (real IMAP "
+                "INTERNALDATE) timestamp — legacy/backfilled or unparseable data; "
+                "follow-up eligibility cannot be safely determined."
+            ),
+            anchor_gmail_message_id=anchor.gmail_message_id,
+            due_at=None,
+        )
+
+    untrusted_inbound = next(
+        (m for m in thread_messages if m.direction == "INBOUND" and not m.timestamp_is_trusted),
+        None,
+    )
+    if untrusted_inbound is not None:
+        return FollowUpEligibilityResult(
+            eligibility="NOT_ELIGIBLE",
+            reason=(
+                "An inbound message's arrival time "
+                f"(id={untrusted_inbound.gmail_message_id}) is not a provider-verified "
+                "(real IMAP INTERNALDATE) timestamp — legacy/backfilled or unparseable "
+                "data; whether it is a reply received after the outbound anchor cannot "
+                "be safely determined, so the follow-up is suppressed."
+            ),
+            anchor_gmail_message_id=anchor.gmail_message_id,
+            due_at=None,
+        )
 
     later_inbound_reply = any(
         m.direction == "INBOUND" and m.timestamp > anchor.timestamp for m in thread_messages

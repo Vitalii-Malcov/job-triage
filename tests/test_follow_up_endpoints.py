@@ -146,6 +146,8 @@ def _seed_eligible_job(session_factory, *, account_key: str = ACCOUNT, uid: int 
         # wall-clock time the test happens to run at" as documented above.
         outbound.received_at = datetime.now(UTC) - timedelta(days=30)
         outbound.provider_arrival_at = datetime.now(UTC) - timedelta(days=30)
+        # S7E-013: simulate a REAL sync with a real IMAP INTERNALDATE.
+        outbound.provider_arrival_is_trusted = True
         db.commit()
         db.add(
             GmailMessageAnalysisRecord(

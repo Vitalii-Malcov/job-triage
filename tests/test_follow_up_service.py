@@ -103,6 +103,11 @@ def _add_message(db, *, uid, message_id, direction, sent_at, received_at=_UNSET,
     if effective_received_at is not None:
         record.received_at = effective_received_at
         record.provider_arrival_at = effective_received_at
+        # S7E-013: this fixture simulates a REAL sync with a real IMAP
+        # INTERNALDATE, not legacy/backfilled data — see
+        # tests/test_follow_up_service.py::TestUntrustedProviderChronology
+        # for the dedicated untrusted-chronology cases.
+        record.provider_arrival_is_trusted = True
         db.commit()
         db.refresh(record)
     return record
@@ -288,6 +293,88 @@ class TestGmailChronologySyncOrderRegression:
         assert result.eligibility == "NOT_ELIGIBLE"
         assert result.proposal is None
         assert "reply was received" in result.reason
+
+
+class TestUntrustedProviderChronology:
+    """S7E-013 (Codex re-review, final safety fix): a message's chronology
+    must be a real, provider-verified IMAP INTERNALDATE
+    (`GmailMessageRecord.provider_arrival_is_trusted`) before it can ever
+    make a follow-up ELIGIBLE — neither a legacy/backfilled row nor a
+    message whose IMAP fetch never returned a parseable INTERNALDATE may
+    be trusted, even if its persisted timestamp looks old enough to have
+    elapsed the follow-up delay.
+    """
+
+    def test_legacy_backfilled_anchor_never_becomes_eligible(self, db):
+        job, outbound = _seed_applied_job_with_outbound_anchor(
+            db, outbound_sent_at=NOW - timedelta(days=10)
+        )
+        # Simulate a pre-S7E-011 legacy row: provider_arrival_at was
+        # backfilled from the old received_at by that migration, never a
+        # real IMAP INTERNALDATE this project ever recorded for it.
+        outbound.provider_arrival_is_trusted = False
+        db.commit()
+
+        result = evaluate_follow_up_for_job(db, ACCOUNT, job.id, settings=SETTINGS, now=NOW)
+
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert result.proposal is None
+        assert "not a provider-verified" in result.reason
+
+    def test_missing_internaldate_anchor_never_becomes_eligible(self, db):
+        job = _add_job(db)
+        # A real sync whose IMAP fetch never returned a parseable
+        # INTERNALDATE (see app/providers/email/imap.py's
+        # _parse_internal_date) — provider_arrival_at is None on the
+        # ParsedGmailMessage, so upsert_message's fallback marks the
+        # persisted row untrusted automatically, exactly like a real
+        # missing-INTERNALDATE sync would.
+        outbound, _created = upsert_message(
+            db,
+            ParsedGmailMessage(
+                account_key=ACCOUNT,
+                mailbox="INBOX",
+                uid=1,
+                uid_validity=100,
+                message_id_header="<out@example.com>",
+                in_reply_to=None,
+                references=(),
+                from_address=ACCOUNT,
+                from_display_name=None,
+                to_addresses=("hr@acme.example.com",),
+                cc_addresses=(),
+                subject="My application at Globex",
+                sent_at=NOW - timedelta(days=10),
+                direction="OUTBOUND",
+                body_plain="I am applying for the Backend Engineer role at Globex.",
+                body_truncated=False,
+                has_html=False,
+                attachments=(),
+                provider_arrival_at=None,
+            ),
+        )
+        outbound.received_at = NOW - timedelta(days=10)
+        db.commit()
+        _add_analysis(db, gmail_message_id=outbound.id, matched_job_id=job.id)
+
+        result = evaluate_follow_up_for_job(db, ACCOUNT, job.id, settings=SETTINGS, now=NOW)
+
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert result.proposal is None
+        assert "not a provider-verified" in result.reason
+
+    def test_real_internaldate_anchor_reaches_normal_eligibility(self, db):
+        """Positive control: once the anchor's chronology IS trusted, the
+        normal (already-tested) eligibility path decides the outcome —
+        this fix must not make everything fail closed."""
+        job, _outbound = _seed_applied_job_with_outbound_anchor(
+            db, outbound_sent_at=NOW - timedelta(days=10)
+        )
+
+        result = evaluate_follow_up_for_job(db, ACCOUNT, job.id, settings=SETTINGS, now=NOW)
+
+        assert result.eligibility == "ELIGIBLE"
+        assert result.created is True
 
 
 class TestEligibleProposalCreation:
