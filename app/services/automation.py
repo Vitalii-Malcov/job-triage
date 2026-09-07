@@ -202,11 +202,23 @@ class _RunLeaseHeartbeat:
     why it runs on its OWN `Session`, in its OWN daemon thread).
 
     `lease_lost` (a `threading.Event`) is set the moment a renewal
-    attempt fails — i.e. `app.db.automation_repository.renew_run_lease`
-    reports the lease was no longer live for `holder` at renewal time —
-    and the heartbeat stops trying immediately afterward. The caller
-    MUST check `lease_lost` before trusting that it may still finalize
-    this run's outcome.
+    attempt fails — either because
+    `app.db.automation_repository.renew_run_lease` reports the lease was
+    no longer live for `holder` at renewal time, OR because the renewal
+    attempt itself raised (e.g. a DB error) — and the heartbeat stops
+    trying immediately afterward in both cases. The caller MUST check
+    `lease_lost` before trusting that it may still finalize this run's
+    outcome.
+
+    An exception from `renew_run_lease` must never be allowed to just
+    kill this thread silently while `run_automation_cycle` carries on
+    assuming it still owns the lease — that would defeat the entire
+    point of the heartbeat. Any such exception is therefore treated
+    exactly like a failed renewal (`lease_lost` set, thread stops), and
+    is logged sanitized only — step/event name and
+    `type(exc).__name__` — never the raw exception text or a traceback,
+    since it may echo upstream/data-bearing detail (S8A-004's same
+    sanitized-logging convention).
     """
 
     def __init__(
@@ -235,9 +247,19 @@ class _RunLeaseHeartbeat:
         session = self._session_factory()
         try:
             while not self._stop_event.wait(self._interval_seconds):
-                renewed = renew_run_lease(
-                    session, self._run_id, holder=self._holder, ttl_seconds=self._ttl_seconds
-                )
+                try:
+                    renewed = renew_run_lease(
+                        session, self._run_id, holder=self._holder, ttl_seconds=self._ttl_seconds
+                    )
+                except Exception as exc:
+                    session.rollback()
+                    logger.warning(
+                        "automation_run_lease_heartbeat_renewal_error run_id=%s error_type=%s",
+                        self._run_id,
+                        type(exc).__name__,
+                    )
+                    self.lease_lost.set()
+                    return
                 if not renewed:
                     logger.warning(
                         "automation_run_lease_heartbeat_lost_ownership run_id=%s",

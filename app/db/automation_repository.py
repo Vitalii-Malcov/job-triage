@@ -257,11 +257,13 @@ def finish_run(
     error_summary: str | None,
 ) -> AutomationRunRecord | None:
     """Transition a RUNNING row to its terminal status — CONDITIONED on
-    `holder` still owning it (S8A-002, Codex re-review). Returns the
-    refreshed record on success, or `None` if `holder` no longer owns
-    this row (the lease was lost — e.g. reconciled away as stale by
-    another request while this one was still executing). Returning
-    `None` rather than raising lets the caller
+    `holder` still owning an UNEXPIRED lease on it (S8A-002, Codex
+    re-review; tightened by a follow-up lease-correctness pass). Returns
+    the refreshed record on success, or `None` if `holder` no longer
+    provably owns this row (either the lease was lost — e.g. reconciled
+    away as stale by another request while this one was still executing
+    — or the lease had simply expired, even if nobody else has reclaimed
+    the row yet). Returning `None` rather than raising lets the caller
     (app.services.automation.run_automation_cycle) decide how to fail
     closed without this module needing to know about
     `AutomationRunLeaseLostError`.
@@ -272,6 +274,14 @@ def finish_run(
     started its own fresh run) would silently corrupt that other run's
     state — exactly what S8A-002 requires never happens ("do not
     overwrite another owner's state").
+
+    The `lease_expires_at >= now` condition is equally deliberate: an
+    expired ownership window must never be silently treated as
+    continuous ownership just because no one else has raced to reclaim
+    it yet. Without this check, a run whose steps happen to finish after
+    the TTL lapsed but before the next heartbeat renewal would finalize
+    as if it had been the owner the whole time — the exact "expired but
+    uncontested" gap this condition closes.
     """
     now = datetime.now(UTC)
     result = db.execute(
@@ -280,6 +290,7 @@ def finish_run(
             AutomationRunRecord.id == record.id,
             AutomationRunRecord.lease_holder == holder,
             AutomationRunRecord.status == "RUNNING",
+            AutomationRunRecord.lease_expires_at >= now,
         )
         .values(
             status=status,

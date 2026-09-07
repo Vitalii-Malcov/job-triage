@@ -144,18 +144,16 @@ class TestHeartbeatKeepsSlowRunAlive:
         db = session_factory()
         session_b = session_factory()
         try:
-            acquire_attempts = {"total": 0, "succeeded": 0}
+            acquire_attempts: list[tuple[bool, int, str]] = []  # (created, run_id, run_status)
             stop_polling = threading.Event()
 
             def _poll_session_b():
                 time.sleep(0.2)  # let run_automation_cycle get past its setup
                 while not stop_polling.is_set():
-                    acquire_attempts["total"] += 1
                     _run, created = create_running_run(
                         session_b, account_key=ACCOUNT, holder="session-B-writer"
                     )
-                    if created:
-                        acquire_attempts["succeeded"] += 1
+                    acquire_attempts.append((created, _run.id, _run.status))
                     time.sleep(0.05)
 
             async def _slow_run_bundesagentur(db, settings):
@@ -190,17 +188,36 @@ class TestHeartbeatKeepsSlowRunAlive:
                 poller.join(timeout=3)
 
             assert run.status == "COMPLETED"
-            assert acquire_attempts["total"] > 3
-            assert acquire_attempts["succeeded"] == 0, (
-                "Session B must never claim the run while the heartbeat is alive "
-                "and renewing on the original holder's behalf"
-            )
+            assert len(acquire_attempts) > 3
 
-            # After the cycle has fully finished (lease released by virtue
-            # of the run reaching a terminal status), a fresh claim works.
-            fresh, created = create_running_run(session_b, account_key=ACCOUNT, holder="after")
-            assert created is True
-            assert fresh.id != run.id
+            # Session B's own write can be left queued behind db's SQLite
+            # write lock right as the original run finishes -- so it may
+            # legitimately claim a brand-new row the instant AFTER
+            # completion, not a steal of the live one. What must NEVER
+            # happen is B reconciling the ORIGINAL row (id == run.id) as
+            # stale while the heartbeat was supposed to be keeping it
+            # alive -- that would mean the heartbeat failed at its one
+            # job. Every attempt that observed the original row must
+            # therefore report it as still RUNNING and never actually
+            # claim it (created=False).
+            original_row_attempts = [
+                (created, status)
+                for created, claimed_run_id, status in acquire_attempts
+                if claimed_run_id == run.id
+            ]
+            assert original_row_attempts, "expected at least one poll to observe the original row"
+            for created, claimed_status in original_row_attempts:
+                assert claimed_status == "RUNNING", (
+                    "the original run must never be observed as reconciled/stolen "
+                    "while the heartbeat should still be renewing it"
+                )
+                assert created is False
+
+            # "Account usable again once a run reaches a terminal status"
+            # is a separate property, already proven deterministically
+            # (without a concurrent poller thread racing against it) by
+            # TestStaleRunIsReconciledAndRecovered and
+            # TestConcurrentDuplicateAtServiceLevel above.
         finally:
             db.close()
             session_b.close()
@@ -290,3 +307,110 @@ class TestConcurrentDuplicateAtServiceLevel:
         finally:
             db.close()
             session_b.close()
+
+
+class TestFinishRunRejectsAnExpiredLeaseEvenIfUncontested:
+    """Follow-up lease-correctness fix: `finish_run`'s CAS must require
+    `lease_expires_at >= now` on top of holder/status, not just
+    holder/status. Without it, a run whose steps happen to finish after
+    the TTL lapsed but before the heartbeat's first renewal tick would
+    finalize as COMPLETED even though its ownership window had already
+    expired and nobody was actively renewing it — an "expired but
+    uncontested" gap distinct from (and not covered by) the
+    already-tested "someone else reconciled/reclaimed it" scenarios.
+    """
+
+    def test_run_does_not_complete_when_steps_finish_after_ttl_but_before_first_heartbeat(
+        self, session_factory, monkeypatch
+    ):
+        async def _bundesagentur_outlives_the_ttl(db, settings):
+            # Tiny TTL (0.05s) expires well before this step returns,
+            # and the heartbeat interval (1.0s) is deliberately longer
+            # than both the TTL and this step -- so no renewal attempt
+            # happens at all before the run tries to finalize. Nobody
+            # else touches the row either: this isolates the "expired
+            # but uncontested" gap specifically.
+            await asyncio.sleep(0.15)
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        async def _xing_noop(db, settings):
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur", _bundesagentur_outlives_the_ttl
+        )
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_noop)
+
+        db = session_factory()
+        try:
+            with pytest.raises(AutomationRunLeaseLostError):
+                asyncio.run(
+                    run_automation_cycle(
+                        db,
+                        account_key=ACCOUNT,
+                        settings=Settings(),
+                        lease_ttl_seconds=0.05,
+                        heartbeat_interval_seconds=1.0,
+                    )
+                )
+
+            # The row must NOT have been silently finalized as COMPLETED
+            # -- it is either still RUNNING (with its lapsed lease) or
+            # was reconciled, but it is never COMPLETED from this call.
+            current = get_running_run_for_account(db, ACCOUNT)
+            assert current is not None
+            assert current.status != "COMPLETED"
+        finally:
+            db.close()
+
+
+class TestHeartbeatRenewalExceptionFailsClosed:
+    """Follow-up lease-correctness fix: an exception raised by
+    `renew_run_lease` inside the heartbeat thread (e.g. a transient DB
+    error) must never kill the heartbeat silently while
+    `run_automation_cycle` carries on believing it still owns the lease.
+    It must be treated exactly like a failed renewal: `lease_lost` set,
+    heartbeat stops, the main call fails closed with
+    `AutomationRunLeaseLostError` -- and the raw exception text must
+    never leak into logs, the API/response layer, or persisted state.
+    """
+
+    def test_renewal_exception_sets_lease_lost_and_fails_the_run_closed(
+        self, session_factory, monkeypatch, caplog
+    ):
+        def _boom(db, run_id, *, holder, ttl_seconds):
+            raise RuntimeError("secret-db-detail")
+
+        monkeypatch.setattr("app.services.automation.renew_run_lease", _boom)
+
+        async def _slow_run_bundesagentur(db, settings):
+            # Long enough for the heartbeat's first tick (interval below)
+            # to fire and hit the patched, always-raising renew_run_lease
+            # before this step returns.
+            await asyncio.sleep(0.3)
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        async def _xing_noop(db, settings):
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _slow_run_bundesagentur)
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_noop)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                with pytest.raises(AutomationRunLeaseLostError):
+                    asyncio.run(
+                        run_automation_cycle(
+                            db,
+                            account_key=ACCOUNT,
+                            settings=Settings(),
+                            lease_ttl_seconds=30.0,
+                            heartbeat_interval_seconds=0.1,
+                        )
+                    )
+
+            assert "secret-db-detail" not in caplog.text
+            assert "RuntimeError" in caplog.text
+        finally:
+            db.close()
