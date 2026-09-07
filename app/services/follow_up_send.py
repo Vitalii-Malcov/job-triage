@@ -152,6 +152,7 @@ from app.db.follow_up_approval_repository import (
 from app.db.follow_up_repository import get_thread_message_infos
 from app.db.gmail_repository import (
     THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
+    THREAD_LOCK_TTL_SECONDS,
     GmailThreadLockTimeoutError,
     get_message_by_id,
     new_thread_lock_holder_token,
@@ -515,9 +516,18 @@ def send_follow_up(
     settings: Settings | None = None,
     now: datetime | None = None,
     lock_wait_seconds: float = THREAD_LOCK_DEFAULT_MAX_WAIT_SECONDS,
+    lock_ttl_seconds: float = THREAD_LOCK_TTL_SECONDS,
 ) -> FollowUpSendRecord:
     """Send an APPROVED follow-up as a real Gmail message. See module
-    docstring for the full send-gate contract. Raises one of
+    docstring for the full send-gate contract. `lock_ttl_seconds`
+    defaults to the safe production value
+    (`app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS`) — overridable
+    only so tests can exercise the lease-expiry boundary quickly (see
+    tests/test_gmail_repository.py's
+    `test_deliberately_slow_provider_still_completes_and_lease_recovers`);
+    production callers should never lower it below what
+    `app.providers.email.smtp.SMTP_OPERATION_TIMEOUT_SECONDS` needs as
+    margin. Raises one of
     `FollowUpProposalNotFoundError` / `FollowUpNotApprovedError` /
     `FollowUpMissingRecipientError` / `FollowUpAlreadySentError` /
     `FollowUpSendInProgressError` / `FollowUpProposalStaleAtSendTimeError`
@@ -568,7 +578,11 @@ def send_follow_up(
     lock_holder = new_thread_lock_holder_token(f"follow_up_send:{send_record.id}")
     try:
         wait_for_thread_lock(
-            db, proposal.gmail_thread_id, holder=lock_holder, max_wait_seconds=lock_wait_seconds
+            db,
+            proposal.gmail_thread_id,
+            holder=lock_holder,
+            max_wait_seconds=lock_wait_seconds,
+            ttl_seconds=lock_ttl_seconds,
         )
     except GmailThreadLockTimeoutError as exc:
         mark_send_failed(db, send_record, last_error="ThreadLockTimeout")

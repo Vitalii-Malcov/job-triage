@@ -9,6 +9,9 @@ adding outbound capability.
 
 import inspect
 import smtplib
+import socket
+import threading
+import time
 
 import pytest
 
@@ -16,13 +19,14 @@ import app.providers.email.base as email_base_module
 import app.providers.email.imap as email_imap_module
 import app.providers.email.outbound_base as outbound_base_module
 import app.providers.email.smtp as smtp_module
+from app.db.gmail_repository import THREAD_LOCK_TTL_SECONDS
 from app.providers.email.outbound_base import (
     EmailSendAuthError,
     EmailSendConnectionError,
     EmailSendOutcomeUnknownError,
     OutboundMessage,
 )
-from app.providers.email.smtp import GmailSmtpProvider
+from app.providers.email.smtp import SMTP_OPERATION_TIMEOUT_SECONDS, GmailSmtpProvider
 
 ACCOUNT = "me@example.com"
 
@@ -245,3 +249,117 @@ class TestInboundProviderContractUnweakened:
     def test_imap_module_never_imports_smtplib(self):
         source = inspect.getsource(email_imap_module)
         assert "smtplib" not in source
+
+
+class TestHardConnectionTimeout:
+    """S7E-014 (Codex re-review, final lock hardening): `send_follow_up`
+    now holds a per-Gmail-thread lock (`app.db.gmail_repository`'s
+    THREAD_LOCK_TTL_SECONDS) across this provider's ENTIRE `send()` call
+    — a hung/black-holed SMTP peer must never be able to hold that lease
+    hostage. These tests prove the hard timeout is real (a genuine socket,
+    not just a mocked kwarg), correctly classified, and safely bounded
+    below the lock's own lease.
+    """
+
+    def test_operation_timeout_is_safely_below_thread_lock_ttl(self):
+        """The actual proof of the safety margin this module's own
+        docstring claims — not just prose. A comfortable margin (at least
+        half the lock's own TTL) is required, not merely `<`, since a
+        pathological peer could hit the per-call cap on more than one
+        round trip (see SMTP_OPERATION_TIMEOUT_SECONDS's docstring)."""
+        assert SMTP_OPERATION_TIMEOUT_SECONDS < THREAD_LOCK_TTL_SECONDS
+        margin = THREAD_LOCK_TTL_SECONDS - SMTP_OPERATION_TIMEOUT_SECONDS
+        assert margin >= THREAD_LOCK_TTL_SECONDS / 2
+
+    def test_connect_passes_the_hard_timeout_to_smtp_ssl(self, monkeypatch):
+        captured = {}
+
+        class _StubClient:
+            def login(self, user, password):
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                return {}
+
+            def quit(self):
+                return (221, b"Bye")
+
+        def _fake_smtp_ssl(host, port, timeout=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["timeout"] = timeout
+            return _StubClient()
+
+        monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", _fake_smtp_ssl)
+        provider = _provider(client=None)
+
+        provider.send(_message())
+
+        assert captured["timeout"] == SMTP_OPERATION_TIMEOUT_SECONDS
+
+    def test_hung_smtp_peer_raises_within_bounded_time_not_indefinitely(self):
+        """A REAL socket, not a mock: a listener that accepts the
+        connection and then sends nothing at all (simulating a
+        black-holed/hung SMTP peer during the TLS handshake). Proves the
+        actual mechanism — not merely that a `timeout=` kwarg is passed —
+        raises well within bounds rather than hanging."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        accepted = threading.Event()
+
+        def _accept_and_hang():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            accepted.set()
+            # Never write anything back — the client's TLS handshake
+            # read blocks until its own socket timeout fires.
+            time.sleep(2)
+            conn.close()
+
+        server_thread = threading.Thread(target=_accept_and_hang, daemon=True)
+        server_thread.start()
+        try:
+            provider = GmailSmtpProvider(
+                smtp_host=host,
+                smtp_port=port,
+                username=ACCOUNT,
+                app_password="app-password",
+                timeout_seconds=0.3,
+            )
+
+            start = time.monotonic()
+            with pytest.raises(EmailSendConnectionError):
+                provider.send(_message())
+            elapsed = time.monotonic() - start
+
+            assert accepted.wait(timeout=2), "test server never accepted the connection"
+            assert elapsed < 2.0, f"the hard timeout did not bound the hang (took {elapsed:.2f}s)"
+        finally:
+            server.close()
+            server_thread.join(timeout=3)
+
+    def test_login_timeout_is_classified_as_connection_error_not_leaked(self, monkeypatch):
+        """S7E-014: a timeout waiting for the login exchange raises
+        `OSError`/`socket.timeout`, NOT `smtplib.SMTPException` — before
+        this fix, `_connect()` only caught the latter around `login()`,
+        so this would have leaked as a raw, unclassified exception
+        instead of the honest `EmailSendConnectionError` a caller
+        (app.services.follow_up_send / response_draft_send) knows how to
+        handle."""
+
+        class _HangingLoginClient:
+            def login(self, user, password):
+                raise TimeoutError("timed out waiting for login response")
+
+            def quit(self):
+                return (221, b"Bye")
+
+        monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: _HangingLoginClient())
+        provider = _provider(client=None)
+
+        with pytest.raises(EmailSendConnectionError):
+            provider.send(_message())
