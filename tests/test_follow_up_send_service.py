@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -30,12 +30,7 @@ from app.db.gmail_repository import (
     release_thread_lock,
     upsert_message,
 )
-from app.db.models import (
-    GmailMessageAnalysisRecord,
-    GmailMessageRecord,
-    GmailThreadRecord,
-    JobRecord,
-)
+from app.db.models import GmailMessageAnalysisRecord, GmailMessageRecord, JobRecord
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
     EmailSendConnectionError,
@@ -847,24 +842,36 @@ class TestLeaseRenewalHeartbeat:
     the entire time, not merely "probably long enough".
     """
 
-    def test_slow_send_keeps_the_guard_via_heartbeat_renewal(self, db):
+    def test_slow_send_keeps_the_guard_via_heartbeat_renewal(self, db, monkeypatch):
         proposal, outbound, _approval = _seed_and_approve(db)
         thread_id = outbound.thread_id
         session_b = sessionmaker(bind=db.get_bind())()
 
         acquire_attempts = {"total": 0, "succeeded": 0}
-        # Records (pre_lock_holder, pre_lock_expires_at) read IMMEDIATELY
-        # before every successful claim -- the real invariant this test
-        # proves is not "session B can never succeed" (a queued write can
-        # legitimately land the instant AFTER send_follow_up's own
-        # release commits -- SQLite serializes writers, so that write is
-        # provably ordered after the release, not a steal), but "session
-        # B can never succeed while the guard was still visibly held by
-        # the original sender (pre_lock_holder not None) at the moment
-        # just before the claim". A plain Core select bypasses the ORM
-        # identity map so this read is never stale.
-        successful_claim_preimages: list[tuple[str | None, object]] = []
+        successful_claims_after_original_release: list[bool] = []
         stop_polling = threading.Event()
+
+        # A SELECT-then-acquire pre-read is a TOCTOU race: the original
+        # sender can legitimately release the guard in the gap between
+        # the read and session B's own acquire attempt, showing a stale
+        # "still held" pre-image for what is actually a valid
+        # post-release claim. Instead of inferring the release from a
+        # separate read, get an unambiguous signal directly from the one
+        # real release call send_follow_up itself makes: wrap
+        # app.services.follow_up_send's OWN release_thread_lock
+        # reference (and ONLY that reference -- the poller below keeps
+        # calling the real, unpatched repository function) so the event
+        # is set the instant that specific call actually completes.
+        original_release_completed = threading.Event()
+
+        def _release_and_signal_original_sender(db_, thread_id_, *, holder):
+            release_thread_lock(db_, thread_id_, holder=holder)
+            original_release_completed.set()
+
+        monkeypatch.setattr(
+            "app.services.follow_up_send.release_thread_lock",
+            _release_and_signal_original_sender,
+        )
 
         def _poll_session_b():
             # Give send_follow_up time to get past its own pre-lock setup
@@ -878,14 +885,11 @@ class TestLeaseRenewalHeartbeat:
             time.sleep(0.3)
             while not stop_polling.is_set():
                 acquire_attempts["total"] += 1
-                pre_holder, pre_expires_at = session_b.execute(
-                    select(GmailThreadRecord.lock_holder, GmailThreadRecord.lock_expires_at).where(
-                        GmailThreadRecord.id == thread_id
-                    )
-                ).one()
                 if acquire_thread_lock(session_b, thread_id, holder="session-B-writer"):
                     acquire_attempts["succeeded"] += 1
-                    successful_claim_preimages.append((pre_holder, pre_expires_at))
+                    successful_claims_after_original_release.append(
+                        original_release_completed.is_set()
+                    )
                     release_thread_lock(session_b, thread_id, holder="session-B-writer")
                 time.sleep(0.03)
 
@@ -901,11 +905,11 @@ class TestLeaseRenewalHeartbeat:
                 # return, strictly BEFORE send_follow_up releases the
                 # guard in its own `finally` -- trims the number of
                 # attempts that land in the legitimate post-release
-                # window. Not required for correctness (the pre-image
-                # check below tolerates a claim landing right after
-                # release regardless of exactly when polling stops), but
-                # keeps the attempt log focused on the window this test
-                # actually cares about.
+                # window. Not required for correctness (the
+                # original_release_completed check below tolerates a
+                # claim landing right after release regardless of
+                # exactly when polling stops), but keeps the attempt log
+                # focused on the window this test actually cares about.
                 self._stop_event.set()
                 return OutboundSendResult(provider_message_id="msg-1")
 
@@ -948,13 +952,17 @@ class TestLeaseRenewalHeartbeat:
             # serializes writers, so that write is provably ordered
             # after the release -- not a steal). What must never happen
             # is session B actually reconciling/stealing the guard while
-            # it was still visibly held by the original sender. Every
-            # successful claim's pre-image must therefore show the guard
-            # already released (lock_holder None) at the moment just
-            # before that claim -- never the original holder's token,
-            # expired lease or not.
-            for pre_holder, _pre_expires_at in successful_claim_preimages:
-                assert pre_holder is None, (
+            # it was still visibly held by the original sender. Judge
+            # this against the unambiguous original_release_completed
+            # signal (set only once the ORIGINAL sender's own real
+            # release_thread_lock call has actually returned) rather
+            # than a separate pre-read, which would be a TOCTOU race of
+            # its own: the original sender could release in the gap
+            # between a read and session B's own acquire attempt,
+            # making a valid post-release claim look like a stale
+            # "still held" pre-image.
+            for claimed_after_release in successful_claims_after_original_release:
+                assert claimed_after_release, (
                     "session B must only ever succeed once the ORIGINAL sender's guard "
                     "was already released -- never by reconciling/stealing a still-held "
                     "lease out from under an active heartbeat"
