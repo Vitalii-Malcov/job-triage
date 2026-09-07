@@ -1288,7 +1288,7 @@ def test_gmail_account_scope_downgrade_preflight_blocks_message_conflict_from_he
     # gmail_message_analyses), 813c9d5086d0's own DDL (dropping
     # gmail_message_analyses), or e6ccb9b4271b's OWN DDL (dropping
     # gmail_message_id_claims) may have run.
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1322,7 +1322,7 @@ def test_gmail_account_scope_downgrade_preflight_blocks_thread_conflict_from_hea
     assert "Cannot downgrade" in str(exc_info.value)
     assert "thread_key" in str(exc_info.value)
 
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     assert "gmail_message_id_claims" in tables
@@ -1359,7 +1359,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1471,7 +1471,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1643,7 +1643,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1733,7 +1733,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2022,7 +2022,7 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
 
@@ -2345,7 +2345,156 @@ def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_pres
     assert job_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "9daea6d21904"
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_draft_approvals" in inspector.get_table_names()
     assert "response_draft_sends" in inspector.get_table_names()
+
+
+def _insert_follow_up_proposal(
+    connection,
+    *,
+    id: int,
+    account_key: str = "a@example.com",
+    job_id: int = 1,
+    gmail_thread_id: int = 1,
+    anchor_gmail_message_id: int = 1,
+    input_fingerprint: str = "fp-1",
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO follow_up_proposals (
+                id, account_key, job_id, gmail_thread_id, anchor_gmail_message_id,
+                eligibility_reason, due_at, subject, body, language, missing_fields_json,
+                recipient, input_fingerprint, provider, generator_version, status,
+                requires_human_review, created_at
+            ) VALUES (
+                :id, :account_key, :job_id, :gmail_thread_id, :anchor_gmail_message_id,
+                'test reason', CURRENT_TIMESTAMP, 'Follow up', 'body', 'en', '[]',
+                'hr@acme.example.com', :input_fingerprint, 'deterministic_template', 'v1',
+                'PROPOSED', 1, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "id": id,
+            "account_key": account_key,
+            "job_id": job_id,
+            "gmail_thread_id": gmail_thread_id,
+            "anchor_gmail_message_id": anchor_gmail_message_id,
+            "input_fingerprint": input_fingerprint,
+        },
+    )
+
+
+def test_follow_up_remediation_downgrade_preflight_blocks_gmail_account_conflict(
+    tmp_path: Path,
+) -> None:
+    """S7E-007 (Codex remediation): 9d4c22a2e372's own downgrade() runs
+    the SAME account-scope compatibility preflight 7058c097a542's
+    downgrade() does, FIRST — before any of this migration's own DDL. A
+    downgrade from head that would eventually be unsafe at 7058c097a542
+    must already fail here, at the very top of the chain, leaving
+    revision/tables/data completely untouched.
+    """
+    db_path = tmp_path / "migrations_follow_up_remediation_gmail_conflict.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="a@example.com", thread_key="<root@a>")
+        _insert_gmail_message(
+            connection, thread_id=1, account_key="a@example.com", mailbox="INBOX", uid=1
+        )
+        _insert_gmail_thread(connection, account_key="b@example.com", thread_key="<root@b>")
+        _insert_gmail_message(
+            connection, thread_id=2, account_key="b@example.com", mailbox="INBOX", uid=1
+        )
+
+    with pytest.raises(Exception) as exc_info:  # noqa: PT011 - migration-defined exception type
+        downgrade(cfg, "c8a2f4e6b1d3")
+    assert "Cannot downgrade past 9d4c22a2e372" in str(exc_info.value)
+    assert "account_key" in str(exc_info.value)
+
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
+    inspector = inspect(engine)
+    tables = inspector.get_table_names()
+    assert "follow_up_proposals" in tables
+    assert not any(table.startswith("_alembic_tmp") for table in tables)
+    assert "recipient" in {col["name"] for col in inspector.get_columns("follow_up_proposals")}
+
+
+def test_follow_up_remediation_downgrade_preflight_blocks_multiple_proposal_revisions(
+    tmp_path: Path,
+) -> None:
+    """S7E-007/009: two legitimate proposal REVISIONS for the same anchor
+    (different input_fingerprint — exactly what the staleness fix
+    produces) cannot be represented by the pre-S7E-009
+    UNIQUE(account_key, anchor_gmail_message_id) constraint. Downgrading
+    must refuse rather than silently deleting/merging a revision.
+    """
+    db_path = tmp_path / "migrations_follow_up_remediation_proposal_conflict.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection, thread_id=1, uid=1)
+        _insert_follow_up_proposal(connection, id=1, input_fingerprint="fp-1")
+        _insert_follow_up_proposal(connection, id=2, input_fingerprint="fp-2")
+
+    with pytest.raises(Exception) as exc_info:  # noqa: PT011 - migration-defined exception type
+        downgrade(cfg, "c8a2f4e6b1d3")
+    assert "Cannot downgrade past 9d4c22a2e372" in str(exc_info.value)
+    assert "revision" in str(exc_info.value)
+
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
+    inspector = inspect(engine)
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    with engine.connect() as connection:
+        proposal_count = connection.execute(
+            text("SELECT COUNT(*) FROM follow_up_proposals")
+        ).scalar()
+    assert proposal_count == 2  # untouched — preflight ran before any DDL
+
+
+def test_follow_up_remediation_downgrade_clean_cycle(tmp_path: Path) -> None:
+    """With compatible data (a single proposal revision, no cross-account
+    gmail conflicts), downgrade -> upgrade must succeed and correctly
+    drop/recreate the S7E remediation columns/constraint.
+    """
+    db_path = tmp_path / "migrations_follow_up_remediation_clean_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection, thread_id=1, uid=1)
+        _insert_follow_up_proposal(connection, id=1, input_fingerprint="fp-1")
+
+    downgrade(cfg, "c8a2f4e6b1d3")
+
+    assert _alembic_current_revision(engine) == "c8a2f4e6b1d3"
+    inspector = inspect(engine)
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
+    assert "recipient" not in proposal_columns
+    assert "input_fingerprint" not in proposal_columns
+    send_columns = {col["name"] for col in inspector.get_columns("follow_up_sends")}
+    assert "send_attempted" not in send_columns
+    with engine.connect() as connection:
+        proposal_count = connection.execute(
+            text("SELECT COUNT(*) FROM follow_up_proposals")
+        ).scalar()
+    assert proposal_count == 1  # sibling data untouched by the column drops
+
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == "9d4c22a2e372"
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
+    assert "recipient" in proposal_columns
+    assert "input_fingerprint" in proposal_columns

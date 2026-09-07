@@ -14,7 +14,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
-from app.db.gmail_repository import list_messages_for_thread
 from app.db.models import (
     FollowUpProposalRecord,
     GmailMessageAnalysisRecord,
@@ -26,10 +25,14 @@ from app.services.follow_up_eligibility import ThreadMessageInfo
 # Bounded, always (mirrors app.services.email_matching's own scan bounds):
 # how many distinct Gmail threads app.services.follow_up considers "the"
 # matched thread pool for one job before giving up rather than risking an
-# unbounded scan, and how many messages within one thread are read to
-# compute outbound/inbound timestamps.
+# unbounded scan.
 FOLLOW_UP_MATCHED_THREAD_SCAN_LIMIT = 50
-FOLLOW_UP_THREAD_MESSAGE_SCAN_LIMIT = 200
+# S7E-003 (Codex remediation): how many distinct JOBS a single Gmail
+# thread is checked against for the reverse thread->job ambiguity guard —
+# see `get_matched_job_ids_for_thread`. Mirrors
+# FOLLOW_UP_MATCHED_THREAD_SCAN_LIMIT's own "protects against a
+# pathological scan, never silently truncates a normal result" rationale.
+FOLLOW_UP_MATCHED_JOB_SCAN_LIMIT = 50
 
 FOLLOW_UP_LIST_DEFAULT_LIMIT = 50
 FOLLOW_UP_LIST_MAX_LIMIT = 200
@@ -104,30 +107,105 @@ def get_matched_thread_ids_for_job(
 
 
 def get_thread_message_infos(
-    db: Session,
-    account_key: str,
-    thread_id: int,
-    limit: int = FOLLOW_UP_THREAD_MESSAGE_SCAN_LIMIT,
+    db: Session, account_key: str, thread_id: int
 ) -> list[ThreadMessageInfo]:
-    """Every message in `thread_id` (already the one job-matched thread —
-    see `get_matched_thread_ids_for_job`), reduced to the direction/
-    timestamp pair app.services.follow_up_eligibility needs. Reuses
-    app.db.gmail_repository.list_messages_for_thread — the same bounded,
-    account-scoped, already-tested query the thread-detail API uses —
-    rather than re-deriving thread membership here. `timestamp` prefers
-    the message's own `sent_at` (its real Date header) and falls back to
-    `received_at` (when this sync run persisted it) only when `sent_at`
-    is unknown — never `JobRecord.first_seen_at`/`last_seen_at`.
+    """The bounded, ALWAYS-CORRECT-REGARDLESS-OF-THREAD-SIZE input
+    `app.services.follow_up_eligibility.evaluate_follow_up_eligibility`
+    needs: the single latest OUTBOUND message and the single latest
+    INBOUND message in `thread_id` (already the one job-matched thread —
+    see `get_matched_thread_ids_for_job`), each found via its own direct
+    `ORDER BY ... DESC LIMIT 1` query — never a bounded top-N scan of the
+    thread's full message list.
+
+    **S7E-003 (Codex remediation, long threads).** The previous
+    implementation loaded up to `FOLLOW_UP_THREAD_MESSAGE_SCAN_LIMIT`
+    (200) messages ordered OLDEST-first and derived "latest outbound" /
+    "any later inbound" from that in-memory slice — correct only for
+    threads with <=200 messages. A thread with more than 200 messages
+    would have its true latest activity silently excluded from the slice
+    (the oldest 200 were kept), which could let a real, already-received
+    reply go undetected and a follow-up fire anyway. Two independent
+    `ORDER BY received_at DESC, id DESC LIMIT 1` queries — one per
+    direction — are sufficient input for the eligibility rule (it only
+    ever needs "the latest OUTBOUND message" as the anchor, and whether
+    ANY inbound message is newer than it — the single latest INBOUND
+    message answers that exactly, regardless of how many older inbound
+    messages also exist) and cost the same regardless of thread size, so
+    there is no completeness bound to violate at all. (This replaces the
+    prior `get_thread_message_infos(..., limit=...)` signature — the
+    `limit` parameter is gone because it is no longer meaningful: these
+    two queries are always complete.)
+
+    **S7E-004 (Codex remediation, temporal order).** Ordered by
+    `received_at` (this project's own sync process's wall-clock write
+    time — see GmailMessageRecord's docstring) and `id` (insertion order)
+    as tiebreak — NEVER `sent_at` (the message's own, sender-controlled
+    RFC 5322 `Date` header). `sent_at` can be missing, arbitrarily
+    skewed, backdated, or postdated by whoever sent the message; trusting
+    it for "is this reply newer than our outbound message" would let a
+    sender suppress (or wrongly trigger) a follow-up merely by setting an
+    old/future Date header. `received_at` is never attacker-influenced.
     """
-    records = list_messages_for_thread(db, account_key, thread_id, limit)
-    return [
-        ThreadMessageInfo(
-            gmail_message_id=record.id,
-            direction=record.direction,
-            timestamp=_ensure_utc(record.sent_at or record.received_at),
+    infos: list[ThreadMessageInfo] = []
+    for direction in ("OUTBOUND", "INBOUND"):
+        record = db.scalar(
+            select(GmailMessageRecord)
+            .where(
+                GmailMessageRecord.account_key == account_key,
+                GmailMessageRecord.thread_id == thread_id,
+                GmailMessageRecord.direction == direction,
+            )
+            .order_by(GmailMessageRecord.received_at.desc(), GmailMessageRecord.id.desc())
+            .limit(1)
         )
-        for record in records
-    ]
+        if record is not None:
+            infos.append(
+                ThreadMessageInfo(
+                    gmail_message_id=record.id,
+                    direction=record.direction,
+                    timestamp=_ensure_utc(record.received_at),
+                )
+            )
+    return infos
+
+
+def get_matched_job_ids_for_thread(
+    db: Session, account_key: str, thread_id: int, limit: int = FOLLOW_UP_MATCHED_JOB_SCAN_LIMIT
+) -> frozenset[int]:
+    """S7E-005 (Codex remediation): the REVERSE of `get_matched_thread_ids_for_job`
+    — every distinct `matched_job_id` any message in `thread_id` is
+    currently decisively matched to (LATEST analysis only, APPLICATION/
+    JOB_ONLY only — same `_DECISIVE_MATCH_TYPES` rule). A job's own
+    "exactly one matched thread" check (`get_matched_thread_ids_for_job`)
+    is not sufficient on its own: it proves the JOB's correspondence isn't
+    spread across multiple threads, but says nothing about whether that
+    ONE thread is ALSO decisively matched to some OTHER job (e.g. two
+    different applications that happen to share one Gmail thread — a
+    forwarded/CC'd conversation, or a recruiter reusing one thread for
+    multiple roles). Without this check, a follow-up proposal built from
+    that thread's anchor message could be silently associated with the
+    wrong job. Bounded like its counterpart; a thread matched to more
+    than one job is exactly the ambiguous case the caller must fail
+    closed on, never guess which job "wins".
+    """
+    rows = db.execute(
+        select(GmailMessageAnalysisRecord.matched_job_id)
+        .join(
+            GmailMessageRecord,
+            GmailMessageRecord.id == GmailMessageAnalysisRecord.gmail_message_id,
+        )
+        .where(
+            GmailMessageRecord.account_key == account_key,
+            GmailMessageRecord.thread_id == thread_id,
+            GmailMessageAnalysisRecord.account_key == account_key,
+            GmailMessageAnalysisRecord.matched_job_id.is_not(None),
+            GmailMessageAnalysisRecord.match_type.in_(_DECISIVE_MATCH_TYPES),
+            GmailMessageAnalysisRecord.id == _latest_analysis_id_subquery(),
+        )
+        .distinct()
+        .limit(limit)
+    ).all()
+    return frozenset(row[0] for row in rows)
 
 
 def _ensure_utc(value: datetime) -> datetime:
@@ -145,13 +223,21 @@ def _ensure_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def get_follow_up_proposal_by_anchor(
-    db: Session, account_key: str, anchor_gmail_message_id: int
+def get_follow_up_proposal_by_anchor_and_fingerprint(
+    db: Session, account_key: str, anchor_gmail_message_id: int, input_fingerprint: str
 ) -> FollowUpProposalRecord | None:
+    """S7E-009 (Codex remediation): identity lookup now includes
+    `input_fingerprint`, not just the anchor — see
+    `FollowUpProposalRecord`'s docstring. A caller whose trusted inputs
+    have changed since the last evaluation of this anchor computes a
+    DIFFERENT fingerprint and therefore never matches an old, now-stale
+    row here.
+    """
     return db.scalar(
         select(FollowUpProposalRecord).where(
             FollowUpProposalRecord.account_key == account_key,
             FollowUpProposalRecord.anchor_gmail_message_id == anchor_gmail_message_id,
+            FollowUpProposalRecord.input_fingerprint == input_fingerprint,
         )
     )
 
@@ -169,24 +255,30 @@ def get_or_create_follow_up_proposal(
     body: str,
     language: str,
     missing_fields: Sequence[str],
+    recipient: str,
+    input_fingerprint: str,
     provider: str,
     generator_version: str,
 ) -> tuple[FollowUpProposalRecord, bool]:
     """Idempotent write of one follow-up proposal, keyed on
-    `(account_key, anchor_gmail_message_id)` — see
+    `(account_key, anchor_gmail_message_id, input_fingerprint)` — see
     `FollowUpProposalRecord`'s docstring for why re-evaluating the same
-    still-eligible anchor is always safe (spec: "duplicate scan
-    idempotent"). Returns `(record, created)` — `created=False` for an
-    already-persisted anchor, in which case the pre-existing row is
-    returned UNCHANGED (this table is never UPDATEd).
+    still-eligible anchor with UNCHANGED trusted inputs is always safe
+    (spec: "duplicate scan idempotent"), and S7E-009 for why a CHANGED
+    input instead produces a NEW revision. Returns `(record, created)` —
+    `created=False` for an already-persisted (anchor, fingerprint) pair,
+    in which case the pre-existing row is returned UNCHANGED (this table
+    is never UPDATEd).
 
     Concurrency: if two callers race to propose a follow-up for the same
-    anchor, the loser's INSERT fails on the UNIQUE constraint; caught
-    below, rolled back, and resolved by re-reading the winner's row —
-    never a double-insert (mirrors
+    (anchor, fingerprint), the loser's INSERT fails on the UNIQUE
+    constraint; caught below, rolled back, and resolved by re-reading the
+    winner's row — never a double-insert (mirrors
     app.db.response_draft_repository.get_or_create_response_draft).
     """
-    existing = get_follow_up_proposal_by_anchor(db, account_key, anchor_gmail_message_id)
+    existing = get_follow_up_proposal_by_anchor_and_fingerprint(
+        db, account_key, anchor_gmail_message_id, input_fingerprint
+    )
     if existing is not None:
         return existing, False
 
@@ -201,6 +293,8 @@ def get_or_create_follow_up_proposal(
         body=body,
         language=language,
         missing_fields_json=json.dumps(list(missing_fields)),
+        recipient=recipient,
+        input_fingerprint=input_fingerprint,
         provider=provider,
         generator_version=generator_version,
         status="PROPOSED",
@@ -211,11 +305,14 @@ def get_or_create_follow_up_proposal(
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing = get_follow_up_proposal_by_anchor(db, account_key, anchor_gmail_message_id)
+        existing = get_follow_up_proposal_by_anchor_and_fingerprint(
+            db, account_key, anchor_gmail_message_id, input_fingerprint
+        )
         if existing is None:
             raise FollowUpRepositoryConsistencyError(
                 f"Expected a follow_up_proposals row for account_key={account_key!r} "
-                f"anchor_gmail_message_id={anchor_gmail_message_id!r} after a UNIQUE "
+                f"anchor_gmail_message_id={anchor_gmail_message_id!r} "
+                f"input_fingerprint={input_fingerprint!r} after a UNIQUE "
                 "constraint collision, but none was found."
             ) from None
         return existing, False
@@ -263,6 +360,8 @@ def to_follow_up_proposal(record: FollowUpProposalRecord) -> FollowUpProposal:
         body=record.body,
         language=record.language,
         missing_fields=json.loads(record.missing_fields_json),
+        recipient=record.recipient,
+        input_fingerprint=record.input_fingerprint,
         provider=record.provider,
         generator_version=record.generator_version,
         status=record.status,

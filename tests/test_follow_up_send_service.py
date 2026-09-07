@@ -5,6 +5,7 @@ fail-closed UNCERTAIN safety net — mirrors
 tests/test_response_draft_send_service.py's coverage for Stage 7D.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,12 +15,13 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.follow_up_approval_repository import (
+    begin_transmission,
     claim_send_attempt,
     get_approval_for_proposal,
     get_send_for_proposal,
     retry_send_attempt,
 )
-from app.db.gmail_repository import upsert_message
+from app.db.gmail_repository import get_message_by_id, upsert_message
 from app.db.models import GmailMessageAnalysisRecord, JobRecord
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
@@ -34,8 +36,8 @@ from app.services.follow_up_send import (
     FollowUpMissingRecipientError,
     FollowUpNotApprovedError,
     FollowUpProposalNotFoundError,
+    FollowUpProposalStaleAtSendTimeError,
     FollowUpSendFailedError,
-    FollowUpSendInProgressError,
     FollowUpSendOutcomeUncertainError,
     approve_or_reject_follow_up,
     get_follow_up_state,
@@ -99,9 +101,26 @@ def _add_job(db, *, uid=1) -> JobRecord:
     return job
 
 
-def _add_outbound_anchor(
-    db, *, uid=1, message_id="<out@example.com>", to_addresses=("hr@acme.example.com",)
+_UNSET = object()
+
+
+def _add_message(
+    db,
+    *,
+    uid,
+    message_id,
+    direction="OUTBOUND",
+    to_addresses=("hr@acme.example.com",),
+    received_at=_UNSET,
+    sent_at=None,
+    **overrides,
 ):
+    """`received_at` (S7E-004: the trusted ordering timestamp) defaults to
+    `NOW - 10 days` (well past the 7-day follow_up_delay) so existing
+    call sites keep behaving as before without needing to pass it
+    explicitly — see tests/test_follow_up_service.py's identical helper
+    for why this must be set directly on the persisted row.
+    """
     data = dict(
         account_key=ACCOUNT,
         mailbox="INBOX",
@@ -110,20 +129,34 @@ def _add_outbound_anchor(
         message_id_header=message_id,
         in_reply_to=None,
         references=(),
-        from_address=ACCOUNT,
+        from_address=ACCOUNT if direction == "OUTBOUND" else "hr@acme.example.com",
         from_display_name=None,
         to_addresses=to_addresses,
         cc_addresses=(),
         subject="My application at Globex",
-        sent_at=NOW - timedelta(days=10),
-        direction="OUTBOUND",
+        sent_at=sent_at,
+        direction=direction,
         body_plain="I am applying for the Backend Engineer role at Globex.",
         body_truncated=False,
         has_html=False,
         attachments=(),
     )
+    data.update(overrides)
     record, _created = upsert_message(db, ParsedGmailMessage(**data))
+    effective_received_at = (NOW - timedelta(days=10)) if received_at is _UNSET else received_at
+    if effective_received_at is not None:
+        record.received_at = effective_received_at
+        db.commit()
+        db.refresh(record)
     return record
+
+
+def _add_outbound_anchor(
+    db, *, uid=1, message_id="<out@example.com>", to_addresses=("hr@acme.example.com",)
+):
+    return _add_message(
+        db, uid=uid, message_id=message_id, direction="OUTBOUND", to_addresses=to_addresses
+    )
 
 
 def _add_analysis(db, *, gmail_message_id, matched_job_id):
@@ -243,8 +276,29 @@ class TestRecipientTrustBoundary:
         assert sent.subject == proposal.subject
         assert sent.body == proposal.body
 
-    def test_missing_recipient_is_rejected(self, db):
-        proposal, _outbound, _approval = _seed_and_approve(db, to_addresses=())
+    def test_ambiguous_to_addresses_never_becomes_a_proposal(self, db):
+        """S7E-008: an anchor with no safe, unambiguous recipient never
+        even becomes an ELIGIBLE proposal in the first place — recipient
+        validation happens at proposal-build time, not send time. See
+        tests/test_follow_up_service.py::TestRecipientSafety for the
+        full matrix of rejected cases.
+        """
+        job = _add_job(db)
+        outbound = _add_outbound_anchor(db, to_addresses=())
+        _add_analysis(db, gmail_message_id=outbound.id, matched_job_id=job.id)
+
+        result = evaluate_follow_up_for_job(db, ACCOUNT, job.id, settings=SETTINGS, now=NOW)
+
+        assert result.eligibility == "NOT_ELIGIBLE"
+        assert result.proposal is None
+
+    def test_blank_pinned_recipient_is_rejected_at_send_time(self, db):
+        """Defense in depth: `_build_outbound_message` must never send to
+        a blank recipient even if the pinned value is somehow empty
+        (e.g. legacy/corrupted data predating S7E-008)."""
+        proposal, _outbound, approval = _seed_and_approve(db)
+        approval.pinned_recipient = ""
+        db.commit()
         provider = FakeOutboundProvider()
 
         with pytest.raises(FollowUpMissingRecipientError):
@@ -264,7 +318,33 @@ class TestConcurrencyAndRetry:
             send_follow_up(db, ACCOUNT, proposal.id, provider)
         assert provider.call_count == 1
 
-    def test_concurrent_pending_claim_blocks_a_second_request(self, db):
+    def test_concurrent_in_flight_transmission_blocks_a_second_request(self, db):
+        """S7E-010: a claim that has ALREADY won `begin_transmission`
+        (i.e. transmission may genuinely be underway) must never let a
+        second request also call the provider — it fails closed to
+        UNCERTAIN instead of blindly retrying."""
+        proposal, _outbound, approval = _seed_and_approve(db)
+        send_record, _claimed = claim_send_attempt(
+            db,
+            account_key=ACCOUNT,
+            follow_up_proposal_id=proposal.id,
+            gmail_message_id=proposal.anchor_gmail_message_id,
+            approval_id=approval.id,
+        )
+        won = begin_transmission(db, send_record)
+        assert won is True
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpSendOutcomeUncertainError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "UNCERTAIN"
+
+    def test_pending_not_yet_attempted_is_safely_taken_over(self, db):
+        """S7E-010: a PENDING claim that never reached `begin_transmission`
+        (e.g. the process that claimed it crashed before calling the
+        provider) is PROVABLY pre-transmission-safe — a later request must
+        be able to take it over and actually send, never blocked forever."""
         proposal, _outbound, approval = _seed_and_approve(db)
         claim_send_attempt(
             db,
@@ -275,9 +355,10 @@ class TestConcurrencyAndRetry:
         )
         provider = FakeOutboundProvider()
 
-        with pytest.raises(FollowUpSendInProgressError):
-            send_follow_up(db, ACCOUNT, proposal.id, provider)
-        assert provider.call_count == 0
+        record = send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert record.status == "SENT"
+        assert provider.call_count == 1
 
     def test_provider_failure_marks_failed_and_allows_retry(self, db):
         proposal, _outbound, _approval = _seed_and_approve(db)
@@ -385,3 +466,121 @@ class TestNoOtherSideEffects:
             "urlopen(",
         ):
             assert forbidden not in source
+
+
+class TestSendTimeRevalidation:
+    """S7E-002 (Codex remediation): immediately before the outbound
+    provider is ever called, eligibility is recomputed from scratch. Any
+    state change between approval and send that would have made the
+    proposal ineligible must fail closed — never silently send stale or
+    re-targeted content. In every case here: the provider is NEVER
+    called, and the underlying send attempt ends up FAILED (transmission
+    was never attempted), not UNCERTAIN.
+    """
+
+    def test_job_no_longer_applied_is_stale(self, db):
+        proposal, _outbound, _approval = _seed_and_approve(db)
+        job = db.get(JobRecord, proposal.job_id)
+        job.status = "INTERVIEW"
+        db.commit()
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_newer_inbound_reply_since_approval_is_stale(self, db):
+        proposal, outbound, _approval = _seed_and_approve(db)
+        _add_message(
+            db,
+            uid=99,
+            message_id="<reply@example.com>",
+            in_reply_to=outbound.message_id_header,
+            references=(outbound.message_id_header,),
+            direction="INBOUND",
+            received_at=NOW,  # after the outbound anchor's received_at
+        )
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_thread_becomes_ambiguous_since_approval_is_stale(self, db):
+        """S7E-005 enforced again at send time: a second job decisively
+        matched to the SAME thread after approval must block the send."""
+        proposal, outbound, _approval = _seed_and_approve(db)
+        other_job = _add_job(db, uid=999)
+        reply = _add_message(
+            db,
+            uid=98,
+            message_id="<reply2@example.com>",
+            in_reply_to=outbound.message_id_header,
+            references=(outbound.message_id_header,),
+            direction="INBOUND",
+        )
+        _add_analysis(db, gmail_message_id=reply.id, matched_job_id=other_job.id)
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_newer_outbound_message_changes_the_anchor_and_is_stale(self, db):
+        """The proposal was built from an OLDER outbound anchor; a newer
+        outbound message sent since then means the thread's true latest
+        OUTBOUND anchor has changed — the pinned content no longer
+        corresponds to the current correspondence state."""
+        proposal, outbound, _approval = _seed_and_approve(db)
+        _add_message(
+            db,
+            uid=97,
+            message_id="<out2@example.com>",
+            in_reply_to=outbound.message_id_header,
+            references=(outbound.message_id_header,),
+            direction="OUTBOUND",
+            received_at=NOW,
+        )
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_recipient_changed_since_approval_is_stale(self, db):
+        """Anchor content is normally immutable — this simulates a
+        hypothetical future bug/direct-DB edit to demonstrate the
+        defense-in-depth re-check still catches a recipient mismatch
+        between the pinned value and a fresh derivation."""
+        proposal, outbound, approval = _seed_and_approve(db)
+        assert approval.pinned_recipient == "hr@acme.example.com"
+
+        stored = get_message_by_id(db, ACCOUNT, outbound.id)
+        stored.to_addresses_json = json.dumps(["different-recruiter@acme.example.com"])
+        db.commit()
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpProposalStaleAtSendTimeError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0
+        assert get_send_for_proposal(db, ACCOUNT, proposal.id).status == "FAILED"
+
+    def test_unchanged_state_still_sends_successfully(self, db):
+        """Sanity check: revalidation must not be so strict it rejects the
+        genuinely-unchanged happy path."""
+        proposal, _outbound, _approval = _seed_and_approve(db)
+        provider = FakeOutboundProvider()
+
+        record = send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert record.status == "SENT"
+        assert provider.call_count == 1

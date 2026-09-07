@@ -1021,8 +1021,18 @@ class FollowUpProposalRecord(Base):
 
     __tablename__ = "follow_up_proposals"
     __table_args__ = (
+        # S7E-009 (Codex remediation): identity now includes
+        # `input_fingerprint`, not just the anchor — see that column's
+        # docstring below. A still-matching re-evaluation of the same
+        # anchor with UNCHANGED trusted inputs is idempotent exactly as
+        # before; CHANGED inputs (job facts, candidate profile revision,
+        # language, generator/config version) now produce a NEW proposal
+        # revision instead of silently reusing a stale one.
         UniqueConstraint(
-            "account_key", "anchor_gmail_message_id", name="uq_follow_up_proposals_anchor"
+            "account_key",
+            "anchor_gmail_message_id",
+            "input_fingerprint",
+            name="uq_follow_up_proposals_anchor_fingerprint",
         ),
         CheckConstraint("language IN ('de', 'en')", name="ck_follow_up_proposals_language_valid"),
         CheckConstraint("status IN ('PROPOSED')", name="ck_follow_up_proposals_status_valid"),
@@ -1050,6 +1060,29 @@ class FollowUpProposalRecord(Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     language: Mapped[str] = mapped_column(String(5), nullable=False)
     missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+
+    # S7E-008 (Codex remediation): the single canonical external recipient
+    # this follow-up would be sent to, derived and VALIDATED (non-empty,
+    # unambiguous, not self, well-formed, no CRLF) from the anchor
+    # OUTBOUND message's own `to_addresses` at proposal-build time — see
+    # app.services.follow_up_recipient.derive_canonical_recipient. Never
+    # re-derived from the anchor at send time; see
+    # FollowUpApprovalRecord.pinned_recipient for why the approval pins a
+    # verbatim copy instead of a live re-read.
+    recipient: Mapped[str] = mapped_column(String(320), nullable=False, server_default="")
+
+    # S7E-009 (Codex remediation): SHA-256 hex digest over every trusted
+    # input this proposal's content depends on (job_id, thread_id, anchor,
+    # trusted job title/company, candidate name/profile_version, recipient,
+    # language, provider, generator_version) — see
+    # app.services.follow_up.compute_follow_up_input_fingerprint. Part of
+    # this row's UNIQUE identity (see __table_args__ above): re-evaluating
+    # the same anchor after any of these inputs changed produces a NEW row
+    # rather than returning a stale one, and an approval recorded against
+    # an old fingerprint can never be reinterpreted as authorizing new
+    # content (approvals key off `follow_up_proposal_id`, which changes
+    # too).
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
 
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     generator_version: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -1102,6 +1135,12 @@ class FollowUpApprovalRecord(Base):
 
     pinned_subject: Mapped[str] = mapped_column(String(500), nullable=False)
     pinned_body: Mapped[str] = mapped_column(Text, nullable=False)
+    # S7E-008 (Codex remediation): verbatim copy of the approved proposal's
+    # own validated `recipient` at decision time — same "pin what the human
+    # saw" rationale as pinned_subject/pinned_body above, and the exact
+    # value app.services.follow_up_send sends to (never re-derived live at
+    # send time) — see that module's module docstring.
+    pinned_recipient: Mapped[str] = mapped_column(String(320), nullable=False, server_default="")
 
     decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
@@ -1151,6 +1190,25 @@ class FollowUpSendRecord(Base):
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # S7E-010 (Codex remediation, crash/CAS recovery): False for the entire
+    # window between winning the PENDING claim and the instant right
+    # before `OutboundEmailProvider.send` is actually invoked; flipped to
+    # True by a dedicated CAS (`app.db.follow_up_approval_repository
+    # .begin_transmission`) immediately before that call, in the same
+    # request that will make it. A row found PENDING with
+    # `send_attempted=False` is PROVABLY pre-transmission — the process
+    # that claimed it crashed (or never got that far) before any network
+    # call was made, so it is always safe to let a later request take over
+    # (see `app.services.follow_up_send._resolve_existing_send_record`).
+    # A row found PENDING with `send_attempted=True` means transmission may
+    # already be underway (either a live concurrent request, or a crash
+    # mid-send) — indistinguishable from here, so it is NEVER retried;
+    # instead it is moved to the fail-closed terminal `UNCERTAIN` state.
+    # `begin_transmission`'s own CAS (`WHERE send_attempted=False`) is what
+    # makes "who gets to actually call the provider" mutually exclusive
+    # between concurrent requests — this column is the single source of
+    # truth for that exclusivity, not `status` alone.
+    send_attempted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     provider_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

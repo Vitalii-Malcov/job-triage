@@ -213,6 +213,7 @@ from app.services.follow_up_send import (
     FollowUpMissingRecipientError,
     FollowUpNotApprovedError,
     FollowUpProposalNotFoundError,
+    FollowUpProposalStaleAtSendTimeError,
     FollowUpSendFailedError,
     FollowUpSendInProgressError,
     FollowUpSendOutcomeUncertainError,
@@ -1549,6 +1550,16 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
         ) from exc
 
 
+def _sum_gmail_sync_results(a: GmailSyncResult, b: GmailSyncResult) -> GmailSyncResult:
+    return GmailSyncResult(
+        fetched=a.fetched + b.fetched,
+        created=a.created + b.created,
+        duplicates=a.duplicates + b.duplicates,
+        skipped=a.skipped + b.skipped,
+        failed=a.failed + b.failed,
+    )
+
+
 async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
     """Fetch (read-only IMAP) + persist one Gmail Inbox Foundation sync run.
 
@@ -1558,6 +1569,17 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
     failure" (502) — GmailInboxService itself never fails closed on
     missing credentials, it just orchestrates fetch+persist for an
     already-constructed provider.
+
+    S7E-001 (Codex remediation, HIGH): syncs BOTH the primary mailbox
+    (gmail_mailbox, INBOUND — `trusted_outbound=False`) and the real
+    Sent-mail folder (gmail_sent_mailbox, `trusted_outbound=True`) every
+    run. Only messages fetched from the Sent folder are ever trusted as
+    OUTBOUND — see app/providers/email/imap.py's `_direction` docstring for
+    why a message's own `From` header is no longer used to decide
+    direction. Both mailboxes share the same account_key/dedup namespace
+    (their (mailbox, uid_validity, uid) identities are independent, so no
+    collision risk), and one mailbox's sync failure/persistence errors
+    never block the other's.
     """
     if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
         raise CollectorNotConfiguredError(
@@ -1565,22 +1587,33 @@ async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
         )
 
     account_key = normalize_account_key(settings.gmail_username)
-    provider = GmailImapProvider(
-        imap_host=settings.gmail_imap_host,
-        imap_port=settings.gmail_imap_port,
-        username=settings.gmail_username,
-        app_password=settings.gmail_app_password,
-        mailbox=settings.gmail_mailbox,
-        lookback_days=settings.gmail_lookback_days,
-        # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound to
-        # this request's db.Session via closure — lets the provider skip
-        # already-persisted UIDs before applying its MAX_MESSAGES_PER_SYNC
-        # cap, in one query per chunk rather than one query per UID.
-        get_known_uids=lambda uid_validity, candidate_uids: get_known_uids(
-            db, account_key, settings.gmail_mailbox, uid_validity, candidate_uids
-        ),
+
+    def _make_provider(mailbox: str, *, trusted_outbound: bool) -> GmailImapProvider:
+        return GmailImapProvider(
+            imap_host=settings.gmail_imap_host,
+            imap_port=settings.gmail_imap_port,
+            username=settings.gmail_username,
+            app_password=settings.gmail_app_password,
+            mailbox=mailbox,
+            lookback_days=settings.gmail_lookback_days,
+            # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound
+            # to this request's db.Session via closure — lets the provider
+            # skip already-persisted UIDs before applying its
+            # MAX_MESSAGES_PER_SYNC cap, in one query per chunk rather than
+            # one query per UID.
+            get_known_uids=lambda uid_validity, candidate_uids, _mailbox=mailbox: get_known_uids(
+                db, account_key, _mailbox, uid_validity, candidate_uids
+            ),
+            trusted_outbound=trusted_outbound,
+        )
+
+    inbox_result = await GmailInboxService().sync(
+        db, _make_provider(settings.gmail_mailbox, trusted_outbound=False)
     )
-    return await GmailInboxService().sync(db, provider)
+    sent_result = await GmailInboxService().sync(
+        db, _make_provider(settings.gmail_sent_mailbox, trusted_outbound=True)
+    )
+    return _sum_gmail_sync_results(inbox_result, sent_result)
 
 
 @router.post(
@@ -2065,17 +2098,31 @@ def get_response_draft_state_endpoint(
     response_model=FollowUpScanSummary,
     dependencies=[Depends(require_api_key), Depends(enforce_follow_up_evaluate_rate_limit)],
 )
-def evaluate_follow_ups(db: Session = Depends(get_db)) -> FollowUpScanSummary:
+def evaluate_follow_ups(
+    after_job_id: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "S7E-006: resume a keyset-paginated scan after this job id "
+            "(pass back a prior call's next_cursor); omit to start from "
+            "the oldest tracked APPLIED job."
+        ),
+    ),
+    db: Session = Depends(get_db),
+) -> FollowUpScanSummary:
     """Stage 7E: the only way follow-up eligibility is ever evaluated —
     there is no background scheduler/cron (spec requirement), so this
-    must be triggered manually. Runs one bounded scan across tracked
-    APPLIED jobs (see app.services.follow_up.FOLLOW_UP_JOB_SCAN_LIMIT),
+    must be triggered manually. Runs one bounded, KEYSET-paginated scan
+    across tracked APPLIED jobs (see app.services.follow_up.FOLLOW_UP_JOB_SCAN_LIMIT),
     persisting a new `FollowUpProposalRecord` for every newly-eligible
-    correspondence anchor. Idempotent: re-running this never duplicates a
-    proposal for an anchor that already has one.
+    correspondence anchor. Idempotent: re-running this with the same
+    `after_job_id` never duplicates a proposal for an anchor whose trusted
+    inputs are unchanged. A backlog larger than one scan's limit is
+    drained by repeatedly passing the response's `next_cursor` back in as
+    `after_job_id` — see app.services.follow_up.list_due_follow_ups.
     """
     account_key = _current_gmail_account_key(get_settings())
-    return list_due_follow_ups(db, account_key)
+    return list_due_follow_ups(db, account_key, after_job_id=after_job_id)
 
 
 @router.post(
@@ -2220,6 +2267,12 @@ def send_follow_up_endpoint(follow_up_id: int, db: Session = Depends(get_db)) ->
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="A send attempt for this follow-up proposal is already in progress",
+        ) from exc
+    except FollowUpProposalStaleAtSendTimeError as exc:
+        logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="This follow-up proposal is no longer eligible to send",
         ) from exc
     except FollowUpSendFailedError as exc:
         logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)

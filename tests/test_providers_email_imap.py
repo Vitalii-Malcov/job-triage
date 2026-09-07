@@ -806,10 +806,44 @@ async def test_body_is_truncated_past_size_limit():
 
 
 @pytest.mark.asyncio
-async def test_direction_outbound_when_sender_is_account_address():
+async def test_direction_inbound_regardless_of_sender_when_not_trusted_outbound():
+    """S7E-001 (Codex remediation, HIGH): a provider instance NOT
+    explicitly configured for the account's real Sent-mail folder
+    (`trusted_outbound=False`, the default — used for the primary
+    INBOX/etc. mailbox) must classify EVERY message INBOUND, even one
+    whose `From` header claims to be the account's own address. The OLD
+    behavior (`From == account` -> OUTBOUND) is exactly what let a
+    trivially spoofed header be trusted as genuine outbound
+    correspondence."""
     raw = _build_email(sender=ACCOUNT)
     client = FakeImapClient(messages={1: raw})
-    provider = _provider(client)
+    provider = _provider(client, trusted_outbound=False)
+
+    result = await provider.fetch()
+
+    assert result.messages[0].direction == "INBOUND"
+
+
+@pytest.mark.asyncio
+async def test_direction_inbound_when_sender_is_not_account_address():
+    raw = _build_email(sender="recruiter@company.example")
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client, trusted_outbound=False)
+
+    result = await provider.fetch()
+
+    assert result.messages[0].direction == "INBOUND"
+
+
+@pytest.mark.asyncio
+async def test_direction_outbound_only_when_provider_configured_for_sent_mailbox():
+    """A provider instance explicitly constructed for the real,
+    authenticated Sent-mail folder (`trusted_outbound=True`) classifies
+    every message it fetches as OUTBOUND — regardless of the message's
+    own `From` header content, which is never consulted at all."""
+    raw = _build_email(sender="anyone@example.com")
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client, mailbox="[Gmail]/Sent Mail", trusted_outbound=True)
 
     result = await provider.fetch()
 
@@ -817,10 +851,15 @@ async def test_direction_outbound_when_sender_is_account_address():
 
 
 @pytest.mark.asyncio
-async def test_direction_inbound_when_sender_is_not_account_address():
-    raw = _build_email(sender="recruiter@company.example")
-    client = FakeImapClient(messages={1: raw})
-    provider = _provider(client)
+async def test_spoofed_from_header_in_inbox_is_never_trusted_as_outbound():
+    """S7E-001 regression: a header-spoofed message claiming `From:
+    <our own address>` that arrives in the primary (non-Sent) mailbox
+    must NEVER be classified OUTBOUND — this is exactly the attack this
+    remediation closes (a spoofed message could otherwise become the
+    trusted anchor/recipient source for a Stage 7E follow-up send)."""
+    spoofed = _build_email(sender=ACCOUNT, subject="Re: totally legitimate")
+    client = FakeImapClient(messages={1: spoofed})
+    provider = _provider(client, mailbox="INBOX", trusted_outbound=False)
 
     result = await provider.fetch()
 

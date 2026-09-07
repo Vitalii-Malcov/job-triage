@@ -251,10 +251,28 @@ def _extract_content(
     return body_plain, truncated, state["has_html"], tuple(attachments)
 
 
-def _direction(from_address: str | None, account_address: str) -> Direction:
-    if from_address and from_address.casefold() == account_address.casefold():
-        return "OUTBOUND"
-    return "INBOUND"
+def _direction(*, trusted_outbound: bool) -> Direction:
+    """S7E-001 (Codex remediation, HIGH): direction is decided ENTIRELY by
+    which mailbox this message was fetched from — never by inspecting the
+    message's own `From` header. A `From` header claiming to be our own
+    account address is trivially forgeable by anyone able to send us mail
+    at all (plain SMTP header spoofing, no mailbox access required); the
+    OLD `from_address == account_address` comparison this replaced would
+    let such a spoofed message land in INBOX and be trusted as a genuine
+    OUTBOUND message we sent — the exact anchor
+    app.services.follow_up_eligibility uses to decide a follow-up is due,
+    and (via that anchor's own `to_addresses`) the very recipient a
+    follow-up would be sent to.
+
+    `trusted_outbound` is caller-supplied per mailbox (see
+    `GmailImapProvider.__init__`) — True only when this provider instance
+    was explicitly configured to sync the account's real, authenticated
+    Sent-mail folder (`Settings.gmail_sent_mailbox`), never derived from
+    message content. Every message fetched from any OTHER mailbox
+    (including the primary INBOX) is unconditionally INBOUND, regardless
+    of its `From` header.
+    """
+    return "OUTBOUND" if trusted_outbound else "INBOUND"
 
 
 class GmailImapProvider:
@@ -274,6 +292,7 @@ class GmailImapProvider:
         lookback_days: int = 30,
         imap_client: ImapClient | None = None,
         get_known_uids: Callable[[int, list[int]], set[int]] | None = None,
+        trusted_outbound: bool = False,
     ) -> None:
         self.imap_host = imap_host
         self.imap_port = imap_port
@@ -281,6 +300,12 @@ class GmailImapProvider:
         self.app_password = app_password
         self.mailbox = mailbox
         self.lookback_days = lookback_days
+        # S7E-001: True only for a provider instance explicitly constructed
+        # to sync the account's real Sent-mail folder — see `_direction`'s
+        # docstring. Every message this instance parses is classified
+        # OUTBOUND/INBOUND purely from this flag, never from message
+        # content.
+        self.trusted_outbound = trusted_outbound
         # GMAIL-002: the stable, non-secret account identity every
         # ParsedGmailMessage from this provider is scoped by.
         self.account_key = normalize_account_key(username)
@@ -552,7 +577,7 @@ class GmailImapProvider:
         subject = _decode_mime_words(msg.get("Subject", ""))[:MAX_SUBJECT_LENGTH]
         sent_at = _parse_date(msg.get("Date"))
         body_plain, body_truncated, has_html, attachments = _extract_content(msg)
-        direction = _direction(from_address, self.username)
+        direction = _direction(trusted_outbound=self.trusted_outbound)
 
         return ParsedGmailMessage(
             account_key=self.account_key,

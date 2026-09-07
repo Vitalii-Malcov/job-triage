@@ -194,6 +194,38 @@ def list_jobs(
     return list(db.scalars(stmt).all())
 
 
+def list_jobs_by_status_after_id(
+    db: Session,
+    status: ApplicationStatus,
+    *,
+    after_id: int | None,
+    limit: int,
+) -> list[JobRecord]:
+    """S7E-006 (Codex remediation, bulk >200 jobs): deterministic KEYSET
+    pagination by `JobRecord.id` — never `offset`. app.services.follow_up's
+    old scan always called `list_jobs(..., offset=0)`, so once tracked
+    APPLIED jobs exceeded `FOLLOW_UP_JOB_SCAN_LIMIT` in one call, every
+    single scan re-evaluated the exact same oldest-`limit` slice by
+    `last_seen_at` forever — jobs past that slice could never be reached
+    by any number of repeated calls. `id` (immutable, monotonically
+    assigned, never reused) is a stable keyset column `last_seen_at`
+    is not (a job's `last_seen_at` can change, reordering an offset-based
+    page underneath a paginating caller); ordering ascending by `id` and
+    filtering `id > after_id` guarantees every APPLIED job is eventually
+    reached by repeatedly passing back the highest `id` seen so far,
+    regardless of how many APPLIED jobs exist in total.
+    """
+    stmt = (
+        select(JobRecord)
+        .where(JobRecord.status == status.value)
+        .order_by(JobRecord.id.asc())
+        .limit(limit)
+    )
+    if after_id is not None:
+        stmt = stmt.where(JobRecord.id > after_id)
+    return list(db.scalars(stmt).all())
+
+
 def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 

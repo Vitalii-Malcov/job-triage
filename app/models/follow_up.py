@@ -38,6 +38,16 @@ class FollowUpProposal(BaseModel):
     body: str
     language: FollowUpLanguage
     missing_fields: list[str]
+    # S7E-008: the single validated external recipient this follow-up
+    # would be sent to — see app.services.follow_up_recipient. Visible
+    # here so a human reviewing GET /follow-ups/{id} sees exactly who a
+    # send would go to before ever approving it.
+    recipient: str
+    # S7E-009: opaque staleness identity — see
+    # app.services.follow_up.compute_follow_up_input_fingerprint. Exposed
+    # for auditability/debugging only; callers never need to construct or
+    # compare it themselves.
+    input_fingerprint: str
     provider: str
     generator_version: str
     status: Literal["PROPOSED"]
@@ -77,6 +87,15 @@ class FollowUpScanSummary(BaseModel):
     eligible: int
     proposals_created: int
     results: list[FollowUpEvaluationResult]
+    # S7E-006 (Codex remediation, bulk >200 jobs): deterministic keyset
+    # cursor (the highest scanned APPLIED job's own `id`) — pass this back
+    # as `after_job_id` on the next POST /follow-ups/evaluate call to
+    # resume exactly where this scan left off, rather than always
+    # rescanning from offset 0. `None` means every tracked APPLIED job's
+    # id was <= what this scan already covered (the backlog is fully
+    # drained as of this call) — a caller wanting to start over from the
+    # beginning simply omits `after_job_id` on its next call.
+    next_cursor: int | None
 
 
 class FollowUpApproval(BaseModel):
@@ -92,6 +111,11 @@ class FollowUpApproval(BaseModel):
     decision_note: str | None
     pinned_subject: str
     pinned_body: str
+    # S7E-008: verbatim copy of the approved proposal's own validated
+    # `recipient` at decision time — the exact address a subsequent send
+    # will use, pinned and visible in this human-approval artifact
+    # alongside pinned_subject/pinned_body.
+    pinned_recipient: str
     decided_at: datetime
 
 

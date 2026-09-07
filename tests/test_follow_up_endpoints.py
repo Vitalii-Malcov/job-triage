@@ -136,6 +136,14 @@ def _seed_eligible_job(session_factory, *, account_key: str = ACCOUNT, uid: int 
                 attachments=(),
             ),
         )
+        # S7E-004 (Codex remediation): eligibility now orders by the
+        # trusted `received_at` (real sync write time), never the
+        # sender-controlled `sent_at` RFC Date header — see
+        # app.db.follow_up_repository.get_thread_message_infos. Set
+        # directly so this fixture stays "always ELIGIBLE regardless of
+        # wall-clock time the test happens to run at" as documented above.
+        outbound.received_at = datetime.now(UTC) - timedelta(days=30)
+        db.commit()
         db.add(
             GmailMessageAnalysisRecord(
                 account_key=account_key,
@@ -192,6 +200,23 @@ class TestEvaluateEndpoints:
         response = test_client.post("/api/v1/follow-ups/evaluate")
         assert response.status_code in (401, 403)
 
+    def test_after_job_id_cursor_resumes_a_paginated_scan(self, client):
+        """S7E-006 (Codex remediation): the response's `next_cursor` can
+        be passed back as `after_job_id` to reach a job a smaller-limit
+        scan didn't cover — never stuck rescanning the same jobs."""
+        test_client, session_factory, _provider = client
+        job_one = _seed_eligible_job(session_factory, uid=1)
+        job_two = _seed_eligible_job(session_factory, uid=2)
+        assert job_two > job_one
+
+        first = test_client.post(
+            "/api/v1/follow-ups/evaluate", headers=_auth_headers(), params={"after_job_id": job_one}
+        )
+        assert first.status_code == 200
+        body = first.json()
+        assert body["scanned"] == 1
+        assert body["results"][0]["job_id"] == job_two
+
 
 class TestListAndGet:
     def test_list_and_get_after_evaluate(self, client):
@@ -236,6 +261,13 @@ class TestApprovalGate:
         test_client, session_factory, provider = client
         follow_up_id = self._create_proposal(test_client, session_factory)
 
+        proposal = test_client.get(
+            f"/api/v1/follow-ups/{follow_up_id}", headers=_auth_headers()
+        ).json()
+        # S7E-008: the exact recipient must be visible on the proposal
+        # itself, before any approval decision is made.
+        assert proposal["recipient"] == "hr@acme.example.com"
+
         decision = test_client.post(
             f"/api/v1/follow-ups/{follow_up_id}/decision",
             headers=_auth_headers(),
@@ -243,11 +275,15 @@ class TestApprovalGate:
         )
         assert decision.status_code == 200
         assert decision.json()["decision"] == "APPROVED"
+        # S7E-008: pinned and visible in the human approval artifact
+        # itself, alongside pinned_subject/pinned_body.
+        assert decision.json()["pinned_recipient"] == "hr@acme.example.com"
 
         send = test_client.post(f"/api/v1/follow-ups/{follow_up_id}/send", headers=_auth_headers())
         assert send.status_code == 200
         assert send.json()["status"] == "SENT"
         assert provider.call_count == 1
+        assert provider.sent_messages[0].to_address == "hr@acme.example.com"
 
         state = test_client.get(f"/api/v1/follow-ups/{follow_up_id}/state", headers=_auth_headers())
         assert state.status_code == 200

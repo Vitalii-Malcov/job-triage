@@ -14,18 +14,68 @@ cannot reach the outbound provider unless every one of these holds:
 - a `FollowUpApprovalRecord` exists for this EXACT `follow_up_proposal_id`
   with `decision == "APPROVED"`;
 - that approval has not already been consumed by a prior successful send,
-  and no OTHER concurrent request currently holds the send claim.
+  and no OTHER concurrent request currently holds the send claim;
+- S7E-002 (Codex remediation): the proposal is STILL eligible at the
+  instant immediately before transmission — see
+  `_revalidate_or_fail_closed` and this module's "Send-time revalidation"
+  section below.
 
 **Recipient/threading trust boundary — different anchor than Stage 7D.**
 Stage 7D replies to an INBOUND message and trusts that message's own
 `from_address` as the recipient. A Stage 7E follow-up is candidate-
 initiated — there is no fresh inbound message to reply to. The recipient
-is instead the anchor **OUTBOUND** message's own `to_addresses` (the
-address the candidate's own prior message was already sent to — already-
-parsed, already-persisted Stage 7A structural metadata, never text
-re-derived from a message body), and `In-Reply-To`/`References` are
-built from that same anchor message's own threading headers. Nothing in
-this module ever parses `body_plain` looking for a recipient/instruction.
+is instead the SINGLE canonical address `app.services.follow_up_recipient
+.derive_canonical_recipient` validated from the anchor **OUTBOUND**
+message's own `to_addresses` (the address the candidate's own prior
+message was already sent to — already-parsed, already-persisted Stage 7A
+structural metadata, never text re-derived from a message body) at
+PROPOSAL-build time, and PINNED on the approval
+(`FollowUpApprovalRecord.pinned_recipient`) — this module always sends to
+that pinned value, never a live re-read (see `_build_outbound_message`).
+`In-Reply-To`/`References` are built from the anchor message's own
+threading headers. Nothing in this module ever parses `body_plain`
+looking for a recipient/instruction.
+
+**Send-time revalidation (S7E-002, Codex remediation).** Winning the send
+claim only proves no other request is CURRENTLY attempting this exact
+proposal — it says nothing about whether the proposal is still valid NOW,
+possibly long after it was approved. Immediately before the outbound
+provider is ever called, `_revalidate_or_fail_closed` re-derives the
+job's CURRENT eligibility from scratch (same
+`app.services.follow_up.compute_fresh_follow_up_state` helper
+`app.services.follow_up.evaluate_follow_up_for_job` itself uses) and
+requires ALL of: the job is still APPLIED; the job's Stage 7B match is
+still decisive and resolves to the SAME single thread; that thread's
+latest-OUTBOUND/latest-INBOUND state is still ELIGIBLE (no newer inbound
+reply, delay still elapsed); the anchor this proposal was built from is
+STILL the thread's latest OUTBOUND message (an unchanged identity); and
+the anchor's freshly-re-derived canonical recipient still EXACTLY matches
+the pinned one. Any mismatch fails closed
+(`FollowUpProposalStaleAtSendTimeError`) and marks the send attempt
+FAILED (not UNCERTAIN — no transmission was attempted) rather than ever
+silently sending stale/re-targeted content.
+
+**Race safety between revalidation and send (S7E-002/010).** Revalidation
+and the provider call are only ever performed by the request that won
+`begin_transmission` — a CAS `send_attempted: False -> True` that is
+mutually exclusive across concurrent requests for the same proposal (see
+`app.db.follow_up_approval_repository.begin_transmission`'s docstring).
+This closes the TOCTOU window a plain "revalidate, then send" sequence
+would otherwise have: two concurrent requests can no longer both pass
+revalidation and then both call the provider, because only one of them
+ever reaches the revalidation step at all for a given proposal.
+
+**Crash/CAS recovery (S7E-010, Codex remediation).** `send_attempted`
+durably distinguishes "transmission was never attempted for this claim"
+(safe to hand to a later request) from "transmission may already be
+underway" (never blindly retried — see
+`FollowUpSendRecord.send_attempted`'s docstring and
+`_resolve_existing_send_record` below). A process crash between claiming
+PENDING and calling `begin_transmission` leaves a row that is PROVABLY
+still safe to retake; a crash AFTER `begin_transmission` succeeded is
+indistinguishable from a still-live concurrent attempt and is always
+resolved to the fail-closed terminal `UNCERTAIN` state, never retried
+automatically.
 
 **No other external side effect.** This module never mutates
 `JobRecord.status`/`ApplicationStatus`, never calls Telegram, and never
@@ -36,10 +86,13 @@ one explicitly-approved `OutboundEmailProvider.send` call in
 
 import json
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings, get_settings
 from app.db.follow_up_approval_repository import (
+    begin_transmission,
     claim_send_attempt,
     create_approval,
     get_approval_for_proposal,
@@ -53,13 +106,19 @@ from app.db.follow_up_approval_repository import (
     to_follow_up_send_status,
 )
 from app.db.gmail_repository import get_message_by_id
-from app.db.models import FollowUpApprovalRecord, FollowUpSendRecord
+from app.db.models import FollowUpApprovalRecord, FollowUpProposalRecord, FollowUpSendRecord
+from app.db.repositories import get_job_by_id
 from app.models.follow_up import FollowUpState
 from app.providers.email.outbound_base import (
     EmailSendError,
     EmailSendOutcomeUnknownError,
     OutboundEmailProvider,
     OutboundMessage,
+)
+from app.services.follow_up import compute_fresh_follow_up_state
+from app.services.follow_up_recipient import (
+    FollowUpRecipientInvalidError,
+    derive_canonical_recipient,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,6 +129,7 @@ __all__ = [
     "FollowUpMissingRecipientError",
     "FollowUpNotApprovedError",
     "FollowUpProposalNotFoundError",
+    "FollowUpProposalStaleAtSendTimeError",
     "FollowUpSendFailedError",
     "FollowUpSendInProgressError",
     "FollowUpSendOutcomeUncertainError",
@@ -103,6 +163,18 @@ class FollowUpNotApprovedError(Exception):
 class FollowUpMissingRecipientError(Exception):
     """The anchor OUTBOUND message this follow-up continues has no usable
     recipient address on record — mapped to 422.
+    """
+
+
+class FollowUpProposalStaleAtSendTimeError(Exception):
+    """S7E-002 (Codex remediation): send-time revalidation found the
+    proposal is no longer eligible — the job's status changed, its Stage
+    7B match/thread is no longer decisive or has changed, a newer reply
+    arrived, the correspondence anchor is no longer current, or the
+    recipient no longer matches the pinned, approved value. Mapped to 409.
+    The underlying send attempt has already been marked FAILED (no
+    transmission was attempted); this is never raised after the provider
+    has actually been called.
     """
 
 
@@ -158,6 +230,7 @@ def approve_or_reject_follow_up(
         decision_note=note,
         pinned_subject=proposal.subject,
         pinned_body=proposal.body,
+        pinned_recipient=proposal.recipient,
     )
     if not created:
         raise FollowUpAlreadyDecidedError(
@@ -174,17 +247,21 @@ def approve_or_reject_follow_up(
 
 
 def _build_outbound_message(anchor_message, approval: FollowUpApprovalRecord) -> OutboundMessage:
-    to_addresses = json.loads(anchor_message.to_addresses_json)
-    if not to_addresses:
+    """S7E-008: the recipient is ALWAYS the approval's own PINNED value —
+    never re-derived from `anchor_message` here. See module docstring for
+    why (and `_revalidate_or_fail_closed` for the send-time re-check that
+    the pinned value still matches a fresh derivation).
+    """
+    if not approval.pinned_recipient:
         raise FollowUpMissingRecipientError(
-            f"gmail_message_id={anchor_message.id!r} (follow-up anchor) has no "
-            "to_addresses on record"
+            f"follow_up_proposal_id={approval.follow_up_proposal_id!r} has no "
+            "pinned_recipient on record"
         )
     references = tuple(json.loads(anchor_message.references_json))
     if anchor_message.message_id_header and anchor_message.message_id_header not in references:
         references = (*references, anchor_message.message_id_header)
     return OutboundMessage(
-        to_address=to_addresses[0],
+        to_address=approval.pinned_recipient,
         subject=approval.pinned_subject,
         body=approval.pinned_body,
         in_reply_to=anchor_message.message_id_header,
@@ -192,12 +269,71 @@ def _build_outbound_message(anchor_message, approval: FollowUpApprovalRecord) ->
     )
 
 
-def _claim_or_retry_send(
-    db: Session, *, account_key: str, proposal, approval: FollowUpApprovalRecord
+def _resolve_existing_send_record(
+    db: Session, *, account_key: str, proposal: FollowUpProposalRecord, record: FollowUpSendRecord
 ) -> FollowUpSendRecord:
-    """Wins (or refuses) the right to actually call the outbound provider
-    for this proposal — see module docstring's concurrency section.
-    Mirrors app.services.response_draft_send._claim_or_retry_send exactly.
+    """S7E-010 (Codex remediation, crash/CAS recovery): dispatch on an
+    ALREADY-EXISTING `FollowUpSendRecord` found by `claim_send_attempt`'s
+    losing INSERT. See module docstring's "Crash/CAS recovery" section.
+    """
+    if record.status == "SENT":
+        raise FollowUpAlreadySentError(
+            f"follow_up_proposal_id={proposal.id!r} has already been sent"
+        )
+    if record.status == "UNCERTAIN":
+        raise FollowUpSendOutcomeUncertainError(
+            f"follow_up_proposal_id={proposal.id!r} has an uncertain prior send outcome; "
+            "manual reconciliation is required, not an automatic retry"
+        )
+    if record.status == "PENDING":
+        if not record.send_attempted:
+            # PROVABLY pre-transmission (see FollowUpSendRecord.send_attempted's
+            # docstring) — always safe for this request to take over. The
+            # actual mutual-exclusion gate is begin_transmission, called by
+            # the caller right after this returns.
+            return record
+        # Transmission may already be underway (a live concurrent request,
+        # or a crash mid-send) — indistinguishable from here, so this is
+        # NEVER retried. Fail closed to the terminal UNCERTAIN state and
+        # check what the CAS actually did (it may lose to whichever
+        # request genuinely owns this attempt finishing first).
+        mark_send_uncertain(db, record, last_error="StrandedPendingTransmissionAttempted")
+        current = get_send_for_proposal(db, account_key, proposal.id)
+        if current is not None and current.status == "SENT":
+            raise FollowUpAlreadySentError(
+                f"follow_up_proposal_id={proposal.id!r} has already been sent"
+            )
+        if current is not None and current.status == "UNCERTAIN":
+            raise FollowUpSendOutcomeUncertainError(
+                f"follow_up_proposal_id={proposal.id!r} has an uncertain prior send outcome; "
+                "manual reconciliation is required, not an automatic retry"
+            )
+        raise FollowUpSendInProgressError(
+            f"A send attempt for follow_up_proposal_id={proposal.id!r} is already in progress"
+        )
+    # status == "FAILED": a legitimate retry — try to win the CAS back to
+    # PENDING (send_attempted reset to False by retry_send_attempt).
+    won_retry = retry_send_attempt(db, record)
+    if not won_retry:
+        raise FollowUpSendInProgressError(
+            f"A concurrent retry for follow_up_proposal_id={proposal.id!r} is already in progress"
+        )
+    return record
+
+
+def _claim_or_retry_send(
+    db: Session,
+    *,
+    account_key: str,
+    proposal: FollowUpProposalRecord,
+    approval: FollowUpApprovalRecord,
+) -> FollowUpSendRecord:
+    """Wins (or refuses) the right to CONTEND for actually calling the
+    outbound provider for this proposal — returns a `FollowUpSendRecord`
+    guaranteed `status='PENDING', send_attempted=False` at read time, or
+    raises. The caller MUST still win `begin_transmission` (S7E-002/010's
+    real exclusivity gate) before revalidating or calling the provider —
+    see module docstring's "Race safety" section.
     """
     record, claimed = claim_send_attempt(
         db,
@@ -208,37 +344,87 @@ def _claim_or_retry_send(
     )
     if claimed:
         return record
+    return _resolve_existing_send_record(
+        db, account_key=account_key, proposal=proposal, record=record
+    )
 
-    if record.status == "SENT":
-        raise FollowUpAlreadySentError(
-            f"follow_up_proposal_id={proposal.id!r} has already been sent"
+
+def _revalidate_or_fail_closed(
+    db: Session,
+    *,
+    account_key: str,
+    proposal: FollowUpProposalRecord,
+    approval: FollowUpApprovalRecord,
+    anchor_message,
+    send_record: FollowUpSendRecord,
+    settings: Settings,
+    now: datetime,
+) -> None:
+    """S7E-002 (Codex remediation): the send-time revalidation gate — see
+    module docstring's "Send-time revalidation" section for exactly what
+    is re-checked and why. Called ONLY after this request has exclusively
+    won `begin_transmission` (no TOCTOU race with another concurrent
+    request — see "Race safety"), and strictly BEFORE the outbound
+    provider is ever invoked. On any mismatch, marks `send_record` FAILED
+    (transmission was never attempted) and raises
+    `FollowUpProposalStaleAtSendTimeError` — never silently proceeds.
+    """
+    stale_reason: str | None = None
+
+    job = get_job_by_id(db, proposal.job_id)
+    if job is None:
+        stale_reason = "the underlying job no longer exists"
+    else:
+        state = compute_fresh_follow_up_state(db, account_key, job, settings=settings, now=now)
+        result = state.eligibility
+        if result.eligibility != "ELIGIBLE":
+            stale_reason = f"job is no longer follow-up eligible ({result.reason})"
+        elif result.anchor_gmail_message_id != proposal.anchor_gmail_message_id:
+            stale_reason = (
+                "the thread's correspondence anchor has changed since this proposal was built"
+            )
+        elif state.thread_id != proposal.gmail_thread_id:
+            stale_reason = (
+                "the job's matched Gmail thread has changed since this proposal was built"
+            )
+
+    if stale_reason is None:
+        try:
+            fresh_recipient = derive_canonical_recipient(
+                json.loads(anchor_message.to_addresses_json), account_key=account_key
+            )
+        except FollowUpRecipientInvalidError as exc:
+            stale_reason = f"recipient is no longer safely derivable ({exc})"
+        else:
+            if fresh_recipient != approval.pinned_recipient:
+                stale_reason = "recipient no longer matches the pinned, approved value"
+
+    if stale_reason is not None:
+        mark_send_failed(db, send_record, last_error="StaleAtSendTime")
+        logger.warning(
+            "follow_up_send_stale_at_send_time follow_up_proposal_id=%s",
+            proposal.id,
         )
-    if record.status == "PENDING":
-        raise FollowUpSendInProgressError(
-            f"A send attempt for follow_up_proposal_id={proposal.id!r} is already in progress"
+        raise FollowUpProposalStaleAtSendTimeError(
+            f"follow_up_proposal_id={proposal.id!r} is no longer eligible to send: {stale_reason}"
         )
-    if record.status == "UNCERTAIN":
-        raise FollowUpSendOutcomeUncertainError(
-            f"follow_up_proposal_id={proposal.id!r} has an uncertain prior send outcome; "
-            "manual reconciliation is required, not an automatic retry"
-        )
-    won_retry = retry_send_attempt(db, record)
-    if not won_retry:
-        raise FollowUpSendInProgressError(
-            f"A concurrent retry for follow_up_proposal_id={proposal.id!r} is already in progress"
-        )
-    return record
 
 
 def send_follow_up(
-    db: Session, account_key: str, follow_up_proposal_id: int, provider: OutboundEmailProvider
+    db: Session,
+    account_key: str,
+    follow_up_proposal_id: int,
+    provider: OutboundEmailProvider,
+    *,
+    settings: Settings | None = None,
+    now: datetime | None = None,
 ) -> FollowUpSendRecord:
     """Send an APPROVED follow-up as a real Gmail message. See module
     docstring for the full send-gate contract. Raises one of
     `FollowUpProposalNotFoundError` / `FollowUpNotApprovedError` /
     `FollowUpMissingRecipientError` / `FollowUpAlreadySentError` /
-    `FollowUpSendInProgressError` / `FollowUpSendFailedError` /
-    `FollowUpSendOutcomeUncertainError`.
+    `FollowUpSendInProgressError` / `FollowUpProposalStaleAtSendTimeError`
+    / `FollowUpSendFailedError` / `FollowUpSendOutcomeUncertainError`.
     """
     proposal = get_follow_up_proposal_by_id(db, account_key, follow_up_proposal_id)
     if proposal is None:
@@ -262,6 +448,28 @@ def send_follow_up(
 
     send_record = _claim_or_retry_send(
         db, account_key=account_key, proposal=proposal, approval=approval
+    )
+
+    # S7E-002/010: the exclusive gate — only the request that wins this
+    # CAS may revalidate/send. See module docstring's "Race safety".
+    won_attempt = begin_transmission(db, send_record)
+    if not won_attempt:
+        raise FollowUpSendInProgressError(
+            f"A concurrent send attempt for follow_up_proposal_id={proposal.id!r} is "
+            "already in progress"
+        )
+
+    settings = settings or get_settings()
+    now = now or datetime.now(UTC)
+    _revalidate_or_fail_closed(
+        db,
+        account_key=account_key,
+        proposal=proposal,
+        approval=approval,
+        anchor_message=anchor_message,
+        send_record=send_record,
+        settings=settings,
+        now=now,
     )
 
     try:

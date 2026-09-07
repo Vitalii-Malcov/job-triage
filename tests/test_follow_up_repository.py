@@ -1,6 +1,7 @@
 """Tests for app.db.follow_up_repository — matched-thread resolution,
-thread message timestamp extraction, and idempotent/account-scoped
-follow-up proposal persistence.
+thread<->job ambiguity (S7E-005), thread message timestamp extraction
+(S7E-003/004), and idempotent/account-scoped follow-up proposal
+persistence (S7E-009).
 """
 
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.follow_up_repository import (
-    get_follow_up_proposal_by_anchor,
+    get_follow_up_proposal_by_anchor_and_fingerprint,
+    get_matched_job_ids_for_thread,
     get_matched_thread_ids_for_job,
     get_or_create_follow_up_proposal,
     get_thread_message_infos,
@@ -174,8 +176,63 @@ class TestMatchedThreadResolution:
         )
 
 
+class TestMatchedJobIdsForThread:
+    """S7E-005 (Codex remediation): the reverse thread<->job ambiguity
+    check — a thread decisively matched to more than one job must never be
+    silently attributed to just one of them.
+    """
+
+    def test_single_matched_job_resolves(self, db):
+        job = _add_job(db)
+        message = _add_message(db, uid=1, message_id="<a@example.com>")
+        _add_analysis(db, gmail_message_id=message.id, matched_job_id=job.id)
+
+        assert get_matched_job_ids_for_thread(db, ACCOUNT_A, message.thread_id) == frozenset(
+            {job.id}
+        )
+
+    def test_two_jobs_matched_to_same_thread_is_ambiguous(self, db):
+        job_a = _add_job(db, fingerprint="fp-a")
+        job_b = _add_job(db, fingerprint="fp-b")
+        msg_a = _add_message(db, uid=1, message_id="<a@example.com>")
+        msg_b = _add_message(
+            db,
+            uid=2,
+            message_id="<b@example.com>",
+            in_reply_to="<a@example.com>",
+            references=("<a@example.com>",),
+        )
+        assert msg_a.thread_id == msg_b.thread_id
+
+        _add_analysis(db, gmail_message_id=msg_a.id, matched_job_id=job_a.id)
+        _add_analysis(db, gmail_message_id=msg_b.id, matched_job_id=job_b.id)
+
+        matched = get_matched_job_ids_for_thread(db, ACCOUNT_A, msg_a.thread_id)
+        assert matched == frozenset({job_a.id, job_b.id})
+
+    def test_no_analysis_yields_empty(self, db):
+        message = _add_message(db, uid=1, message_id="<a@example.com>")
+        assert get_matched_job_ids_for_thread(db, ACCOUNT_A, message.thread_id) == frozenset()
+
+    def test_cross_account_not_visible(self, db):
+        job = _add_job(db)
+        message = _add_message(db, uid=1, message_id="<a@example.com>", account_key=ACCOUNT_B)
+        _add_analysis(db, gmail_message_id=message.id, matched_job_id=job.id, account_key=ACCOUNT_B)
+
+        assert get_matched_job_ids_for_thread(db, ACCOUNT_A, message.thread_id) == frozenset()
+        assert get_matched_job_ids_for_thread(db, ACCOUNT_B, message.thread_id) == frozenset(
+            {job.id}
+        )
+
+
 class TestThreadMessageInfos:
-    def test_returns_direction_and_timestamp_for_every_message_in_thread(self, db):
+    """S7E-003/004 (Codex remediation): only the latest OUTBOUND and
+    latest INBOUND message are ever returned — never a bounded historical
+    scan — and ordering is by trusted `received_at`, never the
+    sender-controlled `sent_at` (RFC Date header).
+    """
+
+    def test_returns_latest_outbound_and_latest_inbound(self, db):
         outbound_time = datetime(2026, 1, 1, tzinfo=UTC)
         inbound_time = datetime(2026, 1, 5, tzinfo=UTC)
         out_msg = _add_message(
@@ -197,30 +254,96 @@ class TestThreadMessageInfos:
         assert out_msg.thread_id == in_msg.thread_id
 
         infos = get_thread_message_infos(db, ACCOUNT_A, out_msg.thread_id)
-        by_id = {info.gmail_message_id: info for info in infos}
-        assert by_id[out_msg.id].direction == "OUTBOUND"
-        # SQLite has no native tz-aware storage: a round-tripped
-        # DateTime(timezone=True) value comes back naive even though it
-        # was written with tzinfo — compare the naive wall-clock value.
-        assert by_id[out_msg.id].timestamp.replace(tzinfo=None) == outbound_time.replace(
-            tzinfo=None
-        )
-        assert by_id[in_msg.id].direction == "INBOUND"
-        assert by_id[in_msg.id].timestamp.replace(tzinfo=None) == inbound_time.replace(tzinfo=None)
+        by_direction = {info.direction: info for info in infos}
+        assert by_direction["OUTBOUND"].gmail_message_id == out_msg.id
+        assert by_direction["INBOUND"].gmail_message_id == in_msg.id
 
-    def test_falls_back_to_received_at_when_sent_at_is_missing(self, db):
+    def test_uses_received_at_not_sent_at_for_ordering(self, db):
+        """A skewed/backdated `sent_at` (attacker-controlled RFC Date
+        header) must never override the real, trusted `received_at`
+        write-time ordering — S7E-004."""
+        out_msg = _add_message(
+            db,
+            uid=1,
+            message_id="<root@example.com>",
+            direction="OUTBOUND",
+            sent_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # A reply whose Date header claims to be BEFORE the outbound
+        # message (backdated/skewed) but was actually received (synced)
+        # afterwards — received_at (real wall-clock write time) must still
+        # correctly identify it as the latest inbound message.
+        in_msg = _add_message(
+            db,
+            uid=2,
+            message_id="<reply@example.com>",
+            in_reply_to="<root@example.com>",
+            references=("<root@example.com>",),
+            direction="INBOUND",
+            sent_at=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+
+        infos = get_thread_message_infos(db, ACCOUNT_A, out_msg.thread_id)
+        by_direction = {info.direction: info for info in infos}
+        stored_inbound = db.get(type(in_msg), in_msg.id)
+        assert by_direction["INBOUND"].timestamp.replace(
+            tzinfo=None
+        ) == stored_inbound.received_at.replace(tzinfo=None)
+        # The pure eligibility engine compares against this timestamp —
+        # confirm it is NOT the (much older) sent_at value.
+        assert by_direction["INBOUND"].timestamp.replace(tzinfo=None) != datetime(2020, 1, 1)
+
+    def test_missing_sent_at_still_resolves_via_received_at(self, db):
         message = _add_message(db, uid=1, message_id="<a@example.com>", sent_at=None)
         infos = get_thread_message_infos(db, ACCOUNT_A, message.thread_id)
         assert infos[0].direction == "OUTBOUND"
         assert infos[0].timestamp is not None
-        # sent_at was explicitly None -> the fallback to received_at must
-        # have been used, not a freshly-computed "now" value.
         stored = db.get(type(message), message.id)
         assert infos[0].timestamp.replace(tzinfo=None) == stored.received_at.replace(tzinfo=None)
 
+    def test_only_the_latest_message_per_direction_is_returned_regardless_of_thread_size(self, db):
+        """A long thread (far more than the old 200-message cap) must
+        still correctly surface only the true latest OUTBOUND/INBOUND
+        message — S7E-003: there is no historical-scan limit to exceed at
+        all with the new direct-query approach."""
+        root = _add_message(
+            db,
+            uid=1,
+            message_id="<root@example.com>",
+            direction="OUTBOUND",
+            sent_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # Simulate 5 older outbound messages (would have been long-ago
+        # history in a real >200-message thread) followed by the true
+        # latest one.
+        latest_outbound = None
+        for i in range(5):
+            latest_outbound = _add_message(
+                db,
+                uid=10 + i,
+                message_id=f"<out{i}@example.com>",
+                in_reply_to="<root@example.com>",
+                references=("<root@example.com>",),
+                direction="OUTBOUND",
+                sent_at=datetime(2026, 1, 2 + i, tzinfo=UTC),
+            )
+
+        infos = get_thread_message_infos(db, ACCOUNT_A, root.thread_id)
+        by_direction = {info.direction: info for info in infos}
+        assert by_direction["OUTBOUND"].gmail_message_id == latest_outbound.id
+
 
 class TestFollowUpProposalIdempotency:
-    def _create(self, db, *, account_key, job, message):
+    def _create(
+        self,
+        db,
+        *,
+        account_key,
+        job,
+        message,
+        input_fingerprint="fp-1",
+        recipient="hr@acme.example.com",
+    ):
         return get_or_create_follow_up_proposal(
             db,
             account_key=account_key,
@@ -233,11 +356,13 @@ class TestFollowUpProposalIdempotency:
             body="body text",
             language="en",
             missing_fields=(),
+            recipient=recipient,
+            input_fingerprint=input_fingerprint,
             provider="deterministic_template",
             generator_version="v1",
         )
 
-    def test_second_call_for_same_anchor_returns_existing_row(self, db):
+    def test_second_call_for_same_anchor_and_fingerprint_returns_existing_row(self, db):
         job = _add_job(db)
         message = _add_message(db, uid=1, message_id="<a@example.com>")
 
@@ -248,10 +373,35 @@ class TestFollowUpProposalIdempotency:
         assert created_two is False
         assert record_one.id == record_two.id
 
+    def test_changed_fingerprint_for_same_anchor_creates_a_new_revision(self, db):
+        """S7E-009: a changed trusted input (different fingerprint) for
+        the SAME anchor must never reuse the old, now-stale proposal."""
+        job = _add_job(db)
+        message = _add_message(db, uid=1, message_id="<a@example.com>")
+
+        record_one, created_one = self._create(
+            db, account_key=ACCOUNT_A, job=job, message=message, input_fingerprint="fp-1"
+        )
+        record_two, created_two = self._create(
+            db, account_key=ACCOUNT_A, job=job, message=message, input_fingerprint="fp-2"
+        )
+
+        assert created_one is True
+        assert created_two is True
+        assert record_one.id != record_two.id
+        assert (
+            get_follow_up_proposal_by_anchor_and_fingerprint(db, ACCOUNT_A, message.id, "fp-1").id
+            == record_one.id
+        )
+        assert (
+            get_follow_up_proposal_by_anchor_and_fingerprint(db, ACCOUNT_A, message.id, "fp-2").id
+            == record_two.id
+        )
+
     def test_different_accounts_can_each_have_their_own_proposal_for_same_message_id(self, db):
         """Not realistic (a message id is account-scoped identity-wise
         already), but confirms the UNIQUE constraint is truly scoped by
-        account_key, not merely by anchor_gmail_message_id."""
+        account_key, not merely by (anchor_gmail_message_id, fingerprint)."""
         job = _add_job(db)
         message_a = _add_message(db, uid=1, message_id="<a@example.com>", account_key=ACCOUNT_A)
         message_b = _add_message(db, uid=1, message_id="<b@example.com>", account_key=ACCOUNT_B)
@@ -262,10 +412,16 @@ class TestFollowUpProposalIdempotency:
         assert created_a is True
         assert created_b is True
 
-    def test_get_by_anchor_is_account_scoped(self, db):
+    def test_get_by_anchor_and_fingerprint_is_account_scoped(self, db):
         job = _add_job(db)
         message = _add_message(db, uid=1, message_id="<a@example.com>", account_key=ACCOUNT_A)
-        self._create(db, account_key=ACCOUNT_A, job=job, message=message)
+        self._create(db, account_key=ACCOUNT_A, job=job, message=message, input_fingerprint="fp-1")
 
-        assert get_follow_up_proposal_by_anchor(db, ACCOUNT_A, message.id) is not None
-        assert get_follow_up_proposal_by_anchor(db, ACCOUNT_B, message.id) is None
+        assert (
+            get_follow_up_proposal_by_anchor_and_fingerprint(db, ACCOUNT_A, message.id, "fp-1")
+            is not None
+        )
+        assert (
+            get_follow_up_proposal_by_anchor_and_fingerprint(db, ACCOUNT_B, message.id, "fp-1")
+            is None
+        )

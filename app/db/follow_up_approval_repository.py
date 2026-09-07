@@ -58,6 +58,7 @@ def create_approval(
     decision_note: str | None,
     pinned_subject: str,
     pinned_body: str,
+    pinned_recipient: str,
 ) -> tuple[FollowUpApprovalRecord, bool]:
     """Insert-only decision write. Returns `(record, created)` —
     `created=False` means a decision ALREADY existed for this
@@ -75,6 +76,7 @@ def create_approval(
         decision_note=decision_note,
         pinned_subject=pinned_subject,
         pinned_body=pinned_body,
+        pinned_recipient=pinned_recipient,
     )
     db.add(record)
     try:
@@ -149,7 +151,11 @@ def claim_send_attempt(
 def retry_send_attempt(db: Session, record: FollowUpSendRecord) -> bool:
     """CAS `FAILED -> PENDING` retry claim — see
     app.db.response_draft_approval_repository.retry_send_attempt's
-    docstring."""
+    docstring. `send_attempted` is reset to False (S7E-010): a FAILED row
+    is, by construction, always a DEFINITE pre-transmission failure (see
+    `mark_send_failed`'s docstring), so a fresh retry legitimately starts
+    the pre-transmission window over.
+    """
     result = db.execute(
         update(FollowUpSendRecord)
         .where(
@@ -158,9 +164,43 @@ def retry_send_attempt(db: Session, record: FollowUpSendRecord) -> bool:
         )
         .values(
             status="PENDING",
+            send_attempted=False,
             attempt_count=FollowUpSendRecord.attempt_count + 1,
             updated_at=datetime.now(UTC),
         )
+    )
+    db.commit()
+    won = result.rowcount == 1
+    if won:
+        db.refresh(record)
+    return won
+
+
+def begin_transmission(db: Session, record: FollowUpSendRecord) -> bool:
+    """S7E-002/010 (Codex remediation): the SOLE exclusivity gate for "who
+    gets to actually call `OutboundEmailProvider.send`" — a CAS
+    `send_attempted: False -> True`, guarded by `WHERE status='PENDING'
+    AND send_attempted=False`. Exactly one concurrent request can ever win
+    this for a given `FollowUpSendRecord` row (a second concurrent
+    request's identical UPDATE affects 0 rows, since the first commit
+    already flipped `send_attempted` to True). Must be called — and won —
+    AFTER claiming/retrying the send record and BEFORE both send-time
+    revalidation (S7E-002) and the actual provider call, so that only the
+    single winner ever reaches either step for this proposal. See
+    `FollowUpSendRecord.send_attempted`'s docstring for the crash-recovery
+    semantics this enables: a row observed PENDING with `send_attempted`
+    still False after a crash is PROVABLY safe to retake (this CAS would
+    still succeed for it); a row observed PENDING with `send_attempted`
+    already True is never retried automatically.
+    """
+    result = db.execute(
+        update(FollowUpSendRecord)
+        .where(
+            FollowUpSendRecord.id == record.id,
+            FollowUpSendRecord.status == "PENDING",
+            FollowUpSendRecord.send_attempted.is_(False),
+        )
+        .values(send_attempted=True, updated_at=datetime.now(UTC))
     )
     db.commit()
     won = result.rowcount == 1
@@ -250,6 +290,7 @@ def to_follow_up_approval(record: FollowUpApprovalRecord) -> FollowUpApproval:
         decision_note=record.decision_note,
         pinned_subject=record.pinned_subject,
         pinned_body=record.pinned_body,
+        pinned_recipient=record.pinned_recipient,
         decided_at=record.decided_at,
     )
 

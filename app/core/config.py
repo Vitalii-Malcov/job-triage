@@ -77,6 +77,16 @@ class Settings(BaseSettings):
     gmail_username: str = ""
     gmail_app_password: str = ""
     gmail_mailbox: str = "INBOX"
+    # S7E-001 (Codex remediation, HIGH): the real Gmail "Sent Mail" folder —
+    # synced in ADDITION to gmail_mailbox (never instead of it). Messages
+    # fetched from THIS mailbox are the only ones ever trusted as
+    # OUTBOUND — see app/providers/email/imap.py's `trusted_outbound`
+    # parameter and its module docstring for why a message's own `From`
+    # header (trivially spoofable by anyone who can send us mail) is no
+    # longer used to decide direction. Gmail's default English label is
+    # used as the default; a non-English/renamed mailbox must be
+    # configured explicitly.
+    gmail_sent_mailbox: str = "[Gmail]/Sent Mail"
     # Bounded so a misconfigured value can't turn a sync into an
     # effectively-unbounded full-mailbox-history fetch (upper bound ~3
     # years) or a no-op (must fetch at least 1 day back).
@@ -125,7 +135,7 @@ class Settings(BaseSettings):
             raise ValueError(f"must not exceed {MAX_ADDRESS_LENGTH} characters")
         return stripped
 
-    @field_validator("gmail_mailbox")
+    @field_validator("gmail_mailbox", "gmail_sent_mailbox")
     @classmethod
     def _validate_gmail_mailbox(cls, value: str) -> str:
         stripped = value.strip()
