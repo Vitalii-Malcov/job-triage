@@ -133,6 +133,22 @@ class TestPostgresReadCommittedConcurrentClaim:
             schedule_repo_module.get_schedule = original_get_schedule
 
         try:
+            # S8B-TEST-001-R1: prove BOTH workers actually finished and
+            # BOTH produced a result BEFORE evaluating the winner count --
+            # a timed join() alone does not guarantee this; a thread
+            # stuck on the barrier (or dead without recording anything)
+            # would otherwise let `results` silently hold fewer than two
+            # entries and let `len(winners) <= 1` pass for the wrong
+            # reason. Asserted INSIDE this try so the surrounding
+            # `finally` (session cleanup below) still runs even if a
+            # worker genuinely hung.
+            assert not thread_a.is_alive(), "thread_a did not terminate within the join timeout"
+            assert not thread_b.is_alive(), "thread_b did not terminate within the join timeout"
+            assert set(results) == {"a", "b"}, (
+                f"both racers must report a result before winners are evaluated -- "
+                f"got {sorted(results)}"
+            )
+
             winners = [
                 payload
                 for status, payload in results.values()
@@ -216,6 +232,18 @@ class TestPostgresSerializableConcurrentClaim:
             schedule_repo_module.get_schedule = original_get_schedule
 
         try:
+            # S8B-TEST-001-R1: prove BOTH workers actually finished and
+            # BOTH produced a result BEFORE evaluating the winner count --
+            # a timed join() alone does not guarantee this. Asserted
+            # INSIDE this try so the surrounding `finally` (session/engine
+            # cleanup below) still runs even if a worker genuinely hung.
+            assert not thread_a.is_alive(), "thread_a did not terminate within the join timeout"
+            assert not thread_b.is_alive(), "thread_b did not terminate within the join timeout"
+            assert set(results) == {"a", "b"}, (
+                f"both racers must report a result before winners are evaluated -- "
+                f"got {sorted(results)}"
+            )
+
             winners = [
                 payload
                 for status, payload in results.values()
