@@ -18,3 +18,42 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
+
+  # Stage 8B (S8B-TEST-001): a focused, separate job -- not the full
+  # suite -- that runs ONLY the scheduler concurrency integration test
+  # against a real PostgreSQL server, proving
+  # app.db.automation_schedule_repository.claim_due_schedule's CAS
+  # UPDATE holds "at most one winner" on Postgres, not just SQLite (the
+  # `test` job above already covers SQLite via
+  # tests/test_automation_schedule_repository.py). See
+  # tests/integration/test_scheduler_postgres_concurrency.py's module
+  # docstring. Runs unconditionally in CI (TEST_POSTGRES_URL is always
+  # set here); the same test module skips locally when that variable is
+  # unset, since this project's default dev/test setup is SQLite-only.
+  scheduler-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scheduler_test
+          POSTGRES_PASSWORD: scheduler_test
+          POSTGRES_DB: scheduler_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scheduler_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev,postgres]"
+      - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
