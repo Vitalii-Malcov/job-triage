@@ -45,6 +45,7 @@ from app.db.telegram_digest_repository import (
     mark_failed,
     mark_sent,
     mark_uncertain,
+    reconcile_stale_pending_to_uncertain,
     retry_delivery,
 )
 from app.services.automation import (
@@ -241,8 +242,9 @@ async def run_due_digest_if_claimed(
     and absorbed, exactly mirroring `run_due_cycle_if_claimed`'s own
     fail-closed, no-retry-storm contract.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     try:
-        local_now = _local_now(settings.telegram_daily_digest_timezone, now)
+        local_now = _local_now(settings.telegram_daily_digest_timezone, effective_now)
     except Exception as exc:
         # An invalid timezone string reaching this far (bypassing both
         # Settings construction and validate_scheduler_settings's own
@@ -257,10 +259,28 @@ async def run_due_digest_if_claimed(
     digest_date = local_now.date()
     record, claimed = claim_delivery(db, account_key, digest_date)
     if not claimed:
+        if record.status == "PENDING":
+            # Codex Stage 8E MEDIUM finding (STALE PENDING): either a
+            # concurrent claimer/attempt is genuinely still in flight
+            # (updated_at too recent -- the CAS below simply won't
+            # match, so this tick correctly does nothing), OR the
+            # process that won the original claim crashed before it
+            # could resolve the outcome. Never distinguish those two
+            # cases by GUESSING -- let the bounded-TTL CAS itself be
+            # the sole arbiter. A successful reconciliation is itself
+            # the terminal outcome for this date: NEVER fall through to
+            # attempt a send in the same tick.
+            reconciled = reconcile_stale_pending_to_uncertain(db, record, now=effective_now)
+            if reconciled:
+                logger.warning(
+                    "telegram_daily_digest_stale_pending_reconciled delivery_id=%s digest_date=%s",
+                    record.id,
+                    digest_date,
+                )
+            return reconciled
         if record.status != "FAILED":
             # SENT (already delivered today) / UNCERTAIN (never
-            # automatically retried) / PENDING (held by a concurrent
-            # claimer or attempt) -- nothing for THIS tick to do.
+            # automatically retried) -- nothing for THIS tick to do.
             return False
         if not retry_delivery(db, record):
             return False  # lost the retry race to a concurrent claimer
@@ -281,30 +301,71 @@ async def run_due_digest_if_claimed(
         # so this is recorded UNCERTAIN, never FAILED -- never
         # automatically retried, to avoid risking a duplicate send.
         db.rollback()
+        # S8E-PRIVACY-001 (Codex finding): account_key (a normalized
+        # email address) must never be logged -- delivery_id +
+        # digest_date are enough to locate the row without it.
         logger.warning(
-            "telegram_daily_digest_unexpected_error account_key=%s error_type=%s",
-            account_key,
+            "telegram_daily_digest_unexpected_error delivery_id=%s digest_date=%s error_type=%s",
+            record.id,
+            digest_date,
             type(exc).__name__,
         )
-        mark_uncertain(db, record, last_error=type(exc).__name__)
+        if not mark_uncertain(db, record, last_error=type(exc).__name__):
+            # CAS TRUTHFULNESS (Codex Stage 8E finding): the row was no
+            # longer PENDING by the time we tried to record this --
+            # e.g. a concurrent worker's stale-PENDING reconciliation
+            # already won first. Never claim a persisted outcome that
+            # did not actually happen; a fixed, sanitized event name is
+            # all this branch may log.
+            logger.warning(
+                "telegram_daily_digest_outcome_not_persisted delivery_id=%s digest_date=%s",
+                record.id,
+                digest_date,
+            )
         return True
 
     if outcome is TelegramSendOutcome.SENT:
-        mark_sent(db, record)
-        logger.info(
-            "telegram_daily_digest_sent account_key=%s digest_date=%s", account_key, digest_date
-        )
+        if mark_sent(db, record):
+            logger.info(
+                "telegram_daily_digest_sent delivery_id=%s digest_date=%s", record.id, digest_date
+            )
+        else:
+            # CAS TRUTHFULNESS: the send DID happen (Telegram confirmed
+            # 2xx), but this row could no longer be transitioned from
+            # PENDING -- never silently report "sent" as if the CAS had
+            # won; the persisted state is now whatever the concurrent
+            # winner set it to (see TelegramDigestDeliveryRecord's CAS
+            # rationale). This does not create a duplicate-send risk on
+            # its own: it is purely a bookkeeping race on an already-
+            # sent message, not a retry decision.
+            logger.warning(
+                "telegram_daily_digest_outcome_not_persisted delivery_id=%s digest_date=%s",
+                record.id,
+                digest_date,
+            )
     elif outcome is TelegramSendOutcome.FAILED:
-        mark_failed(db, record, last_error=outcome.value)
-        logger.warning(
-            "telegram_daily_digest_failed account_key=%s digest_date=%s", account_key, digest_date
-        )
+        if mark_failed(db, record, last_error=outcome.value):
+            logger.warning(
+                "telegram_daily_digest_failed delivery_id=%s digest_date=%s", record.id, digest_date
+            )
+        else:
+            logger.warning(
+                "telegram_daily_digest_outcome_not_persisted delivery_id=%s digest_date=%s",
+                record.id,
+                digest_date,
+            )
     else:
-        mark_uncertain(db, record, last_error=outcome.value)
-        logger.warning(
-            "telegram_daily_digest_uncertain account_key=%s digest_date=%s",
-            account_key,
-            digest_date,
-        )
+        if mark_uncertain(db, record, last_error=outcome.value):
+            logger.warning(
+                "telegram_daily_digest_uncertain delivery_id=%s digest_date=%s",
+                record.id,
+                digest_date,
+            )
+        else:
+            logger.warning(
+                "telegram_daily_digest_outcome_not_persisted delivery_id=%s digest_date=%s",
+                record.id,
+                digest_date,
+            )
 
     return True

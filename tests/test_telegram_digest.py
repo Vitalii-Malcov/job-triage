@@ -264,6 +264,60 @@ class TestPrivacyBoundary:
             assert forbidden not in text
 
 
+class TestExactPendingCountsAbove200:
+    """Codex Stage 8E MEDIUM finding (PENDING COUNTS): the reported
+    total must be EXACT even when it exceeds the old
+    display/query-bounding limit (200) by an arbitrary amount -- never
+    inferred from a bounded id list (which would silently plateau at
+    "200+" instead of reporting the real number).
+    """
+
+    def test_response_draft_count_is_exact_above_the_old_bound(self, db):
+        for i in range(250):
+            _seed_response_draft(db, gmail_message_id=i + 1)
+
+        text = build_digest_text(db, ACCOUNT)
+
+        assert "Pending response-draft approvals: 250 " in text
+        assert "200+" not in text
+
+    def test_follow_up_count_is_exact_above_the_old_bound(self, db):
+        for i in range(250):
+            _seed_follow_up(db, anchor_gmail_message_id=i + 1, fingerprint=f"fp-{i}")
+
+        text = build_digest_text(db, ACCOUNT)
+
+        assert "Pending follow-up approvals: 250 " in text
+        assert "200+" not in text
+
+    def test_rendered_ids_remain_bounded_even_though_count_is_exact(self, db):
+        for i in range(250):
+            _seed_response_draft(db, gmail_message_id=i + 1)
+
+        text = build_digest_text(db, ACCOUNT)
+
+        # Exactly PENDING_IDS_DISPLAY_LIMIT (10) "#<id>" tokens rendered
+        # for the response-draft line, never all 250.
+        response_line = next(
+            line for line in text.splitlines() if line.startswith("Pending response-draft")
+        )
+        assert response_line.count("#") == 10
+        assert "+240 more" in response_line
+
+    def test_message_stays_under_telegram_hard_limit_with_over_200_pending_each(self, db):
+        for i in range(250):
+            _seed_response_draft(db, gmail_message_id=i + 1)
+        for i in range(250):
+            _seed_follow_up(db, anchor_gmail_message_id=i + 1000, fingerprint=f"fu-{i}")
+
+        text = build_digest_text(db, ACCOUNT)
+
+        assert len(text) <= DIGEST_REPLY_SOFT_LIMIT
+        assert len(text) < TELEGRAM_MESSAGE_HARD_LIMIT
+        assert "Pending response-draft approvals: 250 " in text
+        assert "Pending follow-up approvals: 250 " in text
+
+
 class TestMessageLength:
     def test_stays_under_telegram_hard_limit_with_many_steps_and_failures(self, db):
         failures = [

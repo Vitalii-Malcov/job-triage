@@ -85,6 +85,97 @@ class TestOutcomeClassification:
 
         assert outcome is TelegramSendOutcome.UNCERTAIN
 
+    @pytest.mark.asyncio
+    async def test_connect_timeout_is_failed_not_uncertain(self, monkeypatch):
+        """A timeout while still establishing the connection (never
+        reached the point of sending request bytes) is provably
+        undelivered -- FAILED, safe to retry."""
+        _patch_client(monkeypatch, httpx.ConnectTimeout("connect timed out"))
+
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+
+        assert outcome is TelegramSendOutcome.FAILED
+
+    @pytest.mark.asyncio
+    async def test_pool_timeout_is_failed_not_uncertain(self, monkeypatch):
+        """A timeout waiting for a pooled connection -- never even got
+        as far as connecting, let alone sending. Provably undelivered."""
+        _patch_client(monkeypatch, httpx.PoolTimeout("pool timed out"))
+
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+
+        assert outcome is TelegramSendOutcome.FAILED
+
+
+class TestAdversarialAmbiguousOutcomesAreUncertain:
+    """Codex Stage 8E BLOCKER (OUTBOUND UNCERTAINTY): every network
+    failure that occurs AFTER a connection was already established must
+    be UNCERTAIN, never FAILED -- the request may have been partially
+    or fully transmitted (and possibly already processed by Telegram)
+    before the failure surfaced. Classifying any of these FAILED would
+    let the daily digest's CAS retry a send that may have already
+    landed, risking a real duplicate message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_is_uncertain(self, monkeypatch):
+        _patch_client(monkeypatch, httpx.ReadTimeout("read timed out"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_write_timeout_is_uncertain(self, monkeypatch):
+        """A timeout while WRITING the request -- some or all request
+        bytes may already have left the client."""
+        _patch_client(monkeypatch, httpx.WriteTimeout("write timed out"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_read_error_is_uncertain_not_failed(self, monkeypatch):
+        """The connection was established and the request may have been
+        sent; the failure happened while reading the response. Whether
+        Telegram processed the request cannot be disproven."""
+        _patch_client(monkeypatch, httpx.ReadError("connection reset while reading"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_write_error_is_uncertain_not_failed(self, monkeypatch):
+        """The connection was established; the failure happened while
+        WRITING the request, so it may have been partially transmitted
+        and partially processed server-side."""
+        _patch_client(monkeypatch, httpx.WriteError("connection reset while writing"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_is_uncertain_not_failed(self, monkeypatch):
+        """The server sent back a malformed/unexpected response --
+        meaning Telegram DID receive and act on the request; we simply
+        couldn't parse what came back. Must never be classified FAILED
+        (that would imply "safe to retry", which here risks a real
+        duplicate send)."""
+        _patch_client(monkeypatch, httpx.RemoteProtocolError("malformed response"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_generic_transport_error_is_uncertain_not_failed(self, monkeypatch):
+        """A generic httpx.TransportError not otherwise special-cased --
+        the conservative default per send_telegram_text's classification
+        rule ("if we cannot prove Telegram did NOT receive/process the
+        request, the outcome is UNCERTAIN") must apply, not FAILED."""
+        _patch_client(monkeypatch, httpx.TransportError("unspecified transport failure"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_generic_request_error_is_uncertain_not_failed(self, monkeypatch):
+        _patch_client(monkeypatch, httpx.RequestError("unspecified request failure"))
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
 
 class TestNoSensitiveLogging:
     @pytest.mark.asyncio
@@ -94,6 +185,8 @@ class TestNoSensitiveLogging:
             _rejected_response(),
             httpx.ConnectError("connection refused"),
             httpx.ReadTimeout("timed out"),
+            httpx.WriteError("connection reset while writing"),
+            httpx.RemoteProtocolError("malformed response"),
         ):
             _patch_client(monkeypatch, outcome_obj)
             with caplog.at_level("DEBUG"):

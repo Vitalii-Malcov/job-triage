@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
-from app.db.telegram_digest_repository import get_delivery
+from app.db.telegram_digest_repository import claim_delivery, get_delivery
 from app.services.scheduler import (
     SchedulerConfigurationError,
     run_due_digest_if_claimed,
@@ -319,3 +319,245 @@ class TestConfigLevelValidation:
                 telegram_daily_digest_enabled=True,
                 automation_scheduler_account_key="",
             )
+
+
+class TestStalePendingReconciliationViaScheduler:
+    """Codex Stage 8E MEDIUM finding (STALE PENDING), exercised through
+    the actual scheduler entrypoint `run_due_digest_if_claimed` (not
+    just the repository primitive directly -- see
+    tests/test_telegram_digest_repository.py::TestReconcileStalePendingToUncertain
+    for that lower-level proof).
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_pending_claim_causes_no_second_send_this_tick(
+        self, session_factory, monkeypatch
+    ):
+        """Simulates a concurrent claimer/attempt genuinely still in
+        flight (a PENDING row that was JUST claimed) -- a second tick
+        observing it must never send, and must never reconcile it
+        either (it isn't stale yet)."""
+        db = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT])
+        try:
+            digest_date = DUE_UTC.astimezone(_berlin()).date()
+            # Simulates a live concurrent claim.
+            claim_delivery(db, ACCOUNT, digest_date, now=DUE_UTC)
+
+            triggered = await run_due_digest_if_claimed(
+                db, account_key=ACCOUNT, settings=_settings(), now=DUE_UTC
+            )
+
+            assert triggered is False
+            assert calls["count"] == 0  # never sent
+            assert get_delivery(db, ACCOUNT, digest_date).status == "PENDING"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_pending_claim_is_reconciled_to_uncertain_without_sending(
+        self, session_factory, monkeypatch
+    ):
+        """A PENDING claim old enough to be stale (the process that won
+        it crashed before resolving the outcome) must be reconciled to
+        UNCERTAIN -- and the SAME tick that reconciles it must NEVER
+        also attempt a send."""
+        db = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT])
+        try:
+            digest_date = DUE_UTC.astimezone(_berlin()).date()
+            claim_delivery(db, ACCOUNT, digest_date, now=DUE_UTC)  # simulates the crashed claimer
+
+            # A later tick, long enough after the claim for it to be
+            # stale (STALE_PENDING_TTL_SECONDS default is 300s).
+            later = DUE_UTC + timedelta(seconds=301)
+            triggered = await run_due_digest_if_claimed(
+                db, account_key=ACCOUNT, settings=_settings(), now=later
+            )
+
+            assert triggered is True  # an action (reconciliation) happened
+            assert calls["count"] == 0  # never sent in the same tick
+            assert get_delivery(db, ACCOUNT, digest_date).status == "UNCERTAIN"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_restart_after_stale_pending_reconciliation_never_sends(
+        self, session_factory, monkeypatch
+    ):
+        """After a stale PENDING claim has been reconciled to
+        UNCERTAIN, a FRESH restart-style Session (as a new worker
+        process would open) must observe the terminal UNCERTAIN state
+        and never attempt a send for the SAME calendar date."""
+        db_first = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT, TelegramSendOutcome.SENT])
+        try:
+            digest_date = DUE_UTC.astimezone(_berlin()).date()
+            claim_delivery(db_first, ACCOUNT, digest_date, now=DUE_UTC)
+
+            later = DUE_UTC + timedelta(seconds=301)
+            await run_due_digest_if_claimed(
+                db_first, account_key=ACCOUNT, settings=_settings(), now=later
+            )
+        finally:
+            db_first.close()
+
+        db_second = session_factory()
+        try:
+            even_later = DUE_UTC + timedelta(seconds=600)
+            triggered_again = await run_due_digest_if_claimed(
+                db_second, account_key=ACCOUNT, settings=_settings(), now=even_later
+            )
+
+            assert triggered_again is False
+            assert calls["count"] == 0  # never sent, before or after reconciliation
+            assert get_delivery(db_second, ACCOUNT, digest_date).status == "UNCERTAIN"
+        finally:
+            db_second.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stale_reconciliation_only_one_worker_logs_the_action(
+        self, session_factory, monkeypatch
+    ):
+        """Two independent Sessions (simulating two scheduler worker
+        processes) both observing the same stale PENDING row on the
+        same tick -- only one may win the reconciliation CAS; the
+        loser must report "nothing to do" (False), never attempt a
+        send, and never double-reconcile."""
+        db_a = session_factory()
+        db_b = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT, TelegramSendOutcome.SENT])
+        try:
+            digest_date = DUE_UTC.astimezone(_berlin()).date()
+            claim_delivery(db_a, ACCOUNT, digest_date, now=DUE_UTC)
+
+            later = DUE_UTC + timedelta(seconds=301)
+            triggered_a = await run_due_digest_if_claimed(
+                db_a, account_key=ACCOUNT, settings=_settings(), now=later
+            )
+            triggered_b = await run_due_digest_if_claimed(
+                db_b, account_key=ACCOUNT, settings=_settings(), now=later
+            )
+
+            # Exactly one of the two performed the reconciliation;
+            # neither ever sent.
+            assert {triggered_a, triggered_b} == {True, False}
+            assert calls["count"] == 0
+            assert get_delivery(db_a, ACCOUNT, digest_date).status == "UNCERTAIN"
+        finally:
+            db_a.close()
+            db_b.close()
+
+
+class TestCASTruthfulnessOnMarkOutcome:
+    """Codex Stage 8E finding (CAS TRUTHFULNESS): if the CAS that
+    persists a send outcome (mark_sent/mark_failed/mark_uncertain)
+    LOSES -- e.g. a concurrent worker's stale-PENDING reconciliation
+    already flipped the row away from PENDING first -- the scheduler
+    must never silently log the outcome as if it had been recorded. A
+    distinct, sanitized "not persisted" event must be logged instead,
+    and the function must still return True (an attempt genuinely
+    happened) without raising.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lost_mark_sent_cas_is_never_logged_as_a_successful_sent(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.SENT
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+        monkeypatch.setattr("app.services.scheduler.mark_sent", lambda db, record: False)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                triggered = await run_due_digest_if_claimed(
+                    db, account_key=ACCOUNT, settings=_settings(), now=DUE_UTC
+                )
+
+            assert triggered is True
+            assert "telegram_daily_digest_outcome_not_persisted" in caplog.text
+            assert "telegram_daily_digest_sent" not in caplog.text
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_lost_mark_failed_cas_is_never_logged_as_a_recorded_failure(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.FAILED
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+        monkeypatch.setattr(
+            "app.services.scheduler.mark_failed", lambda db, record, *, last_error: False
+        )
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                triggered = await run_due_digest_if_claimed(
+                    db, account_key=ACCOUNT, settings=_settings(), now=DUE_UTC
+                )
+
+            assert triggered is True
+            assert "telegram_daily_digest_outcome_not_persisted" in caplog.text
+            assert "telegram_daily_digest_failed" not in caplog.text
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_lost_mark_uncertain_cas_is_never_logged_as_a_recorded_uncertain(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.UNCERTAIN
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+        monkeypatch.setattr(
+            "app.services.scheduler.mark_uncertain", lambda db, record, *, last_error: False
+        )
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                triggered = await run_due_digest_if_claimed(
+                    db, account_key=ACCOUNT, settings=_settings(), now=DUE_UTC
+                )
+
+            assert triggered is True
+            assert "telegram_daily_digest_outcome_not_persisted" in caplog.text
+            # "telegram_daily_digest_uncertain" (the successfully-persisted
+            # event name) must not appear -- only the not-persisted one.
+            assert "telegram_daily_digest_uncertain " not in caplog.text
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_lost_mark_uncertain_cas_on_unexpected_exception_path(
+        self, session_factory, monkeypatch, caplog
+    ):
+        """Mirrors the three tests above, but for the OTHER call site --
+        the unexpected-exception branch's own mark_uncertain call."""
+
+        async def _boom(bot_token, chat_id, text, *, timeout_seconds):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _boom)
+        monkeypatch.setattr(
+            "app.services.scheduler.mark_uncertain", lambda db, record, *, last_error: False
+        )
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                triggered = await run_due_digest_if_claimed(
+                    db, account_key=ACCOUNT, settings=_settings(), now=DUE_UTC
+                )
+
+            assert triggered is True
+            assert "telegram_daily_digest_outcome_not_persisted" in caplog.text
+        finally:
+            db.close()

@@ -8,6 +8,19 @@ boundary, extended to the new digest modules.
 """
 
 import inspect
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.core.config import Settings
+from app.db.base import Base
+from app.services.scheduler import run_due_digest_if_claimed
+from app.services.telegram import TelegramSendOutcome
+
+DISTINCTIVE_ACCOUNT = "must-never-leak@example.com"
+DUE_UTC = datetime(2026, 9, 8, 7, 0, tzinfo=UTC)  # 09:00 Europe/Berlin -- past hour=8 gate
 
 
 class TestNoTracebackLoggingInTelegramModules:
@@ -50,6 +63,133 @@ class TestNoBotTokenOrUrlLogging:
                 assert "url" not in stripped
                 assert "bot_token" not in stripped
                 assert "token" not in stripped
+
+
+class TestNoAccountKeyInDigestSchedulerLogs:
+    """Codex Stage 8E HIGH finding (PRIVACY): account_key (a normalized
+    email address) must never appear in Stage 8E runtime logs --
+    delivery_id/digest_date/status/counts are the only safe identifiers
+    for locating a specific digest delivery in logs.
+    """
+
+    @pytest.fixture()
+    def session_factory(self, tmp_path):
+        db_path = tmp_path / "test_no_account_key_in_logs.db"
+        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        return sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    def _settings(self) -> Settings:
+        return Settings(
+            automation_scheduler_account_key=DISTINCTIVE_ACCOUNT,
+            telegram_daily_digest_enabled=True,
+            telegram_daily_digest_hour=8,
+            telegram_daily_digest_timezone="Europe/Berlin",
+            telegram_bot_token="test-token",
+            telegram_chat_id="999",
+        )
+
+    @pytest.mark.asyncio
+    async def test_sent_outcome_never_logs_account_key(self, session_factory, monkeypatch, caplog):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.SENT
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                await run_due_digest_if_claimed(
+                    db, account_key=DISTINCTIVE_ACCOUNT, settings=self._settings(), now=DUE_UTC
+                )
+        finally:
+            db.close()
+
+        assert DISTINCTIVE_ACCOUNT not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_failed_outcome_never_logs_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.FAILED
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                await run_due_digest_if_claimed(
+                    db, account_key=DISTINCTIVE_ACCOUNT, settings=self._settings(), now=DUE_UTC
+                )
+        finally:
+            db.close()
+
+        assert DISTINCTIVE_ACCOUNT not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_uncertain_outcome_never_logs_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _send(bot_token, chat_id, text, *, timeout_seconds):
+            return TelegramSendOutcome.UNCERTAIN
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _send)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                await run_due_digest_if_claimed(
+                    db, account_key=DISTINCTIVE_ACCOUNT, settings=self._settings(), now=DUE_UTC
+                )
+        finally:
+            db.close()
+
+        assert DISTINCTIVE_ACCOUNT not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_never_logs_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _boom(bot_token, chat_id, text, *, timeout_seconds):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("app.services.scheduler.send_telegram_text", _boom)
+
+        db = session_factory()
+        try:
+            with caplog.at_level("DEBUG"):
+                await run_due_digest_if_claimed(
+                    db, account_key=DISTINCTIVE_ACCOUNT, settings=self._settings(), now=DUE_UTC
+                )
+        finally:
+            db.close()
+
+        assert DISTINCTIVE_ACCOUNT not in caplog.text
+
+    def test_run_due_digest_if_claimed_source_never_logs_account_key_variable(self):
+        """Source-scan pin: no multi-line `logger.*(...)` call inside
+        app.services.scheduler.run_due_digest_if_claimed ever passes the
+        `account_key` local as a format argument -- catches a future
+        regression even if a test's specific account_key string
+        happened not to trip the runtime checks above."""
+        import ast
+        import textwrap
+
+        import app.services.scheduler as module
+
+        source = textwrap.dedent(inspect.getsource(module.run_due_digest_if_claimed))
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("debug", "info", "warning", "error", "exception")
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            ):
+                for arg in node.args:
+                    assert not (isinstance(arg, ast.Name) and arg.id == "account_key")
 
 
 class TestStage8ENeverSendsOrApproves:

@@ -44,6 +44,7 @@ from app.services.scheduler import (
     run_due_digest_if_claimed,
     validate_scheduler_settings,
 )
+from app.services.telegram_digest import resolve_digest_account_key
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,17 @@ async def _poll_loop(settings) -> None:
                     )
             if settings.telegram_daily_digest_enabled:
                 try:
-                    await run_due_digest_if_claimed(db, account_key=account_key, settings=settings)
+                    # S8E ACCOUNT SCOPE (Codex finding): resolved through
+                    # the SAME shared helper the manual /digest command
+                    # uses (app.services.telegram_digest.cmd_digest),
+                    # never re-derived here -- see
+                    # resolve_digest_account_key's own docstring. Does
+                    # NOT affect `account_key` above, which remains
+                    # Stage 8B's own unchanged automation-cycle identity.
+                    digest_account_key = resolve_digest_account_key(settings)
+                    await run_due_digest_if_claimed(
+                        db, account_key=digest_account_key, settings=settings
+                    )
                 except Exception as exc:
                     db.rollback()
                     logger.warning(

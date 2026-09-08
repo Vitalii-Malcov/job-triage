@@ -24,7 +24,7 @@ Read-only. Nothing in this module writes to any table, sends email,
 approves anything, or mutates Job.status.
 """
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.automation_repository import list_runs, to_automation_run
@@ -35,6 +35,7 @@ from app.db.models import (
     ResponseDraftRecord,
 )
 from app.models.automation import AutomationRunStepResult
+from app.providers.email.base import normalize_account_key
 
 # Telegram's hard cap is 4096 chars -- kept well below it (matches the
 # soft-limit convention already used by app.services.telegram_bot's own
@@ -43,10 +44,14 @@ from app.models.automation import AutomationRunStepResult
 # raising on an oversized payload.
 DIGEST_REPLY_SOFT_LIMIT = 3500
 
-# Bounds how many pending-approval ids this module will ever query, let
-# alone display -- a pending backlog must never turn one /digest call
-# (or one scheduled send) into an unbounded table scan.
-PENDING_IDS_QUERY_LIMIT = 200
+# Codex Stage 8E MEDIUM finding (PENDING COUNTS): bounds how many
+# pending-approval ids this module will ever DISPLAY -- a pending
+# backlog must never turn one /digest call (or one scheduled send) into
+# an unbounded message. The COUNT itself is never bounded/inferred from
+# this limit -- see `_pending_response_draft_count`/
+# `_pending_follow_up_count` below, which run a separate, unbounded
+# `SELECT COUNT(*)` so the reported total stays exact even when it
+# exceeds this display limit by an arbitrary amount.
 PENDING_IDS_DISPLAY_LIMIT = 10
 
 # Fixed, deterministic order -- never dict iteration order, which is
@@ -68,59 +73,137 @@ _STEP_LABELS = {
 }
 
 
-def _format_id_list(ids: list[int], limit: int = PENDING_IDS_DISPLAY_LIMIT) -> str:
+def resolve_digest_account_key(settings) -> str:
+    """The ONE shared rule for "which account_key does the digest read"
+    -- used by BOTH the manual `/digest` command
+    (app.services.telegram_bot.cmd_digest) and the automatic daily
+    digest (app.scheduler, which passes the result to
+    `app.services.scheduler.run_due_digest_if_claimed`). Codex Stage 8E
+    HIGH finding (ACCOUNT SCOPE): the two callers must never be able to
+    silently read different namespaces because one normalizes/falls
+    back differently than the other.
+
+    If `automation_scheduler_account_key` is configured (non-blank
+    after stripping), it is authoritative for BOTH callers -- the daily
+    digest already requires it whenever
+    `telegram_daily_digest_enabled=True` (see
+    `Settings._validate_daily_digest_requires_account_key_when_enabled`),
+    so using the SAME stripped value for the manual command keeps them
+    reading identical rows even as the digest is toggled on/off.
+    Otherwise (scheduler/digest never configured), the manual command
+    falls back to the normalized `GMAIL_USERNAME` -- the same identity
+    every other manual Gmail/API read endpoint already scopes itself to
+    (GMAIL-002, see `app.api.routes._current_gmail_account_key`).
+
+    **Does NOT change Stage 8B's own automation-cycle account_key
+    semantics.** `app.scheduler`'s poll loop still passes
+    `settings.automation_scheduler_account_key` UNCHANGED to
+    `run_due_cycle_if_claimed` -- this helper is only ever used for the
+    digest (both call sites), never for the automation cycle itself.
+    """
+    scheduler_account_key = settings.automation_scheduler_account_key.strip()
+    if scheduler_account_key:
+        return scheduler_account_key
+    return normalize_account_key(settings.gmail_username)
+
+
+def _format_id_list(ids: list[int], total_count: int) -> str:
+    """Renders the (already display-bounded) `ids` list, with a
+    "+N more" suffix computed from the REAL total (`total_count`, from
+    a separate unbounded `COUNT(*)`), never from `len(ids)` itself --
+    `len(ids)` is only ever `min(total_count, PENDING_IDS_DISPLAY_LIMIT)`,
+    which would silently under-report how many more exist once the
+    total exceeds the display limit.
+    """
     if not ids:
         return "none"
-    shown = ids[:limit]
-    suffix = f" (+{len(ids) - limit} more)" if len(ids) > limit else ""
-    return ", ".join(f"#{i}" for i in shown) + suffix
+    remaining = total_count - len(ids)
+    suffix = f" (+{remaining} more)" if remaining > 0 else ""
+    return ", ".join(f"#{i}" for i in ids) + suffix
 
 
-def _count_label(ids: list[int], query_limit: int = PENDING_IDS_QUERY_LIMIT) -> str:
-    if len(ids) >= query_limit:
-        return f"{query_limit}+"
-    return str(len(ids))
+_RESPONSE_DRAFT_PENDING_FILTER = (
+    ResponseDraftRecord.status == "PROPOSED",
+    ResponseDraftApprovalRecord.id.is_(None),
+)
+_FOLLOW_UP_PENDING_FILTER = (
+    FollowUpProposalRecord.status == "PROPOSED",
+    FollowUpApprovalRecord.id.is_(None),
+)
 
 
-def _pending_response_draft_ids(db: Session, account_key: str) -> list[int]:
-    """Response drafts still awaiting a human decision -- `PROPOSED` and
-    with no `ResponseDraftApprovalRecord` yet (see that model's
+def _pending_response_draft_count(db: Session, account_key: str) -> int:
+    """Codex Stage 8E MEDIUM finding (PENDING COUNTS): the EXACT total
+    of response drafts still awaiting a human decision -- `PROPOSED`
+    and with no `ResponseDraftApprovalRecord` yet (see that model's
     docstring: a decision is permanent and insert-only, so "no row" is
-    the exact, unambiguous definition of "still pending")."""
+    the exact, unambiguous definition of "still pending"). A separate,
+    UNBOUNDED `SELECT COUNT(*)` -- never inferred from the display-
+    bounded id list in `_pending_response_draft_display_ids`, which
+    would silently under-report the true total once it exceeds
+    `PENDING_IDS_DISPLAY_LIMIT`.
+    """
+    stmt = (
+        select(func.count(ResponseDraftRecord.id))
+        .select_from(ResponseDraftRecord)
+        .outerjoin(
+            ResponseDraftApprovalRecord,
+            ResponseDraftApprovalRecord.response_draft_id == ResponseDraftRecord.id,
+        )
+        .where(ResponseDraftRecord.account_key == account_key, *_RESPONSE_DRAFT_PENDING_FILTER)
+    )
+    return db.scalar(stmt) or 0
+
+
+def _pending_response_draft_display_ids(
+    db: Session, account_key: str, limit: int = PENDING_IDS_DISPLAY_LIMIT
+) -> list[int]:
+    """A SEPARATE, bounded query for the ids actually rendered in the
+    message -- deliberately never used to derive the count above (see
+    `_pending_response_draft_count`'s docstring)."""
     stmt = (
         select(ResponseDraftRecord.id)
         .outerjoin(
             ResponseDraftApprovalRecord,
             ResponseDraftApprovalRecord.response_draft_id == ResponseDraftRecord.id,
         )
-        .where(
-            ResponseDraftRecord.account_key == account_key,
-            ResponseDraftRecord.status == "PROPOSED",
-            ResponseDraftApprovalRecord.id.is_(None),
-        )
+        .where(ResponseDraftRecord.account_key == account_key, *_RESPONSE_DRAFT_PENDING_FILTER)
         .order_by(ResponseDraftRecord.id.asc())
-        .limit(PENDING_IDS_QUERY_LIMIT)
+        .limit(limit)
     )
     return list(db.scalars(stmt).all())
 
 
-def _pending_follow_up_ids(db: Session, account_key: str) -> list[int]:
-    """Follow-up proposals still awaiting a human decision -- mirrors
-    `_pending_response_draft_ids` exactly, for `FollowUpProposalRecord`/
-    `FollowUpApprovalRecord` instead."""
+def _pending_follow_up_count(db: Session, account_key: str) -> int:
+    """Mirrors `_pending_response_draft_count` exactly, for
+    `FollowUpProposalRecord`/`FollowUpApprovalRecord` instead -- the
+    EXACT total, an unbounded `COUNT(*)`, never inferred from a
+    display-bounded id list."""
+    stmt = (
+        select(func.count(FollowUpProposalRecord.id))
+        .select_from(FollowUpProposalRecord)
+        .outerjoin(
+            FollowUpApprovalRecord,
+            FollowUpApprovalRecord.follow_up_proposal_id == FollowUpProposalRecord.id,
+        )
+        .where(FollowUpProposalRecord.account_key == account_key, *_FOLLOW_UP_PENDING_FILTER)
+    )
+    return db.scalar(stmt) or 0
+
+
+def _pending_follow_up_display_ids(
+    db: Session, account_key: str, limit: int = PENDING_IDS_DISPLAY_LIMIT
+) -> list[int]:
+    """Mirrors `_pending_response_draft_display_ids` exactly."""
     stmt = (
         select(FollowUpProposalRecord.id)
         .outerjoin(
             FollowUpApprovalRecord,
             FollowUpApprovalRecord.follow_up_proposal_id == FollowUpProposalRecord.id,
         )
-        .where(
-            FollowUpProposalRecord.account_key == account_key,
-            FollowUpProposalRecord.status == "PROPOSED",
-            FollowUpApprovalRecord.id.is_(None),
-        )
+        .where(FollowUpProposalRecord.account_key == account_key, *_FOLLOW_UP_PENDING_FILTER)
         .order_by(FollowUpProposalRecord.id.asc())
-        .limit(PENDING_IDS_QUERY_LIMIT)
+        .limit(limit)
     )
     return list(db.scalars(stmt).all())
 
@@ -165,16 +248,18 @@ def build_digest_text(db: Session, account_key: str) -> str:
             if step is not None:
                 sections.append(_format_step_line(step_name, step))
 
-    pending_response_ids = _pending_response_draft_ids(db, account_key)
+    pending_response_count = _pending_response_draft_count(db, account_key)
+    pending_response_ids = _pending_response_draft_display_ids(db, account_key)
     sections.append(
-        f"Pending response-draft approvals: {_count_label(pending_response_ids)} "
-        f"({_format_id_list(pending_response_ids)})"
+        f"Pending response-draft approvals: {pending_response_count} "
+        f"({_format_id_list(pending_response_ids, pending_response_count)})"
     )
 
-    pending_follow_up_ids = _pending_follow_up_ids(db, account_key)
+    pending_follow_up_count = _pending_follow_up_count(db, account_key)
+    pending_follow_up_ids = _pending_follow_up_display_ids(db, account_key)
     sections.append(
-        f"Pending follow-up approvals: {_count_label(pending_follow_up_ids)} "
-        f"({_format_id_list(pending_follow_up_ids)})"
+        f"Pending follow-up approvals: {pending_follow_up_count} "
+        f"({_format_id_list(pending_follow_up_ids, pending_follow_up_count)})"
     )
 
     text = "\n".join(sections)

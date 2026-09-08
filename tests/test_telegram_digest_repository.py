@@ -6,7 +6,7 @@ two-Session/independent-engine-connection proof style, applied to the
 digest delivery claim instead of the schedule-slot claim.
 """
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -19,6 +19,7 @@ from app.db.telegram_digest_repository import (
     mark_failed,
     mark_sent,
     mark_uncertain,
+    reconcile_stale_pending_to_uncertain,
     retry_delivery,
 )
 
@@ -180,6 +181,95 @@ class TestStateTransitions:
             won_b = retry_delivery(session_b, record_b)
 
             assert won_a != won_b  # exactly one of the two wins
+        finally:
+            session_a.close()
+            session_b.close()
+
+
+class TestReconcileStalePendingToUncertain:
+    """Codex Stage 8E MEDIUM finding (STALE PENDING): a crash after
+    `claim_delivery` wins but before the send outcome is classified
+    must not leave the row PENDING forever -- `reconcile_stale_pending_to_uncertain`
+    is the bounded-TTL CAS that self-heals it to a terminal UNCERTAIN,
+    never automatically retried.
+    """
+
+    def test_fresh_pending_is_not_reconciled(self, session_factory):
+        """A claim that just won -- updated_at is 'now' -- must never
+        be treated as stale, or a genuinely in-flight send could be
+        clobbered mid-attempt."""
+        db = session_factory()
+        try:
+            record, _claimed = claim_delivery(db, ACCOUNT, DAY)
+
+            won = reconcile_stale_pending_to_uncertain(db, record, ttl_seconds=300.0)
+
+            assert won is False
+            assert get_delivery(db, ACCOUNT, DAY).status == "PENDING"
+        finally:
+            db.close()
+
+    def test_stale_pending_older_than_ttl_is_reconciled_to_uncertain(self, session_factory):
+        db = session_factory()
+        try:
+            record, _claimed = claim_delivery(db, ACCOUNT, DAY)
+
+            # Simulate "5+ minutes have passed since the claim" by
+            # evaluating the CAS against a `now` far in the future,
+            # rather than sleeping in the test.
+            far_future = datetime.now(UTC) + timedelta(seconds=301)
+            won = reconcile_stale_pending_to_uncertain(
+                db, record, ttl_seconds=300.0, now=far_future
+            )
+
+            assert won is True
+            reloaded = get_delivery(db, ACCOUNT, DAY)
+            assert reloaded.status == "UNCERTAIN"
+        finally:
+            db.close()
+
+    def test_reconciled_stale_pending_is_never_retried(self, session_factory):
+        """UNCERTAIN is terminal -- reconciling a stale PENDING must
+        land in the SAME never-retried state as a fresh UNCERTAIN
+        outcome (see mark_uncertain's own docstring)."""
+        db = session_factory()
+        try:
+            record, _claimed = claim_delivery(db, ACCOUNT, DAY)
+            far_future = datetime.now(UTC) + timedelta(seconds=301)
+            reconcile_stale_pending_to_uncertain(db, record, ttl_seconds=300.0, now=far_future)
+
+            reloaded = get_delivery(db, ACCOUNT, DAY)
+            won_retry = retry_delivery(db, reloaded)
+
+            assert won_retry is False
+            assert get_delivery(db, ACCOUNT, DAY).status == "UNCERTAIN"
+        finally:
+            db.close()
+
+    def test_concurrent_stale_reconciliation_has_exactly_one_cas_winner(self, session_factory):
+        """Two independent sessions both observing the same stale
+        PENDING row must never both win the reconciliation CAS -- the
+        `updated_at < cutoff` predicate is evaluated atomically by each
+        UPDATE, so the first commit's new `updated_at` makes the second
+        UPDATE's own predicate no longer match."""
+        session_a = session_factory()
+        session_b = session_factory()
+        try:
+            record, _claimed = claim_delivery(session_a, ACCOUNT, DAY)
+            far_future = datetime.now(UTC) + timedelta(seconds=301)
+
+            record_a = get_delivery(session_a, ACCOUNT, DAY)
+            record_b = get_delivery(session_b, ACCOUNT, DAY)
+
+            won_a = reconcile_stale_pending_to_uncertain(
+                session_a, record_a, ttl_seconds=300.0, now=far_future
+            )
+            won_b = reconcile_stale_pending_to_uncertain(
+                session_b, record_b, ttl_seconds=300.0, now=far_future
+            )
+
+            assert won_a != won_b  # exactly one of the two wins
+            assert get_delivery(session_a, ACCOUNT, DAY).status == "UNCERTAIN"
         finally:
             session_a.close()
             session_b.close()

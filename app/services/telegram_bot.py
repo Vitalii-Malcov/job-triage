@@ -44,14 +44,13 @@ from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
 from app.providers.base import ProviderNotConfiguredError
-from app.providers.email.base import normalize_account_key
 from app.services.collector_runner import (
     run_bundesagentur,
     run_company_research_for_job,
     run_xing,
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
-from app.services.telegram_digest import build_digest_text
+from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
 
 logger = logging.getLogger(__name__)
 
@@ -391,15 +390,21 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     pending-approval counts/ids. Delegates all content assembly to
     `app.services.telegram_digest.build_digest_text` (shared, unchanged,
     with the optional automatic daily digest) -- this handler only owns
-    picking `account_key` (the same normalized Gmail identity every
-    other Telegram/API read endpoint scopes itself to, per GMAIL-002 —
-    see app.api.routes._current_gmail_account_key) and replying.
+    picking `account_key` and replying.
+
+    **Account scope (Codex Stage 8E HIGH finding).** Uses
+    `resolve_digest_account_key`, the SAME shared helper the automatic
+    daily digest resolves its account_key through -- never re-derives
+    its own normalization here, so a manual `/digest` and the automatic
+    daily digest can never silently read different namespaces (e.g. one
+    scoped to AUTOMATION_SCHEDULER_ACCOUNT_KEY, the other to
+    GMAIL_USERNAME, with divergent casing/whitespace).
 
     Read-only: never sends email, approves a draft/follow-up, submits an
     application, or mutates Job.status.
     """
     settings = get_settings()
-    account_key = normalize_account_key(settings.gmail_username)
+    account_key = resolve_digest_account_key(settings)
 
     db = SessionLocal()
     try:
