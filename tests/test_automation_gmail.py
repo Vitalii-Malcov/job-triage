@@ -803,7 +803,8 @@ class TestTruthfulAnalysisCountersOnDraftFailure:
             db.close()
 
 
-# --- S8D-SYNC-001: GmailSyncResult.failed must prevent "ok" -----------------
+# --- S8D-SYNC-001/002: GmailSyncResult.failed must prevent "ok", and total ---
+# --- failure (fetched > 0, failed == fetched) must be "failed", not "partial"
 
 
 class TestGmailSyncCountsFailuresHonestly:
@@ -834,6 +835,57 @@ class TestGmailSyncCountsFailuresHonestly:
         try:
             result = _run_gmail_sync(db, _settings())
             assert result["status"] == "ok"
+        finally:
+            db.close()
+
+    def test_total_failure_all_fetched_failed_is_failed(self, session_factory, monkeypatch):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            if mailbox == settings.gmail_mailbox:
+                return GmailSyncResult(fetched=10, created=0, duplicates=0, skipped=0, failed=10)
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "failed"
+            assert result["counters"]["fetched"] == 10
+            assert result["counters"]["failed"] == 10
+        finally:
+            db.close()
+
+    def test_mixed_success_and_failure_is_partial(self, session_factory, monkeypatch):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            if mailbox == settings.gmail_mailbox:
+                return GmailSyncResult(fetched=10, created=7, duplicates=0, skipped=0, failed=3)
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "partial"
+            assert result["counters"]["fetched"] == 10
+            assert result["counters"]["failed"] == 3
+        finally:
+            db.close()
+
+    def test_full_fetch_zero_failures_is_ok(self, session_factory, monkeypatch):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            if mailbox == settings.gmail_mailbox:
+                return GmailSyncResult(fetched=10, created=10, duplicates=0, skipped=0, failed=0)
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "ok"
+            assert result["counters"]["fetched"] == 10
+            assert result["counters"]["failed"] == 0
         finally:
             db.close()
 

@@ -170,18 +170,28 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         "sent_failed": sent_r.failed,
     }
 
-    # S8D-SYNC-001 (Codex review): honest ok/partial/failed derivation --
+    # S8D-SYNC-001/002 (Codex review): honest ok/partial/failed derivation --
     # a mailbox-level exception on ONE side is "partial" even if the
     # other mailbox had zero per-message failures; BOTH raising is
-    # "failed"; and even with NEITHER raising, any per-message
+    # "failed". With NEITHER raising, any per-message
     # GmailSyncResult.failed > 0 (persistence failures GmailInboxService
     # already isolates internally, never raised) means real work did NOT
     # fully succeed -- "ok" requires zero exceptions AND zero counted
-    # failures, never just "nothing raised".
+    # failures, never just "nothing raised". S8D-SYNC-002: when nothing
+    # raised but EVERY fetched message failed to persist (fetched > 0 and
+    # failed == fetched), NOTHING was actually accomplished -- that is
+    # "failed", not "partial"; "partial" is reserved for a real mix of
+    # per-message success and failure.
     if inbox_error_type is not None and sent_error_type is not None:
         status = "failed"
     elif inbox_error_type is not None or sent_error_type is not None:
         status = "partial"
+    elif (
+        counters["failed"] > 0
+        and counters["fetched"] > 0
+        and counters["failed"] == counters["fetched"]
+    ):
+        status = "failed"
     elif counters["failed"] > 0:
         status = "partial"
     else:
