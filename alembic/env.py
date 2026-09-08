@@ -13,8 +13,16 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# disable_existing_loggers=False: fileConfig() defaults to True, which sets
+# `.disabled = True` on every Logger object that already exists at call time
+# but isn't named in alembic.ini's [loggers] section -- e.g. app.scheduler,
+# app.services.scheduler when a caller runs migrations programmatically
+# (tests/test_migrations.py, run_migrations_if_enabled() at app startup)
+# after those loggers were already created. That disabled state outlives
+# this function and silently drops all further logging from those loggers.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Inject the application's database URL instead of hardcoding it in alembic.ini,
 # so migrations always target whatever DATABASE_URL the app is configured with.

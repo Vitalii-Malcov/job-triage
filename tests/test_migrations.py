@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -2581,3 +2582,37 @@ def test_automation_schedules_downgrade_removes_table_then_upgrade_restores_it(
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "automation_schedules" in inspector.get_table_names()
+
+
+def test_running_migrations_does_not_disable_application_loggers(tmp_path: Path) -> None:
+    """Regression test: alembic/env.py calls logging.config.fileConfig(),
+    which defaults to disable_existing_loggers=True. That default sets
+    `.disabled = True` on any Logger object that already exists (e.g.
+    because some other already-imported module called
+    logging.getLogger(__name__) at import time) but isn't named in
+    alembic.ini's [loggers] section -- app.scheduler and
+    app.services.scheduler are exactly such loggers. The disabled state
+    survives the migration call and silently drops all further logging
+    from those loggers for the rest of the process, which is what broke
+    caplog-based scheduler tests whenever they ran in the same pytest
+    process after this module.
+    """
+    scheduler_logger = logging.getLogger("app.scheduler")
+    services_scheduler_logger = logging.getLogger("app.services.scheduler")
+
+    original_scheduler_disabled = scheduler_logger.disabled
+    original_services_scheduler_disabled = services_scheduler_logger.disabled
+    scheduler_logger.disabled = False
+    services_scheduler_logger.disabled = False
+
+    try:
+        db_path = tmp_path / "migrations_logger_pollution.db"
+        cfg = _alembic_config(db_path)
+
+        upgrade(cfg, "head")
+
+        assert scheduler_logger.disabled is False
+        assert services_scheduler_logger.disabled is False
+    finally:
+        scheduler_logger.disabled = original_scheduler_disabled
+        services_scheduler_logger.disabled = original_services_scheduler_disabled
