@@ -78,7 +78,6 @@ from app.db.gmail_analysis_repository import (
 from app.db.gmail_repository import (
     THREAD_DETAIL_DEFAULT_MESSAGE_LIMIT,
     THREAD_DETAIL_MAX_MESSAGE_LIMIT,
-    get_known_uids,
     get_message_by_id,
     get_thread_by_id,
     get_thread_message_count,
@@ -161,7 +160,6 @@ from app.models.review_package import (
 from app.providers.base import ProviderNotConfiguredError
 from app.providers.bewerbung.base import BewerbungProviderError, BewerbungProviderNotConfiguredError
 from app.providers.email.base import GmailProviderError, normalize_account_key
-from app.providers.email.imap import GmailImapProvider
 from app.providers.email.smtp import GmailSmtpProvider
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
@@ -229,8 +227,8 @@ from app.services.follow_up_send import (
     get_follow_up_state,
     send_follow_up,
 )
-from app.services.gmail_inbox import GmailInboxService
 from app.services.gmail_message_analysis import GmailMessageNotFoundError, analyze_gmail_message
+from app.services.gmail_sync import run_gmail_sync as run_gmail_sync_service
 from app.services.response_draft import (
     ResponseDraftAnalysisNotFoundError,
     ResponseDraftMessageNotFoundError,
@@ -1124,73 +1122,6 @@ def list_automation_runs(
     return [to_automation_run(record) for record in records]
 
 
-def _sum_gmail_sync_results(a: GmailSyncResult, b: GmailSyncResult) -> GmailSyncResult:
-    return GmailSyncResult(
-        fetched=a.fetched + b.fetched,
-        created=a.created + b.created,
-        duplicates=a.duplicates + b.duplicates,
-        skipped=a.skipped + b.skipped,
-        failed=a.failed + b.failed,
-    )
-
-
-async def _run_gmail_sync(db: Session, settings) -> GmailSyncResult:
-    """Fetch (read-only IMAP) + persist one Gmail Inbox Foundation sync run.
-
-    The configuration check lives here (not inside GmailInboxService),
-    mirroring app.services.collector_runner.run_xing/run_bundesagentur's
-    own split between "not configured" (503, see run_gmail_sync below)
-    and "upstream/provider failure" (502) — GmailInboxService itself
-    never fails closed on
-    missing credentials, it just orchestrates fetch+persist for an
-    already-constructed provider.
-
-    S7E-001 (Codex remediation, HIGH): syncs BOTH the primary mailbox
-    (gmail_mailbox, INBOUND — `trusted_outbound=False`) and the real
-    Sent-mail folder (gmail_sent_mailbox, `trusted_outbound=True`) every
-    run. Only messages fetched from the Sent folder are ever trusted as
-    OUTBOUND — see app/providers/email/imap.py's `_direction` docstring for
-    why a message's own `From` header is no longer used to decide
-    direction. Both mailboxes share the same account_key/dedup namespace
-    (their (mailbox, uid_validity, uid) identities are independent, so no
-    collision risk), and one mailbox's sync failure/persistence errors
-    never block the other's.
-    """
-    if not is_configured(settings.gmail_username) or not is_configured(settings.gmail_app_password):
-        raise CollectorNotConfiguredError(
-            "Gmail inbox sync is not configured: set GMAIL_USERNAME and GMAIL_APP_PASSWORD."
-        )
-
-    account_key = normalize_account_key(settings.gmail_username)
-
-    def _make_provider(mailbox: str, *, trusted_outbound: bool) -> GmailImapProvider:
-        return GmailImapProvider(
-            imap_host=settings.gmail_imap_host,
-            imap_port=settings.gmail_imap_port,
-            username=settings.gmail_username,
-            app_password=settings.gmail_app_password,
-            mailbox=mailbox,
-            lookback_days=settings.gmail_lookback_days,
-            # GMAIL-005 starvation fix (GMAIL-012: bulk, not per-UID): bound
-            # to this request's db.Session via closure — lets the provider
-            # skip already-persisted UIDs before applying its
-            # MAX_MESSAGES_PER_SYNC cap, in one query per chunk rather than
-            # one query per UID.
-            get_known_uids=lambda uid_validity, candidate_uids, _mailbox=mailbox: get_known_uids(
-                db, account_key, _mailbox, uid_validity, candidate_uids
-            ),
-            trusted_outbound=trusted_outbound,
-        )
-
-    inbox_result = await GmailInboxService().sync(
-        db, _make_provider(settings.gmail_mailbox, trusted_outbound=False)
-    )
-    sent_result = await GmailInboxService().sync(
-        db, _make_provider(settings.gmail_sent_mailbox, trusted_outbound=True)
-    )
-    return _sum_gmail_sync_results(inbox_result, sent_result)
-
-
 @router.post(
     "/gmail/sync",
     response_model=GmailSyncResult,
@@ -1204,7 +1135,7 @@ async def run_gmail_sync(db: Session = Depends(get_db)) -> GmailSyncResult:
     """
     settings = get_settings()
     try:
-        return await _run_gmail_sync(db, settings)
+        return await run_gmail_sync_service(db, settings)
     except CollectorNotConfiguredError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)

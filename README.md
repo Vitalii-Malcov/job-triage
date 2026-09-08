@@ -41,7 +41,8 @@ AI-система для сбора, оценки и трекинга вакан
 8. Autonomous Orchestrator — по подэтапам:
    - [x] 8A Orchestrator Foundation — persisted `AutomationRun` + сервис-оркестратор, координирующий существующие Bundesagentur/XING коллекторы в один ручной/синхронный цикл (`POST /api/v1/automation/runs`); без scheduler/cron, без auto-send заявок или email, без обхода существующих approval-gate'ов.
    - [x] 8B Scheduler/cron — смёржено в `main`, см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
-   - [ ] 8C Automatic Shortlist + CV/Bewerbung draft preparation — в разработке на feature-ветке (`feat/stage-8c-auto-shortlist-drafts`, не смёржено), см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
+   - [x] 8C Automatic Shortlist + CV/Bewerbung draft preparation — смёржено в `main`, см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
+   - [ ] 8D Automated Gmail response-draft cycle + follow-up proposal cycle — в разработке на feature-ветке (`feat/stage-8d-gmail-followup-cycle`, не смёржено), см. "Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)" ниже: два независимых опциональных шага автоматизации, переиспользующие существующие Stage 7A/7B/7C/7E Gmail-sync/analysis/response-draft/follow-up сервисы — read-only Gmail sync, детерминированные response-черновики и follow-up ПРЕДЛОЖЕНИЯ, без отправки, без approval, без смены Job.status.
 
 ## Запуск
 ```bash
@@ -1716,8 +1717,7 @@ sender-паттерн и текстовые фразы, поскольку `Gmai
 
 ## Automatic Shortlist + Draft Preparation (Stage 8C)
 
-**Статус: в разработке на feature-ветке `feat/stage-8c-auto-shortlist-drafts`,
-не смёржено в `main`.** Опциональный шаг `app.services.automation.run_automation_cycle`
+**Статус: смёржено в `main`.** Опциональный шаг `app.services.automation.run_automation_cycle`
 (Stage 8A/8B), выполняющийся ПОСЛЕ существующих Bundesagentur/XING
 коллекторов внутри того же ран/lease — без второй lease-подсистемы, без
 отдельного orchestration loop. Полностью переиспользует существующие
@@ -1855,6 +1855,158 @@ convention, что и GMAIL-003/S8A-004). Шаг `shortlist_drafts` получа
 это — только техническая метадата, никогда имя кандидата/текст CV/текст
 Bewerbung/описание вакансии/email/секреты. Эта персистентная структура
 будет использована Stage 8E's Telegram daily digest.
+
+## Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)
+
+**Статус: в разработке на feature-ветке `feat/stage-8d-gmail-followup-cycle`,
+не смёржено в `main`.** Два независимых опциональных шага
+`app.services.automation.run_automation_cycle`, выполняющихся ПОСЛЕ
+существующих Stage 8A/8C шагов внутри того же ран/lease — без второй
+lease-подсистемы. Полностью переиспользует существующие Stage 7A/7B/7C/7E
+сервисы (`app.services.gmail_sync` — извлечённый без изменения поведения
+из `app.api.routes`; `app.services.gmail_message_analysis.analyze_gmail_message`;
+`app.services.response_draft.generate_response_draft_for_message`;
+`app.services.follow_up.evaluate_follow_up_for_job`) — этот этап не
+добавляет НИ ОДНОЙ новой строчки логики Gmail-парсинга/классификации/
+email-to-job матчинга/response-generation/follow-up-eligibility.
+
+**Opt-in, два НЕЗАВИСИМЫХ флага, выключены по умолчанию.**
+```bash
+AUTOMATION_GMAIL_CYCLE_ENABLED=true
+AUTOMATION_GMAIL_PROCESS_MAX_PER_RUN=100      # 1..500, дефолт 100
+AUTOMATION_FOLLOW_UP_CYCLE_ENABLED=true
+AUTOMATION_FOLLOW_UP_JOB_MAX_PER_RUN=100      # 1..200, дефолт 100
+```
+Включение `AUTOMATION_SCHEDULER_ENABLED`/`AUTOMATION_AUTO_PREPARE_ENABLED`
+НЕ включает Gmail/follow-up автоматизацию — четыре независимых флага.
+
+**Только черновики/предложения — никогда не отправка и не approval.**
+Gmail sync — read-only (см. Stage 7A ниже: `BODY.PEEK[]`, ноль записей в
+mailbox). Response-черновики создаются, но НЕ отправляются и НЕ
+approve'ятся. Follow-up ПРЕДЛОЖЕНИЯ создаются, но НЕ отправляются и НЕ
+approve'ятся. `Job.status` никогда не меняется. `app.services.automation_gmail`/
+`app.services.automation_follow_up` НЕ импортируют
+`app.services.response_draft_send.send_response_draft`/
+`approve_or_reject_response_draft`, `app.services.follow_up_send.send_follow_up`/
+`approve_or_reject_follow_up`, или `app.providers.email.smtp.GmailSmtpProvider`
+— human approval остаётся обязательным, без изменений от Stage 7D/7E.
+
+**Gmail sync шаг (`gmail_sync`).** Синхронизирует ОБЕ настроенные
+mailbox'ы (INBOX и Sent) — та же read-only логика, что и
+`POST /gmail/sync` (Stage 7A), но с двумя дополнениями:
+
+1. **Account-mismatch fail-closed.** Перед синком проверяется
+   `normalize_account_key(GMAIL_USERNAME) == account_key` этого
+   `AutomationRun`'а — при несовпадении шаг падает (`"failed"`), Gmail НЕ
+   читается вообще, чтобы никогда не прочитать один аккаунт и не
+   сохранить/оперировать как будто это другой.
+2. **Независимая изоляция ошибок по mailbox'у.** В отличие от ручного
+   `POST /gmail/sync` (всё-или-ничего), INBOX и Sent синхронизируются в
+   ОТДЕЛЬНЫХ try/except — успешный INBOX-персист никогда не теряется
+   из-за падения Sent, и наоборот. `ok` — оба успешны; `partial` — один
+   из двух; `failed` — оба; `not_configured` — GMAIL_USERNAME/APP_PASSWORD
+   не заданы.
+
+**Gmail response-draft шаг (`gmail_response_drafts`) — курсор, не
+timestamp.** НЕ сканирует всю историю `gmail_messages`. Использует
+персистентный курсор `automation_mail_progress.gmail_after_message_id`:
+`gmail_message.id > cursor ORDER BY id ASC LIMIT AUTOMATION_GMAIL_PROCESS_MAX_PER_RUN`.
+Новая инсталляция начинает с самого старого сохранённого сообщения и
+постепенно догоняет; курсор НИКОГДА не сбрасывается — новые сообщения
+всегда получают больший id и естественным образом достигаются позже.
+Этот шаг ВСЕГДА выполняется (если `AUTOMATION_GMAIL_CYCLE_ENABLED=true`),
+даже если `gmail_sync` в ЭТОМ или предыдущих ранах упал — он обрабатывает
+уже сохранённые сообщения независимо от исхода sync'а.
+
+Для каждого сообщения — последовательно: `analyze_gmail_message` (Stage
+7B, идемпотентно), затем `generate_response_draft_for_message` (Stage
+7C, идемпотентно; требует существующего анализа). `NO_RESPONSE_RECOMMENDED`
+— это НОРМАЛЬНЫЙ, успешно обработанный исход (классификация не
+поддерживает шаблон), курсор продвигается как обычно.
+
+**Курсор продвигается ТОЛЬКО после полного успеха пайплайна сообщения**
+(`app.db.automation_mail_progress_repository.advance_gmail_cursor`,
+атомарный CAS `UPDATE ... WHERE account_key = ... AND gmail_after_message_id
+= :expected`). Если сообщение N падает на любой фазе — откат,
+санитизированная техническая запись (`gmail_message_id`, `phase`
+— `"analysis"`/`"response_draft"`, `type(exc).__name__`, никогда
+`str(exc)`), обработка ОСТАНАВЛИВАЕТСЯ для этого рана (сообщения после N
+даже не пытаются обрабатываться), курсор НЕ продвигается мимо N — at
+-least-once retry на следующем цикле, без пропуска сообщений. Если
+анализ успешен, а response-draft падает — соответствующий
+`AutomationMessageItem` всё равно честно отражает реальный
+`analysis_id`/`analysis_created` (откат response-draft'а не может
+отменить уже закоммиченный анализ) — S8C-AUDIT-001-style truthful audit,
+перенесённый на Gmail-пайплайн.
+
+**Почему персистентный курсор, а не in-memory список "сообщений этого
+рана".** `GmailImapProvider` (Stage 7A) намеренно пропускает уже
+сохранённые UID при следующих sync'ах. Если процесс упадёт ПОСЛЕ
+персиста Gmail-сообщения, но ДО его анализа/черновика, in-memory-only
+дизайн навсегда потерял бы это сообщение — ни один следующий sync его не
+вернёт. `gmail_after_message_id` вместо этого якорится на уже
+персистентный `GmailMessageRecord.id`, так что падение стоит лишь
+повторной попытки того же диапазона на следующем ране.
+
+**Follow-up proposal шаг (`follow_up_proposals`) — bounded round-robin,
+WRAP'ается.** Использует `automation_mail_progress.follow_up_after_job_id`
+и существующий keyset-скан
+(`app.db.repositories.list_jobs_by_status_after_id`,
+`ApplicationStatus.APPLIED`, `id > cursor ORDER BY id ASC LIMIT
+AUTOMATION_FOLLOW_UP_JOB_MAX_PER_RUN`). Для каждой вакансии вызывается
+СУЩЕСТВУЮЩИЙ `evaluate_follow_up_for_job` (Stage 7E) — тот же
+детерминированный eligibility/recipient/generation код, что и ручной
+эндпоинт; `send_follow_up`/`approve_or_reject_follow_up` НЕ вызываются.
+Переиспользование proposal'ов уже обеспечено самим Stage 7E
+(`(account_key, anchor_gmail_message_id, input_fingerprint)` UNIQUE) —
+этот шаг не добавляет вторую систему дедупликации.
+
+В ОТЛИЧИЕ от Gmail-курсора, follow-up курсор WRAP'АЕТСЯ: вакансия может
+стать eligible ПРОСТО ПОТОМУ ЧТО прошло время, без новой Gmail-активности,
+которая "разбудила" бы её — однонаправленный курсор со временем перестал
+бы находить что-либо новое. Когда один bounded scan достигает конца
+текущего списка APPLIED-вакансий, курсор сбрасывается на `NULL`
+(тем же CAS-примитивом) — следующий `AutomationRun` начинает СНОВА с
+самой старой APPLIED-вакансии. НЕ запускает второй проход в ТОМ ЖЕ ране
+— это свело бы на нет весь смысл ограничения scan'а за цикл.
+
+**Правило ошибок идентично Gmail-курсору.** `evaluate_follow_up_for_job`
+уже конвертирует невалидный recipient во ВНУТРЕННЕ обработанный
+`NOT_ELIGIBLE` — это НЕ ошибка и не останавливает скан. Только
+неожиданное исключение — откат, `job_id`/`phase="follow_up"`/
+`type(exc).__name__`, скан ОСТАНАВЛИВАЕТСЯ, курсор не продвигается мимо
+упавшей вакансии, следующий ран повторит попытку.
+
+**CAS вместо blind write (обе курсорные колонки).** Lease `AutomationRun`
+(Stage 8A) уже предотвращает обычную конкуренцию для одного аккаунта, но
+старый ран может продолжить выполняться КОРОТКОЕ время после потери
+lease, пока стартует ран-замена. `advance_gmail_cursor`/
+`advance_follow_up_cursor` (`app.db.automation_mail_progress_repository`)
+выполняют один атомарный `UPDATE ... WHERE account_key = ... AND
+<колонка> = :expected` — при несовпадении CAS проваливается, шаг
+ОСТАНАВЛИВАЕТСЯ и fail-closed'ится, никогда не перезаписывая прогресс
+более нового владельца.
+
+**Учёт аккаунта.** Каждый Gmail-запрос уже фильтруется по `account_key`
+(GMAIL-002). Follow-up вакансии сами по себе не привязаны к аккаунту
+(`JobRecord` не хранит `account_key`), но их elig­ibility зависит от
+совпадающей Gmail-переписки — вакансия, чья единственная anchor-переписка
+принадлежит ДРУГОМУ `account_key`, не может стать eligible под текущим
+раном (см. `evaluate_follow_up_for_job`'s собственную account-scoped
+привязку через `GmailMessageAnalysisRecord`).
+
+**Персистентное состояние прогресса, переживает падения.** Таблица
+`automation_mail_progress` (миграция `7c2e4a91b6d3`,
+`app.db.models.AutomationMailProgressRecord`) — одна строка на аккаунт:
+`gmail_after_message_id`, `follow_up_after_job_id`. Никакого email
+-контента — только технические числовые курсоры.
+
+**Общий статус рана.** Отключённые Stage 8D функции не добавляют fake
+-шаг в results. Если core-коллекторы Stage 8A (`bundesagentur`/`xing`)
+оба провалились — общий статус остаётся `FAILED`, Stage 8D не может его
+"повысить" (S8C-STATUS-001's core-collector rule не переоткрыто и не
+ослаблено). Если хотя бы один коллектор успешен — упавший/частичный
+Stage 8D шаг даёт `PARTIAL`; все включённые шаги `ok` → `COMPLETED`.
 
 ## Проверки
 ```bash

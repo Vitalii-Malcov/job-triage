@@ -168,6 +168,28 @@ class Settings(BaseSettings):
     # the FINAL CV/Bewerbung draft count after matching.
     automation_candidate_match_max_per_run: int = Field(default=100, ge=1, le=500)
 
+    # Stage 8D automated Gmail response-draft cycle + follow-up proposal
+    # cycle. Two independent opt-in switches, deliberately unrelated to
+    # automation_scheduler_enabled/automation_auto_prepare_enabled above --
+    # enabling the scheduler or Stage 8C drafting does NOT imply Gmail/
+    # follow-up automation should also run. Off by default. See
+    # app.services.automation_gmail/app.services.automation_follow_up for
+    # what these trigger: only read-only Gmail sync, GmailMessageAnalysis/
+    # ResponseDraft/FollowUpProposal rows, and AutomationRun result
+    # metadata -- never a send, an approval, or a Job.status transition
+    # (those remain manual, unchanged from Stage 7C/7D/7E).
+    automation_gmail_cycle_enabled: bool = False
+    # Bounds how many already-persisted Gmail messages (per account, per
+    # run) the gmail_response_drafts step scans/analyzes/drafts for --
+    # deterministic keyset pagination by GmailMessageRecord.id, see
+    # app.db.automation_mail_progress_repository's cursor design.
+    automation_gmail_process_max_per_run: int = Field(default=100, ge=1, le=500)
+    automation_follow_up_cycle_enabled: bool = False
+    # Bounds how many currently-APPLIED jobs (per account, per run) the
+    # follow_up_proposals step re-evaluates -- a bounded, wrapping
+    # round-robin scan (unlike the Gmail cursor above, which never wraps).
+    automation_follow_up_job_max_per_run: int = Field(default=100, ge=1, le=200)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
