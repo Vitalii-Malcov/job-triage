@@ -5,6 +5,7 @@ import pytest
 import sqlalchemy.exc
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1120,6 +1121,21 @@ def _alembic_current_revision(engine) -> str:
         return connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
 
 
+def _alembic_head_revision(cfg: Config) -> str:
+    """The CURRENT `head` revision id, resolved dynamically from the
+    versions/ directory rather than hardcoded -- so a test asserting
+    "upgrading to `head` lands on `head`" stays correct forever, even as
+    later stages append new migrations on top of whatever used to be
+    `head` when the test was written (see Codex Stage 8E full-regression
+    finding: 7 tests hardcoded `7c2e4a91b6d3` as "head", which broke the
+    moment Stage 8E's own `f1a2b3c4d5e6` migration extended the chain
+    past it).
+    """
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    assert head is not None
+    return head
+
+
 def test_gmail_account_scope_downgrade_preflight_allows_clean_cycle(tmp_path: Path) -> None:
     """Case 1 (no cross-account conflicts): the normal upgrade -> downgrade
     -> upgrade cycle must still succeed when there is nothing for the
@@ -1364,7 +1380,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1476,7 +1492,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1648,7 +1664,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1738,7 +1754,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2027,7 +2043,7 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
 
@@ -2350,7 +2366,7 @@ def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_pres
     assert job_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_draft_approvals" in inspector.get_table_names()
     assert "response_draft_sends" in inspector.get_table_names()
@@ -2498,7 +2514,7 @@ def test_follow_up_remediation_downgrade_clean_cycle(tmp_path: Path) -> None:
     assert proposal_count == 1  # sibling data untouched by the column drops
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
     assert "recipient" in proposal_columns
