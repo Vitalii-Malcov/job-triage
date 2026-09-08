@@ -1,13 +1,15 @@
-"""Stage 8C tests: automatic shortlist + CV/Bewerbung draft preparation.
+"""Stage 8C tests: automatic shortlist + CV/Bewerbung draft preparation,
+covering the Codex-review remediation round (S8C-AUDIT-001/002,
+S8C-STATUS-001, S8C-CACHE-001, S8C-POOL-001, S8C-BOUND-001).
 
 Mirrors tests/test_automation_lease.py's/test_scheduler_service.py's
 approach: a real file-backed SQLite session, no-op collector
 monkeypatches (no network I/O), and direct calls into
 `app.services.automation.run_automation_cycle` for integration-level
 proof plus direct calls into
-`app.services.automation_shortlist.prepare_shortlist_drafts`/
-`app.db.repositories.get_current_cycle_candidate_jobs` for fast,
-precise unit-level proof of the pool/ranking/threshold/reuse policies.
+`app.services.automation_shortlist.prepare_shortlist_drafts` for fast,
+precise unit-level proof of the attribution/bound/ranking/threshold/
+reuse/audit policies.
 
 **Deterministic match-score tiers, no candidate profile setup needed.**
 With the default EMPTY candidate profile (no confirmed skills/experience),
@@ -23,30 +25,40 @@ shape, independent of any specific skill names:
 
 These four tiers give every test below full control over shortlist
 threshold/ranking behavior without ever touching the candidate profile.
+
+**Exact attribution.** Candidate eligibility is no longer inferred from
+`JobRecord.last_seen_at` -- tests build `TouchedJob` entries explicitly
+(the `_touch`/`_run_shortlist` helpers below) exactly like
+`app.services.collector_runner.run_bundesagentur`/`run_xing` do after a
+real successful persist.
 """
 
 import asyncio
 import inspect
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.candidate_profile_repository import apply_candidate_profile_patch
 from app.db.models import (
+    ApplicationPackageReviewRecord,
     BewerbungDraftRecord,
     CandidateCVDraftRecord,
     CandidateJobMatchRecord,
     JobRecord,
 )
-from app.db.repositories import get_current_cycle_candidate_jobs
+from app.models.automation import AutomationRun, AutomationRunStepResult
 from app.models.candidate_profile import CandidateProfilePatchRequest
+from app.models.job import Job
 from app.services.automation import run_automation_cycle
 from app.services.automation_shortlist import prepare_shortlist_drafts
+from app.services.collector_runner import TouchedJob, run_bundesagentur
 
 ACCOUNT = "me@example.com"
 
@@ -68,8 +80,15 @@ def session_factory(tmp_path):
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-async def _noop_collector(db, settings):
+async def _noop_collector(db, settings, *, touched_jobs=None):
     return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+
+def _failing_collector(exc: Exception):
+    async def _fail(db, settings, *, touched_jobs=None):
+        raise exc
+
+    return _fail
 
 
 def _seed_job(db, *, tier=TIER_60, **overrides) -> JobRecord:
@@ -103,23 +122,33 @@ def _seed_job(db, *, tier=TIER_60, **overrides) -> JobRecord:
     return record
 
 
+def _touch(job: JobRecord) -> TouchedJob:
+    return TouchedJob(
+        job_id=job.id, score=job.score, status=job.status, recommendation=job.recommendation
+    )
+
+
 def _settings(**overrides) -> Settings:
     data = {
         "automation_auto_prepare_enabled": True,
         "automation_shortlist_min_match_score": 0,
         "automation_shortlist_max_per_run": 10,
+        "automation_candidate_match_max_per_run": 100,
     }
     data.update(overrides)
     return Settings(**data)
 
 
-def _run_shortlist(db, settings, since=None) -> dict:
-    if since is None:
-        since = datetime.now(UTC) - timedelta(hours=1)
-    return asyncio.run(prepare_shortlist_drafts(db, run_started_at=since, settings=settings))
+def _run_shortlist(db, settings, jobs) -> dict:
+    touched = [_touch(job) for job in jobs]
+    return asyncio.run(prepare_shortlist_drafts(db, touched_jobs=touched, settings=settings))
 
 
-# --- A. Disabled by default -------------------------------------------------
+def _run_shortlist_raw(db, settings, touched_jobs) -> dict:
+    return asyncio.run(prepare_shortlist_drafts(db, touched_jobs=touched_jobs, settings=settings))
+
+
+# --- Disabled by default / unaffected when off -------------------------------
 
 
 class TestDisabledByDefault:
@@ -145,97 +174,132 @@ class TestDisabledByDefault:
             db.close()
 
     def test_enabled_scheduler_alone_does_not_imply_auto_prepare(self, session_factory):
-        # automation_auto_prepare_enabled defaults to False independently
-        # of any scheduler setting -- Settings() with no overrides at all
-        # already proves this (see test above); this test additionally
-        # pins the field's own default value directly.
         assert Settings().automation_auto_prepare_enabled is False
 
 
-# --- B. Candidate pool -------------------------------------------------------
+# --- S8C-STATUS-001: overall status aggregation -----------------------------
 
 
-class TestCandidatePool:
-    def test_pool_filters_by_last_seen_at_status_and_recommendation(self, session_factory):
+class TestOverallStatusAggregation:
+    def test_both_collectors_failed_stage8c_enabled_no_candidates_is_failed(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur",
+            _failing_collector(CollectorError("boom")),
+        )
+        monkeypatch.setattr(
+            "app.services.automation.run_xing", _failing_collector(CollectorError("boom"))
+        )
+
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            stale = since - timedelta(minutes=1)
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+            assert run.status == "FAILED"
+            results = json.loads(run.results_json)
+            assert results["shortlist_drafts"]["status"] == "ok"
+            assert results["shortlist_drafts"]["counters"]["candidate_jobs"] == 0
+        finally:
+            db.close()
 
-            included_new = _seed_job(db, status="NEW", recommendation="APPLY", last_seen_at=fresh)
-            included_saved = _seed_job(
-                db, status="SAVED", recommendation="MAYBE", last_seen_at=fresh
+    def test_both_collectors_not_configured_stage8c_enabled_is_failed(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur",
+            _failing_collector(CollectorNotConfiguredError("not configured")),
+        )
+        monkeypatch.setattr(
+            "app.services.automation.run_xing",
+            _failing_collector(CollectorNotConfiguredError("not configured")),
+        )
+
+        db = session_factory()
+        try:
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+            assert run.status == "FAILED"
+        finally:
+            db.close()
+
+    def test_one_success_one_failure_shortlist_ok_is_partial(self, session_factory, monkeypatch):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr(
+            "app.services.automation.run_xing", _failing_collector(CollectorError("boom"))
+        )
+
+        db = session_factory()
+        try:
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+            assert run.status == "PARTIAL"
+        finally:
+            db.close()
+
+    def test_both_success_shortlist_ok_is_completed(self, session_factory, monkeypatch):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        db = session_factory()
+        try:
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+            assert run.status == "COMPLETED"
+        finally:
+            db.close()
+
+    def test_both_success_shortlist_partial_is_partial(self, session_factory, monkeypatch):
+        db = session_factory()
+        try:
+            failing_job = _seed_job(db, tier=TIER_60, score=99)
+            healthy_job = _seed_job(db, tier=TIER_60, score=1)
+
+            async def _touching_bundesagentur(db, settings, *, touched_jobs=None):
+                if touched_jobs is not None:
+                    touched_jobs.append(_touch(failing_job))
+                    touched_jobs.append(_touch(healthy_job))
+                return await _noop_collector(db, settings)
+
+            monkeypatch.setattr(
+                "app.services.automation.run_bundesagentur", _touching_bundesagentur
             )
-            _seed_job(db, status="NEW", recommendation="APPLY", last_seen_at=stale)  # too old
-            _seed_job(db, status="APPLIED", recommendation="APPLY", last_seen_at=fresh)
-            _seed_job(db, status="INTERVIEW", recommendation="APPLY", last_seen_at=fresh)
-            _seed_job(db, status="OFFER", recommendation="APPLY", last_seen_at=fresh)
-            _seed_job(db, status="REJECTED", recommendation="APPLY", last_seen_at=fresh)
-            _seed_job(db, status="WITHDRAWN", recommendation="APPLY", last_seen_at=fresh)
-            _seed_job(db, status="NEW", recommendation="SKIP", last_seen_at=fresh)
-            _seed_job(db, status="NEW", recommendation="NEEDS_ENRICHMENT", last_seen_at=fresh)
+            monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
 
-            pool = get_current_cycle_candidate_jobs(db, since=since)
+            import app.services.automation_shortlist as shortlist_module
 
-            assert [job.id for job in pool] == sorted(
-                job.id for job in [included_new, included_saved]
+            original = shortlist_module.prepare_candidate_cv_draft_with_outcome
+
+            def _boom_for_failing_job(db, job_id, match_id, *, force_recompute):
+                if job_id == failing_job.id:
+                    raise RuntimeError("boom")
+                return original(db, job_id, match_id, force_recompute=force_recompute)
+
+            monkeypatch.setattr(
+                "app.services.automation_shortlist.prepare_candidate_cv_draft_with_outcome",
+                _boom_for_failing_job,
             )
-        finally:
-            db.close()
 
-    def test_pool_ordering_is_deterministic_ascending_by_id(self, session_factory):
-        db = session_factory()
-        try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            jobs = [_seed_job(db, last_seen_at=fresh) for _ in range(4)]
-
-            pool = get_current_cycle_candidate_jobs(db, since=since)
-
-            assert [job.id for job in pool] == sorted(job.id for job in jobs)
-        finally:
-            db.close()
-
-    def test_boundary_last_seen_at_equal_to_since_is_included(self, session_factory):
-        db = session_factory()
-        try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            job = _seed_job(db, last_seen_at=since)
-
-            pool = get_current_cycle_candidate_jobs(db, since=since)
-
-            assert [j.id for j in pool] == [job.id]
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+            assert run.status == "PARTIAL"
+            results = json.loads(run.results_json)
+            assert results["shortlist_drafts"]["status"] == "partial"
         finally:
             db.close()
 
 
-# --- C. Ranking --------------------------------------------------------------
+# --- Ranking ------------------------------------------------------------------
 
 
 class TestRanking:
     def test_ranked_by_match_score_desc_then_job_score_desc_then_id_asc(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
+            low = _seed_job(db, tier=TIER_20, score=10)
+            high_a = _seed_job(db, tier=TIER_60, score=50)
+            high_b_lower_job_score = _seed_job(db, tier=TIER_60, score=30)
+            mid = _seed_job(db, tier=TIER_40, score=99)
 
-            low = _seed_job(db, tier=TIER_20, score=10, last_seen_at=fresh)
-            high_a = _seed_job(db, tier=TIER_60, score=50, last_seen_at=fresh)
-            high_b_lower_job_score = _seed_job(db, tier=TIER_60, score=30, last_seen_at=fresh)
-            mid = _seed_job(db, tier=TIER_40, score=99, last_seen_at=fresh)
-
-            settings = _settings(
-                automation_shortlist_min_match_score=0, automation_shortlist_max_per_run=10
-            )
-            result = _run_shortlist(db, settings, since=since)
+            settings = _settings()
+            result = _run_shortlist(db, settings, [low, high_a, high_b_lower_job_score, mid])
 
             job_ids_in_order = [item["job_id"] for item in result["items"]]
-            # high tier (60) beats mid (40) beats low (20) regardless of
-            # JobRecord.score; WITHIN the same match-score tier, higher
-            # JobRecord.score (50 > 30) wins; id is never used as the
-            # primary or secondary key here since scores already differ
-            # for high_a vs high_b.
             assert job_ids_in_order == [high_a.id, high_b_lower_job_score.id, mid.id, low.id]
         finally:
             db.close()
@@ -243,15 +307,12 @@ class TestRanking:
     def test_tie_break_on_job_id_ascending_when_scores_are_identical(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-
-            job_a = _seed_job(db, tier=TIER_60, score=50, last_seen_at=fresh)
-            job_b = _seed_job(db, tier=TIER_60, score=50, last_seen_at=fresh)
-            job_c = _seed_job(db, tier=TIER_60, score=50, last_seen_at=fresh)
+            job_a = _seed_job(db, tier=TIER_60, score=50)
+            job_b = _seed_job(db, tier=TIER_60, score=50)
+            job_c = _seed_job(db, tier=TIER_60, score=50)
 
             settings = _settings()
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [job_a, job_b, job_c])
 
             job_ids_in_order = [item["job_id"] for item in result["items"]]
             assert job_ids_in_order == sorted([job_a.id, job_b.id, job_c.id])
@@ -261,13 +322,10 @@ class TestRanking:
     def test_max_per_run_caps_the_shortlist(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            for _ in range(5):
-                _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            jobs = [_seed_job(db, tier=TIER_60) for _ in range(5)]
 
             settings = _settings(automation_shortlist_max_per_run=2)
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, jobs)
 
             assert result["counters"]["matched"] == 5
             assert result["counters"]["shortlisted"] == 2
@@ -276,19 +334,17 @@ class TestRanking:
             db.close()
 
 
-# --- D. Threshold --------------------------------------------------------------
+# --- Threshold ------------------------------------------------------------------
 
 
 class TestThreshold:
     def test_below_threshold_gets_no_cv_or_bewerbung(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_20, last_seen_at=fresh)  # score 20, below 50
+            job = _seed_job(db, tier=TIER_20)  # score 20, below 50
 
             settings = _settings(automation_shortlist_min_match_score=50)
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [job])
 
             assert result["counters"]["matched"] == 1
             assert result["counters"]["shortlisted"] == 0
@@ -301,12 +357,10 @@ class TestThreshold:
     def test_threshold_boundary_itself_is_included(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            job = _seed_job(db, tier=TIER_60, last_seen_at=fresh)  # score exactly 60
+            job = _seed_job(db, tier=TIER_60)  # score exactly 60
 
             settings = _settings(automation_shortlist_min_match_score=60)
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [job])
 
             assert result["counters"]["shortlisted"] == 1
             assert result["items"][0]["job_id"] == job.id
@@ -315,7 +369,7 @@ class TestThreshold:
             db.close()
 
 
-# --- E. Match reuse ------------------------------------------------------------
+# --- Match reuse ------------------------------------------------------------
 
 
 class TestMatchReuse:
@@ -323,7 +377,6 @@ class TestMatchReuse:
         self, session_factory, monkeypatch
     ):
         call_count = 0
-        original = None
         import app.services.candidate_preparation as prep_module
 
         original = prep_module.compute_match
@@ -339,13 +392,11 @@ class TestMatchReuse:
 
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            _run_shortlist(db, settings, since=since)
-            _run_shortlist(db, settings, since=since)
+            _run_shortlist(db, settings, [job])
+            _run_shortlist(db, settings, [job])
 
             assert call_count == 1
             assert db.query(CandidateJobMatchRecord).count() == 1
@@ -353,7 +404,7 @@ class TestMatchReuse:
             db.close()
 
 
-# --- F. CV reuse -----------------------------------------------------------
+# --- CV reuse -----------------------------------------------------------------
 
 
 class TestCVReuse:
@@ -374,13 +425,11 @@ class TestCVReuse:
 
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            first = _run_shortlist(db, settings, since=since)
-            second = _run_shortlist(db, settings, since=since)
+            first = _run_shortlist(db, settings, [job])
+            second = _run_shortlist(db, settings, [job])
 
             assert call_count == 1
             assert db.query(CandidateCVDraftRecord).count() == 1
@@ -390,21 +439,61 @@ class TestCVReuse:
             db.close()
 
 
-# --- G. Bewerbung reuse ------------------------------------------------------
+# --- S8C-CACHE-001: race-safe CV created/reused -----------------------------
+
+
+class TestCVRaceSafety:
+    def test_lost_unique_race_is_reported_as_reused_not_created(self, session_factory, monkeypatch):
+        """Simulates a concurrent writer winning the CV draft's UNIQUE-
+        constraint race: create_draft's own INSERT-or-reload outcome
+        reports created=False even though no cache entry existed BEFORE
+        this call started. Stage 8C must trust that real outcome, not a
+        separate pre-check (S8C-CACHE-001) -- proving `cv_reused=True`/
+        `cv_created` counter stays 0 here is exactly what a
+        pre-check-then-call TOCTOU implementation would get wrong (it
+        would have seen "no cache entry" at pre-check time and wrongly
+        claimed cv_created=1).
+        """
+        import app.services.candidate_preparation as prep_module
+
+        original_create_draft = prep_module.create_draft
+
+        def _create_draft_loses_race(*args, **kwargs):
+            record, _created = original_create_draft(*args, **kwargs)
+            return record, False  # force "lost the race" outcome
+
+        monkeypatch.setattr(
+            "app.services.candidate_preparation.create_draft", _create_draft_loses_race
+        )
+
+        db = session_factory()
+        try:
+            job = _seed_job(db, tier=TIER_60)
+            assert db.query(CandidateCVDraftRecord).count() == 0  # nothing cached yet
+
+            settings = _settings()
+            result = _run_shortlist(db, settings, [job])
+
+            assert result["counters"]["cv_created"] == 0
+            assert result["counters"]["cv_reused"] == 1
+            assert result["items"][0]["cv_reused"] is True
+        finally:
+            db.close()
+
+
+# --- Bewerbung reuse ------------------------------------------------------
 
 
 class TestBewerbungReuse:
     def test_repeated_cycle_with_unchanged_inputs_creates_no_extra_bewerbung(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            first = _run_shortlist(db, settings, since=since)
-            second = _run_shortlist(db, settings, since=since)
-            third = _run_shortlist(db, settings, since=since)
+            first = _run_shortlist(db, settings, [job])
+            second = _run_shortlist(db, settings, [job])
+            third = _run_shortlist(db, settings, [job])
 
             assert db.query(BewerbungDraftRecord).count() == 1
             assert first["counters"]["bewerbung_created"] == 1
@@ -413,9 +502,9 @@ class TestBewerbungReuse:
             assert second["counters"]["bewerbung_reused"] == 1
             assert third["counters"]["bewerbung_created"] == 0
             assert third["counters"]["bewerbung_reused"] == 1
-            assert (
-                first["items"][0]["bewerbung_draft_id"] == second["items"][0]["bewerbung_draft_id"]
-            )
+            first_bewerbung_id = first["items"][0]["bewerbung_draft_id"]
+            second_bewerbung_id = second["items"][0]["bewerbung_draft_id"]
+            assert first_bewerbung_id == second_bewerbung_id
         finally:
             db.close()
 
@@ -424,20 +513,19 @@ class TestBewerbungReuse:
     ):
         """End-to-end proof through the real scheduler-triggered path
         (run_automation_cycle), not just the unit-level
-        prepare_shortlist_drafts call above -- a job whose collector
-        re-touches last_seen_at every cycle (exactly like a real
-        collector re-fetching it) must still only ever get ONE
+        prepare_shortlist_drafts call above -- a job the (fake) collector
+        touches every cycle must still only ever get ONE
         BewerbungDraftRecord across multiple automation cycles.
         """
         db = session_factory()
         try:
-            job = _seed_job(db, tier=TIER_60, last_seen_at=datetime.now(UTC) - timedelta(hours=2))
+            job = _seed_job(db, tier=TIER_60)
             job_id = job.id
 
-            async def _touch_job_collector(db, settings):
+            async def _touch_job_collector(db, settings, *, touched_jobs=None):
                 record = db.get(JobRecord, job_id)
-                record.last_seen_at = datetime.now(UTC)
-                db.commit()
+                if touched_jobs is not None:
+                    touched_jobs.append(_touch(record))
                 return await _noop_collector(db, settings)
 
             monkeypatch.setattr("app.services.automation.run_bundesagentur", _touch_job_collector)
@@ -459,7 +547,7 @@ class TestBewerbungReuse:
             db.close()
 
 
-# --- H. Changed inputs -----------------------------------------------------
+# --- Changed inputs -----------------------------------------------------
 
 
 class TestChangedInputsForceRegeneration:
@@ -468,18 +556,16 @@ class TestChangedInputsForceRegeneration:
     ):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            first = _run_shortlist(db, settings, since=since)
+            first = _run_shortlist(db, settings, [job])
 
             apply_candidate_profile_patch(
                 db, CandidateProfilePatchRequest(expected_profile_version=1, first_name="Anna")
             )
 
-            second = _run_shortlist(db, settings, since=since)
+            second = _run_shortlist(db, settings, [job])
 
             assert db.query(CandidateJobMatchRecord).count() == 2
             assert db.query(CandidateCVDraftRecord).count() == 2
@@ -497,18 +583,16 @@ class TestChangedInputsForceRegeneration:
     def test_job_snapshot_change_forces_new_match_cv_and_bewerbung(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            job = _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            first = _run_shortlist(db, settings, since=since)
+            first = _run_shortlist(db, settings, [job])
 
             job.must_have_skills_json = '["python"]'
             db.add(job)
             db.commit()
 
-            second = _run_shortlist(db, settings, since=since)
+            second = _run_shortlist(db, settings, [job])
 
             assert db.query(CandidateJobMatchRecord).count() == 2
             assert db.query(CandidateCVDraftRecord).count() == 2
@@ -520,7 +604,336 @@ class TestChangedInputsForceRegeneration:
             db.close()
 
 
-# --- I. Failure isolation ----------------------------------------------------
+# --- S8C-AUDIT-001: truthful CV audit on Bewerbung failure ------------------
+
+
+class TestTruthfulCVAudit:
+    def test_cv_committed_then_bewerbung_raises_is_reported_truthfully(
+        self, session_factory, monkeypatch, caplog
+    ):
+        db = session_factory()
+        try:
+            job = _seed_job(db, tier=TIER_60)
+
+            def _boom(db, job_id, cv_draft_id):
+                raise RuntimeError("secret-provider-detail")
+
+            monkeypatch.setattr("app.services.automation_shortlist.prepare_bewerbung_draft", _boom)
+
+            settings = _settings()
+            with caplog.at_level("DEBUG"):
+                result = _run_shortlist(db, settings, [job])
+
+            # The CV draft really is durable.
+            assert db.query(CandidateCVDraftRecord).count() == 1
+            real_cv_draft_id = db.query(CandidateCVDraftRecord).one().id
+
+            item = result["items"][0]
+            assert item["cv_draft_id"] == real_cv_draft_id
+            assert item["cv_reused"] is False  # truthfully CREATED, not reused
+            assert result["counters"]["cv_created"] == 1
+            assert result["counters"]["cv_reused"] == 0
+
+            assert db.query(BewerbungDraftRecord).count() == 0
+            assert item["bewerbung_draft_id"] is None
+            assert item["status"] == "failed"
+            assert item["phase"] == "bewerbung"
+            assert item["error_type"] == "RuntimeError"
+
+            assert result["counters"]["failed"] == 1
+            # Only one candidate job existed and it failed -- per the
+            # step-status rule ("all bounded candidates fail: step =
+            # failed"), this is correctly "failed", not "partial" (the
+            # already-committed CV draft above proves the audit is
+            # truthful regardless of this step-level label).
+            assert result["status"] == "failed"
+
+            failure = result["failures"][0]
+            assert failure["job_id"] == job.id
+            assert failure["phase"] == "bewerbung"
+            assert failure["error_type"] == "RuntimeError"
+
+            assert "secret-provider-detail" not in caplog.text
+            assert "secret-provider-detail" not in json.dumps(result)
+        finally:
+            db.close()
+
+
+# --- S8C-AUDIT-002: persisted match failure traceability --------------------
+
+
+class TestMatchFailureTraceability:
+    def test_match_failure_is_persisted_with_job_id_phase_and_error_type(
+        self, session_factory, monkeypatch
+    ):
+        db = session_factory()
+        try:
+            job = _seed_job(db, tier=TIER_60)
+
+            def _boom(db, job_id, *, force_recompute):
+                raise RuntimeError("another-secret-detail")
+
+            monkeypatch.setattr(
+                "app.services.automation_shortlist.prepare_candidate_job_match", _boom
+            )
+
+            settings = _settings()
+            result = _run_shortlist(db, settings, [job])
+
+            assert result["items"] == []  # never became a shortlist candidate
+            assert result["counters"]["failed"] == 1
+            assert result["counters"]["matched"] == 0
+
+            failure = result["failures"][0]
+            assert failure["job_id"] == job.id
+            assert failure["phase"] == "match"
+            assert failure["error_type"] == "RuntimeError"
+            assert "another-secret-detail" not in json.dumps(result)
+        finally:
+            db.close()
+
+
+# --- S8C-POOL-001: exact run attribution -------------------------------------
+
+
+class TestExactRunAttribution:
+    def test_job_not_touched_by_this_run_is_excluded_even_if_eligible(self, session_factory):
+        db = session_factory()
+        try:
+            untouched = _seed_job(db, tier=TIER_60)  # eligible in DB, but never "touched"
+            touched = _seed_job(db, tier=TIER_60)
+
+            settings = _settings()
+            result = _run_shortlist(db, settings, [touched])  # only `touched` is in the trace
+
+            job_ids = {item["job_id"] for item in result["items"]}
+            assert touched.id in job_ids
+            assert untouched.id not in job_ids
+            assert result["counters"]["candidate_jobs"] == 1
+        finally:
+            db.close()
+
+    def test_job_actually_touched_by_this_run_is_eligible(self, session_factory):
+        db = session_factory()
+        try:
+            job = _seed_job(db, tier=TIER_60)
+
+            settings = _settings()
+            result = _run_shortlist(db, settings, [job])
+
+            assert result["counters"]["candidate_jobs"] == 1
+            assert result["items"][0]["job_id"] == job.id
+        finally:
+            db.close()
+
+    def test_db_revalidation_excludes_a_job_whose_status_changed_after_touch(self, session_factory):
+        db = session_factory()
+        try:
+            job = _seed_job(db, tier=TIER_60)
+            touched = [_touch(job)]  # captured while still NEW
+
+            # A human (or another process) moves it to APPLIED before
+            # Stage 8C actually runs its DB revalidation.
+            job.status = "APPLIED"
+            db.add(job)
+            db.commit()
+
+            settings = _settings()
+            result = _run_shortlist_raw(db, settings, touched)
+
+            assert result["counters"]["candidate_jobs"] == 0
+            assert result["items"] == []
+        finally:
+            db.close()
+
+
+# --- S8C-POOL-001: collector trace correctness -------------------------------
+
+
+def _ba_job(**overrides) -> Job:
+    data = {
+        "source": "bundesagentur",
+        "title": "Python Developer",
+        "company": "Example GmbH",
+        "url": "https://www.arbeitsagentur.de/jobsuche/jobdetail/10000-1184867112-S",
+        "description": "General remote software engineering position.",
+        "source_reference": "10000-1184867112-S",
+        "skills": ["python"],
+    }
+    data.update(overrides)
+    return Job(**data)
+
+
+class _FakeBundesagenturCollector:
+    def __init__(self, jobs):
+        self._jobs = jobs
+        self.skipped_invalid_count = 0
+
+    async def fetch(self, since=None):
+        return self._jobs
+
+    async def fetch_detail(self, source_reference):
+        return None
+
+
+class TestCollectorTrace:
+    def test_persisted_job_is_recorded_and_failed_job_is_not(self, session_factory, monkeypatch):
+        good_job = _ba_job(title="Good Job", url="https://example.com/good")
+        bad_job = _ba_job(title="Bad Job", url="https://example.com/bad")
+
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: _FakeBundesagenturCollector([good_job, bad_job]),
+        )
+        monkeypatch.setattr("app.services.collector_runner.is_api_key_configured", lambda key: True)
+
+        import app.services.collector_runner as runner_module
+
+        original_score_and_persist = runner_module.score_and_persist
+
+        def _fail_for_bad_job(db, profile, job):
+            if job.title == "Bad Job":
+                raise RuntimeError("boom")
+            return original_score_and_persist(db, profile, job)
+
+        monkeypatch.setattr("app.services.collector_runner.score_and_persist", _fail_for_bad_job)
+
+        db = session_factory()
+        try:
+            settings = Settings(bundesagentur_api_key="key")
+            touched: list[TouchedJob] = []
+            counters = asyncio.run(run_bundesagentur(db, settings, touched_jobs=touched))
+
+            assert counters["created"] == 1
+            assert counters["failed"] == 1
+            assert len(touched) == 1
+
+            persisted_job = db.query(JobRecord).filter(JobRecord.title == "Good Job").one()
+            assert touched[0].job_id == persisted_job.id
+        finally:
+            db.close()
+
+    def test_notifier_and_research_failures_do_not_erase_an_already_recorded_touch(
+        self, session_factory, monkeypatch
+    ):
+        job = _ba_job(title="High Score Job", url="https://example.com/high")
+
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: _FakeBundesagenturCollector([job]),
+        )
+        monkeypatch.setattr("app.services.collector_runner.is_api_key_configured", lambda key: True)
+
+        async def _boom_notify(self, job, score):
+            raise RuntimeError("telegram-boom")
+
+        monkeypatch.setattr("app.services.collector_runner.TelegramNotifier.send_job", _boom_notify)
+
+        class _BoomCompanyResearchService:
+            async def get_or_run(self, db, record, settings):
+                raise RuntimeError("research-boom")
+
+        monkeypatch.setattr(
+            "app.services.collector_runner.CompanyResearchService", _BoomCompanyResearchService
+        )
+
+        db = session_factory()
+        try:
+            settings = Settings(
+                bundesagentur_api_key="key",
+                min_job_score_to_notify=0,
+                telegram_bot_token="token",
+                telegram_chat_id="chat",
+                company_research_auto_enabled=True,
+            )
+            touched: list[TouchedJob] = []
+            counters = asyncio.run(run_bundesagentur(db, settings, touched_jobs=touched))
+
+            assert counters["created"] == 1
+            assert len(touched) == 1
+        finally:
+            db.close()
+
+    def test_existing_callers_omitting_touched_jobs_are_unaffected(
+        self, session_factory, monkeypatch
+    ):
+        job = _ba_job(title="Untouched Sink Job", url="https://example.com/untouched")
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: _FakeBundesagenturCollector([job]),
+        )
+        monkeypatch.setattr("app.services.collector_runner.is_api_key_configured", lambda key: True)
+
+        db = session_factory()
+        try:
+            settings = Settings(bundesagentur_api_key="key")
+            counters = asyncio.run(run_bundesagentur(db, settings))  # no touched_jobs kwarg
+            assert counters["created"] == 1
+        finally:
+            db.close()
+
+
+# --- S8C-BOUND-001: bound matching work --------------------------------------
+
+
+class TestCandidateMatchBound:
+    def test_match_calls_never_exceed_the_configured_bound(self, session_factory, monkeypatch):
+        call_count = 0
+        import app.services.automation_shortlist as shortlist_module
+
+        original = shortlist_module.prepare_candidate_job_match
+
+        def _counting(db, job_id, *, force_recompute):
+            nonlocal call_count
+            call_count += 1
+            return original(db, job_id, force_recompute=force_recompute)
+
+        monkeypatch.setattr(
+            "app.services.automation_shortlist.prepare_candidate_job_match", _counting
+        )
+
+        db = session_factory()
+        try:
+            jobs = [_seed_job(db, tier=TIER_60, score=i) for i in range(10)]
+
+            settings = _settings(
+                automation_candidate_match_max_per_run=3, automation_shortlist_max_per_run=3
+            )
+            result = _run_shortlist(db, settings, jobs)
+
+            assert call_count <= 3
+            assert result["counters"]["candidate_jobs"] <= 3
+
+            # Deterministic preselection: the top-3 by JobRecord.score
+            # DESC (id ASC tie-break) must be exactly what got matched --
+            # jobs were seeded with score=0..9, so the top 3 are the last
+            # three seeded (score 9, 8, 7).
+            expected_ids = sorted([jobs[9].id, jobs[8].id, jobs[7].id])
+            matched_job_ids = sorted(item["job_id"] for item in result["items"])
+            assert matched_job_ids == expected_ids
+        finally:
+            db.close()
+
+    def test_bound_is_deterministic_across_repeated_calls(self, session_factory):
+        db = session_factory()
+        try:
+            jobs = [_seed_job(db, tier=TIER_60, score=i) for i in range(6)]
+
+            settings = _settings(
+                automation_candidate_match_max_per_run=2, automation_shortlist_max_per_run=2
+            )
+            first = _run_shortlist(db, settings, jobs)
+            db.rollback()
+            second = _run_shortlist(db, settings, jobs)
+
+            first_ids = sorted(item["job_id"] for item in first["items"])
+            second_ids = sorted(item["job_id"] for item in second["items"])
+            assert first_ids == second_ids
+        finally:
+            db.close()
+
+
+# --- Failure isolation ----------------------------------------------------
 
 
 class TestFailureIsolation:
@@ -529,14 +942,12 @@ class TestFailureIsolation:
     ):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            failing_job = _seed_job(db, tier=TIER_60, score=99, last_seen_at=fresh)
-            healthy_job = _seed_job(db, tier=TIER_60, score=1, last_seen_at=fresh)
+            failing_job = _seed_job(db, tier=TIER_60, score=99)
+            healthy_job = _seed_job(db, tier=TIER_60, score=1)
 
             import app.services.automation_shortlist as shortlist_module
 
-            original = shortlist_module.prepare_candidate_cv_draft
+            original = shortlist_module.prepare_candidate_cv_draft_with_outcome
 
             def _boom_for_failing_job(db, job_id, match_id, *, force_recompute):
                 if job_id == failing_job.id:
@@ -544,13 +955,13 @@ class TestFailureIsolation:
                 return original(db, job_id, match_id, force_recompute=force_recompute)
 
             monkeypatch.setattr(
-                "app.services.automation_shortlist.prepare_candidate_cv_draft",
+                "app.services.automation_shortlist.prepare_candidate_cv_draft_with_outcome",
                 _boom_for_failing_job,
             )
 
             settings = _settings()
             with caplog.at_level("DEBUG"):
-                result = _run_shortlist(db, settings, since=since)
+                result = _run_shortlist(db, settings, [failing_job, healthy_job])
 
             assert result["status"] == "partial"
             assert result["counters"]["failed"] == 1
@@ -558,13 +969,12 @@ class TestFailureIsolation:
 
             by_job_id = {item["job_id"]: item for item in result["items"]}
             assert by_job_id[failing_job.id]["status"] == "failed"
+            assert by_job_id[failing_job.id]["phase"] == "cv"
             assert by_job_id[failing_job.id]["error_type"] == "RuntimeError"
             assert by_job_id[failing_job.id]["cv_draft_id"] is None
             assert by_job_id[healthy_job.id]["status"] == "ok"
             assert by_job_id[healthy_job.id]["cv_draft_id"] is not None
 
-            # The healthy job's own draft really did get committed despite
-            # the other job's rollback.
             assert db.query(CandidateCVDraftRecord).count() == 1
             assert db.query(BewerbungDraftRecord).count() == 1
 
@@ -575,21 +985,19 @@ class TestFailureIsolation:
     def test_step_result_never_contains_raw_exception_text(self, session_factory, monkeypatch):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            job = _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             def _boom(db, job_id, match_id, *, force_recompute):
                 raise RuntimeError("another-secret-detail-xyz")
 
             monkeypatch.setattr(
-                "app.services.automation_shortlist.prepare_candidate_cv_draft", _boom
+                "app.services.automation_shortlist.prepare_candidate_cv_draft_with_outcome", _boom
             )
 
             settings = _settings()
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [job])
 
-            serialized = repr(result)
+            serialized = json.dumps(result)
             assert "another-secret-detail-xyz" not in serialized
             assert result["items"][0]["error_type"] == "RuntimeError"
             assert result["items"][0]["job_id"] == job.id
@@ -597,20 +1005,18 @@ class TestFailureIsolation:
             db.close()
 
 
-# --- J. Job status safety ---------------------------------------------------
+# --- Job status safety ---------------------------------------------------
 
 
 class TestJobStatusSafety:
     def test_new_and_saved_status_are_never_mutated_by_shortlisting(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            new_job = _seed_job(db, tier=TIER_60, status="NEW", last_seen_at=fresh)
-            saved_job = _seed_job(db, tier=TIER_60, status="SAVED", last_seen_at=fresh)
+            new_job = _seed_job(db, tier=TIER_60, status="NEW")
+            saved_job = _seed_job(db, tier=TIER_60, status="SAVED")
 
             settings = _settings()
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [new_job, saved_job])
 
             assert result["counters"]["shortlisted"] == 2
 
@@ -621,7 +1027,7 @@ class TestJobStatusSafety:
             db.close()
 
 
-# --- K. Human approval safety -------------------------------------------------
+# --- Human approval safety -------------------------------------------------
 
 
 class TestSafetyNoSendOrApprovalImports:
@@ -662,20 +1068,56 @@ class TestSafetyNoSendOrApprovalImports:
     def test_shortlist_run_creates_zero_review_or_send_side_effects(self, session_factory):
         db = session_factory()
         try:
-            since = datetime.now(UTC) - timedelta(hours=1)
-            fresh = since + timedelta(minutes=1)
-            _seed_job(db, tier=TIER_60, last_seen_at=fresh)
+            job = _seed_job(db, tier=TIER_60)
 
             settings = _settings()
-            result = _run_shortlist(db, settings, since=since)
+            result = _run_shortlist(db, settings, [job])
 
             assert result["counters"]["shortlisted"] == 1
-            # Only match/CV/Bewerbung rows exist -- proven exhaustively by
-            # the counts above in other tests; here we additionally prove
-            # no ApplicationPackageReviewRecord was created as a side
-            # effect of drafting.
-            from app.db.models import ApplicationPackageReviewRecord
-
             assert db.query(ApplicationPackageReviewRecord).count() == 0
         finally:
             db.close()
+
+
+# --- Backward compatibility --------------------------------------------------
+
+
+class TestBackwardCompatibility:
+    def test_old_collector_only_results_without_items_or_failures_still_deserialize(self):
+        old_style_results = {
+            "bundesagentur": {
+                "status": "ok",
+                "counters": {
+                    "fetched": 1,
+                    "created": 1,
+                    "updated": 0,
+                    "skipped_invalid": 0,
+                    "failed": 0,
+                },
+                "error_type": None,
+            },
+            "xing": {
+                "status": "not_configured",
+                "counters": None,
+                "error_type": "CollectorNotConfiguredError",
+            },
+        }
+        parsed = {
+            name: AutomationRunStepResult(**payload) for name, payload in old_style_results.items()
+        }
+        assert parsed["bundesagentur"].items is None
+        assert parsed["bundesagentur"].failures is None
+        assert parsed["xing"].status == "not_configured"
+
+        run = AutomationRun(
+            id=1,
+            account_key=ACCOUNT,
+            status="COMPLETED",
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:01:00+00:00",
+            results=old_style_results,
+            error_summary=None,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        assert run.results["bundesagentur"].items is None
+        assert run.results["bundesagentur"].failures is None

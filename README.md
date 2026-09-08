@@ -1732,8 +1732,9 @@ scheduler'а (`AUTOMATION_SCHEDULER_ENABLED=true`) НЕ включает
 
 ```bash
 AUTOMATION_AUTO_PREPARE_ENABLED=true
-AUTOMATION_SHORTLIST_MIN_MATCH_SCORE=80   # 0..100, дефолт 80
-AUTOMATION_SHORTLIST_MAX_PER_RUN=10       # 0..50, дефолт 10
+AUTOMATION_SHORTLIST_MIN_MATCH_SCORE=80        # 0..100, дефолт 80
+AUTOMATION_SHORTLIST_MAX_PER_RUN=10            # 0..50, дефолт 10
+AUTOMATION_CANDIDATE_MATCH_MAX_PER_RUN=100     # 1..500, дефолт 100, >= SHORTLIST_MAX_PER_RUN
 ```
 
 **Только черновики — никогда не отправка и не approval.** Этот этап
@@ -1744,19 +1745,51 @@ AUTOMATION_SHORTLIST_MAX_PER_RUN=10       # 0..50, дефолт 10
 ничего, никогда не меняет `Job.status` — шортлист НЕ эквивалентен статусу
 SAVED. Approval-границы Stage 6E/7D/7E полностью не тронуты.
 
-**Кандидатный пул текущего цикла.** Не сканирует всю историческую
-таблицу `jobs`. Отбираются только вакансии, которые ЭТОТ ран уже
-затронул: `JobRecord.last_seen_at >= automation_run.started_at`, статус
-`NEW`/`SAVED`, рекомендация `APPLY`/`MAYBE` (см.
-`app.db.repositories.get_current_cycle_candidate_jobs`).
+**Точная атрибуция текущего рана — не эвристика по timestamp'у.**
+Ранняя версия отбирала кандидатов через `JobRecord.last_seen_at >=
+automation_run.started_at` — Codex review (S8C-POOL-001) указал, что это
+могло случайно включить вакансию, обновлённую КОНКУРЕНТНЫМ раном для
+другого аккаунта или ручным вызовом эндпоинта в то же окно времени.
+Теперь `run_automation_cycle` создаёт один in-memory список
+`touched_jobs` (`app.services.collector_runner.TouchedJob`) и передаёт
+его ОБОИМ коллекторам; `run_bundesagentur`/`run_xing` добавляют туда
+запись СРАЗУ после каждого успешного commit'а — ДО best-effort Telegram/
+research side-effects, так что их сбой никогда не стирает уже
+записанный touch, а сбой самой персистентности вакансии — никогда не
+добавляет её. Существующие вызовы (`POST /collectors/*/run`, Telegram
+`/run bundesagentur`) не передают этот параметр и не меняют поведение.
+Кандидатами Stage 8C являются ИСКЛЮЧИТЕЛЬНО вакансии из этого списка —
+не blind-скан `jobs`, не timestamp-эвристика.
 
-**Матчинг + детерминированный шортлист.** Для каждой кандидатной вакансии
-вычисляется/переиспользуется `CandidateJobMatch` (`force_recompute=False`,
-без LLM/embeddings/сети — тот же детерминированный алгоритм, что и
-`POST /jobs/{id}/match`). Вакансии с `overall_score >=
+**Ограниченный (bounded) двухэтапный матчинг (S8C-BOUND-001).**
+`AUTOMATION_SHORTLIST_MAX_PER_RUN` ограничивает только финальное
+количество CV/Bewerbung черновиков — но до этой правки Stage 8C мог
+вычислить `CandidateJobMatch` для ВСЕХ вакансий, которые затронул ран,
+без верхней границы. Теперь применяется двухэтапный детерминированный
+policy:
+
+1. **Дешёвая preselection (в памяти, без БД).** `touched_jobs`
+   дедуплицируется по `job_id`, отфильтровывается по собственным
+   (cheap, captured-at-touch-time) `status`/`recommendation`, сортируется
+   `JobRecord.score DESC, job_id ASC`, обрезается до
+   `AUTOMATION_CANDIDATE_MATCH_MAX_PER_RUN` — ДО вычисления единого
+   `CandidateJobMatch`.
+2. **Ревалидация из БД.** Только этот ограниченный набор id
+   перезагружается (`app.db.repositories.get_jobs_by_ids_if_eligible`) и
+   ПОВТОРНО проверяется по `status IN (NEW, SAVED)`/`recommendation IN
+   (APPLY, MAYBE)` — БД всегда авторитетна: если статус вакансии
+   изменился между touch и подготовкой (например, вручную переведена в
+   `APPLIED`), она исключается здесь, даже если дешёвая preselection
+   считала её подходящей.
+3. Только для этого bounded/revalidated набора вычисляется
+   `CandidateJobMatch` (`force_recompute=False`, без LLM/embeddings/сети
+   — тот же детерминированный алгоритм, что и `POST /jobs/{id}/match`).
+
+**Финальный детерминированный шортлист.** Вакансии с `overall_score >=
 AUTOMATION_SHORTLIST_MIN_MATCH_SCORE` ранжируются: match score DESC →
 `JobRecord.score` DESC → `job.id` ASC (никогда randomness), берутся первые
-`AUTOMATION_SHORTLIST_MAX_PER_RUN`.
+`AUTOMATION_SHORTLIST_MAX_PER_RUN`. Это НЕ вероятность найма — только
+покрытие требований вакансии.
 
 **CV-черновик.** Для каждой шортлистнутой вакансии
 генерируется/переиспользуется `CandidateCVDraft` — та же кэш-семантика
@@ -1777,29 +1810,51 @@ scheduler не должен плодить идентичный Bewerbung каж
 `BewerbungDraftRecord` — только при реальном изменении (новая версия
 профиля, изменившийся снапшот вакансии) появляется новая запись.
 
-**Изоляция ошибок по вакансии.** Одна проблемная вакансия не блокирует
-остальные шортлистнутые. Каждая вакансия обрабатывается в своём
-try/except: при исключении — `db.rollback()`, в результат попадает
-только `job_id` + `type(exc).__name__` (никогда `str(exc)`/`repr(exc)`/
-traceback — тот же sanitized-logging convention, что и GMAIL-003/S8A-004),
-обработка продолжается со следующей вакансии. Шаг `shortlist_drafts`
-получает статус `partial`, если часть вакансий успешна, а часть — нет
-(`AutomationRunStepResult.status` расширен значением `"partial"`,
-обратно совместимо); общий `AutomationRun.status` наследует это как
-`PARTIAL`, как и для любого другого частично неудачного шага.
+**Изоляция ошибок по вакансии, честный CV-аудит (S8C-AUDIT-001).** Одна
+проблемная вакансия не блокирует остальные шортлистнутые. Match, CV и
+Bewerbung подготовка КАЖДОЙ вакансии — это ОТДЕЛЬНЫЕ try/except (не один
+общий): если CV успешно подготовлен и закоммичен, а ПОСЛЕ этого падает
+Bewerbung, `db.rollback()` Bewerbung-исключения откатывает только
+незакоммиченную попытку Bewerbung — уже закоммиченный CV draft он
+отменить не может и не должен. Соответствующий `ShortlistDraftItem`
+поэтому честно отражает реальный `cv_draft_id`/`cv_reused`, а
+`bewerbung_draft_id=null`, `status="failed"`, `phase="bewerbung"`. Каждая
+запись об ошибке — только `job_id` + `phase` + `type(exc).__name__`
+(никогда `str(exc)`/`repr(exc)`/traceback — тот же sanitized-logging
+convention, что и GMAIL-003/S8A-004). Шаг `shortlist_drafts` получает
+статус `partial`, если часть вакансий-кандидатов успешна, а часть —
+нет; `failed`, если ВСЕ провалились; `ok`, если провалов нет вообще
+(включая случай нулевых кандидатов).
+
+**Общий статус рана остаётся честным даже при "успешном" Stage 8C
+(S8C-STATUS-001).** До этой правки шаг `shortlist_drafts` со статусом
+`ok` (например, потому что кандидатов не нашлось) мог "повысить"
+`AutomationRun.status` до `PARTIAL`, даже если ОБА коллектора Stage 8A
+полностью упали. Теперь core-коллекторы (`bundesagentur`/`xing`)
+авторитетны для `FAILED`: если НИ ОДИН из них не завершился `ok`, общий
+статус рана — `FAILED`, независимо от исхода `shortlist_drafts`. Когда
+хотя бы один коллектор успешен, поведение прежнее (все шаги `ok` →
+`COMPLETED`, иначе → `PARTIAL`). При выключенном Stage 8C поведение
+идентично Stage 8A/8B.
 
 **Результат в `AutomationRun.results`.** Когда `AUTOMATION_AUTO_PREPARE_ENABLED=false`,
 `results` остаётся ТОЧНО такой же формы, как Stage 8A/8B (`bundesagentur`/
 `xing` — никакого fake disabled-шага). Когда включено, добавляется шаг
 `"shortlist_drafts"` со счётчиками (`candidate_jobs`, `matched`,
 `shortlisted`, `cv_created`, `cv_reused`, `bewerbung_created`,
-`bewerbung_reused`, `failed`) и списком `items` — по одной записи на
-каждую шортлистнутую вакансию (`job_id`, `match_id`, `match_score`,
+`bewerbung_reused`, `failed`), списком `items` — по одной записи на
+каждую ШОРТЛИСТНУТУЮ вакансию (`job_id`, `match_id`, `match_score`,
 `cv_draft_id`, `bewerbung_draft_id`, `cv_reused`, `bewerbung_reused`,
-`status`, `error_type`) — только техническая метадата, никогда имя
-кандидата/текст CV/текст Bewerbung/описание вакансии/email/секреты.
-Эта персистентная структура будет использована Stage 8E's Telegram
-daily digest.
+`status`, `phase`, `error_type`) — и списком `failures`
+(S8C-AUDIT-002) — по одной записи на КАЖДЫЙ технический сбой, включая
+вакансии, упавшие на этапе match'а и поэтому НЕ попавшие в шортлист
+(`job_id`, `phase` — `"match"`/`"cv"`/`"bewerbung"`, `error_type`).
+`items`/`failures` — оба опциональны (`None`) для старых записей и
+для Stage 8A-only шагов, так что уже сохранённые до этой правки
+`AutomationRun` строки продолжают десериализоваться без изменений. Всё
+это — только техническая метадата, никогда имя кандидата/текст CV/текст
+Bewerbung/описание вакансии/email/секреты. Эта персистентная структура
+будет использована Stage 8E's Telegram daily digest.
 
 ## Проверки
 ```bash

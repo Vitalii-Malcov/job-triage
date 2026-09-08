@@ -159,6 +159,14 @@ class Settings(BaseSettings):
     # threshold -- bounds both the DB writes and the size of the persisted
     # AutomationRun.results shortlist_drafts step per run.
     automation_shortlist_max_per_run: int = Field(default=10, ge=0, le=50)
+    # S8C-BOUND-001 (Codex review): bounds how many jobs THIS RUN touched
+    # ever get a CandidateJobMatch computed at all -- a cheap, deterministic
+    # JobRecord.score-DESC/id-ASC preselection (see
+    # app.services.automation_shortlist.prepare_shortlist_drafts) is applied
+    # BEFORE match computation, independent of (and always >=, see the
+    # validator below) automation_shortlist_max_per_run, which only bounds
+    # the FINAL CV/Bewerbung draft count after matching.
+    automation_candidate_match_max_per_run: int = Field(default=100, ge=1, le=500)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -244,6 +252,26 @@ class Settings(BaseSettings):
             raise ValueError(
                 "automation_scheduler_account_key must be set when "
                 "automation_scheduler_enabled=True"
+            )
+        return self
+
+    # S8C-BOUND-001 (Codex review): keeps the two-stage bound coherent --
+    # the cheap match-computation bound must be able to cover the final
+    # draft-preparation bound, or the shortlist could be silently starved
+    # of otherwise-eligible higher-scoring jobs purely by a misconfigured
+    # pair of limits. Skipped when automation_shortlist_max_per_run == 0
+    # (nothing will ever be drafted regardless, so no coherence constraint
+    # applies -- an operator may still want a match-only bound in that
+    # case for cheap experimentation/observability).
+    @model_validator(mode="after")
+    def _validate_candidate_match_bound_covers_shortlist(self) -> "Settings":
+        if (
+            self.automation_shortlist_max_per_run > 0
+            and self.automation_candidate_match_max_per_run < self.automation_shortlist_max_per_run
+        ):
+            raise ValueError(
+                "automation_candidate_match_max_per_run must be >= "
+                "automation_shortlist_max_per_run (unless automation_shortlist_max_per_run == 0)"
             )
         return self
 

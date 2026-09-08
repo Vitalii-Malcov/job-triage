@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "prepare_candidate_job_match",
     "prepare_candidate_cv_draft",
+    "prepare_candidate_cv_draft_with_outcome",
     "prepare_bewerbung_draft",
 ]
 
@@ -150,6 +151,39 @@ def prepare_candidate_cv_draft(
     compute_match (0 network) has already run in Stage 6B, and
     compute_cv_draft performs zero I/O of its own (no LLM, no network —
     section 29/42), so nothing here needs to await.
+
+    Thin wrapper around `prepare_candidate_cv_draft_with_outcome` that
+    discards the `created` flag — kept as its own function/signature so
+    the manual `POST /jobs/{id}/cv-draft` endpoint's behavior and return
+    type are completely unchanged (S8C-CACHE-001).
+    """
+    result = prepare_candidate_cv_draft_with_outcome(
+        db, job_id, match_id, force_recompute=force_recompute
+    )
+    if result is None:
+        return None
+    draft, _created = result
+    return draft
+
+
+def prepare_candidate_cv_draft_with_outcome(
+    db: Session, job_id: int, match_id: int, *, force_recompute: bool
+) -> tuple[TailoredCVDraft, bool] | None:
+    """Same computation as `prepare_candidate_cv_draft`, but additionally
+    exposes the REAL `created` outcome from
+    `app.db.candidate_cv_draft_repository.create_draft`'s own
+    INSERT-or-reload race handling (S8C-CACHE-001) — `created=True` only
+    for a genuinely fresh row THIS call inserted; `created=False` for
+    both an existing-cache-hit return AND for losing a concurrent
+    UNIQUE-constraint race (another writer's row is reloaded and
+    returned instead). Callers that need to know "did *I* just create
+    this, or was it already there/won by someone else" (Stage 8C's
+    cv_created/cv_reused counters) must use this function instead of
+    separately pre-checking `get_cached_draft(...)` before calling
+    `prepare_candidate_cv_draft` — that pre-check-then-call pattern is a
+    TOCTOU race: another writer can create the row in between, making
+    the pre-check's answer stale by the time this function's own insert
+    runs.
     """
     job = get_job_by_id(db, job_id)
     if job is None:
@@ -175,12 +209,12 @@ def prepare_candidate_cv_draft(
     if not force_recompute:
         existing = get_cached_draft(db, match_id=match_id, cv_adapter_version=CV_ADAPTER_VERSION)
         if existing is not None:
-            return to_tailored_cv_draft(existing)
+            return to_tailored_cv_draft(existing), False
 
     profile = to_candidate_profile_response(profile_record)
     match = to_candidate_job_match(match_record)
     data = compute_cv_draft(profile, match)
-    record, _created = create_draft(db, job_id, current_fingerprint, data)
+    record, created = create_draft(db, job_id, current_fingerprint, data)
 
     # Privacy-safe (Stage 6C section 41): technical metadata only, never
     # candidate name/summary/experience/project/skill/language content.
@@ -194,7 +228,7 @@ def prepare_candidate_cv_draft(
         CV_ADAPTER_VERSION,
         record.status,
     )
-    return to_tailored_cv_draft(record)
+    return to_tailored_cv_draft(record), created
 
 
 async def prepare_bewerbung_draft(

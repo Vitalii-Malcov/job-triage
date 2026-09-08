@@ -226,26 +226,34 @@ def list_jobs_by_status_after_id(
     return list(db.scalars(stmt).all())
 
 
-def get_current_cycle_candidate_jobs(db: Session, *, since: datetime) -> list[JobRecord]:
-    """Stage 8C: the pool of jobs eligible for automatic shortlist/CV/
-    Bewerbung draft preparation in ONE automation cycle -- jobs the
-    current cycle's own collectors first surfaced or refreshed
-    (`last_seen_at >= since`, the calling `AutomationRunRecord`'s own
-    `started_at`), never a blind scan of the entire historical `jobs`
-    table. `status` restricted to NEW/SAVED (APPLIED/INTERVIEW/OFFER/
-    REJECTED/WITHDRAWN jobs are already past the point where an automatic
-    draft is useful) and `recommendation` restricted to APPLY/MAYBE
-    (SKIP/NEEDS_ENRICHMENT jobs are deliberately excluded — see
-    app.models.job.Recommendation). Deterministic ascending-`id` ordering
-    (never `last_seen_at`, which two jobs can share and which a collector
-    can later revise) so repeated calls against the same snapshot see a
-    stable processing order — mirrors `list_jobs_by_status_after_id`'s own
-    keyset-ordering rationale above.
+def get_jobs_by_ids_if_eligible(db: Session, job_ids: list[int]) -> list[JobRecord]:
+    """Stage 8C (S8C-POOL-001, Codex review): the FINAL DB revalidation
+    step of the two-stage candidate-match bound (see
+    app.services.automation_shortlist.prepare_shortlist_drafts) -- given
+    an already bounded, already cheaply-preselected set of job ids (from
+    this automation run's own in-memory
+    app.services.collector_runner.TouchedJob attribution, never a blind
+    `last_seen_at` timestamp scan), reloads and re-checks each one's
+    CURRENT `status`/`recommendation` against the DB, which is always
+    authoritative. A job whose status/recommendation changed between
+    being touched and this revalidation (e.g. a human moved it to
+    APPLIED in the meantime) is excluded here even if the earlier cheap
+    preselection thought it eligible. `status` restricted to NEW/SAVED
+    (APPLIED/INTERVIEW/OFFER/REJECTED/WITHDRAWN jobs are already past the
+    point where an automatic draft is useful) and `recommendation`
+    restricted to APPLY/MAYBE (SKIP/NEEDS_ENRICHMENT jobs are
+    deliberately excluded — see app.models.job.Recommendation).
+    Deterministic ascending-`id` ordering, mirroring
+    `list_jobs_by_status_after_id`'s own keyset-ordering rationale above.
+    Returns `[]` immediately for an empty `job_ids` (never issues a
+    pointless `WHERE id IN ()` query).
     """
+    if not job_ids:
+        return []
     stmt = (
         select(JobRecord)
         .where(
-            JobRecord.last_seen_at >= since,
+            JobRecord.id.in_(job_ids),
             JobRecord.status.in_([ApplicationStatus.NEW.value, ApplicationStatus.SAVED.value]),
             JobRecord.recommendation.in_(["APPLY", "MAYBE"]),
         )

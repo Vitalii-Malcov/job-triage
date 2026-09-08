@@ -38,6 +38,7 @@ public contract, not an implementation detail of routes.py.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
@@ -66,11 +67,32 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CollectorError",
     "CollectorNotConfiguredError",
+    "TouchedJob",
     "run_bundesagentur",
     "run_company_research_for_job",
     "run_xing",
     "score_and_persist",
 ]
+
+
+@dataclass(frozen=True)
+class TouchedJob:
+    """S8C-POOL-001 (Codex review): a cheap, in-memory record of one job
+    THIS collector call actually persisted successfully — the run-local
+    attribution mechanism Stage 8C uses instead of inferring "touched by
+    this run" from `JobRecord.last_seen_at >= run.started_at` (which
+    could also match a job independently refreshed by a concurrent
+    collector run for a different account, or a manual endpoint call,
+    in the same time window). Carries only cheap technical fields
+    (never job content) so a caller can cheaply preselect/bound a large
+    candidate set before any DB re-query — see
+    `app.services.automation_shortlist.prepare_shortlist_drafts`.
+    """
+
+    job_id: int
+    score: int
+    status: str
+    recommendation: str
 
 
 def score_and_persist(
@@ -150,7 +172,9 @@ async def _maybe_auto_research(
         )
 
 
-async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
+async def run_bundesagentur(
+    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+) -> dict[str, int]:
     """Fetch + score + persist one Bundesagentur collector run.
 
     Shared by POST /collectors/bundesagentur/run, the Telegram control
@@ -161,6 +185,16 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
     upstream fetch ultimately fails — callers translate these into their
     own presentation (HTTP status code, chat message, or
     AutomationRunStepResult).
+
+    `touched_jobs` (S8C-POOL-001): optional kw-only sink. When provided,
+    every job this call successfully scores+persists is appended as a
+    `TouchedJob` immediately after that commit — BEFORE the best-effort
+    Telegram/auto-research side effects below, so a notification/research
+    failure can never remove an already-recorded touch. A job whose
+    scoring/persistence itself fails is never appended (see the
+    `except Exception` branch's `continue` above the touch point).
+    Existing callers (the API endpoint, the Telegram bot command) omit
+    this parameter entirely and see no behavior change whatsoever.
     """
     if not is_api_key_configured(settings.bundesagentur_api_key):
         raise CollectorNotConfiguredError(
@@ -263,6 +297,16 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
         else:
             updated_count += 1
 
+        if touched_jobs is not None:
+            touched_jobs.append(
+                TouchedJob(
+                    job_id=job_record.id,
+                    score=job_record.score,
+                    status=job_record.status,
+                    recommendation=job_record.recommendation,
+                )
+            )
+
         await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
 
         if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
@@ -307,12 +351,15 @@ async def run_bundesagentur(db: Session, settings) -> dict[str, int]:
     }
 
 
-async def run_xing(db: Session, settings) -> dict[str, int]:
+async def run_xing(
+    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+) -> dict[str, int]:
     """Fetch + score + persist one XING mailbox collector run.
 
     Shared by POST /collectors/xing/run, the Telegram control center's
     `/run xing` command, and Stage 8A's automation orchestrator — see
-    `run_bundesagentur` above for the same rationale.
+    `run_bundesagentur` above for the same rationale, including
+    `touched_jobs`'s exact semantics (S8C-POOL-001).
     """
     if not is_configured(settings.xing_mailbox_username) or not is_configured(
         settings.xing_mailbox_app_password
@@ -378,6 +425,16 @@ async def run_xing(db: Session, settings) -> dict[str, int]:
                 created_count += 1
             else:
                 updated_count += 1
+
+            if touched_jobs is not None:
+                touched_jobs.append(
+                    TouchedJob(
+                        job_id=job_record.id,
+                        score=job_record.score,
+                        status=job_record.status,
+                        recommendation=job_record.recommendation,
+                    )
+                )
 
             await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
 
