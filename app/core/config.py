@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.providers.email.base import (
@@ -109,6 +109,29 @@ class Settings(BaseSettings):
     # configurable delay entirely.
     follow_up_delay_days: int = Field(default=7, ge=1, le=90)
 
+    # Stage 8B scheduler (standalone `python -m app.scheduler` worker, never
+    # embedded in FastAPI's own process/lifespan -- see app/scheduler.py's
+    # module docstring for why: multiple Uvicorn workers must not each run
+    # their own independent timer loop). Disabled by default -- opt-in only.
+    # account_key is identity only (which account's automation to run), never
+    # a secret credential -- it is whatever app.services.automation's own
+    # account_key parameter already accepts (mirrors GMAIL_USERNAME's role
+    # elsewhere in this project).
+    automation_scheduler_enabled: bool = False
+    automation_scheduler_account_key: str = ""
+    # Bounded 60s..7 days: below 60s risks hammering the DB/collectors far
+    # faster than any real job source refreshes; above 7 days defeats the
+    # point of a "periodic" scheduler.
+    automation_scheduler_interval_seconds: int = Field(default=3600, ge=60, le=604_800)
+    # How often the standalone worker polls persisted schedule state to check
+    # whether a slot is due -- deliberately independent of
+    # automation_scheduler_interval_seconds (the actual run cadence): a small
+    # poll interval just keeps the worker responsive to a due slot without
+    # busy-looping. 15s is a sensible production default -- frequent enough
+    # that a due slot is claimed promptly, far below the interval floor above
+    # so it never itself becomes the bottleneck.
+    automation_scheduler_poll_seconds: int = Field(default=15, ge=1, le=3600)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
@@ -154,6 +177,22 @@ class Settings(BaseSettings):
         if len(stripped) > MAX_IMAP_HOST_LENGTH:
             raise ValueError(f"must not exceed {MAX_IMAP_HOST_LENGTH} characters")
         return stripped
+
+    # Stage 8B: fail closed at construction time rather than letting a
+    # blank account_key reach the standalone worker and either crash
+    # opaquely mid-poll-loop or (worse) silently poll nothing. Cross-field,
+    # so a model_validator, not a field_validator -- deliberately checked
+    # here (not only in app.services.scheduler.validate_scheduler_settings)
+    # so ANY Settings() construction with this combination fails the same
+    # way, not just the one the standalone worker happens to call.
+    @model_validator(mode="after")
+    def _validate_scheduler_requires_account_key_when_enabled(self) -> "Settings":
+        if self.automation_scheduler_enabled and not self.automation_scheduler_account_key.strip():
+            raise ValueError(
+                "automation_scheduler_account_key must be set when "
+                "automation_scheduler_enabled=True"
+            )
+        return self
 
 
 @lru_cache

@@ -40,7 +40,7 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 7E Follow-up Agent — eligibility только по real Gmail-подтверждённой хронологии (IMAP INTERNALDATE, никогда не sender-controlled `Date`/sync-order-зависимый `received_at`), approve/reject + отправка, per-Gmail-thread lock с lease-renewal heartbeat против гонки с Gmail sync.
 8. Autonomous Orchestrator — по подэтапам:
    - [x] 8A Orchestrator Foundation — persisted `AutomationRun` + сервис-оркестратор, координирующий существующие Bundesagentur/XING коллекторы в один ручной/синхронный цикл (`POST /api/v1/automation/runs`); без scheduler/cron, без auto-send заявок или email, без обхода существующих approval-gate'ов.
-   - [ ] 8B Scheduler/cron (будущий этап)
+   - [x] 8B Scheduler/cron — реализовано на feature-ветке (`feat/stage-8b-scheduler`, не смёржено), см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
 
 ## Запуск
 ```bash
@@ -443,6 +443,129 @@ relevant facts; если refresh не удался, но показан стар
 `app/collectors/bundesagentur.py` (внешний job source, не Company
 Research); секреты не нужны для дефолтного provider'а, для будущих
 провайдеров — только через `Settings`/env.
+
+## Automation Scheduler (Stage 8B)
+
+**Статус: реализовано на feature-ветке `feat/stage-8b-scheduler`, не
+смёржено в `main`.** Периодически (по конфигурируемому интервалу)
+запускает СУЩЕСТВУЮЩИЙ Stage 8A `app.services.automation.run_automation_cycle(...)`
+— тот же orchestrator, что вызывает `POST /api/v1/automation/runs` —
+без единой новой строчки логики сбора/скоринга/dedup/отправки. Ничего
+из Stage 8A не переопределено: та же per-account concurrency защита
+(RUNNING lease), тот же fail-closed contract, то же отсутствие
+auto-send заявок/писем.
+
+**Opt-in, выключено по умолчанию.** `AUTOMATION_SCHEDULER_ENABLED=false`
+— дефолт. Если включить (`true`), `AUTOMATION_SCHEDULER_ACCOUNT_KEY`
+обязателен — пустое значение при включённом scheduler'е падает с
+понятной ошибкой конфигурации **уже на этапе создания `Settings`**
+(`app.core.config.Settings`'s `model_validator`), а не где-то посреди
+polling loop'а. `account_key` — это identity (какой аккаунт
+автоматизировать), не секрет.
+
+**Отдельный standalone worker-процесс, НЕ embedded в FastAPI.**
+```bash
+python -m app.scheduler
+```
+Намеренно не встроен в `app.main`'s lifespan — прод-деплой может
+поднимать несколько Uvicorn worker-процессов (или несколько инстансов
+за балансировщиком); если бы каждый из них сам поднимал свой таймер,
+один и тот же аккаунт автоматизировался бы N раз одновременно вместо
+одного раза. `python -m app.scheduler` — это отдельный процесс,
+который деплоящий явно поднимает ровно один раз. Ни APScheduler, ни
+Celery, ни другой scheduler-зависимости не добавлено — только
+Python stdlib (`asyncio.sleep` poll loop) + существующая SQLAlchemy
+архитектура.
+
+**Переменные окружения (`.env`):**
+```bash
+AUTOMATION_SCHEDULER_ENABLED=true
+AUTOMATION_SCHEDULER_ACCOUNT_KEY=you@example.com
+AUTOMATION_SCHEDULER_INTERVAL_SECONDS=3600   # 60..604800 (1 мин..7 дней)
+AUTOMATION_SCHEDULER_POLL_SECONDS=15         # 1..3600
+```
+`AUTOMATION_SCHEDULER_INTERVAL_SECONDS` — как часто реально запускается
+цикл автоматизации. `AUTOMATION_SCHEDULER_POLL_SECONDS` — как часто
+worker проверяет persisted schedule state на предмет "не наступил ли
+due slot"; независимая, обычно намного меньшая величина.
+
+**Persisted schedule state.** Новая таблица `automation_schedules`
+(миграция `4fb941b18aff`, `app.db.models.AutomationScheduleRecord`) —
+одна строка на аккаунт: `account_key` (DB-enforced UNIQUE),
+`next_run_at`, `last_claimed_at`, `last_run_id` (informational pointer
+на последний триггернутый `AutomationRunRecord`, не FK-зависимость для
+корректности), `created_at`/`updated_at`. Ничего из `automation_runs`
+(Stage 8A) не дублируется.
+
+**Multi-process safety — atomic CAS claim, не in-memory lock.**
+`app.db.automation_schedule_repository.claim_due_schedule` делает ОДИН
+атомарный `UPDATE ... WHERE account_key = :account_key AND next_run_at
+= :observed_next_run_at AND next_run_at <= :now`, который в этом же
+statement сразу сдвигает `next_run_at` в будущее. Два конкурентных
+scheduler-процесса, наблюдающих один и тот же due slot, никогда оба не
+выигрывают — ровно один claim побеждает (`rowcount == 1`), проигравший
+получает `None` и ничего не делает. Обычный портируемый SQL (plain
+conditional `UPDATE`), без `SELECT ... FOR UPDATE`, без SQLite-only
+конструкций — идентично компилируется и работает на SQLite и
+PostgreSQL (см. `tests/test_automation_schedule_migration.py`). Не
+полагается на in-memory locks, process-local singleton, количество
+FastAPI worker'ов или filesystem locks.
+
+**Coalescing scheduling — без catch-up storm.** Если несколько
+интервалов было пропущено (машина/worker были offline), при возврате
+online происходит РОВНО ОДИН запуск, не replay пропущенных интервалов.
+Побеждающий claim сдвигает `next_run_at` на `now + interval_seconds`
+относительно момента claim'а, а не `previous_next_run_at +
+interval_seconds`, повторённое N раз. Пример: интервал 1 час, машина
+офлайн 5 часов — при рестарте наступает ровно один due slot, claim
+происходит один раз, `next_run_at = now + 1 час`; пять исторических
+циклов НЕ запускаются.
+
+**Первичная инициализация.** Первый старт scheduler'а для аккаунта,
+у которого ещё нет строки в `automation_schedules`, создаёт её сразу
+как due (`next_run_at = now`) — первый цикл может запуститься сразу,
+дальнейшие следуют обычному интервалу.
+
+**Fail-closed at-most-once slot claim (осознанный tradeoff).**
+`next_run_at` сдвигается в будущее КАК ЧАСТЬ того же claim UPDATE, ДО
+вызова `run_automation_cycle`. Если worker-процесс падает после
+успешного claim, но до/во время самого запуска — этот один slot
+пропускается, без retry storm; следующий обычный интервал остаётся
+запланированным как обычно. В Stage 8B намеренно НЕТ отдельной
+heartbeat/lease-подсистемы для schedule-claim'ов — существующий
+`AutomationRunRecord.lease_holder`/`lease_expires_at` (Stage 8A) уже
+защищает владение самим RUNNING run'ом, как только тот стартовал;
+городить вторую lease-систему поверх schedule slot'а было бы избыточно
+для failure mode, уже ограниченного "подождать следующий обычный
+интервал".
+
+**Обработка результатов.** После выигранного claim'а вызывается
+СУЩЕСТВУЮЩИЙ `run_automation_cycle(...)`: успешный прогон — `last_run_id`
+обновляется (best-effort, отдельная неудача этого шага не валит итерацию
+poll loop'а), логируется `run_id`/`status`.
+`AutomationRunAlreadyInProgressError` и `AutomationRunLeaseLostError` —
+оба поглощаются с sanitized-логом, без немедленного retry, до
+следующего обычного интервала. Любое неожиданное исключение —
+`db.rollback()` + лог только `type(exc).__name__` (никогда
+`logger.exception`, `exc_info=True`, `str(exc)` или сырой traceback) —
+и poll loop продолжает работать на следующей итерации, если только не
+запрошено graceful shutdown.
+
+**Безопасность / границы.** Stage 8B может автоматически триггерить
+ТОЛЬКО существующий Stage 8A automation cycle. Не отправляет заявки, не
+approve'ит ничего, не отправляет Bewerbung, не отправляет Gmail-ответы
+или follow-up'ы, не обходит approval state, не создаёт auto-approval, не
+меняет safety-границы Stage 7D/7E. Существующие collector-side Telegram
+уведомления остаются ровно такими, как их уже вызывает Stage 8A.
+`app/services/scheduler.py`/`app/scheduler.py` не импортируют ни одного
+send/approval-модуля (`tests/test_scheduler_service.py`'s
+`TestSafetyNoSendOrApprovalImports`).
+
+**Graceful shutdown.** `python -m app.scheduler` останавливается по
+Ctrl+C/`KeyboardInterrupt` — каждая polling-итерация открывает и
+закрывает свою собственную `Session` (никогда одна long-lived Session на
+весь процесс), поэтому прерывание не оставляет висящих
+соединений/ресурсов.
 
 ## Candidate Profile (Stage 6A)
 

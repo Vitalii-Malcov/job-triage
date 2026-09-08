@@ -1955,3 +1955,79 @@ class AutomationRunRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
+
+
+class AutomationScheduleRecord(Base):
+    """Stage 8B: one persisted row per account tracking when its next
+    scheduled `app.services.automation.run_automation_cycle` cycle is
+    due. This table owns ONLY schedule-arbitration state -- it never
+    duplicates anything already recorded by `AutomationRunRecord`
+    (status/results/lease); `last_run_id` is a plain informational
+    pointer to the most recent triggered run, not a foreign key this
+    table depends on for correctness.
+
+    **One row per account.** `account_key` is DB-enforced UNIQUE
+    (`uq_automation_schedules_account_key`) -- the same normalized
+    identity `AutomationRunRecord.account_key` already uses (mirrors
+    GMAIL-002's convention elsewhere in this project).
+
+    **Multi-process claim (fail-closed, at-most-once).** `next_run_at` is
+    the sole arbiter of "is a slot due right now, and has it already been
+    claimed". `app.db.automation_schedule_repository.claim_due_schedule`
+    performs a single atomic `UPDATE ... WHERE account_key = :account_key
+    AND next_run_at = :observed_next_run_at AND next_run_at <= :now` --
+    exactly one concurrent claimer's UPDATE can ever match a given
+    `next_run_at` value (every winning claim immediately moves
+    `next_run_at` into the future as part of the SAME statement), so two
+    scheduler processes racing the same due slot can never both trigger a
+    cycle. This is a plain conditional UPDATE (portable SQL), not a
+    SELECT ... FOR UPDATE row lock or any SQLite-only construct -- it
+    compiles and behaves identically on SQLite and PostgreSQL (see
+    tests/test_automation_schedule_migration.py).
+
+    **Coalescing, not catch-up.** A winning claim advances `next_run_at`
+    to `now + interval_seconds` (relative to the claim moment), never to
+    `previous_next_run_at + interval_seconds` repeated N times -- so a
+    worker that was offline for many missed intervals runs exactly ONE
+    cycle on return, then resumes its normal cadence. There is
+    deliberately no backlog/replay queue.
+
+    **At-most-once, not exactly-once (accepted tradeoff).** `next_run_at`
+    is advanced as part of the SAME claim UPDATE that "reserves" the
+    slot, BEFORE `run_automation_cycle` is ever called. If the worker
+    process crashes after a successful claim but before (or during) that
+    call, this single slot is simply skipped -- there is no separate
+    heartbeat/lease/retry subsystem for schedule claims in Stage 8B (the
+    existing `AutomationRunRecord.lease_holder`/`lease_expires_at` from
+    Stage 8A already protects the ACTUAL run's ownership once it starts;
+    stacking a second lease system on top of the schedule slot itself
+    would be redundant machinery for a failure mode already bounded by
+    "wait for the next normal interval").
+
+    **No first-run backlog.** `app.db.automation_schedule_repository.get_or_create_schedule`
+    seeds a brand-new row with `next_run_at = now` (immediately due) --
+    the deterministic "first scheduler start creates a due schedule, can
+    run immediately" semantics this stage documents, not an arbitrary
+    delay before the very first cycle.
+    """
+
+    __tablename__ = "automation_schedules"
+    __table_args__ = (UniqueConstraint("account_key", name="uq_automation_schedules_account_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("automation_runs.id"), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )

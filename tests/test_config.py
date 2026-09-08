@@ -126,3 +126,60 @@ def test_gmail_imap_host_rejects_length_254():
 def test_gmail_username_and_mailbox_are_stripped_of_surrounding_whitespace():
     settings = Settings(gmail_mailbox="  INBOX  ")
     assert settings.gmail_mailbox == "INBOX"
+
+
+# ---------------------------------------------------------------------------
+# Stage 8B: scheduler configuration -- disabled by default, fail-closed if
+# enabled without an account_key, bounded interval/poll settings.
+# ---------------------------------------------------------------------------
+
+
+def test_automation_scheduler_disabled_by_default():
+    settings = Settings()
+    assert settings.automation_scheduler_enabled is False
+    assert settings.automation_scheduler_account_key == ""
+
+
+def test_automation_scheduler_enabled_with_blank_account_key_fails_closed():
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_enabled=True, automation_scheduler_account_key="")
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_enabled=True, automation_scheduler_account_key="   ")
+
+
+def test_automation_scheduler_enabled_with_account_key_is_valid():
+    settings = Settings(
+        automation_scheduler_enabled=True, automation_scheduler_account_key="me@example.com"
+    )
+    assert settings.automation_scheduler_enabled is True
+    assert settings.automation_scheduler_account_key == "me@example.com"
+
+
+def test_automation_scheduler_disabled_with_blank_account_key_is_still_valid():
+    """Disabled is the safe default -- a blank account_key must never be
+    rejected just because the scheduler happens to be off."""
+    settings = Settings(automation_scheduler_enabled=False, automation_scheduler_account_key="")
+    assert settings.automation_scheduler_enabled is False
+
+
+def test_automation_scheduler_interval_seconds_default_and_bounds():
+    assert Settings().automation_scheduler_interval_seconds == 3600
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_interval_seconds=59)
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_interval_seconds=604_801)
+
+
+def test_automation_scheduler_interval_seconds_accepts_boundary_values():
+    lower = Settings(automation_scheduler_interval_seconds=60)
+    assert lower.automation_scheduler_interval_seconds == 60
+    upper = Settings(automation_scheduler_interval_seconds=604_800)
+    assert upper.automation_scheduler_interval_seconds == 604_800
+
+
+def test_automation_scheduler_poll_seconds_default_and_bounds():
+    assert Settings().automation_scheduler_poll_seconds == 15
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_poll_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_poll_seconds=3601)
