@@ -168,7 +168,7 @@ class TestRunGmailSync:
     def test_successful_run_reports_counts(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             self._inbox_only_provider_factory([_parsed(1), _parsed(2)]),
         )
 
@@ -186,7 +186,7 @@ class TestRunGmailSync:
     def test_second_run_reports_duplicates(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             self._inbox_only_provider_factory([_parsed(1), _parsed(2)]),
         )
 
@@ -214,7 +214,7 @@ class TestRunGmailSync:
             uid = 1 if mailbox == "INBOX" else 2
             return FakeProvider(messages=[_parsed(uid, mailbox=mailbox)])
 
-        monkeypatch.setattr("app.api.routes.GmailImapProvider", factory)
+        monkeypatch.setattr("app.services.gmail_sync.GmailImapProvider", factory)
 
         response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
 
@@ -226,7 +226,7 @@ class TestRunGmailSync:
     def test_auth_error_returns_502(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(error=GmailAuthError("login rejected")),
         )
 
@@ -237,7 +237,7 @@ class TestRunGmailSync:
     def test_connection_error_returns_502(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(error=GmailConnectionError("boom")),
         )
 
@@ -248,7 +248,7 @@ class TestRunGmailSync:
     def test_sync_response_never_contains_message_content(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1, subject="Secret subject")]),
         )
 
@@ -267,7 +267,7 @@ class TestRunGmailSync:
     def test_gmail_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1)]),
         )
         monkeypatch.setattr("app.security.rate_limit.GMAIL_RATE_LIMIT_REQUESTS", 1)
@@ -300,7 +300,7 @@ class TestGmailSyncErrorSanitization:
         test_client, _ = client
         poisoned_message = " ".join(self.SECRET_MARKERS)
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(error=GmailConnectionError(poisoned_message)),
         )
 
@@ -326,7 +326,7 @@ class TestGetGmailMessagesAndThreads:
         def boom(**kwargs):
             raise AssertionError("GET must never construct/trigger a mailbox provider")
 
-        monkeypatch.setattr("app.api.routes.GmailImapProvider", boom)
+        monkeypatch.setattr("app.services.gmail_sync.GmailImapProvider", boom)
 
         response = test_client.get("/api/v1/gmail/messages", headers=_auth_headers())
         assert response.status_code == 200
@@ -335,7 +335,7 @@ class TestGetGmailMessagesAndThreads:
     def test_list_messages_after_sync(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1), _parsed(2)]),
         )
         test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
@@ -353,7 +353,7 @@ class TestGetGmailMessagesAndThreads:
     def test_pagination_limit_and_offset_applied(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(
                 messages=[_parsed(uid) for uid in range(1, 6)],
             ),
@@ -374,7 +374,7 @@ class TestGetGmailMessagesAndThreads:
     def test_get_message_by_id_returns_full_message(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1, subject="Interview invite")]),
         )
         test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
@@ -394,7 +394,7 @@ class TestGetGmailMessagesAndThreads:
     def test_list_threads_after_sync(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1), _parsed(2)]),
         )
         test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
@@ -416,7 +416,7 @@ class TestGmailMessageSummaryVsDetail:
     def test_list_excludes_body_plain_and_full_recipients(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(
                 messages=[_parsed(1, body_plain="Confidential recruiter message body")]
             ),
@@ -437,7 +437,7 @@ class TestGmailMessageSummaryVsDetail:
     def test_detail_includes_body_plain(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(
                 messages=[_parsed(1, body_plain="Confidential recruiter message body")]
             ),
@@ -456,7 +456,7 @@ class TestGmailThreadDetail:
     def test_thread_detail_returns_bounded_message_list(self, client, monkeypatch):
         test_client, _ = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(
                 messages=[
                     _parsed(1, message_id="<root@example.com>"),
@@ -532,7 +532,7 @@ class TestGmailInboxIsReadOnly:
     def test_sync_does_not_create_any_job_records(self, client, monkeypatch):
         test_client, session_factory = client
         monkeypatch.setattr(
-            "app.api.routes.GmailImapProvider",
+            "app.services.gmail_sync.GmailImapProvider",
             lambda **kwargs: FakeProvider(messages=[_parsed(1), _parsed(2)]),
         )
 

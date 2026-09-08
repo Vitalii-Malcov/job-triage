@@ -2031,3 +2031,97 @@ class AutomationScheduleRecord(Base):
         onupdate=lambda: datetime.now(UTC),
         nullable=False,
     )
+
+
+class AutomationMailProgressRecord(Base):
+    """Stage 8D: one persisted row per account tracking how far the
+    Gmail response-draft cycle and the follow-up proposal cycle have
+    each progressed -- crash-safe resumption state for
+    `app.services.automation_gmail`/`app.services.automation_follow_up`,
+    analogous to `AutomationScheduleRecord`'s "one row per account"
+    shape but for IN-RUN processing cursors rather than run-scheduling.
+
+    **Why a persisted cursor, not an in-memory "messages touched this
+    run" list.** `app.providers.email.imap.GmailImapProvider` (Stage 7A)
+    deliberately skips already-persisted UIDs on every sync (see
+    `get_known_uids`) -- so if a process crashes AFTER a Gmail message is
+    persisted but BEFORE it is analyzed/drafted, an in-memory-only
+    "touched this run" design would lose that message forever: no later
+    sync would ever re-surface it. `gmail_after_message_id` instead
+    anchors progress to `GmailMessageRecord.id` itself (already-persisted,
+    monotonic, account-scoped), so a crash mid-cycle only ever costs
+    re-attempting the SAME message range on the next run -- never a
+    silently skipped one.
+
+    **Two independent cursors, two independent semantics.** Gmail message
+    processing is a one-directional catch-up scan (oldest-first, never
+    reset -- see `gmail_after_message_id`'s own column comment) — new
+    messages simply get larger ids and are naturally reached later. Follow
+    -up scanning is a bounded ROUND-ROBIN over currently-`APPLIED` jobs
+    (see `follow_up_after_job_id`'s own column comment) -- it must
+    eventually wrap back to the oldest APPLIED job so a job that becomes
+    newly due (purely because time passed) is periodically re-checked,
+    which a one-directional cursor could never achieve on its own.
+
+    **`account_key` (mirrors GMAIL-002's convention elsewhere).** DB
+    -enforced UNIQUE (`uq_automation_mail_progress_account_key`) -- one
+    row per account, same normalized identity
+    `AutomationRunRecord.account_key` already uses.
+
+    **Concurrency (CAS, not blind writes) — S8D-PROGRESS.**
+    `app.db.automation_mail_progress_repository.advance_gmail_cursor`/
+    `advance_follow_up_cursor` perform a single atomic `UPDATE ... WHERE
+    account_key = :account_key AND <cursor column> = :expected_cursor`
+    -- exactly like `claim_due_schedule`'s CAS. `AutomationRunRecord`'s
+    own lease/heartbeat already prevents ordinary same-account
+    concurrency, but a run that briefly continues after losing its lease
+    (heartbeat renewal races a replacement run's claim) must never be
+    able to silently clobber a NEWER owner's already-advanced progress --
+    the CAS's `expected_cursor` mismatch makes that fail closed instead,
+    exactly mirroring the run-level lease's own fail-closed contract.
+
+    No email content lives here -- only technical integer cursors.
+    """
+
+    __tablename__ = "automation_mail_progress"
+    __table_args__ = (
+        UniqueConstraint("account_key", name="uq_automation_mail_progress_account_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False)
+
+    # The largest GmailMessageRecord.id fully processed (analyzed +
+    # response-draft-or-NO_RESPONSE_RECOMMENDED persisted) so far, for
+    # this account. NULL means "no message ever fully processed yet" --
+    # the next scan starts from the oldest stored message
+    # (`id > NULL` is never true in SQL, so
+    # app.db.gmail_repository's Stage 8D scan helper treats NULL as "no
+    # lower bound" in Python, not as a literal SQL comparison). NEVER
+    # reset to NULL once advanced -- unlike follow_up_after_job_id below,
+    # this cursor is a one-directional catch-up scan; new messages always
+    # get larger ids and are naturally reached without ever needing a
+    # wrap-around.
+    gmail_after_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # The largest JobRecord.id (status=APPLIED) fully evaluated for
+    # follow-up eligibility so far, in the CURRENT round-robin pass, for
+    # this account. NULL means "start the pass from the oldest currently
+    # -APPLIED job". UNLIKE gmail_after_message_id, this IS periodically
+    # reset back to NULL (via the same CAS primitive) once a full pass
+    # reaches the end of currently-APPLIED jobs -- see
+    # app.services.automation_follow_up's module docstring for the
+    # wrap-around rationale (a job's follow-up eligibility can become due
+    # purely because time passed, with no new Gmail activity to "wake" it,
+    # so periodic re-scanning from the top is required).
+    follow_up_after_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )

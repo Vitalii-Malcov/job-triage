@@ -704,6 +704,30 @@ def list_messages(
     return list(db.scalars(stmt).all())
 
 
+def list_messages_by_id_after(
+    db: Session, account_key: str, *, after_id: int | None, limit: int
+) -> list[GmailMessageRecord]:
+    """Stage 8D: deterministic KEYSET pagination by `GmailMessageRecord.id`
+    -- mirrors `app.db.repositories.list_jobs_by_status_after_id`'s own
+    keyset-ordering rationale (S7E-006): ordering ASCENDING by `id`
+    (never `list_messages`' own `received_at DESC` UI-listing order) and
+    filtering `id > after_id` guarantees every message for this account
+    is eventually reached exactly once, regardless of total count, so a
+    new Stage 8D installation naturally starts from the OLDEST stored
+    message and gradually catches up. `after_id=None` means "no lower
+    bound yet" (nothing processed for this account so far).
+    """
+    stmt = (
+        select(GmailMessageRecord)
+        .where(GmailMessageRecord.account_key == account_key)
+        .order_by(GmailMessageRecord.id.asc())
+        .limit(limit)
+    )
+    if after_id is not None:
+        stmt = stmt.where(GmailMessageRecord.id > after_id)
+    return list(db.scalars(stmt).all())
+
+
 def get_thread_by_id(db: Session, account_key: str, thread_id: int) -> GmailThreadRecord | None:
     return db.scalar(
         select(GmailThreadRecord).where(

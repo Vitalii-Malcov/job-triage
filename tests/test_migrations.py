@@ -1364,7 +1364,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1476,7 +1476,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1648,7 +1648,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1738,7 +1738,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2027,7 +2027,7 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
 
@@ -2350,7 +2350,7 @@ def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_pres
     assert job_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_draft_approvals" in inspector.get_table_names()
     assert "response_draft_sends" in inspector.get_table_names()
@@ -2498,7 +2498,7 @@ def test_follow_up_remediation_downgrade_clean_cycle(tmp_path: Path) -> None:
     assert proposal_count == 1  # sibling data untouched by the column drops
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "4fb941b18aff"
+    assert _alembic_current_revision(engine) == "7c2e4a91b6d3"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
     assert "recipient" in proposal_columns
@@ -2616,3 +2616,77 @@ def test_running_migrations_does_not_disable_application_loggers(tmp_path: Path)
     finally:
         scheduler_logger.disabled = original_scheduler_disabled
         services_scheduler_logger.disabled = original_services_scheduler_disabled
+
+
+# ---------------------------------------------------------------------------
+# 7c2e4a91b6d3 (Stage 8D: automation_mail_progress)
+# ---------------------------------------------------------------------------
+
+
+def test_automation_mail_progress_migration_creates_table_and_constraints(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_automation_mail_progress.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "automation_mail_progress" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("automation_mail_progress")}
+    assert columns == {
+        "id",
+        "account_key",
+        "gmail_after_message_id",
+        "follow_up_after_job_id",
+        "created_at",
+        "updated_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("automation_mail_progress")
+    assert any(uc["column_names"] == ["account_key"] for uc in unique_constraints)
+
+
+def test_automation_mail_progress_rejects_duplicate_account_key(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_automation_mail_progress_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert_sql = text(
+        """
+        INSERT INTO automation_mail_progress (account_key, created_at, updated_at)
+        VALUES ('me@example.com', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert_sql)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(insert_sql)
+
+
+def test_automation_mail_progress_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_automation_mail_progress_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "4fb941b18aff")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "automation_mail_progress" not in tables
+    # Downgrading one step must not touch the previous (Stage 8B
+    # automation_schedules) migration's own table.
+    assert "automation_schedules" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "automation_mail_progress" in inspector.get_table_names()

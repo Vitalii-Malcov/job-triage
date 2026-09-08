@@ -97,6 +97,8 @@ from app.db.automation_repository import (
     renew_run_lease,
 )
 from app.db.models import AutomationRunRecord
+from app.services.automation_follow_up import prepare_follow_up_proposals
+from app.services.automation_gmail import prepare_gmail_response_drafts, prepare_gmail_sync
 from app.services.automation_shortlist import prepare_shortlist_drafts
 from app.services.collector_runner import (
     CollectorError,
@@ -214,6 +216,75 @@ async def _run_shortlist_drafts_step(db: Session, settings, touched_jobs: list[T
         db.rollback()
         logger.warning(
             "automation_run_step_unexpected_error step=shortlist_drafts error_type=%s",
+            type(exc).__name__,
+        )
+        return {
+            "status": "failed",
+            "counters": None,
+            "items": None,
+            "failures": None,
+            "error_type": type(exc).__name__,
+        }
+
+
+async def _run_gmail_sync_step(db: Session, account_key: str, settings) -> dict:
+    """Stage 8D post-processing step — mirrors `_run_step`'s outer safety
+    net for a genuinely unexpected, STEP-level failure.
+    `app.services.automation_gmail.prepare_gmail_sync` already isolates
+    each mailbox's own failure internally (never lets it propagate this
+    far); this only catches something even that function's own try/except
+    didn't anticipate (e.g. the account-mismatch check itself raising).
+    """
+    try:
+        return await prepare_gmail_sync(db, account_key=account_key, settings=settings)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "automation_run_step_unexpected_error step=gmail_sync error_type=%s",
+            type(exc).__name__,
+        )
+        return {"status": "failed", "counters": None, "error_type": type(exc).__name__}
+
+
+async def _run_gmail_response_drafts_step(db: Session, account_key: str, settings) -> dict:
+    """Stage 8D post-processing step — mirrors `_run_step`'s outer safety
+    net. Per-MESSAGE failures within the step are already isolated and
+    reported inside its own returned `items`/`failures`/
+    `counters["failed"]` —
+    `app.services.automation_gmail.prepare_gmail_response_drafts` never
+    lets a single message's exception propagate this far.
+    """
+    try:
+        return await prepare_gmail_response_drafts(db, account_key=account_key, settings=settings)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "automation_run_step_unexpected_error step=gmail_response_drafts error_type=%s",
+            type(exc).__name__,
+        )
+        return {
+            "status": "failed",
+            "counters": None,
+            "items": None,
+            "failures": None,
+            "error_type": type(exc).__name__,
+        }
+
+
+async def _run_follow_up_proposals_step(db: Session, account_key: str, settings) -> dict:
+    """Stage 8D post-processing step — mirrors `_run_step`'s outer safety
+    net. Per-JOB failures within the step are already isolated and
+    reported inside its own returned `items`/`failures`/
+    `counters["failed"]` —
+    `app.services.automation_follow_up.prepare_follow_up_proposals` never
+    lets a single job's exception propagate this far.
+    """
+    try:
+        return await prepare_follow_up_proposals(db, account_key=account_key, settings=settings)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "automation_run_step_unexpected_error step=follow_up_proposals error_type=%s",
             type(exc).__name__,
         )
         return {
@@ -410,6 +481,25 @@ async def run_automation_cycle(
         if settings.automation_auto_prepare_enabled:
             step_results["shortlist_drafts"] = await _run_shortlist_drafts_step(
                 db, settings, touched_jobs
+            )
+
+        # Stage 8D: two independent opt-in switches (off by default,
+        # unrelated to every other automation flag above -- see
+        # app.core.config.Settings). Disabled features add NO fake step
+        # to results. gmail_response_drafts always runs when the Gmail
+        # cycle is enabled, regardless of gmail_sync's own outcome (a
+        # partial/failed sync must not block processing messages already
+        # persisted from this or a previous run — see
+        # app.services.automation_gmail's module docstring).
+        if settings.automation_gmail_cycle_enabled:
+            step_results["gmail_sync"] = await _run_gmail_sync_step(db, account_key, settings)
+            step_results["gmail_response_drafts"] = await _run_gmail_response_drafts_step(
+                db, account_key, settings
+            )
+
+        if settings.automation_follow_up_cycle_enabled:
+            step_results["follow_up_proposals"] = await _run_follow_up_proposals_step(
+                db, account_key, settings
             )
 
         overall_status = _compute_overall_status(step_results, AUTOMATION_STEPS)
