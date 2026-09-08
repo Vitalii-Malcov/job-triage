@@ -46,6 +46,15 @@ from app.services.scheduler import (
 
 logger = logging.getLogger(__name__)
 
+# S8B-PRE-001: a fixed, generic message only -- `Settings` holds several
+# credentials (Gmail app password, Telegram bot token, API keys, ...), and
+# pydantic's ValidationError.__str__ can include the offending INPUT VALUE
+# for other, unrelated fields that also failed validation in the same
+# construction. `str(exc)`/`repr(exc)`/a traceback must never reach
+# stdout/stderr or a log line -- only `type(exc).__name__` is safe (see
+# each `except` branch in `main()` below).
+_CONFIGURATION_ERROR_MESSAGE = "Automation scheduler configuration error. Check scheduler settings."
+
 
 async def _poll_loop(settings) -> None:
     """Poll persisted schedule state every `automation_scheduler_poll_seconds`,
@@ -97,10 +106,16 @@ def main() -> int:
     except ValidationError as exc:
         # Covers this stage's own "enabled but blank account_key" rule
         # (app.core.config.Settings's model_validator) as well as any
-        # other Settings misconfiguration -- fail closed with a clear
-        # message here rather than an unhandled traceback.
+        # other Settings misconfiguration -- fail closed with a clear,
+        # SANITIZED message here rather than an unhandled traceback.
+        # S8B-PRE-001: never print/log str(exc)/repr(exc) -- a
+        # ValidationError's own message can embed the offending input
+        # value for ANY field that failed validation in this same
+        # Settings() construction, which may be a credential (Gmail app
+        # password, Telegram bot token, an API key, ...), not just this
+        # stage's own account_key.
         logger.error("automation_scheduler_configuration_error error_type=%s", type(exc).__name__)
-        print(f"Automation scheduler configuration error: {exc}", file=sys.stderr)
+        print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
 
     if not settings.automation_scheduler_enabled:
@@ -114,8 +129,13 @@ def main() -> int:
     try:
         validate_scheduler_settings(settings)
     except SchedulerConfigurationError as exc:
+        # S8B-PRE-001 (defense-in-depth): this exception's own message is
+        # currently a fixed string with no user input embedded, but never
+        # print str(exc) here either -- keeps this branch safe even if a
+        # future SchedulerConfigurationError ever echoes caller-provided
+        # detail, matching the ValidationError branch above exactly.
         logger.error("automation_scheduler_configuration_error error_type=%s", type(exc).__name__)
-        print(f"Automation scheduler configuration error: {exc}", file=sys.stderr)
+        print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
 
     try:

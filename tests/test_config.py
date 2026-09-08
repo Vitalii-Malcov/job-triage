@@ -183,3 +183,56 @@ def test_automation_scheduler_poll_seconds_default_and_bounds():
         Settings(automation_scheduler_poll_seconds=0)
     with pytest.raises(ValidationError):
         Settings(automation_scheduler_poll_seconds=3601)
+
+
+# ---------------------------------------------------------------------------
+# S8B-PRE-002: automation_scheduler_account_key canonicalization (whitespace
+# normalization, same as gmail_username) + DB length parity
+# (automation_schedules.account_key / automation_runs.account_key are both
+# String(320) == MAX_ADDRESS_LENGTH).
+# ---------------------------------------------------------------------------
+
+
+def test_automation_scheduler_account_key_is_stripped_of_surrounding_whitespace():
+    """S8B-PRE-002: " me@example.com " must normalize to the exact same
+    identity as "me@example.com" -- otherwise the two would silently claim
+    two different schedule/AutomationRun account namespaces."""
+    settings = Settings(
+        automation_scheduler_enabled=True,
+        automation_scheduler_account_key="  me@example.com  ",
+    )
+    assert settings.automation_scheduler_account_key == "me@example.com"
+
+
+def test_automation_scheduler_account_key_whitespace_only_is_blank_while_disabled():
+    settings = Settings(automation_scheduler_enabled=False, automation_scheduler_account_key="   ")
+    assert settings.automation_scheduler_account_key == ""
+
+
+def test_automation_scheduler_account_key_whitespace_only_fails_closed_while_enabled():
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_enabled=True, automation_scheduler_account_key="   ")
+
+
+def test_automation_scheduler_account_key_accepts_max_length_320():
+    settings = Settings(
+        automation_scheduler_enabled=True, automation_scheduler_account_key="a" * 320
+    )
+    assert len(settings.automation_scheduler_account_key) == 320
+
+
+def test_automation_scheduler_account_key_rejects_length_321():
+    with pytest.raises(ValidationError):
+        Settings(automation_scheduler_account_key="a" * 321)
+
+
+def test_automation_scheduler_account_key_overlong_value_never_echoed_in_error():
+    """S8B-PRE-002: the rejected value itself must never appear in the
+    validator's own error message -- account_key identity strings are not
+    exempt from this project's "don't echo untrusted/sensitive input into
+    error text" convention just because they aren't literal credentials.
+    """
+    overlong = "s" * 321
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(automation_scheduler_account_key=overlong)
+    assert overlong not in str(exc_info.value)

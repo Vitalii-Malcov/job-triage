@@ -9,6 +9,13 @@ from app.providers.email.base import (
     MAX_MAILBOX_NAME_LENGTH,
 )
 
+# S8B-PRE-002: automation_schedules.account_key / automation_runs.account_key
+# are both String(320) -- the exact same invariant MAX_ADDRESS_LENGTH already
+# encodes for gmail_username's own DB columns (RFC 5321 4.5.3.1.3), so it is
+# reused rather than a new constant, keeping SQLite (permissive about
+# over-length TEXT) and PostgreSQL (would reject an overlong VARCHAR at
+# INSERT time) from ever disagreeing about what a valid account_key is.
+
 
 class Settings(BaseSettings):
     app_env: str = "development"
@@ -178,16 +185,41 @@ class Settings(BaseSettings):
             raise ValueError(f"must not exceed {MAX_IMAP_HOST_LENGTH} characters")
         return stripped
 
+    # S8B-PRE-002: normalizes the same way gmail_username does (strip
+    # only, no casefold -- preserves Stage 8A's existing account_key
+    # identity semantics exactly, just whitespace-normalized; casefolding
+    # is not part of that contract and is deliberately not invented here)
+    # so " me@example.com " and "me@example.com" can never silently become
+    # two different schedule/AutomationRun account namespaces. Blank
+    # remains a deliberate, meaningful "not configured" state by itself
+    # (whitespace-only input returns "") -- whether blank is actually
+    # ALLOWED depends on automation_scheduler_enabled, checked below by
+    # the model_validator against this already-normalized value. The
+    # rejected value is never included in the error message -- account_key
+    # identity strings should not be echoed into logs/error output any
+    # more freely than any other Settings field.
+    @field_validator("automation_scheduler_account_key")
+    @classmethod
+    def _validate_automation_scheduler_account_key(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if len(stripped) > MAX_ADDRESS_LENGTH:
+            raise ValueError(f"must not exceed {MAX_ADDRESS_LENGTH} characters")
+        return stripped
+
     # Stage 8B: fail closed at construction time rather than letting a
     # blank account_key reach the standalone worker and either crash
     # opaquely mid-poll-loop or (worse) silently poll nothing. Cross-field,
     # so a model_validator, not a field_validator -- deliberately checked
     # here (not only in app.services.scheduler.validate_scheduler_settings)
     # so ANY Settings() construction with this combination fails the same
-    # way, not just the one the standalone worker happens to call.
+    # way, not just the one the standalone worker happens to call. Checks
+    # the ALREADY-NORMALIZED value (field validators run before this
+    # model_validator) -- no redundant .strip() here.
     @model_validator(mode="after")
     def _validate_scheduler_requires_account_key_when_enabled(self) -> "Settings":
-        if self.automation_scheduler_enabled and not self.automation_scheduler_account_key.strip():
+        if self.automation_scheduler_enabled and not self.automation_scheduler_account_key:
             raise ValueError(
                 "automation_scheduler_account_key must be set when "
                 "automation_scheduler_enabled=True"
