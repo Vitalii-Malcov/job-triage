@@ -43,7 +43,7 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 8B Scheduler/cron — смёржено в `main`, см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
    - [x] 8C Automatic Shortlist + CV/Bewerbung draft preparation — смёржено в `main`, см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
    - [x] 8D Automated Gmail response-draft cycle + follow-up proposal cycle — COMPLETE / MERGED, см. "Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)" ниже: два независимых опциональных шага автоматизации, переиспользующие существующие Stage 7A/7B/7C/7E Gmail-sync/analysis/response-draft/follow-up сервисы — read-only Gmail sync, детерминированные response-черновики и follow-up ПРЕДЛОЖЕНИЯ, без отправки, без approval, без смены Job.status.
-9. Stage 8E Telegram daily control/digest + operational hardening — IN DEVELOPMENT, см. "Telegram Daily Digest + Operational Hardening (Stage 8E)" ниже: `/digest`-команда в СУЩЕСТВУЮЩЕМ Telegram-боте, опциональный ежедневный автодайджест из standalone scheduler-процесса с DB-CAS идемпотентностью, hardening приватности логов (без chat_id/текста неавторизованных сообщений, без traceback/token в логах). Ветка не смёржена в `main`.
+9. Stage 8E Telegram daily control/digest + operational hardening — COMPLETE / MERGED, см. "Telegram Daily Digest + Operational Hardening (Stage 8E)" ниже: `/digest`-команда в СУЩЕСТВУЮЩЕМ Telegram-боте, опциональный ежедневный автодайджест из standalone scheduler-процесса с DB-CAS идемпотентностью, hardening приватности логов (без chat_id/текста неавторизованных сообщений, без traceback/token в логах).
 
 ## Запуск
 ```bash
@@ -2010,10 +2010,10 @@ Stage 8D шаг даёт `PARTIAL`; все включённые шаги `ok` �
 
 ## Telegram Daily Digest + Operational Hardening (Stage 8E)
 
-**Статус: IN DEVELOPMENT, ветка `feat/stage-8e-telegram-digest-hardening`,
-НЕ СМЁРЖЕНА в `main`.** Переиспользует СУЩЕСТВУЮЩИЙ Telegram-бот
-(`app.services.telegram_bot`) и СУЩЕСТВУЮЩИЙ standalone scheduler
-(`python -m app.scheduler`) — второй бот/процесс НЕ создаётся.
+**Статус: COMPLETE / MERGED в `main`.** Переиспользует СУЩЕСТВУЮЩИЙ
+Telegram-бот (`app.services.telegram_bot`) и СУЩЕСТВУЮЩИЙ standalone
+scheduler (`python -m app.scheduler`) — второй бот/процесс НЕ
+создаётся.
 
 **`/digest` — новая команда в существующем боте.** Bounded,
 privacy-safe сводка: id/статус последнего `AutomationRun`, счётчики по
