@@ -36,6 +36,7 @@ real successful persist.
 import asyncio
 import inspect
 import json
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -58,6 +59,10 @@ from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.models.job import Job
 from app.services.automation import run_automation_cycle
 from app.services.automation_shortlist import prepare_shortlist_drafts
+from app.services.candidate_preparation import (
+    prepare_candidate_cv_draft_with_outcome,
+    prepare_candidate_job_match,
+)
 from app.services.collector_runner import TouchedJob, run_bundesagentur
 
 ACCOUNT = "me@example.com"
@@ -442,43 +447,176 @@ class TestCVReuse:
 # --- S8C-CACHE-001: race-safe CV created/reused -----------------------------
 
 
+def _make_barrier_synced_get_cached_draft(original, barrier: threading.Barrier):
+    """S8C-TEST-001 (Codex re-review): identical technique to
+    tests/test_automation_schedule_repository.py's own
+    `_make_barrier_synced_get_schedule` helper (see that module's
+    docstring for the full rationale) -- a THIN, test-only wrapper around
+    the REAL `get_cached_draft` (never a reimplementation of the CAS/
+    UNIQUE-constraint logic itself, never a change to production code).
+    `prepare_candidate_cv_draft_with_outcome` calls `get_cached_draft`
+    exactly once, as its pre-check before deciding whether to attempt an
+    INSERT -- wrapping THAT one call site is enough to force "both racers
+    observe the identical empty-cache starting state before either
+    writes", without touching a single line of `create_draft`'s actual
+    INSERT-or-reload logic under test. Tracked per-thread (like the
+    Stage 8B helper) so a later, unrelated call from the same thread
+    (there isn't one here, but the pattern is kept identical for
+    consistency/safety) can never deadlock waiting for a second
+    rendezvous nobody else is coming to.
+    """
+    waited_thread_ids: set[int] = set()
+    lock = threading.Lock()
+
+    def _wrapped(db, *, match_id, cv_adapter_version):
+        result = original(db, match_id=match_id, cv_adapter_version=cv_adapter_version)
+        ident = threading.get_ident()
+        with lock:
+            first_call_from_this_thread = ident not in waited_thread_ids
+            waited_thread_ids.add(ident)
+        if first_call_from_this_thread:
+            barrier.wait(timeout=10)
+        return result
+
+    return _wrapped
+
+
 class TestCVRaceSafety:
-    def test_lost_unique_race_is_reported_as_reused_not_created(self, session_factory, monkeypatch):
-        """Simulates a concurrent writer winning the CV draft's UNIQUE-
-        constraint race: create_draft's own INSERT-or-reload outcome
-        reports created=False even though no cache entry existed BEFORE
-        this call started. Stage 8C must trust that real outcome, not a
-        separate pre-check (S8C-CACHE-001) -- proving `cv_reused=True`/
-        `cv_created` counter stays 0 here is exactly what a
-        pre-check-then-call TOCTOU implementation would get wrong (it
-        would have seen "no cache entry" at pre-check time and wrongly
-        claimed cv_created=1).
+    def test_lost_unique_race_is_reported_as_reused_not_created(self, tmp_path):
+        """S8C-TEST-001 (Codex re-review): genuine two-real-thread,
+        two-real-Session race against a real UNIQUE constraint -- NOT a
+        forced return value. Both threads call the REAL Stage 8C CV
+        service path (`prepare_candidate_cv_draft_with_outcome`, which
+        `app.services.automation_shortlist.prepare_shortlist_drafts`
+        itself calls) with the SAME (match_id, cv_adapter_version) cache
+        identity. The barrier forces both threads' `get_cached_draft`
+        pre-check to return "no row yet" before EITHER proceeds to its
+        own `create_draft` INSERT, so one thread's commit genuinely wins
+        the DB's own `uq_candidate_cv_drafts_cache_identity` UNIQUE
+        constraint and the other's INSERT genuinely raises
+        `sqlalchemy.exc.IntegrityError`, caught by `create_draft`'s own
+        (unmodified) `except IntegrityError: db.rollback(); reload
+        winner` branch.
         """
+        db_path = tmp_path / "test_cv_draft_race.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 30}
+        )
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+        # Single-writer setup, deliberately OUTSIDE the race: seed the job
+        # and its match first, so the race below exercises ONLY the CV
+        # draft's own cache-identity race (match caching has its own,
+        # separately-proven race handling -- not what S8C-TEST-001 is
+        # about).
+        setup_db = factory()
+        job = _seed_job(setup_db, tier=TIER_60)
+        match = prepare_candidate_job_match(setup_db, job.id, force_recompute=False)
+        job_id = job.id
+        match_id = match.id
+        setup_db.close()
+
+        verify_before = factory()
+        assert verify_before.query(CandidateCVDraftRecord).count() == 0  # cache genuinely empty
+        verify_before.close()
+
+        barrier = threading.Barrier(2)
+        results: dict[str, tuple[str, object]] = {}
+
+        def _worker(name, db):
+            try:
+                outcome = prepare_candidate_cv_draft_with_outcome(
+                    db, job_id, match_id, force_recompute=False
+                )
+                results[name] = ("ok", outcome)
+            except Exception as exc:
+                db.rollback()
+                results[name] = ("error", exc)
+
+        session_a = factory()
+        session_b = factory()
+
         import app.services.candidate_preparation as prep_module
 
-        original_create_draft = prep_module.create_draft
-
-        def _create_draft_loses_race(*args, **kwargs):
-            record, _created = original_create_draft(*args, **kwargs)
-            return record, False  # force "lost the race" outcome
-
-        monkeypatch.setattr(
-            "app.services.candidate_preparation.create_draft", _create_draft_loses_race
-        )
-
-        db = session_factory()
+        original_get_cached_draft = prep_module.get_cached_draft
+        wrapped = _make_barrier_synced_get_cached_draft(original_get_cached_draft, barrier)
+        prep_module.get_cached_draft = wrapped
         try:
-            job = _seed_job(db, tier=TIER_60)
-            assert db.query(CandidateCVDraftRecord).count() == 0  # nothing cached yet
+            thread_a = threading.Thread(target=_worker, args=("a", session_a))
+            thread_b = threading.Thread(target=_worker, args=("b", session_b))
+            thread_a.start()
+            thread_b.start()
+            thread_a.join(timeout=15)
+            thread_b.join(timeout=15)
+        finally:
+            prep_module.get_cached_draft = original_get_cached_draft
 
+        try:
+            # Prove BOTH racers actually finished and BOTH produced a
+            # result before evaluating anything below (S8B-TEST-001-R1
+            # convention) -- a timed join() alone does not guarantee this.
+            assert not thread_a.is_alive(), "thread_a did not terminate within the join timeout"
+            assert not thread_b.is_alive(), "thread_b did not terminate within the join timeout"
+            assert set(results) == {"a", "b"}, (
+                f"both racers must report a result before evaluating outcomes -- "
+                f"got {sorted(results)}"
+            )
+            assert all(status == "ok" for status, _ in results.values()), results
+
+            # Exactly one durable row for this cache identity -- no
+            # duplicate CV draft, regardless of which thread "won".
+            verify_after = factory()
+            try:
+                row_count = verify_after.query(CandidateCVDraftRecord).count()
+                assert row_count == 1
+                canonical = verify_after.query(CandidateCVDraftRecord).one()
+            finally:
+                verify_after.close()
+
+            (_, (draft_a, created_a)) = results["a"]
+            (_, (draft_b, created_b)) = results["b"]
+
+            # Exactly one winner (created=True), exactly one loser
+            # (created=False) -- this is create_draft's OWN real
+            # INSERT-or-reload outcome, never forced by this test.
+            assert sorted([created_a, created_b]) == [False, True]
+            assert draft_a.id == canonical.id
+            assert draft_b.id == canonical.id  # the loser reloaded the SAME winner row
+
+            loser_draft, loser_created = (
+                (draft_a, created_a) if not created_a else (draft_b, created_b)
+            )
+            assert loser_created is False
+        finally:
+            session_a.close()
+            session_b.close()
+
+        # Stage 8C's own real, unmodified mapping (app.services.
+        # automation_shortlist.prepare_shortlist_drafts) must now report
+        # this as a REUSE for a fresh automation cycle over the same job
+        # -- proven by actually calling it, not by re-deriving the
+        # created/reused boolean ourselves. No new race here (the CV
+        # cache is already durably populated from above): this exercises
+        # the ordinary cache-hit path with the loser's OWN, real, already
+        # -durable row id.
+        stage8c_db = factory()
+        try:
             settings = _settings()
-            result = _run_shortlist(db, settings, [job])
+            fresh_job = stage8c_db.get(JobRecord, job_id)
+            result = _run_shortlist(stage8c_db, settings, [fresh_job])
 
             assert result["counters"]["cv_created"] == 0
             assert result["counters"]["cv_reused"] == 1
             assert result["items"][0]["cv_reused"] is True
+            assert result["items"][0]["cv_draft_id"] == canonical.id
+
+            # No Bewerbung duplication caused by this test: exactly one
+            # BewerbungDraftRecord exists after this single, sequential,
+            # non-racing Stage 8C cycle.
+            assert stage8c_db.query(BewerbungDraftRecord).count() == 1
         finally:
-            db.close()
+            stage8c_db.close()
 
 
 # --- Bewerbung reuse ------------------------------------------------------
