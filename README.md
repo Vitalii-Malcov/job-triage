@@ -42,7 +42,8 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 8A Orchestrator Foundation — persisted `AutomationRun` + сервис-оркестратор, координирующий существующие Bundesagentur/XING коллекторы в один ручной/синхронный цикл (`POST /api/v1/automation/runs`); без scheduler/cron, без auto-send заявок или email, без обхода существующих approval-gate'ов.
    - [x] 8B Scheduler/cron — смёржено в `main`, см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
    - [x] 8C Automatic Shortlist + CV/Bewerbung draft preparation — смёржено в `main`, см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
-   - [ ] 8D Automated Gmail response-draft cycle + follow-up proposal cycle — в разработке на feature-ветке (`feat/stage-8d-gmail-followup-cycle`, не смёржено), см. "Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)" ниже: два независимых опциональных шага автоматизации, переиспользующие существующие Stage 7A/7B/7C/7E Gmail-sync/analysis/response-draft/follow-up сервисы — read-only Gmail sync, детерминированные response-черновики и follow-up ПРЕДЛОЖЕНИЯ, без отправки, без approval, без смены Job.status.
+   - [x] 8D Automated Gmail response-draft cycle + follow-up proposal cycle — COMPLETE / MERGED, см. "Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)" ниже: два независимых опциональных шага автоматизации, переиспользующие существующие Stage 7A/7B/7C/7E Gmail-sync/analysis/response-draft/follow-up сервисы — read-only Gmail sync, детерминированные response-черновики и follow-up ПРЕДЛОЖЕНИЯ, без отправки, без approval, без смены Job.status.
+9. Stage 8E Telegram daily control/digest + operational hardening — NOT STARTED.
 
 ## Запуск
 ```bash
@@ -1858,8 +1859,7 @@ Bewerbung/описание вакансии/email/секреты. Эта пер�
 
 ## Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)
 
-**Статус: в разработке на feature-ветке `feat/stage-8d-gmail-followup-cycle`,
-не смёржено в `main`.** Два независимых опциональных шага
+**Статус: COMPLETE / MERGED в `main`.** Два независимых опциональных шага
 `app.services.automation.run_automation_cycle`, выполняющихся ПОСЛЕ
 существующих Stage 8A/8C шагов внутри того же ран/lease — без второй
 lease-подсистемы. Полностью переиспользует существующие Stage 7A/7B/7C/7E
