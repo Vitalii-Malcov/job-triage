@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.providers.email.base import (
@@ -8,6 +8,13 @@ from app.providers.email.base import (
     MAX_IMAP_HOST_LENGTH,
     MAX_MAILBOX_NAME_LENGTH,
 )
+
+# S8B-PRE-002: automation_schedules.account_key / automation_runs.account_key
+# are both String(320) -- the exact same invariant MAX_ADDRESS_LENGTH already
+# encodes for gmail_username's own DB columns (RFC 5321 4.5.3.1.3), so it is
+# reused rather than a new constant, keeping SQLite (permissive about
+# over-length TEXT) and PostgreSQL (would reject an overlong VARCHAR at
+# INSERT time) from ever disagreeing about what a valid account_key is.
 
 
 class Settings(BaseSettings):
@@ -109,6 +116,29 @@ class Settings(BaseSettings):
     # configurable delay entirely.
     follow_up_delay_days: int = Field(default=7, ge=1, le=90)
 
+    # Stage 8B scheduler (standalone `python -m app.scheduler` worker, never
+    # embedded in FastAPI's own process/lifespan -- see app/scheduler.py's
+    # module docstring for why: multiple Uvicorn workers must not each run
+    # their own independent timer loop). Disabled by default -- opt-in only.
+    # account_key is identity only (which account's automation to run), never
+    # a secret credential -- it is whatever app.services.automation's own
+    # account_key parameter already accepts (mirrors GMAIL_USERNAME's role
+    # elsewhere in this project).
+    automation_scheduler_enabled: bool = False
+    automation_scheduler_account_key: str = ""
+    # Bounded 60s..7 days: below 60s risks hammering the DB/collectors far
+    # faster than any real job source refreshes; above 7 days defeats the
+    # point of a "periodic" scheduler.
+    automation_scheduler_interval_seconds: int = Field(default=3600, ge=60, le=604_800)
+    # How often the standalone worker polls persisted schedule state to check
+    # whether a slot is due -- deliberately independent of
+    # automation_scheduler_interval_seconds (the actual run cadence): a small
+    # poll interval just keeps the worker responsive to a due slot without
+    # busy-looping. 15s is a sensible production default -- frequent enough
+    # that a due slot is claimed promptly, far below the interval floor above
+    # so it never itself becomes the bottleneck.
+    automation_scheduler_poll_seconds: int = Field(default=15, ge=1, le=3600)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
@@ -154,6 +184,47 @@ class Settings(BaseSettings):
         if len(stripped) > MAX_IMAP_HOST_LENGTH:
             raise ValueError(f"must not exceed {MAX_IMAP_HOST_LENGTH} characters")
         return stripped
+
+    # S8B-PRE-002: normalizes the same way gmail_username does (strip
+    # only, no casefold -- preserves Stage 8A's existing account_key
+    # identity semantics exactly, just whitespace-normalized; casefolding
+    # is not part of that contract and is deliberately not invented here)
+    # so " me@example.com " and "me@example.com" can never silently become
+    # two different schedule/AutomationRun account namespaces. Blank
+    # remains a deliberate, meaningful "not configured" state by itself
+    # (whitespace-only input returns "") -- whether blank is actually
+    # ALLOWED depends on automation_scheduler_enabled, checked below by
+    # the model_validator against this already-normalized value. The
+    # rejected value is never included in the error message -- account_key
+    # identity strings should not be echoed into logs/error output any
+    # more freely than any other Settings field.
+    @field_validator("automation_scheduler_account_key")
+    @classmethod
+    def _validate_automation_scheduler_account_key(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if len(stripped) > MAX_ADDRESS_LENGTH:
+            raise ValueError(f"must not exceed {MAX_ADDRESS_LENGTH} characters")
+        return stripped
+
+    # Stage 8B: fail closed at construction time rather than letting a
+    # blank account_key reach the standalone worker and either crash
+    # opaquely mid-poll-loop or (worse) silently poll nothing. Cross-field,
+    # so a model_validator, not a field_validator -- deliberately checked
+    # here (not only in app.services.scheduler.validate_scheduler_settings)
+    # so ANY Settings() construction with this combination fails the same
+    # way, not just the one the standalone worker happens to call. Checks
+    # the ALREADY-NORMALIZED value (field validators run before this
+    # model_validator) -- no redundant .strip() here.
+    @model_validator(mode="after")
+    def _validate_scheduler_requires_account_key_when_enabled(self) -> "Settings":
+        if self.automation_scheduler_enabled and not self.automation_scheduler_account_key:
+            raise ValueError(
+                "automation_scheduler_account_key must be set when "
+                "automation_scheduler_enabled=True"
+            )
+        return self
 
 
 @lru_cache

@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -1363,7 +1364,7 @@ def test_gmail_account_scope_downgrade_from_head_clean_cycle(tmp_path: Path) -> 
     assert not any(table.startswith("_alembic_tmp") for table in tables)
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_id_claims" in inspector.get_table_names()
     assert "gmail_message_analyses" in inspector.get_table_names()
@@ -1475,7 +1476,7 @@ def test_gmail_message_analyses_upgrade_downgrade_upgrade_cycle_preserves_siblin
     assert thread_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "gmail_message_analyses" in inspector.get_table_names()
     assert "job_reference_tokens" in inspector.get_table_names()
@@ -1647,7 +1648,7 @@ def test_job_reference_tokens_upgrade_downgrade_upgrade_cycle_preserves_sibling_
     assert job_count == 1  # sibling data untouched by the reference-tokens table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "job_reference_tokens" in inspector.get_table_names()
 
@@ -1737,7 +1738,7 @@ def test_job_reference_tokens_migration_survives_runtime_extractor_failure(
 
     # Must NOT raise, despite the runtime extractor being broken above.
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT token FROM job_reference_tokens")).fetchall()
@@ -2026,7 +2027,7 @@ def test_response_drafts_upgrade_downgrade_upgrade_cycle_preserves_sibling_data(
     assert job_count == 1  # sibling data untouched by the response_drafts table drop
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_drafts" in inspector.get_table_names()
 
@@ -2349,7 +2350,7 @@ def test_response_draft_approvals_and_sends_upgrade_downgrade_upgrade_cycle_pres
     assert job_count == 1
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "response_draft_approvals" in inspector.get_table_names()
     assert "response_draft_sends" in inspector.get_table_names()
@@ -2497,8 +2498,121 @@ def test_follow_up_remediation_downgrade_clean_cycle(tmp_path: Path) -> None:
     assert proposal_count == 1  # sibling data untouched by the column drops
 
     upgrade(cfg, "head")
-    assert _alembic_current_revision(engine) == "d4a7e1c3f8b2"
+    assert _alembic_current_revision(engine) == "4fb941b18aff"
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     proposal_columns = {col["name"] for col in inspector.get_columns("follow_up_proposals")}
     assert "recipient" in proposal_columns
     assert "input_fingerprint" in proposal_columns
+
+
+# ---------------------------------------------------------------------------
+# 4fb941b18aff (Stage 8B: automation_schedules)
+# ---------------------------------------------------------------------------
+
+
+def test_automation_schedules_migration_creates_table_and_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_automation_schedules.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "automation_schedules" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("automation_schedules")}
+    assert columns == {
+        "id",
+        "account_key",
+        "next_run_at",
+        "last_claimed_at",
+        "last_run_id",
+        "created_at",
+        "updated_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("automation_schedules")
+    assert any(uc["column_names"] == ["account_key"] for uc in unique_constraints)
+
+    foreign_keys = inspector.get_foreign_keys("automation_schedules")
+    assert any(
+        fk["referred_table"] == "automation_runs" and fk["constrained_columns"] == ["last_run_id"]
+        for fk in foreign_keys
+    )
+
+
+def test_automation_schedules_rejects_duplicate_account_key(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_automation_schedules_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert_sql = text(
+        """
+        INSERT INTO automation_schedules (account_key, next_run_at, created_at, updated_at)
+        VALUES ('me@example.com', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert_sql)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(insert_sql)
+
+
+def test_automation_schedules_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_automation_schedules_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "d4a7e1c3f8b2")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "automation_schedules" not in tables
+    # Downgrading one step must not touch the previous (Stage 8A
+    # automation_runs) migration's own table.
+    assert "automation_runs" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "automation_schedules" in inspector.get_table_names()
+
+
+def test_running_migrations_does_not_disable_application_loggers(tmp_path: Path) -> None:
+    """Regression test: alembic/env.py calls logging.config.fileConfig(),
+    which defaults to disable_existing_loggers=True. That default sets
+    `.disabled = True` on any Logger object that already exists (e.g.
+    because some other already-imported module called
+    logging.getLogger(__name__) at import time) but isn't named in
+    alembic.ini's [loggers] section -- app.scheduler and
+    app.services.scheduler are exactly such loggers. The disabled state
+    survives the migration call and silently drops all further logging
+    from those loggers for the rest of the process, which is what broke
+    caplog-based scheduler tests whenever they ran in the same pytest
+    process after this module.
+    """
+    scheduler_logger = logging.getLogger("app.scheduler")
+    services_scheduler_logger = logging.getLogger("app.services.scheduler")
+
+    original_scheduler_disabled = scheduler_logger.disabled
+    original_services_scheduler_disabled = services_scheduler_logger.disabled
+    scheduler_logger.disabled = False
+    services_scheduler_logger.disabled = False
+
+    try:
+        db_path = tmp_path / "migrations_logger_pollution.db"
+        cfg = _alembic_config(db_path)
+
+        upgrade(cfg, "head")
+
+        assert scheduler_logger.disabled is False
+        assert services_scheduler_logger.disabled is False
+    finally:
+        scheduler_logger.disabled = original_scheduler_disabled
+        services_scheduler_logger.disabled = original_services_scheduler_disabled
