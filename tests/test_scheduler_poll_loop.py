@@ -23,6 +23,8 @@ def _fake_settings(**overrides) -> SimpleNamespace:
         "automation_scheduler_account_key": "me@example.com",
         "automation_scheduler_poll_seconds": 0.01,
         "automation_scheduler_interval_seconds": 3600,
+        "automation_scheduler_enabled": True,
+        "telegram_daily_digest_enabled": False,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

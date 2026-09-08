@@ -50,6 +50,7 @@ from app.services.collector_runner import (
     run_xing,
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
+from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ HELP_TEXT = (
     "/run bundesagentur - run the Bundesagentur collector\n"
     "/run xing - run the XING mailbox collector\n"
     "/research <id> - research the hiring company for a job (cached, may refresh)\n"
+    "/digest - automation summary: latest run, collector/draft/follow-up counts, "
+    "pending approvals\n"
 )
 
 _VALID_STATUSES = ", ".join(status.value for status in ApplicationStatus)
@@ -85,8 +88,16 @@ def _is_authorized(update: Update, settings: Settings) -> bool:
     if settings.telegram_chat_id and chat_id == settings.telegram_chat_id:
         return True
 
-    text = update.message.text if update.message is not None else ""
-    logger.warning("telegram_bot_unauthorized_message chat_id=%s text=%s", chat_id, text)
+    # S8E-HARDEN-001: never log chat_id or message/command text here --
+    # both are attacker-controlled input from an UNAUTHENTICATED sender
+    # (this branch is reached precisely because the sender is NOT the
+    # configured operator chat). Logging either would let any stranger
+    # who finds this bot write arbitrary content into server logs, and
+    # chat_id itself is a stable identifier for a real Telegram
+    # user/chat -- not something to persist about an unauthorized
+    # sender. A fixed, no-detail event name is enough to see "someone
+    # tried" in metrics/logs without recording who or what they sent.
+    logger.warning("telegram_bot_unauthorized_message")
     return False
 
 
@@ -372,6 +383,38 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@require_authorized
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 8E: bounded, privacy-safe automation summary -- latest
+    `AutomationRun`, per-step collector/draft/follow-up counters, and
+    pending-approval counts/ids. Delegates all content assembly to
+    `app.services.telegram_digest.build_digest_text` (shared, unchanged,
+    with the optional automatic daily digest) -- this handler only owns
+    picking `account_key` and replying.
+
+    **Account scope (Codex Stage 8E HIGH finding).** Uses
+    `resolve_digest_account_key`, the SAME shared helper the automatic
+    daily digest resolves its account_key through -- never re-derives
+    its own normalization here, so a manual `/digest` and the automatic
+    daily digest can never silently read different namespaces (e.g. one
+    scoped to AUTOMATION_SCHEDULER_ACCOUNT_KEY, the other to
+    GMAIL_USERNAME, with divergent casing/whitespace).
+
+    Read-only: never sends email, approves a draft/follow-up, submits an
+    application, or mutates Job.status.
+    """
+    settings = get_settings()
+    account_key = resolve_digest_account_key(settings)
+
+    db = SessionLocal()
+    try:
+        text = build_digest_text(db, account_key)
+    finally:
+        db.close()
+
+    await update.message.reply_text(text)
+
+
 async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Catch-all for exceptions raised by any command handler.
 
@@ -383,7 +426,13 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     human operator doesn't have to be tailing server logs to notice a
     command silently failed.
     """
-    logger.error("telegram_bot_unhandled_error", exc_info=context.error)
+    # S8E-HARDEN-001: only the exception TYPE, never exc_info/a traceback
+    # or str(context.error) -- PTB's own error handler contract hands us
+    # whatever exception a command handler raised, which could echo back
+    # untrusted upstream detail (e.g. a collector's error message) that
+    # must never reach a log sink verbatim.
+    error_type = type(context.error).__name__ if context.error is not None else "unknown"
+    logger.error("telegram_bot_unhandled_error error_type=%s", error_type)
 
     settings = get_settings()
     if not settings.telegram_chat_id:
@@ -393,12 +442,12 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             chat_id=settings.telegram_chat_id,
             text="Internal error — check server logs.",
         )
-    except Exception:
+    except Exception as exc:
         # Best-effort only: if even the failure notification fails (e.g.
         # Telegram itself is unreachable), log and stop — must not raise
         # from inside an error handler and risk masking the original error
         # or looping.
-        logger.warning("telegram_bot_error_notification_failed", exc_info=True)
+        logger.warning("telegram_bot_error_notification_failed error_type=%s", type(exc).__name__)
 
 
 def build_application(settings: Settings) -> Application:
@@ -410,6 +459,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("run", cmd_run))
     application.add_handler(CommandHandler("research", cmd_research))
+    application.add_handler(CommandHandler("digest", cmd_digest))
     application.add_error_handler(_handle_error)
     return application
 
@@ -440,8 +490,12 @@ async def start_bot(settings: Settings) -> Application | None:
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
-    except Exception:
-        logger.exception("telegram_bot_start_failed")
+    except Exception as exc:
+        # S8E-HARDEN-001: only the exception TYPE -- a bad/revoked token
+        # or network failure here must never log exc_info/a traceback,
+        # which could otherwise surface request/response detail from the
+        # underlying HTTP client.
+        logger.error("telegram_bot_start_failed error_type=%s", type(exc).__name__)
         try:
             # Best-effort cleanup of whatever partially started (e.g. the
             # Bot's HTTP client) so a failed start doesn't leak resources
@@ -449,8 +503,11 @@ async def start_bot(settings: Settings) -> Application | None:
             # itself never completed — Application.shutdown() no-ops when
             # not yet initialized.
             await application.shutdown()
-        except Exception:
-            logger.warning("telegram_bot_cleanup_after_failed_start_failed", exc_info=True)
+        except Exception as cleanup_exc:
+            logger.warning(
+                "telegram_bot_cleanup_after_failed_start_failed error_type=%s",
+                type(cleanup_exc).__name__,
+            )
         return None
 
     logger.info("telegram_bot_started")

@@ -43,7 +43,7 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 8B Scheduler/cron — смёржено в `main`, см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
    - [x] 8C Automatic Shortlist + CV/Bewerbung draft preparation — смёржено в `main`, см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
    - [x] 8D Automated Gmail response-draft cycle + follow-up proposal cycle — COMPLETE / MERGED, см. "Automated Gmail Response-Draft + Follow-Up Cycle (Stage 8D)" ниже: два независимых опциональных шага автоматизации, переиспользующие существующие Stage 7A/7B/7C/7E Gmail-sync/analysis/response-draft/follow-up сервисы — read-only Gmail sync, детерминированные response-черновики и follow-up ПРЕДЛОЖЕНИЯ, без отправки, без approval, без смены Job.status.
-9. Stage 8E Telegram daily control/digest + operational hardening — NOT STARTED.
+9. Stage 8E Telegram daily control/digest + operational hardening — IN DEVELOPMENT, см. "Telegram Daily Digest + Operational Hardening (Stage 8E)" ниже: `/digest`-команда в СУЩЕСТВУЮЩЕМ Telegram-боте, опциональный ежедневный автодайджест из standalone scheduler-процесса с DB-CAS идемпотентностью, hardening приватности логов (без chat_id/текста неавторизованных сообщений, без traceback/token в логах). Ветка не смёржена в `main`.
 
 ## Запуск
 ```bash
@@ -2007,6 +2007,99 @@ lease, пока стартует ран-замена. `advance_gmail_cursor`/
 "повысить" (S8C-STATUS-001's core-collector rule не переоткрыто и не
 ослаблено). Если хотя бы один коллектор успешен — упавший/частичный
 Stage 8D шаг даёт `PARTIAL`; все включённые шаги `ok` → `COMPLETED`.
+
+## Telegram Daily Digest + Operational Hardening (Stage 8E)
+
+**Статус: IN DEVELOPMENT, ветка `feat/stage-8e-telegram-digest-hardening`,
+НЕ СМЁРЖЕНА в `main`.** Переиспользует СУЩЕСТВУЮЩИЙ Telegram-бот
+(`app.services.telegram_bot`) и СУЩЕСТВУЮЩИЙ standalone scheduler
+(`python -m app.scheduler`) — второй бот/процесс НЕ создаётся.
+
+**`/digest` — новая команда в существующем боте.** Bounded,
+privacy-safe сводка: id/статус последнего `AutomationRun`, счётчики по
+каждому включённому шагу (Bundesagentur/XING/shortlist/Gmail
+response-draft/follow-up — те же уже приватность-аудированные
+`counters`/`failures` из `AutomationRunStepResult`, см. Stage 8C/8D
+выше), число + id ожидающих human-approval response-draft'ов и
+follow-up-предложений (`status='PROPOSED'` без записи в
+`response_draft_approvals`/`follow_up_approvals`). НИКОГДА: текст
+письма, email-адрес, текст response/follow-up черновика, секреты.
+`account_key` (нормализованный `GMAIL_USERNAME`) используется только
+для scoping запросов — сам email в текст ответа никогда не попадает.
+Реализация — `app.services.telegram_digest.build_digest_text`
+(read-only, общий код для `/digest` и автодайджеста ниже).
+
+**Опциональный ежедневный автодайджест, выключен по умолчанию.**
+```bash
+TELEGRAM_DAILY_DIGEST_ENABLED=false
+TELEGRAM_DAILY_DIGEST_HOUR=8                  # 0..23, локальный час
+TELEGRAM_DAILY_DIGEST_TIMEZONE=Europe/Berlin  # IANA tz, через zoneinfo/tzdata
+```
+Использует `AUTOMATION_SCHEDULER_ACCOUNT_KEY` как account scope (та же
+identity-роль, что и для Stage 8B) — если `TELEGRAM_DAILY_DIGEST_ENABLED=true`,
+`AUTOMATION_SCHEDULER_ACCOUNT_KEY` обязателен непустым
+(`Settings`-level `model_validator`, симметрично Stage 8B's собственному
+правилу).
+
+**Доставка — ТОЛЬКО из standalone `python -m app.scheduler`, никогда из
+FastAPI lifespan** — по той же причине, что и Stage 8B: несколько
+Uvicorn worker-процессов не должны каждый заводить свой независимый
+дневной таймер (см. `app/scheduler.py`'s module docstring). Worker-процесс
+стартует свой poll loop, если включён `AUTOMATION_SCHEDULER_ENABLED`
+**ИЛИ** `TELEGRAM_DAILY_DIGEST_ENABLED` — но каждый тик poll loop'а
+гейтит каждую фичу СВОИМ собственным флагом (`app.scheduler._poll_loop`):
+automation-цикл запускается ТОЛЬКО при `AUTOMATION_SCHEDULER_ENABLED`,
+дайджест — ТОЛЬКО при `TELEGRAM_DAILY_DIGEST_ENABLED`; ни один флаг не
+подразумевает другой.
+
+**Идемпотентность — DB-CAS, не in-memory таймер.** Новая таблица
+`telegram_digest_deliveries` (миграция `f1a2b3c4d5e6`,
+`app.db.models.TelegramDigestDeliveryRecord`) — `UNIQUE(account_key,
+digest_date)`, где `digest_date` — ЛОКАЛЬНАЯ календарная дата в
+`TELEGRAM_DAILY_DIGEST_TIMEZONE` (через `zoneinfo.ZoneInfo`, корректно
+учитывает DST-переходы). `app.db.telegram_digest_repository.claim_delivery`
+— тот же INSERT + IntegrityError-catch idiom, что и
+`response_draft_sends`/`follow_up_sends` (Stage 7D/7E): ровно один
+воркер (при restart'е или нескольких одновременных scheduler-процессах)
+выигрывает claim на данную дату для данного аккаунта. `status`:
+`PENDING` → `SENT` (Telegram подтвердил 2xx — терминально) /
+`FAILED` (соединение не удалось ИЛИ Telegram вернул не-2xx — точно
+известный отказ, может быть повторён следующим тиком в ТОТ ЖЕ день via
+CAS `FAILED → PENDING`) / `UNCERTAIN` (timeout — исход неизвестен,
+запрос МОГ дойти до Telegram — терминально, НИКОГДА не повторяется
+автоматически, чтобы не рисковать дублирующим сообщением; дайджест
+просто возобновляется на следующую календарную дату).
+
+**Различение FAILED vs UNCERTAIN** — новая
+`app.services.telegram.send_telegram_text` (переиспользуется и
+существующим `TelegramNotifier.send_job`): non-2xx response ИЛИ
+connection-level ошибка (запрос точно не дошёл) → `FAILED`; timeout
+ПОСЛЕ отправки запроса (исход неизвестен) → `UNCERTAIN`. Тот же
+словарь исходов, что уже используется для outbound email (Stage 7D/7E
+`EmailSendOutcomeUnknownError`), применённый к Telegram Bot API вместо
+SMTP.
+
+**Telegram hardening (privacy).** В `app.services.telegram`/
+`app.services.telegram_bot`:
+- неавторизованное сообщение больше НЕ логирует `chat_id`/текст
+  команды — только фиксированное имя события
+  (`telegram_bot_unauthorized_message`, без параметров);
+- `logger.exception`/`exc_info=` полностью удалены из Telegram runtime
+  путей (`start_bot`, `_handle_error`, cleanup-путь) — только
+  `type(exc).__name__`;
+- bot token и URL запроса (который embed'ит token) никогда не логируются;
+- `send_telegram_text` логирует только исход + `type(exc).__name__`,
+  никогда сырое сообщение исключения или текст сообщения.
+
+`/status` (ручная смена статуса вакансии человеком) не изменён.
+
+**Границы безопасности — Stage 8E НИКОГДА:** не отправляет email, не
+approve'ит response-draft/follow-up, не отправляет заявки, не меняет
+`Job.status` автоматически. `app.services.telegram_digest`/
+`app.services.scheduler`/`app.services.telegram` не импортируют
+`send_response_draft`/`send_follow_up`/`approve_or_reject_*`/
+`GmailSmtpProvider`/`update_job_status` — закреплено source-scan тестами
+(`tests/test_telegram_hardening_safety.py`).
 
 ## Проверки
 ```bash

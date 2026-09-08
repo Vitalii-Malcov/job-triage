@@ -79,6 +79,7 @@ class TestAuthorization:
             (bot.cmd_status, ["1", "APPLIED"]),
             (bot.cmd_run, ["bundesagentur"]),
             (bot.cmd_research, ["1"]),
+            (bot.cmd_digest, []),
         ],
     )
     async def test_unauthorized_chat_gets_no_reply_but_is_logged(self, handler, args, monkeypatch):
@@ -97,9 +98,10 @@ class TestAuthorization:
         await handler(update, context)
 
         update.message.reply_text.assert_not_called()
-        warning.assert_called_once_with(
-            "telegram_bot_unauthorized_message chat_id=%s text=%s", "999", "poking around"
-        )
+        # S8E-HARDEN-001: chat_id/message text of an unauthorized sender
+        # must never be logged (see app.services.telegram_bot._is_authorized) —
+        # only the fixed, detail-free event name.
+        warning.assert_called_once_with("telegram_bot_unauthorized_message")
 
 
 class TestStartHelp:
@@ -568,6 +570,40 @@ class TestJobsMessageLimit:
         text = update.message.reply_text.call_args[0][0]
         assert "more" not in text
         assert text.count("\n") == 19
+
+
+class TestDigestCommand:
+    """Stage 8E: the manual /digest command delegates entirely to
+    app.services.telegram_digest.build_digest_text -- these tests prove
+    the handler wires it correctly (account_key selection, reply
+    plumbing) without re-testing digest CONTENT itself (already covered
+    exhaustively in tests/test_telegram_digest.py)."""
+
+    @pytest.mark.asyncio
+    async def test_replies_with_digest_text_for_empty_account(self):
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_digest(update, _make_context())
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Automation digest" in text
+        assert "Latest run: none yet" in text
+        assert "Pending response-draft approvals: 0" in text
+        assert "Pending follow-up approvals: 0" in text
+
+    @pytest.mark.asyncio
+    async def test_never_sends_email_approves_or_mutates_job_status(self, monkeypatch):
+        """Zero email send/approval calls -- the digest is read-only
+        reporting (see app.services.telegram_digest's module docstring)."""
+        from app.db import repositories as job_repo
+
+        update_job_status = MagicMock()
+        monkeypatch.setattr(job_repo, "update_job_status", update_job_status)
+
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_digest(update, _make_context())
+
+        update_job_status.assert_not_called()
+        update.message.reply_text.assert_called_once()
 
 
 class TestStartBot:

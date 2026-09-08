@@ -2125,3 +2125,79 @@ class AutomationMailProgressRecord(Base):
         onupdate=lambda: datetime.now(UTC),
         nullable=False,
     )
+
+
+class TelegramDigestDeliveryRecord(Base):
+    """Stage 8E: one persisted delivery attempt of the optional DAILY
+    Telegram digest, for one account, for one LOCAL calendar date (in
+    `settings.telegram_daily_digest_timezone`) -- the sole idempotency
+    primitive that keeps a restart, or more than one standalone
+    `python -m app.scheduler` worker process, from sending the same
+    day's digest twice. Mirrors `ResponseDraftSendRecord`'s claim/CAS
+    shape (see `app.db.response_draft_approval_repository`) applied to
+    "send one Telegram message" instead of "send one email".
+
+    **Identity is `(account_key, digest_date)` — `UNIQUE`, enforced by
+    the database, not a Python check-then-act read.**
+    `app.db.telegram_digest_repository.claim_delivery` always attempts a
+    plain INSERT (status=`PENDING`) first and lets a concurrent duplicate
+    fail on this constraint -- the same INSERT + IntegrityError-catch
+    idiom used throughout this project (e.g.
+    `app.db.response_draft_approval_repository.claim_send_attempt`). Only
+    the caller that wins the INSERT may attempt the actual Telegram send
+    for that date; every other caller (a second worker process, or the
+    same worker's next poll tick before the date rolls over) observes the
+    existing row and does not resend.
+
+    **`status`.** `PENDING` from the winning claim until the send
+    attempt resolves. `SENT` once Telegram's API has POSITIVELY
+    confirmed delivery (2xx response) -- terminal, never resent for this
+    date. `FAILED` for a send that DEFINITELY did not reach Telegram (a
+    connection-level error, or a non-2xx response Telegram itself
+    returned) -- the one non-terminal state: a LATER poll tick on the
+    SAME still-current date may retry it via `retry_delivery`'s CAS
+    (`FAILED -> PENDING`), mirroring
+    `app.db.response_draft_approval_repository.retry_send_attempt`.
+    `UNCERTAIN` for a send whose outcome could not be proven either way
+    (e.g. a network timeout after the request may already have reached
+    Telegram) -- terminal, exactly like `ResponseDraftSendRecord.UNCERTAIN`
+    (see that model's docstring): retrying an uncertain send risks a
+    real duplicate message landing in the operator's chat, so this
+    project's conservative default is to never automatically retry it.
+    The digest simply resumes normally on the NEXT calendar date.
+
+    **No email content, no job data, no draft/response text lives
+    here** -- only `account_key` (an identity, not a secret -- mirrors
+    every other `account_key` column in this project), `digest_date`,
+    delivery bookkeeping, and a truncated, sanitized `last_error` (never
+    a raw Telegram response body or bot token).
+    """
+
+    __tablename__ = "telegram_digest_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key", "digest_date", name="uq_telegram_digest_deliveries_account_date"
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
+            name="ck_telegram_digest_deliveries_status_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    digest_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )

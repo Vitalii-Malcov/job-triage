@@ -16,6 +16,10 @@ dependencies = [
   "sqlalchemy>=2.0",
   "alembic>=1.13",
   "python-telegram-bot>=21.0",
+  # Stage 8E daily digest timezone resolution (zoneinfo.ZoneInfo) --
+  # Windows has no system IANA tz database, so this must be an explicit
+  # dependency rather than relying on the OS to provide one.
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

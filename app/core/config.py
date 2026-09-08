@@ -190,6 +190,39 @@ class Settings(BaseSettings):
     # round-robin scan (unlike the Gmail cursor above, which never wraps).
     automation_follow_up_job_max_per_run: int = Field(default=100, ge=1, le=200)
 
+    # Stage 8E optional DAILY Telegram digest, sent from the standalone
+    # `python -m app.scheduler` worker (NEVER from FastAPI's own
+    # lifespan -- see app/scheduler.py's module docstring: multiple
+    # Uvicorn workers must not each start their own independent daily
+    # timer). Off by default -- opt-in only, independent of
+    # automation_scheduler_enabled/automation_auto_prepare_enabled/
+    # automation_gmail_cycle_enabled/automation_follow_up_cycle_enabled
+    # above: enabling the digest does NOT require the automation cycle
+    # itself to be enabled, and vice versa -- see
+    # app.services.scheduler.run_due_digest_if_claimed for what this
+    # triggers (a single bounded, privacy-safe summary message; never a
+    # send/approval/Job.status mutation). Reuses
+    # automation_scheduler_account_key as the account scope (see the
+    # model_validator below) rather than inventing a second account-key
+    # setting -- both name "which account's automation/digest state to
+    # read", the same identity role GMAIL_USERNAME already plays
+    # elsewhere in this project.
+    telegram_daily_digest_enabled: bool = False
+    # 0-23, the LOCAL hour (in telegram_daily_digest_timezone) at or
+    # after which the standalone worker's poll loop is allowed to send
+    # that local calendar date's digest -- see
+    # app.db.telegram_digest_repository/TelegramDigestDeliveryRecord for
+    # the actual once-per-(account_key, digest_date) idempotency
+    # guarantee; this hour is only ever a "not before" gate, never part
+    # of the uniqueness identity itself.
+    telegram_daily_digest_hour: int = Field(default=8, ge=0, le=23)
+    # An IANA tz database key (e.g. "Europe/Berlin"), resolved via
+    # zoneinfo.ZoneInfo at send time -- never a fixed UTC offset, so the
+    # configured local hour stays correct across DST transitions.
+    # Windows has no system IANA tz database, hence the `tzdata` PyPI
+    # package in this project's dependencies (see pyproject.toml).
+    telegram_daily_digest_timezone: str = "Europe/Berlin"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
@@ -274,6 +307,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 "automation_scheduler_account_key must be set when "
                 "automation_scheduler_enabled=True"
+            )
+        return self
+
+    # Stage 8E: same fail-closed rationale as
+    # _validate_scheduler_requires_account_key_when_enabled immediately
+    # above, applied to the daily digest's own independent enable switch
+    # -- telegram_daily_digest_enabled=True must never reach the
+    # standalone worker with a blank account_key to scope its
+    # once-per-(account_key, digest_date) delivery claim against.
+    @model_validator(mode="after")
+    def _validate_daily_digest_requires_account_key_when_enabled(self) -> "Settings":
+        if self.telegram_daily_digest_enabled and not self.automation_scheduler_account_key:
+            raise ValueError(
+                "automation_scheduler_account_key must be set when "
+                "telegram_daily_digest_enabled=True"
             )
         return self
 
