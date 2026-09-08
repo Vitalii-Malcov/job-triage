@@ -217,7 +217,7 @@ def test_get_match_never_computes(client, monkeypatch):
     def _boom(*args, **kwargs):
         raise AssertionError("GET must never compute a match")
 
-    monkeypatch.setattr("app.api.routes.compute_match", _boom)
+    monkeypatch.setattr("app.services.candidate_preparation.compute_match", _boom)
     response = test_client.get(f"/api/v1/jobs/{job_id}/match", headers=_auth_headers())
     assert response.status_code == 404
 

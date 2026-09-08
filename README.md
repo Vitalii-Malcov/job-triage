@@ -40,7 +40,8 @@ AI-система для сбора, оценки и трекинга вакан
    - [x] 7E Follow-up Agent — eligibility только по real Gmail-подтверждённой хронологии (IMAP INTERNALDATE, никогда не sender-controlled `Date`/sync-order-зависимый `received_at`), approve/reject + отправка, per-Gmail-thread lock с lease-renewal heartbeat против гонки с Gmail sync.
 8. Autonomous Orchestrator — по подэтапам:
    - [x] 8A Orchestrator Foundation — persisted `AutomationRun` + сервис-оркестратор, координирующий существующие Bundesagentur/XING коллекторы в один ручной/синхронный цикл (`POST /api/v1/automation/runs`); без scheduler/cron, без auto-send заявок или email, без обхода существующих approval-gate'ов.
-   - [x] 8B Scheduler/cron — реализовано на feature-ветке (`feat/stage-8b-scheduler`, не смёржено), см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
+   - [x] 8B Scheduler/cron — смёржено в `main`, см. "Automation Scheduler" ниже: отдельный standalone worker-процесс (`python -m app.scheduler`), опционально включаемый, без нового scheduler-зависимости, без обхода approval-gate'ов.
+   - [ ] 8C Automatic Shortlist + CV/Bewerbung draft preparation — в разработке на feature-ветке (`feat/stage-8c-auto-shortlist-drafts`, не смёржено), см. "Automatic Shortlist + Draft Preparation (Stage 8C)" ниже: опциональный шаг автоматизации, детерминированно отбирающий кандидатные вакансии текущего цикла и переиспользующий существующие Stage 6B/6C/6D match/CV/Bewerbung сервисы для подготовки ЧЕРНОВИКОВ — без отправки заявок/писем, без approval, без смены Job.status.
 
 ## Запуск
 ```bash
@@ -446,8 +447,7 @@ Research); секреты не нужны для дефолтного provider'�
 
 ## Automation Scheduler (Stage 8B)
 
-**Статус: реализовано на feature-ветке `feat/stage-8b-scheduler`, не
-смёржено в `main`.** Периодически (по конфигурируемому интервалу)
+**Статус: смёржено в `main`.** Периодически (по конфигурируемому интервалу)
 запускает СУЩЕСТВУЮЩИЙ Stage 8A `app.services.automation.run_automation_cycle(...)`
 — тот же orchestrator, что вызывает `POST /api/v1/automation/runs` —
 без единой новой строчки логики сбора/скоринга/dedup/отправки. Ничего
@@ -1713,6 +1713,93 @@ best-effort regex по явным меткам ("Referenz-Nr", "Job-ID",
 (List-Unsubscribe/X-Mailer) — `is_automated` опирается только на
 sender-паттерн и текстовые фразы, поскольку `GmailMessageRecord` их не
 хранит.
+
+## Automatic Shortlist + Draft Preparation (Stage 8C)
+
+**Статус: в разработке на feature-ветке `feat/stage-8c-auto-shortlist-drafts`,
+не смёржено в `main`.** Опциональный шаг `app.services.automation.run_automation_cycle`
+(Stage 8A/8B), выполняющийся ПОСЛЕ существующих Bundesagentur/XING
+коллекторов внутри того же ран/lease — без второй lease-подсистемы, без
+отдельного orchestration loop. Полностью переиспользует существующие
+Stage 6B/6C/6D сервисы (`app.services.candidate_preparation`, извлечённые
+из `app.api.routes` без изменения поведения) — этот этап не добавляет
+НИ ОДНОЙ новой строчки логики matching/CV-generation/Bewerbung-generation.
+
+**Opt-in, выключено по умолчанию, независимо от scheduler'а.**
+`AUTOMATION_AUTO_PREPARE_ENABLED=false` — дефолт. Включение Stage 8B
+scheduler'а (`AUTOMATION_SCHEDULER_ENABLED=true`) НЕ включает
+автоматическую подготовку черновиков — это два независимых флага.
+
+```bash
+AUTOMATION_AUTO_PREPARE_ENABLED=true
+AUTOMATION_SHORTLIST_MIN_MATCH_SCORE=80   # 0..100, дефолт 80
+AUTOMATION_SHORTLIST_MAX_PER_RUN=10       # 0..50, дефолт 10
+```
+
+**Только черновики — никогда не отправка и не approval.** Этот этап
+создаёт ИСКЛЮЧИТЕЛЬНО `CandidateJobMatch`/`CandidateCVDraft`/
+`BewerbungDraft` строки (все уже существующие таблицы Stage 6B/6C/6D)
+плюс техническую метадату в `AutomationRun.results["shortlist_drafts"]`.
+Никогда не отправляет заявку/письмо, никогда не approve'ит/auto-approve'ит
+ничего, никогда не меняет `Job.status` — шортлист НЕ эквивалентен статусу
+SAVED. Approval-границы Stage 6E/7D/7E полностью не тронуты.
+
+**Кандидатный пул текущего цикла.** Не сканирует всю историческую
+таблицу `jobs`. Отбираются только вакансии, которые ЭТОТ ран уже
+затронул: `JobRecord.last_seen_at >= automation_run.started_at`, статус
+`NEW`/`SAVED`, рекомендация `APPLY`/`MAYBE` (см.
+`app.db.repositories.get_current_cycle_candidate_jobs`).
+
+**Матчинг + детерминированный шортлист.** Для каждой кандидатной вакансии
+вычисляется/переиспользуется `CandidateJobMatch` (`force_recompute=False`,
+без LLM/embeddings/сети — тот же детерминированный алгоритм, что и
+`POST /jobs/{id}/match`). Вакансии с `overall_score >=
+AUTOMATION_SHORTLIST_MIN_MATCH_SCORE` ранжируются: match score DESC →
+`JobRecord.score` DESC → `job.id` ASC (никогда randomness), берутся первые
+`AUTOMATION_SHORTLIST_MAX_PER_RUN`.
+
+**CV-черновик.** Для каждой шортлистнутой вакансии
+генерируется/переиспользуется `CandidateCVDraft` — та же кэш-семантика
+Stage 6C (`force_recompute=False`), без изменений.
+
+**Bewerbung — отдельная automation-level reuse-политика.**
+`BewerbungService.generate()` при ручном вызове ВСЕГДА создаёт новую
+строку (намеренно, Stage 6D) — это поведение не тронуто. Но Stage 8C
+scheduler не должен плодить идентичный Bewerbung каждый час: ПЕРЕД
+вызовом `generate()` этот модуль сравнивает последний существующий
+`BewerbungDraftRecord` для вакансии с только что подготовленным CV
+черновиком по: `cv_draft_id`, `match_id`, `candidate_profile_version`,
+`job_snapshot_fingerprint`, `match_algorithm_version`,
+`cv_adapter_version`, `bewerbung_generator_version`, `provider` (детерминистичный
+провайдер по умолчанию). Если ВСЕ совпадают — переиспользуется
+существующий черновик; иначе вызывается `generate()`. Повторный
+автоматический цикл с неизменными входами НЕ создаёт новый
+`BewerbungDraftRecord` — только при реальном изменении (новая версия
+профиля, изменившийся снапшот вакансии) появляется новая запись.
+
+**Изоляция ошибок по вакансии.** Одна проблемная вакансия не блокирует
+остальные шортлистнутые. Каждая вакансия обрабатывается в своём
+try/except: при исключении — `db.rollback()`, в результат попадает
+только `job_id` + `type(exc).__name__` (никогда `str(exc)`/`repr(exc)`/
+traceback — тот же sanitized-logging convention, что и GMAIL-003/S8A-004),
+обработка продолжается со следующей вакансии. Шаг `shortlist_drafts`
+получает статус `partial`, если часть вакансий успешна, а часть — нет
+(`AutomationRunStepResult.status` расширен значением `"partial"`,
+обратно совместимо); общий `AutomationRun.status` наследует это как
+`PARTIAL`, как и для любого другого частично неудачного шага.
+
+**Результат в `AutomationRun.results`.** Когда `AUTOMATION_AUTO_PREPARE_ENABLED=false`,
+`results` остаётся ТОЧНО такой же формы, как Stage 8A/8B (`bundesagentur`/
+`xing` — никакого fake disabled-шага). Когда включено, добавляется шаг
+`"shortlist_drafts"` со счётчиками (`candidate_jobs`, `matched`,
+`shortlisted`, `cv_created`, `cv_reused`, `bewerbung_created`,
+`bewerbung_reused`, `failed`) и списком `items` — по одной записи на
+каждую шортлистнутую вакансию (`job_id`, `match_id`, `match_score`,
+`cv_draft_id`, `bewerbung_draft_id`, `cv_reused`, `bewerbung_reused`,
+`status`, `error_type`) — только техническая метадата, никогда имя
+кандидата/текст CV/текст Bewerbung/описание вакансии/email/секреты.
+Эта персистентная структура будет использована Stage 8E's Telegram
+daily digest.
 
 ## Проверки
 ```bash

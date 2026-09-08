@@ -226,6 +226,34 @@ def list_jobs_by_status_after_id(
     return list(db.scalars(stmt).all())
 
 
+def get_current_cycle_candidate_jobs(db: Session, *, since: datetime) -> list[JobRecord]:
+    """Stage 8C: the pool of jobs eligible for automatic shortlist/CV/
+    Bewerbung draft preparation in ONE automation cycle -- jobs the
+    current cycle's own collectors first surfaced or refreshed
+    (`last_seen_at >= since`, the calling `AutomationRunRecord`'s own
+    `started_at`), never a blind scan of the entire historical `jobs`
+    table. `status` restricted to NEW/SAVED (APPLIED/INTERVIEW/OFFER/
+    REJECTED/WITHDRAWN jobs are already past the point where an automatic
+    draft is useful) and `recommendation` restricted to APPLY/MAYBE
+    (SKIP/NEEDS_ENRICHMENT jobs are deliberately excluded — see
+    app.models.job.Recommendation). Deterministic ascending-`id` ordering
+    (never `last_seen_at`, which two jobs can share and which a collector
+    can later revise) so repeated calls against the same snapshot see a
+    stable processing order — mirrors `list_jobs_by_status_after_id`'s own
+    keyset-ordering rationale above.
+    """
+    stmt = (
+        select(JobRecord)
+        .where(
+            JobRecord.last_seen_at >= since,
+            JobRecord.status.in_([ApplicationStatus.NEW.value, ApplicationStatus.SAVED.value]),
+            JobRecord.recommendation.in_(["APPLY", "MAYBE"]),
+        )
+        .order_by(JobRecord.id.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
 def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 
