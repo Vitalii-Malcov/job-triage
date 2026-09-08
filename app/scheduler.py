@@ -41,6 +41,7 @@ from app.core.logging import configure_logging
 from app.services.scheduler import (
     SchedulerConfigurationError,
     run_due_cycle_if_claimed,
+    run_due_digest_if_claimed,
     validate_scheduler_settings,
 )
 
@@ -75,25 +76,46 @@ async def _poll_loop(settings) -> None:
     account_key = settings.automation_scheduler_account_key
     poll_seconds = settings.automation_scheduler_poll_seconds
     logger.info(
-        "automation_scheduler_started account_key=%s interval_seconds=%s poll_seconds=%s",
+        "automation_scheduler_started account_key=%s interval_seconds=%s poll_seconds=%s "
+        "automation_enabled=%s digest_enabled=%s",
         account_key,
         settings.automation_scheduler_interval_seconds,
         poll_seconds,
+        settings.automation_scheduler_enabled,
+        settings.telegram_daily_digest_enabled,
     )
     while True:
         db = SessionLocal()
         try:
-            await run_due_cycle_if_claimed(db, account_key=account_key, settings=settings)
-        except Exception as exc:
-            # A tick-level failure (e.g. a DB connectivity blip) must
-            # never kill the whole worker process -- log sanitized only
-            # (never the raw exception text/traceback, mirroring
-            # app.services.scheduler's own convention) and keep polling.
-            db.rollback()
-            logger.warning(
-                "automation_scheduler_poll_iteration_error error_type=%s",
-                type(exc).__name__,
-            )
+            # S8E: the automation cycle and the daily Telegram digest are
+            # independent features, each gated on its OWN settings flag
+            # -- one being enabled must never imply or require the
+            # other (see app.services.scheduler's module docstring). Two
+            # separate try/except blocks so a failure in one can never
+            # prevent the other from being attempted this same tick.
+            if settings.automation_scheduler_enabled:
+                try:
+                    await run_due_cycle_if_claimed(db, account_key=account_key, settings=settings)
+                except Exception as exc:
+                    # A tick-level failure (e.g. a DB connectivity blip)
+                    # must never kill the whole worker process -- log
+                    # sanitized only (never the raw exception
+                    # text/traceback, mirroring app.services.scheduler's
+                    # own convention) and keep polling.
+                    db.rollback()
+                    logger.warning(
+                        "automation_scheduler_poll_iteration_error error_type=%s",
+                        type(exc).__name__,
+                    )
+            if settings.telegram_daily_digest_enabled:
+                try:
+                    await run_due_digest_if_claimed(db, account_key=account_key, settings=settings)
+                except Exception as exc:
+                    db.rollback()
+                    logger.warning(
+                        "telegram_daily_digest_poll_iteration_error error_type=%s",
+                        type(exc).__name__,
+                    )
         finally:
             db.close()
         await asyncio.sleep(poll_seconds)
@@ -118,10 +140,17 @@ def main() -> int:
         print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
 
-    if not settings.automation_scheduler_enabled:
+    # S8E: the worker starts its poll loop if EITHER the automation
+    # cycle OR the daily Telegram digest is enabled -- neither implies
+    # or requires the other (see app.services.scheduler's module
+    # docstring). _poll_loop itself gates each independently per tick,
+    # so a worker started for "digest only" never triggers an
+    # automation cycle, and vice versa.
+    if not settings.automation_scheduler_enabled and not settings.telegram_daily_digest_enabled:
         logger.info("automation_scheduler_disabled")
         print(
-            "Automation scheduler is disabled (AUTOMATION_SCHEDULER_ENABLED=false) "
+            "Automation scheduler and Telegram daily digest are both disabled "
+            "(AUTOMATION_SCHEDULER_ENABLED=false, TELEGRAM_DAILY_DIGEST_ENABLED=false) "
             "-- exiting without starting a poll loop."
         )
         return 0

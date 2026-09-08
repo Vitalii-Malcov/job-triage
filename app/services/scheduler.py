@@ -30,6 +30,8 @@ crash-between-claim-and-run tradeoff.
 """
 
 import logging
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
@@ -38,17 +40,27 @@ from app.db.automation_schedule_repository import (
     get_or_create_schedule,
     record_last_run,
 )
+from app.db.telegram_digest_repository import (
+    claim_delivery,
+    mark_failed,
+    mark_sent,
+    mark_uncertain,
+    retry_delivery,
+)
 from app.services.automation import (
     AutomationRunAlreadyInProgressError,
     AutomationRunLeaseLostError,
     run_automation_cycle,
 )
+from app.services.telegram import TelegramSendOutcome, send_telegram_text
+from app.services.telegram_digest import build_digest_text
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "SchedulerConfigurationError",
     "run_due_cycle_if_claimed",
+    "run_due_digest_if_claimed",
     "validate_scheduler_settings",
 ]
 
@@ -67,22 +79,44 @@ class SchedulerConfigurationError(Exception):
 def validate_scheduler_settings(settings) -> None:
     """Fail-closed configuration check for the standalone worker
     (`app/scheduler.py`) to run once at startup, before entering its
-    poll loop. A disabled scheduler is always valid (nothing to
-    validate) -- `app.core.config.Settings` itself already enforces the
-    same "enabled requires a non-blank account_key" rule at construction
-    time (`Settings._validate_scheduler_requires_account_key_when_enabled`),
-    so in practice this only ever re-confirms what `get_settings()`
-    already guaranteed; it exists as its own explicit step so the
-    worker's fail-closed behavior does not depend on that Settings-level
-    validator never changing.
+    poll loop. Both the automation cycle and the Stage 8E daily digest
+    are validated INDEPENDENTLY -- neither being enabled is itself
+    invalid (the worker simply does not start at all in that case; see
+    `app.scheduler.main`), and either one can be enabled without the
+    other. `app.core.config.Settings` itself already enforces the same
+    "enabled requires a non-blank account_key" rules at construction
+    time (`Settings._validate_scheduler_requires_account_key_when_enabled`/
+    `_validate_daily_digest_requires_account_key_when_enabled`), so in
+    practice the account_key checks below only ever re-confirm what
+    `get_settings()` already guaranteed; they exist as their own
+    explicit step so the worker's fail-closed behavior does not depend
+    on those Settings-level validators never changing.
     """
-    if not settings.automation_scheduler_enabled:
-        return
-    if not settings.automation_scheduler_account_key.strip():
+    scheduler_account_key = settings.automation_scheduler_account_key.strip()
+    if settings.automation_scheduler_enabled and not scheduler_account_key:
         raise SchedulerConfigurationError(
             "automation_scheduler_enabled=True requires a non-blank "
             "automation_scheduler_account_key (AUTOMATION_SCHEDULER_ACCOUNT_KEY)."
         )
+
+    if settings.telegram_daily_digest_enabled:
+        if not scheduler_account_key:
+            raise SchedulerConfigurationError(
+                "telegram_daily_digest_enabled=True requires a non-blank "
+                "automation_scheduler_account_key (AUTOMATION_SCHEDULER_ACCOUNT_KEY)."
+            )
+        if not settings.telegram_bot_token.strip() or not settings.telegram_chat_id.strip():
+            raise SchedulerConfigurationError(
+                "telegram_daily_digest_enabled=True requires TELEGRAM_BOT_TOKEN and "
+                "TELEGRAM_CHAT_ID to be configured."
+            )
+        try:
+            ZoneInfo(settings.telegram_daily_digest_timezone)
+        except ZoneInfoNotFoundError:
+            raise SchedulerConfigurationError(
+                "telegram_daily_digest_enabled=True requires a valid IANA "
+                "TELEGRAM_DAILY_DIGEST_TIMEZONE."
+            ) from None
 
 
 async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -> bool:
@@ -163,4 +197,114 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
         run.id,
         run.status,
     )
+    return True
+
+
+def _local_now(timezone_name: str, now: datetime | None = None) -> datetime:
+    """The current time in `timezone_name` -- `now` is a UTC-aware
+    override for tests (never used in production, where the default
+    `datetime.now(UTC)` is always the real clock); a separate helper so
+    tests can inject a fixed instant without monkeypatching `datetime`
+    itself.
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+    return effective_now.astimezone(ZoneInfo(timezone_name))
+
+
+async def run_due_digest_if_claimed(
+    db: Session, *, account_key: str, settings, now: datetime | None = None
+) -> bool:
+    """One polling tick's worth of work for the Stage 8E optional DAILY
+    Telegram digest -- entirely independent of
+    `run_due_cycle_if_claimed`/the automation cycle (see this module's
+    docstring: either may be enabled without the other; the standalone
+    worker's poll loop, `app.scheduler._poll_loop`, calls each
+    independently, gated on its OWN settings flag).
+
+    Computes the current LOCAL date in
+    `settings.telegram_daily_digest_timezone`, gates on
+    `settings.telegram_daily_digest_hour` having already passed for that
+    date, and -- only if so -- attempts the once-per-`(account_key,
+    digest_date)` claim (`app.db.telegram_digest_repository.claim_delivery`)
+    that is the actual duplicate-send guard (see
+    `TelegramDigestDeliveryRecord`'s docstring for the full CAS
+    rationale: a `FAILED` delivery may be retried on a LATER tick of the
+    SAME still-current date; a `SENT` or `UNCERTAIN` one never is).
+
+    Returns `True` if a send was attempted this tick (any outcome --
+    SENT/FAILED/UNCERTAIN all count as "attempted"), `False` if nothing
+    was due yet, or the claim/retry was lost to a concurrent claimer, or
+    today's digest already resolved SENT/UNCERTAIN. Never raises -- a
+    truly unexpected failure is caught, sanitized, recorded as
+    `UNCERTAIN` (never automatically retried -- the safest assumption
+    when the failure mode itself is unknown, see the model docstring),
+    and absorbed, exactly mirroring `run_due_cycle_if_claimed`'s own
+    fail-closed, no-retry-storm contract.
+    """
+    try:
+        local_now = _local_now(settings.telegram_daily_digest_timezone, now)
+    except Exception as exc:
+        # An invalid timezone string reaching this far (bypassing both
+        # Settings construction and validate_scheduler_settings's own
+        # startup check) must still fail closed per-tick, not crash the
+        # worker.
+        logger.warning("telegram_daily_digest_invalid_timezone error_type=%s", type(exc).__name__)
+        return False
+
+    if local_now.hour < settings.telegram_daily_digest_hour:
+        return False  # not due yet today
+
+    digest_date = local_now.date()
+    record, claimed = claim_delivery(db, account_key, digest_date)
+    if not claimed:
+        if record.status != "FAILED":
+            # SENT (already delivered today) / UNCERTAIN (never
+            # automatically retried) / PENDING (held by a concurrent
+            # claimer or attempt) -- nothing for THIS tick to do.
+            return False
+        if not retry_delivery(db, record):
+            return False  # lost the retry race to a concurrent claimer
+
+    try:
+        text = build_digest_text(db, account_key)
+        outcome = await send_telegram_text(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            text,
+            timeout_seconds=settings.telegram_timeout_seconds,
+        )
+    except Exception as exc:
+        # Truly unexpected (e.g. a bug in build_digest_text, not a
+        # Telegram/network failure -- send_telegram_text already catches
+        # and classifies every httpx exception itself). Whether the
+        # message actually reached Telegram is genuinely unknown here,
+        # so this is recorded UNCERTAIN, never FAILED -- never
+        # automatically retried, to avoid risking a duplicate send.
+        db.rollback()
+        logger.warning(
+            "telegram_daily_digest_unexpected_error account_key=%s error_type=%s",
+            account_key,
+            type(exc).__name__,
+        )
+        mark_uncertain(db, record, last_error=type(exc).__name__)
+        return True
+
+    if outcome is TelegramSendOutcome.SENT:
+        mark_sent(db, record)
+        logger.info(
+            "telegram_daily_digest_sent account_key=%s digest_date=%s", account_key, digest_date
+        )
+    elif outcome is TelegramSendOutcome.FAILED:
+        mark_failed(db, record, last_error=outcome.value)
+        logger.warning(
+            "telegram_daily_digest_failed account_key=%s digest_date=%s", account_key, digest_date
+        )
+    else:
+        mark_uncertain(db, record, last_error=outcome.value)
+        logger.warning(
+            "telegram_daily_digest_uncertain account_key=%s digest_date=%s",
+            account_key,
+            digest_date,
+        )
+
     return True
