@@ -69,6 +69,19 @@ docstring). If the lease is ever lost while the run is still executing
 it raises `AutomationRunLeaseLostError` instead of finalizing the run's
 status, so it can never overwrite whatever a NEW owner has since done
 with that row.
+
+**Stage 8C — optional shortlist + CV/Bewerbung draft preparation.** After
+the fixed `AUTOMATION_STEPS` collector loop finishes, if
+`settings.automation_auto_prepare_enabled` is on (off by default),
+`app.services.automation_shortlist.prepare_shortlist_drafts` runs as one
+more step (`"shortlist_drafts"`) inside this SAME try/finally — no second
+lease, no second orchestration loop; Stage 8A's existing heartbeat
+already covers it for as long as it takes. It reuses the SAME
+match/CV/Bewerbung service logic the manual endpoints call
+(`app.services.candidate_preparation`), creates drafts only (never sends,
+approves, or transitions a `JobRecord`'s status), and — like every other
+step here — can never itself abort the run or corrupt another step's
+results; see that module's own docstring for the full policy.
 """
 
 import logging
@@ -84,9 +97,11 @@ from app.db.automation_repository import (
     renew_run_lease,
 )
 from app.db.models import AutomationRunRecord
+from app.services.automation_shortlist import prepare_shortlist_drafts
 from app.services.collector_runner import (
     CollectorError,
     CollectorNotConfiguredError,
+    TouchedJob,
     run_bundesagentur,
     run_xing,
 )
@@ -126,7 +141,9 @@ class AutomationRunLeaseLostError(Exception):
     """
 
 
-async def _run_step(db: Session, step_name: str, step_callable, settings) -> dict:
+async def _run_step(
+    db: Session, step_name: str, step_callable, settings, touched_jobs: list[TouchedJob]
+) -> dict:
     """Run exactly one coordinated step, translating its outcome into an
     `AutomationRunStepResult`-shaped dict — never lets an exception
     escape to the caller, so one step's failure can never prevent the
@@ -134,9 +151,14 @@ async def _run_step(db: Session, step_name: str, step_callable, settings) -> dic
     already-committed results (those were already committed by the
     step's own internal per-job transaction handling before it returned
     or raised).
+
+    `touched_jobs` (S8C-POOL-001): one shared, run-scoped sink passed to
+    every collector step so `run_automation_cycle` can hand Stage 8C the
+    exact set of jobs THIS run's own collectors persisted — see
+    `app.services.collector_runner.TouchedJob`.
     """
     try:
-        counters = await step_callable(db, settings)
+        counters = await step_callable(db, settings, touched_jobs=touched_jobs)
     except CollectorNotConfiguredError as exc:
         db.rollback()
         logger.info("automation_run_step_not_configured step=%s", step_name)
@@ -174,12 +196,55 @@ async def _run_step(db: Session, step_name: str, step_callable, settings) -> dic
     return {"status": "ok", "counters": counters, "error_type": None}
 
 
-def _compute_overall_status(step_results: dict[str, dict]) -> str:
+async def _run_shortlist_drafts_step(db: Session, settings, touched_jobs: list[TouchedJob]) -> dict:
+    """Stage 8C post-processing step — mirrors `_run_step`'s outer safety
+    net (never lets an exception escape, so this step can never abort the
+    run or block finalizing it) for a genuinely unexpected, STEP-level
+    failure (e.g. the candidate-preselection query itself raising).
+    Per-JOB failures within the step are already isolated and reported
+    inside its own returned `items`/`failures`/`counters["failed"]` —
+    `app.services.automation_shortlist.prepare_shortlist_drafts` never
+    lets a single job's exception propagate this far. `touched_jobs`
+    (S8C-POOL-001) is the exact set of jobs THIS run's own collector
+    steps persisted, collected by `run_automation_cycle` below.
+    """
+    try:
+        return await prepare_shortlist_drafts(db, touched_jobs=touched_jobs, settings=settings)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "automation_run_step_unexpected_error step=shortlist_drafts error_type=%s",
+            type(exc).__name__,
+        )
+        return {
+            "status": "failed",
+            "counters": None,
+            "items": None,
+            "failures": None,
+            "error_type": type(exc).__name__,
+        }
+
+
+def _compute_overall_status(step_results: dict[str, dict], core_step_names) -> str:
+    """S8C-STATUS-001 (Codex review): core JOB COLLECTION success is
+    authoritative for FAILED — a downstream Stage 8C `shortlist_drafts`
+    step that happens to report "ok" (e.g. because zero candidate jobs
+    were eligible, which is trivially "ok" on its own) must never promote
+    a run whose actual collectors ALL failed/were-not-configured into
+    PARTIAL. `core_step_names` is `AUTOMATION_STEPS`
+    (`("bundesagentur", "xing")`) — the fixed Stage 8A collector list,
+    unaffected by whether Stage 8C is enabled. If Stage 8C is disabled,
+    `step_results` contains only those same core steps, so this reduces
+    to exactly the previous all-ok/none-ok/mixed logic.
+    """
+    core_ok_count = sum(
+        1 for name in core_step_names if step_results.get(name, {}).get("status") == "ok"
+    )
+    if core_ok_count == 0:
+        return "FAILED"
     ok_count = sum(1 for result in step_results.values() if result["status"] == "ok")
     if ok_count == len(step_results):
         return "COMPLETED"
-    if ok_count == 0:
-        return "FAILED"
     return "PARTIAL"
 
 
@@ -323,14 +388,31 @@ async def run_automation_cycle(
         interval_seconds=effective_heartbeat_interval,
     )
     heartbeat.start()
+    # S8C-POOL-001: one run-scoped, in-memory sink shared by both collector
+    # steps below -- the exact-attribution record of which jobs THIS run's
+    # own collectors persisted, handed to Stage 8C instead of inferring
+    # attribution from JobRecord.last_seen_at (which could also match a job
+    # touched by a concurrent run for a different account, or a manual
+    # endpoint call, in the same time window). Never persisted itself.
+    touched_jobs: list[TouchedJob] = []
     try:
         step_results: dict[str, dict] = {}
         for step_name in AUTOMATION_STEPS:
             step_results[step_name] = await _run_step(
-                db, step_name, step_callables[step_name], settings
+                db, step_name, step_callables[step_name], settings, touched_jobs
             )
 
-        overall_status = _compute_overall_status(step_results)
+        # Stage 8C: opt-in only (Settings.automation_auto_prepare_enabled
+        # defaults to False, independent of the scheduler being enabled —
+        # see app.core.config.Settings). When disabled, AutomationRun.results
+        # stays EXACTLY the Stage 8A/8B collector result shape — no fake
+        # disabled/skipped step is ever added.
+        if settings.automation_auto_prepare_enabled:
+            step_results["shortlist_drafts"] = await _run_shortlist_drafts_step(
+                db, settings, touched_jobs
+            )
+
+        overall_status = _compute_overall_status(step_results, AUTOMATION_STEPS)
         error_summary = _build_error_summary(step_results)
 
         if heartbeat.lease_lost.is_set():

@@ -139,6 +139,35 @@ class Settings(BaseSettings):
     # so it never itself becomes the bottleneck.
     automation_scheduler_poll_seconds: int = Field(default=15, ge=1, le=3600)
 
+    # Stage 8C automation-triggered shortlist + CV/Bewerbung draft
+    # preparation. Deliberately its own opt-in switch, independent of
+    # automation_scheduler_enabled -- enabling the Stage 8B scheduler does
+    # NOT imply document generation should also run automatically; an
+    # operator may want automated collection without automated drafting.
+    # Off by default. See app.services.automation's Stage 8C section and
+    # app/services/candidate_preparation.py for what this triggers: only
+    # CandidateJobMatch/CandidateCVDraft/BewerbungDraft rows and
+    # AutomationRun result metadata -- never a job status transition, send,
+    # or approval (those remain manual, unchanged from Stage 6E/7D/7E).
+    automation_auto_prepare_enabled: bool = False
+    # Minimum CandidateJobMatch.overall_score (requirement coverage, not a
+    # probability of being hired) for a current-cycle candidate job to be
+    # shortlisted for CV/Bewerbung draft preparation.
+    automation_shortlist_min_match_score: int = Field(default=80, ge=0, le=100)
+    # Caps how many shortlisted jobs one automation cycle prepares
+    # CV/Bewerbung drafts for, regardless of how many jobs clear the score
+    # threshold -- bounds both the DB writes and the size of the persisted
+    # AutomationRun.results shortlist_drafts step per run.
+    automation_shortlist_max_per_run: int = Field(default=10, ge=0, le=50)
+    # S8C-BOUND-001 (Codex review): bounds how many jobs THIS RUN touched
+    # ever get a CandidateJobMatch computed at all -- a cheap, deterministic
+    # JobRecord.score-DESC/id-ASC preselection (see
+    # app.services.automation_shortlist.prepare_shortlist_drafts) is applied
+    # BEFORE match computation, independent of (and always >=, see the
+    # validator below) automation_shortlist_max_per_run, which only bounds
+    # the FINAL CV/Bewerbung draft count after matching.
+    automation_candidate_match_max_per_run: int = Field(default=100, ge=1, le=500)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
@@ -223,6 +252,26 @@ class Settings(BaseSettings):
             raise ValueError(
                 "automation_scheduler_account_key must be set when "
                 "automation_scheduler_enabled=True"
+            )
+        return self
+
+    # S8C-BOUND-001 (Codex review): keeps the two-stage bound coherent --
+    # the cheap match-computation bound must be able to cover the final
+    # draft-preparation bound, or the shortlist could be silently starved
+    # of otherwise-eligible higher-scoring jobs purely by a misconfigured
+    # pair of limits. Skipped when automation_shortlist_max_per_run == 0
+    # (nothing will ever be drafted regardless, so no coherence constraint
+    # applies -- an operator may still want a match-only bound in that
+    # case for cheap experimentation/observability).
+    @model_validator(mode="after")
+    def _validate_candidate_match_bound_covers_shortlist(self) -> "Settings":
+        if (
+            self.automation_shortlist_max_per_run > 0
+            and self.automation_candidate_match_max_per_run < self.automation_shortlist_max_per_run
+        ):
+            raise ValueError(
+                "automation_candidate_match_max_per_run must be >= "
+                "automation_shortlist_max_per_run (unless automation_shortlist_max_per_run == 0)"
             )
         return self
 

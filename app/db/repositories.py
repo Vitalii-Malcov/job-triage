@@ -226,6 +226,42 @@ def list_jobs_by_status_after_id(
     return list(db.scalars(stmt).all())
 
 
+def get_jobs_by_ids_if_eligible(db: Session, job_ids: list[int]) -> list[JobRecord]:
+    """Stage 8C (S8C-POOL-001, Codex review): the FINAL DB revalidation
+    step of the two-stage candidate-match bound (see
+    app.services.automation_shortlist.prepare_shortlist_drafts) -- given
+    an already bounded, already cheaply-preselected set of job ids (from
+    this automation run's own in-memory
+    app.services.collector_runner.TouchedJob attribution, never a blind
+    `last_seen_at` timestamp scan), reloads and re-checks each one's
+    CURRENT `status`/`recommendation` against the DB, which is always
+    authoritative. A job whose status/recommendation changed between
+    being touched and this revalidation (e.g. a human moved it to
+    APPLIED in the meantime) is excluded here even if the earlier cheap
+    preselection thought it eligible. `status` restricted to NEW/SAVED
+    (APPLIED/INTERVIEW/OFFER/REJECTED/WITHDRAWN jobs are already past the
+    point where an automatic draft is useful) and `recommendation`
+    restricted to APPLY/MAYBE (SKIP/NEEDS_ENRICHMENT jobs are
+    deliberately excluded — see app.models.job.Recommendation).
+    Deterministic ascending-`id` ordering, mirroring
+    `list_jobs_by_status_after_id`'s own keyset-ordering rationale above.
+    Returns `[]` immediately for an empty `job_ids` (never issues a
+    pointless `WHERE id IN ()` query).
+    """
+    if not job_ids:
+        return []
+    stmt = (
+        select(JobRecord)
+        .where(
+            JobRecord.id.in_(job_ids),
+            JobRecord.status.in_([ApplicationStatus.NEW.value, ApplicationStatus.SAVED.value]),
+            JobRecord.recommendation.in_(["APPLY", "MAYBE"]),
+        )
+        .order_by(JobRecord.id.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
 def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 

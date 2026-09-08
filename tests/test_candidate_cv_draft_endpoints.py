@@ -336,7 +336,7 @@ def test_get_cv_draft_never_computes(client, monkeypatch):
     def _boom(*args, **kwargs):
         raise AssertionError("GET must never compute a CV draft")
 
-    monkeypatch.setattr("app.api.routes.compute_cv_draft", _boom)
+    monkeypatch.setattr("app.services.candidate_preparation.compute_cv_draft", _boom)
     response = test_client.get(f"/api/v1/jobs/{job_id}/cv-draft", headers=_auth_headers())
     assert response.status_code == 404
 
