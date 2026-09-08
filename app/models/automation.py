@@ -109,7 +109,7 @@ class AutomationMessageItem(BaseModel):
     analysis_created: bool = False
     draft_created: bool = False
     status: Literal["ok", "failed"]
-    phase: Literal["analysis", "response_draft"] | None = None
+    phase: Literal["analysis", "response_draft", "cursor"] | None = None
     error_type: str | None = None
 
 
@@ -118,12 +118,16 @@ class AutomationMessageFailure(BaseModel):
     Gmail message — persisted in AutomationRunStepResult.failures,
     mirroring `AutomationJobFailure`'s shape but keyed by
     `gmail_message_id` instead of `job_id` (a Gmail message is never a
-    `JobRecord`). `error_type` only — NEVER `str(exc)`/`repr(exc)`/a
-    traceback.
+    `JobRecord`). `"cursor"` (S8D-PROGRESS-001, Codex review) is used
+    when the message's own analysis/draft pipeline fully succeeded but
+    the CAS advancing `gmail_after_message_id` past it was lost to a
+    newer owner — the work is real and durable, but bookkeeping could
+    not be safely recorded, so this is still a failure, never `"ok"`.
+    `error_type` only — NEVER `str(exc)`/`repr(exc)`/a traceback.
     """
 
     gmail_message_id: int
-    phase: Literal["analysis", "response_draft"]
+    phase: Literal["analysis", "response_draft", "cursor"]
     error_type: str
 
 

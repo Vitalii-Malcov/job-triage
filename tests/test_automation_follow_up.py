@@ -553,3 +553,174 @@ class TestNotEligibleIsNotAFailure:
             assert direct.eligibility == "ELIGIBLE"
         finally:
             db.close()
+
+
+# --- S8D-PROGRESS-002: follow-up cursor/wrap CAS loss must never be "ok" ---
+
+
+class TestFollowUpCursorCASLossIsNonOk:
+    def test_normal_cursor_cas_loss_is_non_ok(self, session_factory, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.automation_follow_up.advance_follow_up_cursor", lambda *a, **kw: False
+        )
+
+        db = session_factory()
+        try:
+            _seed_eligible_job(db)
+            result = _run_follow_up(db, _settings())
+
+            assert result["status"] != "ok"
+            assert result["counters"]["failed"] == 1
+            assert result["counters"]["cursor_wrapped"] == 0
+
+            failure = result["failures"][0]
+            assert failure["phase"] == "follow_up"
+            assert failure["error_type"] == "AutomationMailProgressCASLostError"
+
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.follow_up_after_job_id is None  # never advanced
+        finally:
+            db.close()
+
+    def test_cas_loss_with_a_prior_success_is_partial(self, session_factory, monkeypatch):
+        db = session_factory()
+        try:
+            first, _ = _seed_eligible_job(db)
+            _seed_eligible_job(db)
+
+            import app.services.automation_follow_up as follow_up_module
+
+            original = follow_up_module.advance_follow_up_cursor
+
+            def _fail_on_second(db, account_key, *, expected_cursor, new_cursor):
+                if expected_cursor == first.id:
+                    return False
+                return original(
+                    db, account_key, expected_cursor=expected_cursor, new_cursor=new_cursor
+                )
+
+            monkeypatch.setattr(
+                "app.services.automation_follow_up.advance_follow_up_cursor", _fail_on_second
+            )
+
+            result = _run_follow_up(db, _settings())
+            assert result["status"] == "partial"
+            assert result["counters"]["failed"] == 1
+
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.follow_up_after_job_id == first.id
+        finally:
+            db.close()
+
+    def test_wrap_cas_loss_is_non_ok_and_cursor_wrapped_stays_zero(
+        self, session_factory, monkeypatch
+    ):
+        db = session_factory()
+        try:
+            _seed_eligible_job(db)  # exactly one job -- wrap is attempted after it
+
+            import app.services.automation_follow_up as follow_up_module
+
+            original = follow_up_module.advance_follow_up_cursor
+
+            def _fail_only_the_wrap(db, account_key, *, expected_cursor, new_cursor):
+                if new_cursor is None:
+                    return False
+                return original(
+                    db, account_key, expected_cursor=expected_cursor, new_cursor=new_cursor
+                )
+
+            monkeypatch.setattr(
+                "app.services.automation_follow_up.advance_follow_up_cursor", _fail_only_the_wrap
+            )
+
+            result = _run_follow_up(db, _settings())
+
+            assert result["status"] != "ok"
+            assert result["counters"]["cursor_wrapped"] == 0
+            assert result["counters"]["failed"] == 1
+
+            failure = result["failures"][0]
+            assert failure["phase"] == "follow_up"
+            assert failure["error_type"] == "AutomationMailProgressCASLostError"
+
+            # The job itself WAS successfully evaluated -- only the wrap
+            # bookkeeping failed. The cursor stays at that job's id
+            # (never silently reset, never silently advanced further).
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.follow_up_after_job_id is not None
+        finally:
+            db.close()
+
+    def test_wrap_cas_loss_with_zero_eligible_jobs_is_non_ok(self, session_factory, monkeypatch):
+        """Edge case: zero APPLIED jobs exist at all, so the loop never
+        runs, but the wrap-check/CAS attempt is still made and can still
+        be lost to a newer owner -- this must not default to "ok" merely
+        because nothing was "scanned".
+        """
+        monkeypatch.setattr(
+            "app.services.automation_follow_up.advance_follow_up_cursor", lambda *a, **kw: False
+        )
+        db = session_factory()
+        try:
+            result = _run_follow_up(db, _settings())
+            assert result["counters"]["scanned"] == 0
+            assert result["status"] != "ok"
+            assert result["counters"]["failed"] == 1
+        finally:
+            db.close()
+
+
+# --- S8D-PRIVACY-001: no account_key in Stage 8D follow-up logs -------------
+
+
+class TestPrivacyNoAccountKeyInFollowUpLogs:
+    def test_success_path_logs_never_contain_account_key(self, session_factory, caplog):
+        db = session_factory()
+        try:
+            _seed_eligible_job(db)
+            with caplog.at_level("DEBUG"):
+                _run_follow_up(db, _settings())
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+
+    def test_failure_path_logs_never_contain_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "app.services.automation_follow_up.advance_follow_up_cursor", lambda *a, **kw: False
+        )
+        db = session_factory()
+        try:
+            _seed_eligible_job(db)
+            with caplog.at_level("DEBUG"):
+                _run_follow_up(db, _settings())
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+
+
+# --- CAS failure propagates AutomationRun to PARTIAL ------------------------
+
+
+class TestCASFailurePropagatesToOverallPartial:
+    def test_follow_up_cursor_cas_loss_makes_run_partial_when_core_collectors_ok(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+        monkeypatch.setattr(
+            "app.services.automation_follow_up.advance_follow_up_cursor", lambda *a, **kw: False
+        )
+
+        db = session_factory()
+        try:
+            _seed_eligible_job(db)
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+
+            assert run.status == "PARTIAL"
+            results = json.loads(run.results_json)
+            assert results["follow_up_proposals"]["status"] != "ok"
+        finally:
+            db.close()

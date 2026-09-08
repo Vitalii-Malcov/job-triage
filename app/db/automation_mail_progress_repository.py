@@ -24,6 +24,24 @@ class AutomationMailProgressConsistencyError(Exception):
     violated anyway -- e.g. reloading the row a UNIQUE constraint
     IntegrityError implies must exist comes back None. Mirrors
     app.db.automation_schedule_repository.AutomationScheduleRepositoryConsistencyError.
+
+    S8D-PRIVACY-001: the message never includes `account_key` (the
+    Gmail address) -- callers only ever log `type(exc).__name__`, never
+    `str(exc)`, but the message text is kept identity-free anyway as
+    defense in depth (mirrors GMAIL-002's "account_key identity strings
+    should not be echoed into logs/error output" convention).
+    """
+
+
+class AutomationMailProgressCASLostError(Exception):
+    """S8D-PROGRESS-001/002 (Codex review): raised (constructed, never
+    actually thrown -- see callers) when `advance_gmail_cursor`/
+    `advance_follow_up_cursor` returns `False`: a newer owner already
+    advanced this account's progress since the caller last observed it.
+    Callers use `type(this).__name__` as the sanitized `error_type` on a
+    non-"ok" step/item/failure record -- CAS loss must never be silently
+    folded into a `"ok"` status. The message never includes
+    `account_key`.
     """
 
 
@@ -68,8 +86,8 @@ def get_or_create_mail_progress(db: Session, account_key: str) -> AutomationMail
         existing = get_mail_progress(db, account_key)
         if existing is None:
             raise AutomationMailProgressConsistencyError(
-                f"Could not create or observe an automation_mail_progress row for "
-                f"account_key={account_key!r} after a UNIQUE constraint conflict."
+                "Could not create or observe an automation_mail_progress row after a "
+                "UNIQUE constraint conflict."
             ) from None
         return existing
     db.refresh(record)

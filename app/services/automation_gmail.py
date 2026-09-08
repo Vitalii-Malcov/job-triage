@@ -80,6 +80,7 @@ from sqlalchemy.orm import Session
 
 from app.collectors.base import CollectorNotConfiguredError, is_configured
 from app.db.automation_mail_progress_repository import (
+    AutomationMailProgressCASLostError,
     advance_gmail_cursor,
     get_or_create_mail_progress,
 )
@@ -123,7 +124,8 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         mismatch = GmailAccountMismatchError(
             "automation account_key does not match normalize_account_key(settings.gmail_username)"
         )
-        logger.warning("automation_gmail_sync_account_mismatch account_key=%s", account_key)
+        # S8D-PRIVACY-001: account_key IS the Gmail address -- never logged.
+        logger.warning("automation_gmail_sync_account_mismatch")
         return {"status": "failed", "counters": None, "error_type": type(mismatch).__name__}
 
     inbox_error_type: str | None = None
@@ -135,11 +137,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
     except Exception as exc:
         db.rollback()
         inbox_error_type = type(exc).__name__
-        logger.warning(
-            "automation_gmail_inbox_sync_failed account_key=%s error_type=%s",
-            account_key,
-            inbox_error_type,
-        )
+        logger.warning("automation_gmail_inbox_sync_failed error_type=%s", inbox_error_type)
 
     sent_error_type: str | None = None
     sent_result: GmailSyncResult | None = None
@@ -150,18 +148,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
     except Exception as exc:
         db.rollback()
         sent_error_type = type(exc).__name__
-        logger.warning(
-            "automation_gmail_sent_sync_failed account_key=%s error_type=%s",
-            account_key,
-            sent_error_type,
-        )
-
-    if inbox_error_type is None and sent_error_type is None:
-        status = "ok"
-    elif inbox_error_type is not None and sent_error_type is not None:
-        status = "failed"
-    else:
-        status = "partial"
+        logger.warning("automation_gmail_sent_sync_failed error_type=%s", sent_error_type)
 
     inbox_r = inbox_result or _EMPTY_SYNC_RESULT
     sent_r = sent_result or _EMPTY_SYNC_RESULT
@@ -183,10 +170,26 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         "sent_failed": sent_r.failed,
     }
 
+    # S8D-SYNC-001 (Codex review): honest ok/partial/failed derivation --
+    # a mailbox-level exception on ONE side is "partial" even if the
+    # other mailbox had zero per-message failures; BOTH raising is
+    # "failed"; and even with NEITHER raising, any per-message
+    # GmailSyncResult.failed > 0 (persistence failures GmailInboxService
+    # already isolates internally, never raised) means real work did NOT
+    # fully succeed -- "ok" requires zero exceptions AND zero counted
+    # failures, never just "nothing raised".
+    if inbox_error_type is not None and sent_error_type is not None:
+        status = "failed"
+    elif inbox_error_type is not None or sent_error_type is not None:
+        status = "partial"
+    elif counters["failed"] > 0:
+        status = "partial"
+    else:
+        status = "ok"
+
     logger.info(
-        "automation_gmail_sync_finished account_key=%s status=%s fetched=%s created=%s "
+        "automation_gmail_sync_finished status=%s fetched=%s created=%s "
         "duplicates=%s skipped=%s failed=%s",
-        account_key,
         status,
         counters["fetched"],
         counters["created"],
@@ -223,6 +226,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
     draft_created = 0
     draft_reused = 0
     no_response_recommended = 0
+    outbound_analysis_only = 0
     failed = 0
     items: list[AutomationMessageItem] = []
     failures: list[AutomationMessageFailure] = []
@@ -237,9 +241,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
             db.rollback()
             failed += 1
             logger.warning(
-                "automation_gmail_message_analysis_failed account_key=%s gmail_message_id=%s "
-                "error_type=%s",
-                account_key,
+                "automation_gmail_message_analysis_failed gmail_message_id=%s error_type=%s",
                 message.id,
                 type(exc).__name__,
             )
@@ -258,73 +260,116 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
             )
             break  # at-least-once retry (spec section 9): stop, never skip ahead
 
-        try:
-            draft_record, draft_was_created = generate_response_draft_for_message(
-                db, account_key, message.id
-            )
-        except Exception as exc:
-            db.rollback()
-            failed += 1
-            logger.warning(
-                "automation_gmail_response_draft_failed account_key=%s gmail_message_id=%s "
-                "error_type=%s",
-                account_key,
-                message.id,
-                type(exc).__name__,
-            )
-            failures.append(
-                AutomationMessageFailure(
-                    gmail_message_id=message.id,
-                    phase="response_draft",
-                    error_type=type(exc).__name__,
-                )
-            )
-            # S8C-AUDIT-001-style truthful audit: the analysis above DID
-            # durably commit -- report it, even though the draft failed.
-            items.append(
-                AutomationMessageItem(
-                    gmail_message_id=message.id,
-                    analysis_id=analysis_record.id,
-                    analysis_created=analysis_was_created,
-                    status="failed",
-                    phase="response_draft",
-                    error_type=type(exc).__name__,
-                )
-            )
-            break
-
+        # S8D-AUDIT-001 (Codex review): increment immediately after a
+        # successful analysis, BEFORE attempting response-draft
+        # generation -- so a later draft failure still leaves these
+        # counters truthfully reflecting the already-committed analysis
+        # (created vs reused), never silently omitted.
         if analysis_was_created:
             analyzed_created += 1
         else:
             analyzed_reused += 1
 
-        if draft_record.status == "NO_RESPONSE_RECOMMENDED":
-            no_response_recommended += 1
-        elif draft_was_created:
-            draft_created += 1
+        # S8D-OUTBOUND-001 (Codex review): the user's own Sent message
+        # must still be analyzed (it carries real thread/job/follow-up
+        # context -- see app.services.follow_up's anchor-message
+        # dependency), but must NEVER get a response draft: that would
+        # create an approvable "reply" to something the user themselves
+        # sent. Treated as a normal, successful, cursor-advancing outcome
+        # -- not a failure, not skipped.
+        draft_record = None
+        draft_was_created = False
+        if message.direction == "OUTBOUND":
+            outbound_analysis_only += 1
         else:
-            draft_reused += 1
+            try:
+                draft_record, draft_was_created = generate_response_draft_for_message(
+                    db, account_key, message.id
+                )
+            except Exception as exc:
+                db.rollback()
+                failed += 1
+                logger.warning(
+                    "automation_gmail_response_draft_failed gmail_message_id=%s error_type=%s",
+                    message.id,
+                    type(exc).__name__,
+                )
+                failures.append(
+                    AutomationMessageFailure(
+                        gmail_message_id=message.id,
+                        phase="response_draft",
+                        error_type=type(exc).__name__,
+                    )
+                )
+                # S8C-AUDIT-001-style truthful audit: the analysis above
+                # DID durably commit (and its counter above already
+                # reflects that) -- report it, even though the draft
+                # failed.
+                items.append(
+                    AutomationMessageItem(
+                        gmail_message_id=message.id,
+                        analysis_id=analysis_record.id,
+                        analysis_created=analysis_was_created,
+                        status="failed",
+                        phase="response_draft",
+                        error_type=type(exc).__name__,
+                    )
+                )
+                break
 
-        items.append(
-            AutomationMessageItem(
-                gmail_message_id=message.id,
-                analysis_id=analysis_record.id,
-                response_draft_id=draft_record.id,
-                response_status=draft_record.status,
-                analysis_created=analysis_was_created,
-                draft_created=draft_was_created,
-                status="ok",
-            )
-        )
+            if draft_record.status == "NO_RESPONSE_RECOMMENDED":
+                no_response_recommended += 1
+            elif draft_was_created:
+                draft_created += 1
+            else:
+                draft_reused += 1
 
         advanced = advance_gmail_cursor(
             db, account_key, expected_cursor=cursor, new_cursor=message.id
         )
         if not advanced:
-            # S8D-PROGRESS CAS lost: a newer owner already moved this
-            # account's progress -- fail closed, never overwrite.
-            logger.warning("automation_gmail_cursor_cas_lost account_key=%s", account_key)
+            # S8D-PROGRESS-001 (Codex review): a newer owner already
+            # moved this account's progress -- the message's own
+            # pipeline genuinely succeeded (analysis, and draft-or
+            # -outbound-skip), but that success could not be safely
+            # recorded as this account's current position, so it must
+            # NEVER be reported as "ok". Fail closed, never overwrite.
+            failed += 1
+            cas_lost = AutomationMailProgressCASLostError("gmail cursor CAS lost to a newer owner")
+            logger.warning("automation_gmail_cursor_cas_lost gmail_message_id=%s", message.id)
+            failures.append(
+                AutomationMessageFailure(
+                    gmail_message_id=message.id,
+                    phase="cursor",
+                    error_type=type(cas_lost).__name__,
+                )
+            )
+            items.append(
+                AutomationMessageItem(
+                    gmail_message_id=message.id,
+                    analysis_id=analysis_record.id,
+                    response_draft_id=draft_record.id if draft_record is not None else None,
+                    response_status=draft_record.status if draft_record is not None else None,
+                    analysis_created=analysis_was_created,
+                    draft_created=draft_was_created,
+                    status="failed",
+                    phase="cursor",
+                    error_type=type(cas_lost).__name__,
+                )
+            )
             break
+
+        items.append(
+            AutomationMessageItem(
+                gmail_message_id=message.id,
+                analysis_id=analysis_record.id,
+                response_draft_id=draft_record.id if draft_record is not None else None,
+                response_status=draft_record.status if draft_record is not None else None,
+                analysis_created=analysis_was_created,
+                draft_created=draft_was_created,
+                status="ok",
+            )
+        )
         cursor = message.id
 
     if scanned == 0 or failed == 0:
@@ -341,14 +386,14 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
         "draft_created": draft_created,
         "draft_reused": draft_reused,
         "no_response_recommended": no_response_recommended,
+        "outbound_analysis_only": outbound_analysis_only,
         "failed": failed,
     }
 
     logger.info(
-        "automation_gmail_response_drafts_finished account_key=%s status=%s scanned=%s "
+        "automation_gmail_response_drafts_finished status=%s scanned=%s "
         "analyzed_created=%s analyzed_reused=%s draft_created=%s draft_reused=%s "
-        "no_response_recommended=%s failed=%s",
-        account_key,
+        "no_response_recommended=%s outbound_analysis_only=%s failed=%s",
         status,
         scanned,
         analyzed_created,
@@ -356,6 +401,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
         draft_created,
         draft_reused,
         no_response_recommended,
+        outbound_analysis_only,
         failed,
     )
 

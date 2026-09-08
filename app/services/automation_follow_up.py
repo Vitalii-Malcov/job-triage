@@ -51,6 +51,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.db.automation_mail_progress_repository import (
+    AutomationMailProgressCASLostError,
     advance_follow_up_cursor,
     get_or_create_mail_progress,
 )
@@ -87,11 +88,18 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
     failed = 0
     cursor_wrapped = 0
     interrupted = False
+    # S8D-STATUS denominator: "attempted units" -- every scanned job PLUS
+    # (only if the loop finished cleanly) the one wrap-check/CAS attempt
+    # below. Mirrors app.services.automation_gmail's own
+    # scanned-includes-the-failing-unit denominator, extended for the
+    # one out-of-loop wrap event follow-up alone has.
+    attempted = 0
     items: list[AutomationFollowUpItem] = []
     failures: list[AutomationJobFailure] = []
 
     for job in jobs:
         scanned += 1
+        attempted += 1
         try:
             result = evaluate_follow_up_for_job(db, account_key, job.id, settings=settings)
         except Exception as exc:
@@ -99,8 +107,7 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
             failed += 1
             interrupted = True
             logger.warning(
-                "automation_follow_up_evaluation_failed account_key=%s job_id=%s error_type=%s",
-                account_key,
+                "automation_follow_up_evaluation_failed job_id=%s error_type=%s",
                 job.id,
                 type(exc).__name__,
             )
@@ -135,10 +142,22 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
             db, account_key, expected_cursor=cursor, new_cursor=job.id
         )
         if not advanced:
-            # S8D-PROGRESS CAS lost: a newer owner already moved this
-            # account's progress -- fail closed, never overwrite.
+            # S8D-PROGRESS-002 (Codex review): a newer owner already
+            # moved this account's progress -- this job's own evaluation
+            # genuinely succeeded, but that success could not be safely
+            # recorded as this account's current position. Fail closed,
+            # never overwrite, and never report "ok".
+            failed += 1
             interrupted = True
-            logger.warning("automation_follow_up_cursor_cas_lost account_key=%s", account_key)
+            cas_lost = AutomationMailProgressCASLostError(
+                "follow-up cursor CAS lost to a newer owner"
+            )
+            logger.warning("automation_follow_up_cursor_cas_lost job_id=%s", job.id)
+            failures.append(
+                AutomationJobFailure(
+                    job_id=job.id, phase="follow_up", error_type=type(cas_lost).__name__
+                )
+            )
             break
         cursor = job.id
 
@@ -147,6 +166,7 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
         # loss -- check whether that also means the end of the
         # currently-APPLIED job list, and if so wrap the cursor back to
         # the start for the NEXT run (never re-scanning within this one).
+        attempted += 1
         remaining = list_jobs_by_status_after_id(
             db, ApplicationStatus.APPLIED, after_id=cursor, limit=1
         )
@@ -156,10 +176,27 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
             )
             if wrapped:
                 cursor_wrapped = 1
+            else:
+                # S8D-PROGRESS-002 (Codex review): the wrap-to-NULL CAS
+                # itself was lost to a newer owner -- cursor_wrapped must
+                # stay 0 (it did NOT happen) and this must never be
+                # reported as "ok".
+                failed += 1
+                cas_lost = AutomationMailProgressCASLostError(
+                    "follow-up wrap CAS lost to a newer owner"
+                )
+                logger.warning("automation_follow_up_wrap_cursor_cas_lost")
+                failures.append(
+                    AutomationJobFailure(
+                        job_id=cursor if cursor is not None else 0,
+                        phase="follow_up",
+                        error_type=type(cas_lost).__name__,
+                    )
+                )
 
-    if scanned == 0 or failed == 0:
+    if failed == 0:
         status = "ok"
-    elif failed == scanned:
+    elif attempted > 0 and failed >= attempted:
         status = "failed"
     else:
         status = "partial"
@@ -175,9 +212,8 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
     }
 
     logger.info(
-        "automation_follow_up_proposals_finished account_key=%s status=%s scanned=%s eligible=%s "
+        "automation_follow_up_proposals_finished status=%s scanned=%s eligible=%s "
         "not_eligible=%s proposal_created=%s proposal_reused=%s failed=%s cursor_wrapped=%s",
-        account_key,
         status,
         scanned,
         eligible,

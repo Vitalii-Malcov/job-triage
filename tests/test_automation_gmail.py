@@ -27,7 +27,7 @@ from app.db.automation_mail_progress_repository import (
 )
 from app.db.base import Base
 from app.db.gmail_repository import upsert_message
-from app.db.models import GmailMessageAnalysisRecord, JobRecord
+from app.db.models import GmailMessageAnalysisRecord, JobRecord, ResponseDraftRecord
 from app.models.automation import AutomationRun, AutomationRunStepResult
 from app.models.gmail import GmailSyncResult
 from app.providers.email.base import ParsedGmailMessage
@@ -682,3 +682,281 @@ class TestBackwardCompatibility:
         )
         assert result.items[0].gmail_message_id == 1
         assert result.failures[0].gmail_message_id == 2
+
+
+# --- S8D-PROGRESS-001: Gmail cursor CAS loss must never be "ok" -------------
+
+
+class TestGmailCursorCASLossIsNonOk:
+    def test_cas_loss_after_successful_pipeline_is_non_ok(self, session_factory, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+        )
+
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY)
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["status"] != "ok"
+            assert result["counters"]["failed"] == 1
+
+            failure = result["failures"][0]
+            assert failure["phase"] == "cursor"
+            assert failure["error_type"] == "AutomationMailProgressCASLostError"
+
+            item = result["items"][0]
+            assert item["status"] == "failed"
+            assert item["phase"] == "cursor"
+            # Truthful: the underlying work (analysis + draft) really did
+            # commit -- only the cursor bookkeeping was lost.
+            assert item["analysis_id"] is not None
+            assert item["response_draft_id"] is not None
+
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.gmail_after_message_id is None  # never advanced
+        finally:
+            db.close()
+
+    def test_cas_loss_with_a_prior_success_is_partial(self, session_factory, monkeypatch):
+        db = session_factory()
+        try:
+            first = _seed_message(db, body_plain=OFFER_BODY)
+            _seed_message(db, body_plain=OFFER_BODY)
+
+            import app.services.automation_gmail as gmail_module
+
+            original = gmail_module.advance_gmail_cursor
+
+            def _fail_on_second(db, account_key, *, expected_cursor, new_cursor):
+                if expected_cursor == first.id:
+                    return False
+                return original(
+                    db, account_key, expected_cursor=expected_cursor, new_cursor=new_cursor
+                )
+
+            monkeypatch.setattr(
+                "app.services.automation_gmail.advance_gmail_cursor", _fail_on_second
+            )
+
+            result = _run_gmail_drafts(db, _settings())
+            assert result["status"] == "partial"
+            assert result["counters"]["failed"] == 1
+
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.gmail_after_message_id == first.id
+        finally:
+            db.close()
+
+
+# --- S8D-AUDIT-001: truthful analyzed_created/reused on draft failure -------
+
+
+class TestTruthfulAnalysisCountersOnDraftFailure:
+    def test_fresh_analysis_then_draft_failure_reports_analyzed_created(
+        self, session_factory, monkeypatch
+    ):
+        def _boom(db, account_key, gmail_message_id):
+            raise RuntimeError("secret-draft-detail")
+
+        monkeypatch.setattr(
+            "app.services.automation_gmail.generate_response_draft_for_message", _boom
+        )
+
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY)
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["counters"]["analyzed_created"] == 1
+            assert result["counters"]["analyzed_reused"] == 0
+            assert result["counters"]["failed"] == 1
+            assert result["items"][0]["analysis_created"] is True
+        finally:
+            db.close()
+
+    def test_reused_analysis_then_draft_failure_reports_analyzed_reused(
+        self, session_factory, monkeypatch
+    ):
+        db = session_factory()
+        try:
+            message = _seed_message(db, body_plain=OFFER_BODY)
+            # Pre-populate the analysis via the real, unmodified Stage 7B
+            # service -- exactly what the automation pipeline itself
+            # would do on an earlier, successful cycle.
+            analyze_gmail_message(db, ACCOUNT, message.id)
+
+            def _boom(db, account_key, gmail_message_id):
+                raise RuntimeError("secret-draft-detail")
+
+            monkeypatch.setattr(
+                "app.services.automation_gmail.generate_response_draft_for_message", _boom
+            )
+
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["counters"]["analyzed_created"] == 0
+            assert result["counters"]["analyzed_reused"] == 1
+            assert result["counters"]["failed"] == 1
+            assert result["items"][0]["analysis_created"] is False
+        finally:
+            db.close()
+
+
+# --- S8D-SYNC-001: GmailSyncResult.failed must prevent "ok" -----------------
+
+
+class TestGmailSyncCountsFailuresHonestly:
+    def test_per_message_sync_failures_prevent_ok_status(self, session_factory, monkeypatch):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            if mailbox == settings.gmail_mailbox:
+                return GmailSyncResult(fetched=2, created=1, duplicates=0, skipped=0, failed=1)
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "partial"
+            assert result["counters"]["failed"] == 1
+            assert result["counters"]["inbox_failed"] == 1
+        finally:
+            db.close()
+
+    def test_zero_failures_and_no_exceptions_is_ok(self, session_factory, monkeypatch):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            return GmailSyncResult(fetched=1, created=1, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "ok"
+        finally:
+            db.close()
+
+
+# --- S8D-PRIVACY-001: no account_key in Stage 8D logs -----------------------
+
+
+class TestPrivacyNoAccountKeyInGmailLogs:
+    def test_success_path_logs_never_contain_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY)
+            with caplog.at_level("DEBUG"):
+                _run_gmail_sync(db, _settings())
+                _run_gmail_drafts(db, _settings())
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+
+    def test_failure_path_logs_never_contain_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+        )
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY)
+            with caplog.at_level("DEBUG"):
+                _run_gmail_drafts(db, _settings())
+                _run_gmail_sync(
+                    db, _settings(gmail_username="different@example.com"), account_key=ACCOUNT
+                )
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+
+
+# --- S8D-OUTBOUND-001: Sent messages get analysis, never a draft -----------
+
+
+class TestOutboundMessageAnalysisOnly:
+    def test_outbound_message_gets_analysis_but_no_response_draft(self, session_factory):
+        db = session_factory()
+        try:
+            message = _seed_message(db, body_plain=OFFER_BODY, direction="OUTBOUND")
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["counters"]["outbound_analysis_only"] == 1
+            assert result["counters"]["draft_created"] == 0
+            assert result["counters"]["draft_reused"] == 0
+            assert result["counters"]["no_response_recommended"] == 0
+            assert result["counters"]["failed"] == 0
+            assert result["status"] == "ok"
+
+            item = result["items"][0]
+            assert item["status"] == "ok"
+            assert item["analysis_id"] is not None
+            assert item["response_draft_id"] is None
+
+            assert db.query(GmailMessageAnalysisRecord).count() == 1
+            assert db.query(ResponseDraftRecord).count() == 0
+
+            progress = get_mail_progress(db, ACCOUNT)
+            assert progress.gmail_after_message_id == message.id
+        finally:
+            db.close()
+
+    def test_inbound_message_still_generates_a_response_draft(self, session_factory):
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY, direction="INBOUND")
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["counters"]["outbound_analysis_only"] == 0
+            assert result["items"][0]["response_draft_id"] is not None
+            assert db.query(ResponseDraftRecord).count() == 1
+        finally:
+            db.close()
+
+    def test_mixed_outbound_and_inbound_batch(self, session_factory):
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY, direction="OUTBOUND")
+            _seed_message(db, body_plain=OFFER_BODY, direction="INBOUND")
+            result = _run_gmail_drafts(db, _settings())
+
+            assert result["counters"]["scanned"] == 2
+            assert result["counters"]["outbound_analysis_only"] == 1
+            assert result["counters"]["draft_created"] == 1
+            assert db.query(ResponseDraftRecord).count() == 1
+            assert db.query(GmailMessageAnalysisRecord).count() == 2
+        finally:
+            db.close()
+
+
+# --- CAS failure propagates AutomationRun to PARTIAL ------------------------
+
+
+class TestCASFailurePropagatesToOverallPartial:
+    def test_gmail_cursor_cas_loss_makes_run_partial_when_core_collectors_ok(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+        monkeypatch.setattr(
+            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+        )
+
+        db = session_factory()
+        try:
+            _seed_message(db, body_plain=OFFER_BODY)
+            run = asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=_settings()))
+
+            assert run.status == "PARTIAL"
+            results = json.loads(run.results_json)
+            assert results["gmail_response_drafts"]["status"] != "ok"
+        finally:
+            db.close()
