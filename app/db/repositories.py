@@ -18,7 +18,11 @@ from app.db.models import (
     ProcessedEmailMessage,
     UserProfile,
 )
-from app.domain.status_transitions import validate_transition
+from app.domain.status_transitions import (
+    ALLOWED_TRANSITIONS,
+    InvalidStatusTransitionError,
+    validate_transition,
+)
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchData
 from app.models.job import Job, JobScore
@@ -266,11 +270,40 @@ def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 
 
+# AUD-007 (Astra R2): reverse of ALLOWED_TRANSITIONS -- for a given target
+# status, the set of source statuses a transition into it may legally come
+# from. Built once at import time (the transition table is static) and used
+# to encode the allowed source state(s) directly in update_job_status's
+# UPDATE predicate below, rather than only checking them in Python against a
+# potentially-stale read.
+_ALLOWED_SOURCE_STATUSES: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
+    target: frozenset(
+        source for source, targets in ALLOWED_TRANSITIONS.items() if target in targets
+    )
+    for target in ApplicationStatus
+}
+
+
 def update_job_status(db: Session, job_id: int, new_status: ApplicationStatus) -> JobRecord | None:
     """Update a job's status after validating the transition.
 
     Returns None if the job does not exist. Raises InvalidStatusTransitionError
-    (from app.domain.status_transitions) if the transition is not allowed.
+    (from app.domain.status_transitions) if the transition is not allowed --
+    including when a CONCURRENT writer already committed a conflicting status
+    change (e.g. moved the job to a terminal REJECTED/WITHDRAWN state)
+    between this call's initial read and its write.
+
+    AUD-007 (Astra R2): a plain read -> validate-in-Python -> mutate ORM
+    object -> commit sequence is race-prone -- a reader that saw a
+    still-mutable status before commit can go on to unconditionally
+    overwrite whatever the row's status has become by commit time, including
+    a terminal state a concurrent writer already committed in between. The
+    UPDATE below instead encodes the allowed source status(es) for
+    `new_status` directly in its WHERE predicate as a single atomic
+    compare-and-set, so a stale writer's UPDATE affects zero rows whenever
+    the row's real, currently-committed status is not one of those allowed
+    sources -- a terminal status can never be moved again by a stale writer,
+    regardless of what that writer's own earlier read saw.
     """
     record = db.get(JobRecord, job_id)
     if record is None:
@@ -279,7 +312,26 @@ def update_job_status(db: Session, job_id: int, new_status: ApplicationStatus) -
     current_status = ApplicationStatus(record.status)
     validate_transition(current_status, new_status)
 
-    record.status = new_status.value
+    allowed_sources = [s.value for s in _ALLOWED_SOURCE_STATUSES[new_status]]
+    stmt = (
+        update(JobRecord)
+        .where(JobRecord.id == job_id, JobRecord.status.in_(allowed_sources))
+        .values(status=new_status.value)
+        .execution_options(synchronize_session=False)
+    )
+    result = db.execute(stmt)
+    if result.rowcount == 0:
+        # Either the job vanished, or -- the case this guard exists for -- a
+        # concurrent writer already committed a status this stale read never
+        # saw. Roll back (SQLAlchemy expires all Session-bound objects on
+        # rollback) and re-read the row's actual current status so the error
+        # raised below reflects reality, not this call's stale snapshot.
+        db.rollback()
+        fresh = db.get(JobRecord, job_id)
+        if fresh is None:
+            return None
+        raise InvalidStatusTransitionError(ApplicationStatus(fresh.status), new_status)
+
     db.commit()
     db.refresh(record)
     return record

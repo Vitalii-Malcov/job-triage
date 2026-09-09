@@ -1082,3 +1082,73 @@ class TestLeaseRenewalHeartbeat:
         send_record = get_send_for_proposal(db, ACCOUNT, proposal.id)
         assert send_record.status == "UNCERTAIN"
         assert send_record.last_error == "ThreadLockOwnershipLost"
+
+    def test_heartbeat_marks_lock_lost_when_renewal_raises(self, db, monkeypatch):
+        """AUD-003 (Astra R2): a renewal attempt that RAISES (a transient
+        DB error, a dropped connection, anything) must be treated exactly
+        like an explicit "not renewed" result -- `lock_lost` must still
+        get set. Before this fix, an uncaught exception would simply kill
+        the daemon heartbeat thread silently (Python never propagates a
+        thread's exception to its starter), leaving `lock_lost` unset
+        forever and the caller wrongly believing renewal was still
+        happening.
+        """
+        import app.services.follow_up_send as send_module
+
+        proposal, outbound, _approval = _seed_and_approve(db)
+        thread_id = outbound.thread_id
+        holder = "raises-holder"
+        assert acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=5.0) is True
+
+        def _raising_renew(*args, **kwargs):
+            raise RuntimeError("simulated transient DB error during renewal")
+
+        monkeypatch.setattr(send_module, "renew_thread_lock", _raising_renew)
+
+        heartbeat = send_module._ThreadLockHeartbeat(
+            db, thread_id, holder=holder, ttl_seconds=5.0, interval_seconds=0.05
+        )
+        heartbeat.start()
+        try:
+            assert heartbeat.lock_lost.wait(timeout=2.0), (
+                "lock_lost must be set when the renewal call raises"
+            )
+        finally:
+            heartbeat.stop()
+
+    def test_send_fails_closed_when_lease_already_lost_before_dispatch(self, db, monkeypatch):
+        """AUD-003 (Astra R2): if the heartbeat has already lost the lease
+        BEFORE the outbound provider is ever called, the provider must
+        never be invoked at all -- there is no exclusivity guarantee left
+        to protect that external side effect. This must fail closed to
+        FAILED (not UNCERTAIN/SENT), since nothing was actually sent yet.
+        """
+        import app.services.follow_up_send as send_module
+
+        proposal, _outbound, _approval = _seed_and_approve(db)
+
+        real_heartbeat_cls = send_module._ThreadLockHeartbeat
+
+        class _PreLostHeartbeat(real_heartbeat_cls):
+            def start(self) -> None:
+                # Simulate the lease already having been lost by the time
+                # send_follow_up reaches the pre-dispatch check, without
+                # actually racing a real background thread.
+                self.lock_lost.set()
+
+            def stop(self) -> None:
+                pass
+
+        monkeypatch.setattr(send_module, "_ThreadLockHeartbeat", _PreLostHeartbeat)
+
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(FollowUpSendFailedError):
+            send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert provider.call_count == 0, (
+            "the outbound provider must NEVER be called once the lease is already lost"
+        )
+        send_record = get_send_for_proposal(db, ACCOUNT, proposal.id)
+        assert send_record.status == "FAILED"
+        assert send_record.last_error == "ThreadLockOwnershipLostBeforeDispatch"

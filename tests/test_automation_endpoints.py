@@ -280,6 +280,123 @@ class TestPartialAndFailedOutcomes:
         assert body["results"]["bundesagentur"]["status"] == "not_configured"
         assert body["results"]["xing"]["status"] == "not_configured"
 
+
+class TestItemLevelBusinessOutcome:
+    """AUD-009 (Astra R2): `run_bundesagentur`/`run_xing` isolate PER-JOB
+    persist failures internally (their own try/except, never propagating
+    — see collector_runner.py) and report them via `counters["failed"]`,
+    so a collector step function returning WITHOUT raising only means it
+    didn't crash, not that any actual work succeeded. The step's own
+    reported `status` (and therefore the run's overall status) must
+    reflect the real business outcome of the attempted items, not just
+    "the call didn't raise".
+    """
+
+    def test_all_fetched_items_failing_to_persist_is_run_failed_not_completed(
+        self, client, monkeypatch
+    ):
+        from app.services import collector_runner as collector_runner_module
+
+        def _always_fail(db, profile, job):
+            raise ValueError("simulated persist failure")
+
+        monkeypatch.setattr(collector_runner_module, "score_and_persist", _always_fail)
+
+        test_client, _session_factory = client
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeBundesagenturCollector(jobs=[_ba_job()]),
+        )
+        monkeypatch.setattr(
+            "app.services.collector_runner.XingEmailCollector",
+            lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
+        )
+
+        response = test_client.post("/api/v1/automation/runs", headers=_auth_headers())
+
+        assert response.status_code == 201
+        body = response.json()
+        # Before the AUD-009 fix, both steps reported "ok" here (neither
+        # run_bundesagentur nor run_xing itself raised) and the run would
+        # have wrongly reported COMPLETED even though every single
+        # fetched job failed to persist.
+        assert body["results"]["bundesagentur"]["status"] == "failed"
+        assert body["results"]["bundesagentur"]["counters"]["failed"] == 1
+        assert body["results"]["bundesagentur"]["counters"]["created"] == 0
+        assert body["results"]["xing"]["status"] == "failed"
+        assert body["results"]["xing"]["counters"]["failed"] == 1
+        assert body["status"] == "FAILED"
+
+    def test_some_items_succeed_some_fail_is_step_partial_and_run_partial(
+        self, client, monkeypatch
+    ):
+        from app.services import collector_runner as collector_runner_module
+
+        real_score_and_persist = collector_runner_module.score_and_persist
+
+        def _fail_for_marked_job(db, profile, job):
+            if str(job.url).endswith("/FAIL"):
+                raise ValueError("simulated persist failure")
+            return real_score_and_persist(db, profile, job)
+
+        monkeypatch.setattr(collector_runner_module, "score_and_persist", _fail_for_marked_job)
+
+        test_client, _session_factory = client
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeBundesagenturCollector(
+                jobs=[
+                    _ba_job(
+                        url="https://www.arbeitsagentur.de/jobsuche/jobdetail/OK",
+                        source_reference="10000-1184867112-A",
+                    ),
+                    _ba_job(
+                        url="https://www.arbeitsagentur.de/jobsuche/jobdetail/FAIL",
+                        source_reference="10000-1184867112-B",
+                    ),
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.collector_runner.XingEmailCollector",
+            lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
+        )
+
+        response = test_client.post("/api/v1/automation/runs", headers=_auth_headers())
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["results"]["bundesagentur"]["status"] == "partial"
+        assert body["results"]["bundesagentur"]["counters"]["created"] == 1
+        assert body["results"]["bundesagentur"]["counters"]["failed"] == 1
+        assert body["results"]["xing"]["status"] == "ok"
+        assert body["status"] == "PARTIAL"
+
+    def test_zero_fetched_items_is_step_ok_not_failed(self, client, monkeypatch):
+        """No-op / no-eligible-items must never be misreported as a
+        business failure -- zero attempted items is a legitimate "ok".
+        """
+        test_client, _session_factory = client
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeBundesagenturCollector(jobs=[]),
+        )
+        monkeypatch.setattr(
+            "app.services.collector_runner.XingEmailCollector",
+            lambda **kwargs: FakeXingCollector(jobs=[]),
+        )
+
+        response = test_client.post("/api/v1/automation/runs", headers=_auth_headers())
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["results"]["bundesagentur"]["status"] == "ok"
+        assert body["results"]["bundesagentur"]["counters"]["failed"] == 0
+        assert body["results"]["xing"]["status"] == "ok"
+        assert body["status"] == "COMPLETED"
+
+
+class TestErrorSummarySanitization:
     def test_error_summary_never_leaks_raw_exception_text(self, client, monkeypatch):
         """GMAIL-003-style sanitization: only type(exc).__name__ may ever
         appear — never the exception's own message, which could carry a

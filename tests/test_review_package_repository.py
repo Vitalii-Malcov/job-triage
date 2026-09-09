@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -361,6 +363,92 @@ def test_get_latest_approved_review_for_job_returns_approved_one():
     found = get_latest_approved_review_for_job(db, 1)
     assert found is not None
     assert found.id == record.id
+
+
+def test_get_latest_approved_review_for_job_orders_by_decided_at_not_creation_order():
+    """AUD-008 (Astra R2) regression: review A is CREATED before review B
+    (so A has the lower id), but B is APPROVED first and A is approved
+    LATER -- "latest approved" must follow the approval decision
+    chronology (`decided_at`), not id/creation order, so it must return A,
+    not B.
+    """
+    db = _db()
+    review_a, revision_a = _create(db)
+    review_b, revision_b = _create(db)
+    assert review_a.id < review_b.id
+
+    decide_review(
+        db,
+        review_id=review_b.id,
+        expected_review_version=1,
+        new_status="APPROVED",
+        decision_note=None,
+        approved_revision_id=revision_b.id,
+    )
+    # Force an unambiguous decided_at ordering (B earlier, A later) rather
+    # than depending on real wall-clock granularity between two fast,
+    # back-to-back calls in the same test.
+    approved_b = get_review_by_id(db, review_b.id)
+    approved_b.decided_at = datetime(2026, 1, 1, tzinfo=UTC)
+    db.commit()
+
+    decide_review(
+        db,
+        review_id=review_a.id,
+        expected_review_version=1,
+        new_status="APPROVED",
+        decision_note=None,
+        approved_revision_id=revision_a.id,
+    )
+    approved_a = get_review_by_id(db, review_a.id)
+    approved_a.decided_at = datetime(2026, 1, 2, tzinfo=UTC)
+    db.commit()
+
+    found = get_latest_approved_review_for_job(db, 1)
+    assert found is not None
+    assert found.id == review_a.id
+
+
+def test_get_latest_approved_review_for_job_tie_breaks_on_id_when_decided_at_equal():
+    """When two approved reviews for the same job share the exact same
+    `decided_at` (e.g. a batch decision process), ordering must fall back
+    to a deterministic tie-breaker (`id.desc()`) rather than being
+    arbitrary/unstable.
+    """
+    db = _db()
+    review_a, revision_a = _create(db)
+    review_b, revision_b = _create(db)
+    assert review_a.id < review_b.id
+
+    same_instant = datetime(2026, 1, 1, tzinfo=UTC)
+
+    decide_review(
+        db,
+        review_id=review_a.id,
+        expected_review_version=1,
+        new_status="APPROVED",
+        decision_note=None,
+        approved_revision_id=revision_a.id,
+    )
+    approved_a = get_review_by_id(db, review_a.id)
+    approved_a.decided_at = same_instant
+    db.commit()
+
+    decide_review(
+        db,
+        review_id=review_b.id,
+        expected_review_version=1,
+        new_status="APPROVED",
+        decision_note=None,
+        approved_revision_id=revision_b.id,
+    )
+    approved_b = get_review_by_id(db, review_b.id)
+    approved_b.decided_at = same_instant
+    db.commit()
+
+    found = get_latest_approved_review_for_job(db, 1)
+    assert found is not None
+    assert found.id == review_b.id, "tie on decided_at must deterministically favor the higher id"
 
 
 # --- privacy-safe persisted JSON --------------------------------------------
