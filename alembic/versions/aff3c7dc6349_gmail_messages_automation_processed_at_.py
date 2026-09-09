@@ -16,17 +16,44 @@ docstring and app/db/gmail_repository.py's
 `list_unprocessed_messages_for_automation`/`mark_message_automation_processed`
 for the fixed selection query and CAS.
 
-**Backfill is additive, not destructive.** Existing rows are marked
-processed (`automation_processed_at = now`) wherever their `id` is `<=`
-that account's existing `gmail_after_message_id` cursor — preserving
-current progress so upgrading does not trigger a reprocessing flood of
-the entire historical mailbox. This mirrors migration
-`b3f1c9a7d5e2`'s (`provider_arrival_at`) "honest best-effort backfill,
-identical behavior to what this project already had, strictly no worse"
-precedent — it is not a claim that no message committed out of order
-before this fix; historical continuity, not retroactive correctness
-recovery, is the goal. `automation_mail_progress.gmail_after_message_id`
-itself is left completely untouched (not dropped, not written to by this
+**No backfill from the old watermark (Astra R3 Codex re-review, HIGH
+finding fixed here).** An earlier version of this migration backfilled
+`automation_processed_at` for every existing row whose `id` was `<=`
+that account's `gmail_after_message_id`. That was wrong, and exactly
+backwards for what this migration exists to fix: the whole reason
+AUD-004 is a real bug is that `gmail_after_message_id` is NOT trustworthy
+evidence a message was actually processed — it is precisely the
+mechanism that could advance past a lower-`id` row that had not yet
+committed. Backfilling from it would silently CEMENT any historical
+instance of the AUD-004 race as a permanent, undetectable skip: a
+message that was never actually processed would be marked
+`automation_processed_at != NULL` and would never be picked up by the
+fixed selector either. There is no other durable, per-message evidence
+in this schema that unambiguously proves Stage 8D's full pipeline
+(analysis + response-draft-or-NO_RESPONSE_RECOMMENDED-or-OUTBOUND-skip)
+already completed for a given message — `GmailMessageAnalysisRecord`/
+`ResponseDraftRecord` existence is close but was never treated as the
+authoritative signal Stage 8D itself relies on, and inferring "safe to
+skip" from it here would reintroduce the same class of assumption this
+fix removes elsewhere.
+
+Every pre-existing `gmail_messages` row is therefore left with
+`automation_processed_at = NULL` — eligible for the very next Stage 8D
+scan, exactly like a message the fixed code path would treat as
+unprocessed for any other reason. This trades a one-time, BOUNDED
+(`Settings.automation_gmail_process_max_per_run` per cycle) historical
+catch-up reprocessing pass for actual correctness: analysis and
+response-draft generation are idempotent (re-running them for an
+already-handled message reuses/no-ops rather than duplicating), and
+Stage 8D never sends email or performs any external/approval-requiring
+action on its own (see app/services/automation_gmail.py's own module
+docstring, "Drafts only") — so re-scanning old messages after this
+migration is safe, side-effect-free beyond bounded extra DB work, and
+recovers any message the old watermark may have silently stranded.
+Correctness over avoiding a bounded amount of harmless reprocessing.
+
+`automation_mail_progress.gmail_after_message_id` itself is left
+completely untouched (not dropped, not read, not written by this
 migration) — Stage 8D's own code simply stops reading it for message
 selection going forward; nothing here is destructive or loses data.
 
@@ -63,21 +90,11 @@ def upgrade() -> None:
             "ix_gmail_messages_account_key_automation_processed_at",
             ["account_key", "automation_processed_at"],
         )
-    # Best-effort backfill (see module docstring): preserve each account's
-    # existing Stage 8D progress so upgrading does not reprocess the whole
-    # historical mailbox. A correlated subquery against
-    # automation_mail_progress works identically on SQLite and PostgreSQL.
-    op.execute(
-        """
-        UPDATE gmail_messages
-        SET automation_processed_at = CURRENT_TIMESTAMP
-        WHERE id <= (
-            SELECT gmail_after_message_id
-            FROM automation_mail_progress
-            WHERE automation_mail_progress.account_key = gmail_messages.account_key
-        )
-        """
-    )
+    # Deliberately NO backfill (see module docstring) — every existing row
+    # stays automation_processed_at = NULL, so it remains eligible for the
+    # next Stage 8D scan rather than risking silently cementing a message
+    # the old, untrustworthy `gmail_after_message_id` watermark may have
+    # skipped without ever actually processing it.
 
 
 def downgrade() -> None:
