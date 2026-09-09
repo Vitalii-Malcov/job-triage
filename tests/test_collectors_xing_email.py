@@ -570,6 +570,97 @@ class TestConnectSecurityHardening:
 
         assert sensitive_exc_text not in str(exc_info.value)
 
+    @pytest.mark.asyncio
+    async def test_constructor_imap4_abort_raises_sanitized_connection_error(self, monkeypatch):
+        """Codex final review, MEDIUM: DeadlineIMAP4SSL's constructor
+        (TLS/greeting/CAPABILITY processing, or a deadline-triggered
+        forced close mid-read) can raise imaplib.IMAP4.abort -- a plain
+        Exception subclass, NOT an OSError -- carrying raw, potentially
+        server-controlled text. Exercises the REAL production path
+        (owns_connection=True, deadline is not None -> DeadlineIMAP4SSL),
+        not the deadline=None path the OSError test above uses."""
+        sensitive_host = "corp-mailserver-do-not-leak.internal"
+        sensitive_port = 47993
+        sensitive_exc_text = "SECRET_RAW_SERVER_TEXT"
+
+        def fake_deadline_client(host, port, **kwargs):
+            raise imaplib.IMAP4.abort(sensitive_exc_text)
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", fake_deadline_client)
+        collector = XingEmailCollector(
+            imap_host=sensitive_host,
+            imap_port=sensitive_port,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingConnectionError) as exc_info:
+            await collector.fetch()
+
+        message = str(exc_info.value)
+        assert sensitive_exc_text not in message
+        assert sensitive_host not in message
+        assert str(sensitive_port) not in message
+
+    @pytest.mark.asyncio
+    async def test_constructor_imap4_error_raises_sanitized_connection_error(self, monkeypatch):
+        """Same as above for the base imaplib.IMAP4.error (abort's
+        parent class) -- e.g. a malformed/unexpected greeting or
+        CAPABILITY response the constructor rejects outright."""
+        sensitive_host = "corp-mailserver-do-not-leak.internal"
+        sensitive_port = 47993
+        sensitive_exc_text = "SECRET_RAW_SERVER_TEXT"
+
+        def fake_deadline_client(host, port, **kwargs):
+            raise imaplib.IMAP4.error(sensitive_exc_text)
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", fake_deadline_client)
+        collector = XingEmailCollector(
+            imap_host=sensitive_host,
+            imap_port=sensitive_port,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingConnectionError) as exc_info:
+            await collector.fetch()
+
+        message = str(exc_info.value)
+        assert sensitive_exc_text not in message
+        assert sensitive_host not in message
+        assert str(sensitive_port) not in message
+
+    @pytest.mark.asyncio
+    async def test_login_rejected_with_imap4_error_still_raises_sanitized_auth_error(
+        self, monkeypatch
+    ):
+        """The constructor-time imaplib.IMAP4.error handling added
+        above must not swallow the EXPLICIT, later client.login()
+        rejection into a connection error -- login rejection is a
+        distinct, separately try/excepted block and must keep raising
+        XingAuthError, sanitized exactly like the constructor path."""
+        sensitive_exc_text = "SECRET_RAW_LOGIN_REJECTION_TEXT"
+
+        class _RejectingClient:
+            def login(self, user, password):
+                raise imaplib.IMAP4.error(sensitive_exc_text)
+
+        def fake_deadline_client(host, port, **kwargs):
+            return _RejectingClient()
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", fake_deadline_client)
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingAuthError) as exc_info:
+            await collector.fetch()
+
+        assert sensitive_exc_text not in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # AUD-005 (total wall-clock session deadline, not just per-read inactivity).

@@ -250,6 +250,107 @@ async def test_connect_os_error_raises_connection_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connect_os_error_does_not_leak_host_port_or_raw_exception_text(monkeypatch):
+    """Codex final review, MEDIUM: constructor-time OSError sanitization
+    (still) must not leak the configured host/port or raw exception
+    text. Uses distinctive fake sensitive values so a leak is
+    unambiguous."""
+    sensitive_host = "corp-mailserver-do-not-leak.internal"
+    sensitive_port = 47993
+    sensitive_exc_text = "SECRET_RAW_OS_TEXT_LEAKED_IF_VISIBLE"
+
+    def fake_deadline_client(host, port, **kwargs):
+        raise OSError(sensitive_exc_text)
+
+    monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", fake_deadline_client)
+    provider = _provider(None, imap_host=sensitive_host, imap_port=sensitive_port)
+
+    with pytest.raises(GmailConnectionError) as exc_info:
+        await provider.fetch()
+
+    message = str(exc_info.value)
+    assert sensitive_host not in message
+    assert str(sensitive_port) not in message
+    assert sensitive_exc_text not in message
+
+
+@pytest.mark.asyncio
+async def test_constructor_imap4_abort_raises_sanitized_connection_error(monkeypatch):
+    """Codex final review, MEDIUM: DeadlineIMAP4SSL's constructor (TLS/
+    greeting/CAPABILITY processing, or a deadline-triggered forced
+    close mid-read) can raise imaplib.IMAP4.abort -- a plain Exception
+    subclass, NOT an OSError -- carrying raw, potentially
+    server-controlled text. This must be caught and sanitized exactly
+    like a constructor-time OSError, not left to escape raw."""
+    sensitive_host = "corp-mailserver-do-not-leak.internal"
+    sensitive_port = 47993
+    sensitive_exc_text = "SECRET_RAW_SERVER_TEXT"
+
+    def fake_deadline_client(host, port, **kwargs):
+        raise imaplib.IMAP4.abort(sensitive_exc_text)
+
+    monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", fake_deadline_client)
+    provider = _provider(None, imap_host=sensitive_host, imap_port=sensitive_port)
+
+    with pytest.raises(GmailConnectionError) as exc_info:
+        await provider.fetch()
+
+    message = str(exc_info.value)
+    assert sensitive_exc_text not in message
+    assert sensitive_host not in message
+    assert str(sensitive_port) not in message
+
+
+@pytest.mark.asyncio
+async def test_constructor_imap4_error_raises_sanitized_connection_error(monkeypatch):
+    """Same as above for the base imaplib.IMAP4.error (abort's parent
+    class) -- e.g. a malformed/unexpected greeting or CAPABILITY
+    response the constructor rejects outright."""
+    sensitive_host = "corp-mailserver-do-not-leak.internal"
+    sensitive_port = 47993
+    sensitive_exc_text = "SECRET_RAW_SERVER_TEXT"
+
+    def fake_deadline_client(host, port, **kwargs):
+        raise imaplib.IMAP4.error(sensitive_exc_text)
+
+    monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", fake_deadline_client)
+    provider = _provider(None, imap_host=sensitive_host, imap_port=sensitive_port)
+
+    with pytest.raises(GmailConnectionError) as exc_info:
+        await provider.fetch()
+
+    message = str(exc_info.value)
+    assert sensitive_exc_text not in message
+    assert sensitive_host not in message
+    assert str(sensitive_port) not in message
+
+
+@pytest.mark.asyncio
+async def test_login_rejected_with_imap4_error_still_raises_sanitized_auth_error(monkeypatch):
+    """The constructor-time imaplib.IMAP4.error handling added above
+    must not swallow the EXPLICIT, later client.login() rejection into
+    a connection error -- login rejection is a distinct, separately
+    try/excepted block and must keep raising GmailAuthError, sanitized
+    exactly like the constructor path."""
+    sensitive_exc_text = "SECRET_RAW_LOGIN_REJECTION_TEXT"
+
+    class RejectingClient(FakeImapClient):
+        def login(self, user, password):
+            raise imaplib.IMAP4.error(sensitive_exc_text)
+
+    def fake_deadline_client(host, port, **kwargs):
+        return RejectingClient()
+
+    monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", fake_deadline_client)
+    provider = _provider(None)
+
+    with pytest.raises(GmailAuthError) as exc_info:
+        await provider.fetch()
+
+    assert sensitive_exc_text not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_select_failure_raises_connection_error():
     client = FakeImapClient(select_typ="NO")
     provider = _provider(client)

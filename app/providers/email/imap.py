@@ -603,9 +603,16 @@ class GmailImapProvider:
                     ssl_context=ssl_context,
                     timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
                 )
-        except OSError as exc:
-            # GMAIL-003: never interpolate the underlying OSError/host/port
-            # into the raised message — see base.py's GmailProviderError
+        except (OSError, imaplib.IMAP4.error) as exc:
+            # GMAIL-003 (Codex final review, MEDIUM): constructor-time
+            # protocol failures -- imaplib.IMAP4.error/abort, e.g. a
+            # malformed/aborted greeting or CAPABILITY response, or the
+            # deadline forcing the socket closed mid-read -- can carry
+            # raw server-controlled text just like an OSError can carry
+            # raw host/port text. `imaplib.IMAP4.abort` subclasses
+            # `imaplib.IMAP4.error`, so catching `error` alone already
+            # covers both. Never interpolate exc/host/port into the
+            # raised message — see base.py's GmailProviderError
             # docstring. Internal-only diagnosis uses type(exc).__name__.
             logger.warning("gmail_connect_failed error_type=%s", type(exc).__name__)
             raise GmailConnectionError(
