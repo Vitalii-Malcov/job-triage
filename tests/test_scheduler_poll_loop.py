@@ -257,3 +257,45 @@ class TestTickLevelExceptionContainment:
         assert all(session.closed for session in fake_session_local.created)
         assert "boom-1" not in caplog.text
         assert "boom-2" not in caplog.text
+
+
+class TestStartupLoggingPrivacy:
+    """AUD-010: `_poll_loop`'s one-time startup log line must never
+    include `account_key` -- an operator's real account identity
+    (an email address in practice, see app.core.config's own account_key
+    docstrings). Before the fix, `automation_scheduler_started` logged
+    `account_key=%s` directly.
+    """
+
+    def test_startup_log_never_contains_the_configured_account_key(self, monkeypatch, caplog):
+        fake_session_local = _FakeSessionLocal()
+        monkeypatch.setattr("app.db.session.SessionLocal", fake_session_local)
+
+        started = asyncio.Event()
+
+        async def _fake_run_due_cycle_if_claimed(db, *, account_key, settings):
+            started.set()
+            return True
+
+        monkeypatch.setattr(
+            "app.scheduler.run_due_cycle_if_claimed", _fake_run_due_cycle_if_claimed
+        )
+
+        secret_account_key = "vitalikmalkov003@example.com"
+
+        async def _drive():
+            task = asyncio.create_task(
+                _poll_loop(_fake_settings(automation_scheduler_account_key=secret_account_key))
+            )
+            await _cancel_after(task, started)
+
+        with caplog.at_level("DEBUG"):
+            asyncio.run(_drive())
+
+        assert secret_account_key not in caplog.text
+        assert "account_key" not in caplog.text
+        # Non-identifying operational fields must still be logged -- this
+        # is a privacy fix, not a removal of useful startup observability.
+        assert "automation_scheduler_started" in caplog.text
+        assert "interval_seconds" in caplog.text
+        assert "poll_seconds" in caplog.text

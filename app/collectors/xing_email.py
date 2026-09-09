@@ -51,10 +51,12 @@ Beyond that constraint, this collector:
 """
 
 import asyncio
+import contextlib
 import email
 import imaplib
 import logging
 import re
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -67,11 +69,23 @@ from pydantic import ValidationError
 
 from app.collectors.base import CollectorError, JobCollector, is_configured
 from app.models.job import Job
+from app.providers.email.imap_deadline import (
+    IMAP_SESSION_DEADLINE_SECONDS,
+    DeadlineIMAP4SSL,
+    ImapSessionDeadline,
+)
 
 logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "xing"
 XING_DIGEST_SENDER = "jobs@mail.xing.com"
+
+# AUD-005: mirrors app.providers.email.imap.IMAP_OPERATION_TIMEOUT_SECONDS
+# -- bounds every blocking socket operation on this collector's IMAP
+# connection so a hung/black-holed mailbox server can't stall the worker
+# thread (see fetch_message_batches's asyncio.to_thread docstring)
+# indefinitely.
+IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 
 # Both observed digest subject formats. Anything else from the same sender
 # domain (e.g. "Wochencheck" from mailrobot@, industry news from news@) is
@@ -359,42 +373,129 @@ class XingEmailCollector(JobCollector):
     def _fetch_sync(self, since: datetime) -> list[XingEmailBatch]:
         client = self._injected_client
         owns_connection = client is None
-        if client is None:
-            client = self._connect()
+        # AUD-005: a real total wall-clock deadline for this whole session
+        # (login through select/search/fetch/close/logout), not just the
+        # per-read inactivity timeout `timeout=` already gives the socket
+        # -- see app/providers/email/imap_deadline.py's module docstring
+        # for why a slow-drip peer needs this. Only applied when this call
+        # owns the connection: a test-injected client has no real socket
+        # to bound.
+        deadline = ImapSessionDeadline(IMAP_SESSION_DEADLINE_SECONDS) if owns_connection else None
 
+        with contextlib.ExitStack() as stack:
+            if deadline is not None:
+                stack.enter_context(deadline)
+            if client is None:
+                client = self._connect(deadline)
+            try:
+                return self._fetch_sync_body(client, since, deadline)
+            except OSError as exc:
+                if deadline is not None and deadline.exceeded:
+                    logger.warning("xing_email_imap_session_deadline_exceeded")
+                else:
+                    logger.warning(
+                        "xing_email_imap_operation_failed error_type=%s", type(exc).__name__
+                    )
+                raise XingConnectionError("IMAP operation failed") from exc
+            finally:
+                if owns_connection:
+                    self._disconnect(client)
+
+    def _fetch_sync_body(
+        self,
+        client: ImapClient,
+        since: datetime,
+        deadline: ImapSessionDeadline | None,
+    ) -> list[XingEmailBatch]:
+        typ, _ = client.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise XingConnectionError(f"IMAP SELECT failed: {typ}")
+
+        criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
+        typ, data = client.search(None, criteria)
+        if typ != "OK":
+            raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
+
+        message_numbers = data[0].split() if data and data[0] else []
+        batches: list[XingEmailBatch] = []
+        for message_number in message_numbers:
+            # AUD-005: once the total session deadline has fired, the
+            # connection's socket is already forcibly closed (see
+            # ImapSessionDeadline) -- stop issuing further FETCHes on it
+            # instead of letting each remaining message fail one at a
+            # time.
+            if deadline is not None and deadline.exceeded:
+                break
+            batch = self._fetch_and_process_message(client, message_number)
+            if batch is not None:
+                batches.append(batch)
+
+        if deadline is not None and deadline.exceeded:
+            raise XingConnectionError("IMAP session exceeded its total operation deadline")
+
+        return batches
+
+    def _connect(self, deadline: ImapSessionDeadline | None = None) -> imaplib.IMAP4_SSL:
         try:
-            typ, _ = client.select("INBOX", readonly=True)
-            if typ != "OK":
-                raise XingConnectionError(f"IMAP SELECT failed: {typ}")
-
-            criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
-            typ, data = client.search(None, criteria)
-            if typ != "OK":
-                raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
-
-            message_numbers = data[0].split() if data and data[0] else []
-            batches: list[XingEmailBatch] = []
-            for message_number in message_numbers:
-                batch = self._fetch_and_process_message(client, message_number)
-                if batch is not None:
-                    batches.append(batch)
-            return batches
-        finally:
-            if owns_connection:
-                self._disconnect(client)
-
-    def _connect(self) -> imaplib.IMAP4_SSL:
-        try:
-            client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
-        except OSError as exc:
+            # AUD-001: an explicit verifying SSLContext -- imaplib's own
+            # default (ssl_context=None) resolves to
+            # ssl._create_stdlib_context(), which sets verify_mode=CERT_NONE
+            # and check_hostname=False, i.e. no certificate verification at
+            # all. AUD-005: `timeout=` bounds each individual blocking
+            # socket read on this connection.
+            ssl_context = ssl.create_default_context()
+            if deadline is not None:
+                # AUD-005 (narrow re-review): DeadlineIMAP4SSL binds the
+                # watchdog to the real socket from the moment it's
+                # created -- covering the TCP connect, TLS handshake, and
+                # (once this constructor call returns and
+                # imaplib.IMAP4.__init__ proceeds to IMAP4._connect())
+                # the greeting/CAPABILITY reads, not just the commands
+                # this collector issues after _connect() returns. See
+                # app/providers/email/imap_deadline.py's DeadlineIMAP4SSL
+                # docstring for why binding the socket only after this
+                # call returned (the previous version of this fix) left
+                # the whole constructor unprotected.
+                client = DeadlineIMAP4SSL(
+                    self.imap_host,
+                    self.imap_port,
+                    ssl_context=ssl_context,
+                    timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+                    deadline=deadline,
+                )
+            else:
+                client = imaplib.IMAP4_SSL(
+                    self.imap_host,
+                    self.imap_port,
+                    ssl_context=ssl_context,
+                    timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+                )
+        except (OSError, imaplib.IMAP4.error) as exc:
+            # AUD-005 (Codex final review, MEDIUM): never interpolate the
+            # underlying OSError/host/port into the raised message -- an
+            # operator-visible surface (see app/api/routes.py's
+            # `run_xing_collector`, which puts `str(exc)` straight into
+            # an HTTP 502 `detail`) must not leak connection internals or
+            # raw exception text. Mirrors GMAIL-003's sanitization
+            # exactly (app/providers/email/imap.py's `_connect`).
+            # Constructor-time protocol failures -- imaplib.IMAP4.error/
+            # abort, e.g. a malformed/aborted greeting or CAPABILITY
+            # response, or the deadline forcing the socket closed
+            # mid-read -- can carry raw server-controlled text just like
+            # an OSError can carry raw host/port text.
+            # `imaplib.IMAP4.abort` subclasses `imaplib.IMAP4.error`, so
+            # catching `error` alone already covers both. Internal-only
+            # diagnosis uses type(exc).__name__, never str(exc).
+            logger.warning("xing_connect_failed error_type=%s", type(exc).__name__)
             raise XingConnectionError(
-                f"Could not connect to {self.imap_host}:{self.imap_port}: {exc}"
+                "Could not connect to the configured XING mailbox IMAP host"
             ) from exc
 
         try:
             client.login(self.username, self.app_password)
         except imaplib.IMAP4.error as exc:
-            raise XingAuthError(f"XING mailbox IMAP login rejected: {exc}") from exc
+            logger.warning("xing_login_failed error_type=%s", type(exc).__name__)
+            raise XingAuthError("XING mailbox IMAP login was rejected") from exc
         return client
 
     def _disconnect(self, client: ImapClient) -> None:
