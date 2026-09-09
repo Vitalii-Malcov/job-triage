@@ -16,6 +16,7 @@ from app.collectors.xing_email import (
     XingConnectionError,
     XingEmailCollector,
 )
+from app.providers.email.imap_deadline import ImapSessionDeadline
 
 XING_SENDER = "jobs@mail.xing.com"
 
@@ -521,19 +522,6 @@ class TestConnectSecurityHardening:
 # ---------------------------------------------------------------------------
 
 
-class _RecordingDeadline:
-    """Stands in for ImapSessionDeadline to prove `_connect` binds the
-    real connection socket to whatever deadline it's given, without
-    depending on ImapSessionDeadline's own (separately tested) internals.
-    """
-
-    def __init__(self) -> None:
-        self.bound_socket = "not called"
-
-    def bind_socket(self, sock):
-        self.bound_socket = sock
-
-
 class _AlreadyExceededDeadline:
     """Stands in for an ImapSessionDeadline that has already fired by the
     time the per-message fetch loop runs -- lets the "deadline exceeded
@@ -544,7 +532,7 @@ class _AlreadyExceededDeadline:
     def __init__(self, _total_seconds: float) -> None:
         pass
 
-    def bind_socket(self, sock) -> None:
+    def bind_socket(self, sock, *, extra_closable=None) -> None:
         pass
 
     @property
@@ -559,32 +547,48 @@ class _AlreadyExceededDeadline:
 
 
 class TestSessionDeadlineWiring:
-    def test_connect_binds_the_real_connection_socket_to_the_given_deadline(self, monkeypatch):
-        sentinel_sock = object()
+    def test_connect_passes_a_verifying_ssl_context_to_deadline_imap4ssl(self, monkeypatch):
+        """AUD-001 must remain true for the path production actually uses
+        (owns_connection=True, deadline is not None): `_connect(deadline)`
+        must construct `DeadlineIMAP4SSL` with the same verifying
+        ssl_context/finite timeout as the plain `imaplib.IMAP4_SSL` path
+        above, plus the given deadline. Real socket binding is
+        DeadlineIMAP4SSL's own concern, covered by its dedicated tests in
+        tests/test_imap_deadline.py -- this test only checks wiring.
+        """
+        captured = {}
 
         class _StubClient:
-            sock = sentinel_sock
-
             def login(self, user, password):
                 return ("OK", [b"LOGIN completed"])
 
-        monkeypatch.setattr(xing_email_module.imaplib, "IMAP4_SSL", lambda *a, **kw: _StubClient())
+        def _stub_deadline_client(host, port, *, ssl_context, timeout, deadline):
+            captured["ssl_context"] = ssl_context
+            captured["timeout"] = timeout
+            captured["deadline"] = deadline
+            return _StubClient()
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", _stub_deadline_client)
         collector = XingEmailCollector(
             imap_host="imap.example.com",
             imap_port=993,
             username="user@example.com",
             app_password="app-password",
         )
-        deadline = _RecordingDeadline()
+        deadline = ImapSessionDeadline(5.0)
 
         collector._connect(deadline)
 
-        assert deadline.bound_socket is sentinel_sock
+        assert isinstance(captured["ssl_context"], ssl.SSLContext)
+        assert captured["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+        assert captured["ssl_context"].check_hostname is True
+        assert captured["timeout"] == IMAP_OPERATION_TIMEOUT_SECONDS
+        assert captured["deadline"] is deadline
 
     def test_connect_without_a_deadline_does_not_require_one(self, monkeypatch):
         """`deadline` defaults to None -- existing callers/tests that call
         `_connect()` with no argument (e.g. the AUD-001 tests above) must
-        keep working unchanged."""
+        keep working unchanged, still via plain imaplib.IMAP4_SSL."""
 
         class _StubClient:
             def login(self, user, password):
@@ -609,9 +613,8 @@ class TestSessionDeadlineWiring:
         body = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
         raw = _build_email(XING_SENDER, "3 neue Stellenangebote für Python", body)
         fake_client = FakeImapClient([raw])
-        fake_client.sock = object()
 
-        monkeypatch.setattr(xing_email_module.imaplib, "IMAP4_SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
         collector = XingEmailCollector(
             imap_host="imap.example.com",
             imap_port=993,
@@ -636,9 +639,8 @@ class TestSessionDeadlineWiring:
         body = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
         raw = _build_email(XING_SENDER, "3 neue Stellenangebote für Python", body)
         fake_client = FakeImapClient([raw])
-        fake_client.sock = object()
 
-        monkeypatch.setattr(xing_email_module.imaplib, "IMAP4_SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
         monkeypatch.setattr(xing_email_module, "ImapSessionDeadline", _AlreadyExceededDeadline)
         collector = XingEmailCollector(
             imap_host="imap.example.com",

@@ -76,6 +76,7 @@ from app.providers.email.base import (
 )
 from app.providers.email.imap_deadline import (
     IMAP_SESSION_DEADLINE_SECONDS,
+    DeadlineIMAP4SSL,
     ImapSessionDeadline,
 )
 
@@ -574,16 +575,34 @@ class GmailImapProvider:
             # including a forged one from a MITM peer, over a channel
             # that authenticates with a real mailbox password. AUD-005:
             # `timeout=` bounds each individual blocking socket read on
-            # this connection (see IMAP_OPERATION_TIMEOUT_SECONDS); the
-            # `deadline` bound below adds a REAL total wall-clock bound on
-            # top of that -- see imap_deadline.py's module docstring.
+            # this connection (see IMAP_OPERATION_TIMEOUT_SECONDS).
             ssl_context = ssl.create_default_context()
-            client = imaplib.IMAP4_SSL(
-                self.imap_host,
-                self.imap_port,
-                ssl_context=ssl_context,
-                timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
-            )
+            if deadline is not None:
+                # AUD-005 (narrow re-review): DeadlineIMAP4SSL binds the
+                # watchdog to the real socket from the moment it's
+                # created -- covering the TCP connect, TLS handshake, and
+                # (once this constructor call returns and
+                # imaplib.IMAP4.__init__ proceeds to IMAP4._connect())
+                # the greeting/CAPABILITY reads, not just the commands
+                # this provider issues after _connect() returns. See
+                # imap_deadline.py's DeadlineIMAP4SSL docstring for why
+                # binding the socket only after this call returned (the
+                # previous version of this fix) left the whole
+                # constructor unprotected.
+                client = DeadlineIMAP4SSL(
+                    self.imap_host,
+                    self.imap_port,
+                    ssl_context=ssl_context,
+                    timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+                    deadline=deadline,
+                )
+            else:
+                client = imaplib.IMAP4_SSL(
+                    self.imap_host,
+                    self.imap_port,
+                    ssl_context=ssl_context,
+                    timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+                )
         except OSError as exc:
             # GMAIL-003: never interpolate the underlying OSError/host/port
             # into the raised message — see base.py's GmailProviderError
@@ -592,16 +611,6 @@ class GmailImapProvider:
             raise GmailConnectionError(
                 "Could not connect to the configured Gmail IMAP host"
             ) from exc
-
-        if deadline is not None:
-            # AUD-005: from here on this connection's socket is watched by
-            # the total-session deadline (login through the caller's later
-            # select/search/fetch/close/logout, all sharing this socket).
-            # getattr, not client.sock: a test-injected fake client (see
-            # tests/test_providers_email_imap.py) may not expose a real
-            # socket at all -- an unbound deadline is simply a no-op
-            # watchdog for that case.
-            deadline.bind_socket(getattr(client, "sock", None))
 
         try:
             client.login(self.username, self.app_password)
