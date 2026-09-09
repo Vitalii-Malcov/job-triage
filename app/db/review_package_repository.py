@@ -65,8 +65,17 @@ def get_latest_approved_review_for_job(
     *approved* review for this job (spec section 31) — never a
     PENDING_REVIEW or REJECTED one, and never auto-approved. If more than
     one review has ever been approved for the same job (duplicates are
-    allowed at creation time — spec section 36), the most recent decision
-    wins; this is a documented, deliberate choice, not an ambiguity.
+    allowed at creation time — spec section 36), the most recent APPROVAL
+    DECISION wins; this is a documented, deliberate choice, not an
+    ambiguity.
+
+    AUD-008 (Astra R2): "most recent" is ordered by `decided_at` (when the
+    APPROVED decision actually happened), never by `id`/creation order —
+    those two can disagree whenever reviews are created in one order but
+    decided in another (e.g. review A created, then review B created, but
+    B is approved before A is). `id.desc()` is only a deterministic
+    tie-breaker for the (rare, same-instant) case of two equal
+    `decided_at` values, not the primary ordering.
     """
     stmt = (
         select(ApplicationPackageReviewRecord)
@@ -74,7 +83,10 @@ def get_latest_approved_review_for_job(
             ApplicationPackageReviewRecord.job_id == job_id,
             ApplicationPackageReviewRecord.status == "APPROVED",
         )
-        .order_by(ApplicationPackageReviewRecord.id.desc())
+        .order_by(
+            ApplicationPackageReviewRecord.decided_at.desc(),
+            ApplicationPackageReviewRecord.id.desc(),
+        )
         .limit(1)
     )
     return db.scalar(stmt)

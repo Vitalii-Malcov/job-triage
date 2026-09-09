@@ -614,15 +614,39 @@ class _ThreadLockHeartbeat:
             # thread never outlives the guarded section by more than a
             # single wait tick.
             while not self._stop_event.wait(self._interval_seconds):
-                # S7E-016: `renew_thread_lock`, NEVER `acquire_thread_lock`
-                # — see that function's docstring for exactly why the two
-                # are not interchangeable here. A renewal must fail the
-                # instant the lease has expired, even if nobody else has
-                # taken it yet; it must never silently resume as though
-                # ownership had been continuous.
-                renewed = renew_thread_lock(
-                    session, self._thread_id, holder=self._holder, ttl_seconds=self._ttl_seconds
-                )
+                # AUD-003 (Astra R2): a renewal attempt that RAISES (a
+                # transient DB error, a lost connection, anything) is
+                # NOT distinguishable from "ownership lost" for this
+                # heartbeat's purposes -- either way, this thread can no
+                # longer PROVE the lease is still held, and an uncaught
+                # exception here would otherwise just kill this daemon
+                # thread silently (Python does not propagate a thread's
+                # exception to the thread that started it), leaving
+                # `lock_lost` never set and the caller wrongly believing
+                # renewal was still happening. Fail closed exactly like
+                # an explicit "not renewed" result below.
+                try:
+                    # S7E-016: `renew_thread_lock`, NEVER
+                    # `acquire_thread_lock` — see that function's
+                    # docstring for exactly why the two are not
+                    # interchangeable here. A renewal must fail the
+                    # instant the lease has expired, even if nobody else
+                    # has taken it yet; it must never silently resume as
+                    # though ownership had been continuous.
+                    renewed = renew_thread_lock(
+                        session,
+                        self._thread_id,
+                        holder=self._holder,
+                        ttl_seconds=self._ttl_seconds,
+                    )
+                except Exception:
+                    logger.warning(
+                        "follow_up_send_lock_heartbeat_renewal_error gmail_thread_id=%s",
+                        self._thread_id,
+                        exc_info=True,
+                    )
+                    self.lock_lost.set()
+                    return
                 if not renewed:
                     # Ownership is gone — never keep renewing on the
                     # assumption it might come back; the caller's
@@ -775,6 +799,27 @@ def send_follow_up(
         _fail_closed_if_reply_raced_dispatch(
             db, account_key=account_key, proposal=proposal, send_record=send_record
         )
+
+        # AUD-003 (Astra R2): if the heartbeat already lost the lease
+        # BEFORE the outbound provider is ever called (e.g. a slow
+        # revalidation step above let a renewal tick fail first), the
+        # outbound provider must never be invoked at all — calling it
+        # now would be a real external side effect with NO exclusivity
+        # guarantee behind it whatsoever, not even the "maybe it raced"
+        # uncertainty the POST-send check below exists for. Nothing has
+        # been sent yet, so this is safe to retry: FAILED (not
+        # UNCERTAIN), mirroring the EmailSendError handling below.
+        if heartbeat.lock_lost.is_set():
+            mark_send_failed(db, send_record, last_error="ThreadLockOwnershipLostBeforeDispatch")
+            logger.warning(
+                "follow_up_send_lock_lost_before_dispatch follow_up_proposal_id=%s",
+                proposal.id,
+            )
+            raise FollowUpSendFailedError(
+                f"follow_up_proposal_id={follow_up_proposal_id!r}: lost exclusive "
+                "ownership of the Gmail thread guard before the outbound provider "
+                "was ever called; nothing was sent, safe to retry"
+            )
 
         try:
             result = provider.send(outbound_message)

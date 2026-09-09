@@ -195,7 +195,26 @@ async def _run_step(
             type(exc).__name__,
         )
         return {"status": "failed", "counters": None, "error_type": type(exc).__name__}
-    return {"status": "ok", "counters": counters, "error_type": None}
+
+    # AUD-009 (Astra R2): `step_callable` returning normally only means it
+    # didn't RAISE — `run_bundesagentur`/`run_xing` isolate per-job
+    # failures internally (see their own docstrings) and report them via
+    # `counters["failed"]` instead of propagating, so a return here can
+    # still mean every single fetched job failed to score/persist. Mirror
+    # `app.services.automation_shortlist.prepare_shortlist_drafts`'s own
+    # S8C-STATUS-001 convention: the denominator is jobs actually
+    # ATTEMPTED (created + updated + failed) — `skipped_invalid` jobs were
+    # never attempted, so they must not count as failures, and zero
+    # attempted (nothing fetched, or everything was skipped_invalid) is a
+    # legitimate no-op "ok", never "failed".
+    attempted = counters["created"] + counters["updated"] + counters["failed"]
+    if attempted == 0 or counters["failed"] == 0:
+        status = "ok"
+    elif counters["failed"] == attempted:
+        status = "failed"
+    else:
+        status = "partial"
+    return {"status": status, "counters": counters, "error_type": None}
 
 
 async def _run_shortlist_drafts_step(db: Session, settings, touched_jobs: list[TouchedJob]) -> dict:
@@ -307,11 +326,21 @@ def _compute_overall_status(step_results: dict[str, dict], core_step_names) -> s
     unaffected by whether Stage 8C is enabled. If Stage 8C is disabled,
     `step_results` contains only those same core steps, so this reduces
     to exactly the previous all-ok/none-ok/mixed logic.
+
+    AUD-009 (Astra R2): a core collector step's own `status` (see
+    `_run_step`) can now be "partial" (some fetched jobs persisted, some
+    failed) — that is still real, attributable business success, so it
+    counts the same as "ok" for the FAILED-override check below; only
+    "failed"/"not_configured" (zero jobs actually persisted) do not.
+    Without this, a collector that partially succeeded would incorrectly
+    make the WHOLE run report FAILED instead of PARTIAL.
     """
-    core_ok_count = sum(
-        1 for name in core_step_names if step_results.get(name, {}).get("status") == "ok"
+    core_success_count = sum(
+        1
+        for name in core_step_names
+        if step_results.get(name, {}).get("status") in ("ok", "partial")
     )
-    if core_ok_count == 0:
+    if core_success_count == 0:
         return "FAILED"
     ok_count = sum(1 for result in step_results.values() if result["status"] == "ok")
     if ok_count == len(step_results):
