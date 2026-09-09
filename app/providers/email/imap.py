@@ -43,6 +43,7 @@ import email
 import imaplib
 import logging
 import re
+import ssl
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from email.header import decode_header
@@ -74,6 +75,18 @@ from app.providers.email.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# AUD-005: bounds every blocking socket operation on the IMAP connection
+# (connect, TLS handshake, and every later imaplib call on the same
+# socket -- SELECT/STATUS/UID SEARCH/UID FETCH/CLOSE/LOGOUT all share it).
+# A hung/black-holed IMAP peer raises socket.timeout within this bound
+# instead of blocking the worker thread (see `fetch`'s
+# asyncio.to_thread docstring) indefinitely -- an asyncio-level timeout
+# wrapped around that thread could not itself unblock or cancel a still
+# in-flight blocking socket call, only give up waiting on it, leaking the
+# thread. 30s is generous for a full BODY.PEEK[] fetch of one message
+# while still bounding a truly unresponsive server.
+IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 
 _UIDVALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)")
 _RFC822_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
@@ -516,7 +529,22 @@ class GmailImapProvider:
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         try:
-            client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+            # AUD-001: imaplib.IMAP4_SSL's default ssl_context (when None)
+            # is built via ssl._create_stdlib_context(), which -- unlike
+            # ssl.create_default_context() -- sets verify_mode=CERT_NONE
+            # and check_hostname=False. Without an explicit verifying
+            # context, this connection would accept ANY certificate,
+            # including a forged one from a MITM peer, over a channel
+            # that authenticates with a real mailbox password. AUD-005:
+            # `timeout=` bounds this connection's underlying socket for
+            # its whole lifetime (see IMAP_OPERATION_TIMEOUT_SECONDS).
+            ssl_context = ssl.create_default_context()
+            client = imaplib.IMAP4_SSL(
+                self.imap_host,
+                self.imap_port,
+                ssl_context=ssl_context,
+                timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+            )
         except OSError as exc:
             # GMAIL-003: never interpolate the underlying OSError/host/port
             # into the raised message — see base.py's GmailProviderError

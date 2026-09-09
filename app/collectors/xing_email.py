@@ -55,6 +55,7 @@ import email
 import imaplib
 import logging
 import re
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,13 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "xing"
 XING_DIGEST_SENDER = "jobs@mail.xing.com"
+
+# AUD-005: mirrors app.providers.email.imap.IMAP_OPERATION_TIMEOUT_SECONDS
+# -- bounds every blocking socket operation on this collector's IMAP
+# connection so a hung/black-holed mailbox server can't stall the worker
+# thread (see fetch_message_batches's asyncio.to_thread docstring)
+# indefinitely.
+IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 
 # Both observed digest subject formats. Anything else from the same sender
 # domain (e.g. "Wochencheck" from mailrobot@, industry news from news@) is
@@ -385,7 +393,19 @@ class XingEmailCollector(JobCollector):
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         try:
-            client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+            # AUD-001: an explicit verifying SSLContext -- imaplib's own
+            # default (ssl_context=None) resolves to
+            # ssl._create_stdlib_context(), which sets verify_mode=CERT_NONE
+            # and check_hostname=False, i.e. no certificate verification at
+            # all. AUD-005: `timeout=` bounds this connection's underlying
+            # socket for its whole lifetime.
+            ssl_context = ssl.create_default_context()
+            client = imaplib.IMAP4_SSL(
+                self.imap_host,
+                self.imap_port,
+                ssl_context=ssl_context,
+                timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
+            )
         except OSError as exc:
             raise XingConnectionError(
                 f"Could not connect to {self.imap_host}:{self.imap_port}: {exc}"

@@ -1,4 +1,8 @@
 import inspect
+import socket
+import ssl
+import threading
+import time
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -7,7 +11,9 @@ import pytest
 
 import app.collectors.xing_email as xing_email_module
 from app.collectors.xing_email import (
+    IMAP_OPERATION_TIMEOUT_SECONDS,
     XingAuthError,
+    XingConnectionError,
     XingEmailCollector,
 )
 
@@ -417,3 +423,90 @@ async def test_fetch_raises_auth_error_when_not_configured():
 
     with pytest.raises(XingAuthError):
         await collector.fetch()
+
+
+# ---------------------------------------------------------------------------
+# AUD-001 (TLS certificate verification) / AUD-005 (unbounded IMAP ops).
+# ---------------------------------------------------------------------------
+
+
+class TestConnectSecurityHardening:
+    def test_connect_passes_a_verifying_ssl_context_and_a_finite_timeout(self, monkeypatch):
+        captured = {}
+
+        class _StubClient:
+            def login(self, user, password):
+                return ("OK", [b"LOGIN completed"])
+
+        def _fake_imap4_ssl(host, port, *, ssl_context=None, timeout=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["ssl_context"] = ssl_context
+            captured["timeout"] = timeout
+            return _StubClient()
+
+        monkeypatch.setattr(xing_email_module.imaplib, "IMAP4_SSL", _fake_imap4_ssl)
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        collector._connect()
+
+        assert isinstance(captured["ssl_context"], ssl.SSLContext)
+        assert captured["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+        assert captured["ssl_context"].check_hostname is True
+        assert captured["timeout"] == IMAP_OPERATION_TIMEOUT_SECONDS
+
+    def test_hung_imap_peer_raises_within_bounded_time_not_indefinitely(self):
+        """A REAL socket, not a mock: a listener that accepts the
+        connection and then sends nothing at all (simulating a
+        black-holed/hung IMAP peer during the TLS handshake). Proves the
+        actual mechanism -- not merely that a `timeout=` kwarg is passed
+        -- raises well within bounds instead of hanging the worker
+        thread indefinitely (AUD-005: an asyncio-level timeout wrapped
+        around a thread running this call could not itself unblock it)."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        accepted = threading.Event()
+
+        def _accept_and_hang():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            accepted.set()
+            time.sleep(2)
+            conn.close()
+
+        server_thread = threading.Thread(target=_accept_and_hang, daemon=True)
+        server_thread.start()
+        try:
+            collector = XingEmailCollector(
+                imap_host=host,
+                imap_port=port,
+                username="user@example.com",
+                app_password="app-password",
+            )
+            # _connect() reads the module-level constant directly (not an
+            # instance attribute), so a short bound for this test is set
+            # by patching the module, restored in `finally`.
+            original_timeout = xing_email_module.IMAP_OPERATION_TIMEOUT_SECONDS
+            xing_email_module.IMAP_OPERATION_TIMEOUT_SECONDS = 0.3
+            start = time.monotonic()
+            try:
+                with pytest.raises(XingConnectionError):
+                    collector._connect()
+            finally:
+                xing_email_module.IMAP_OPERATION_TIMEOUT_SECONDS = original_timeout
+            elapsed = time.monotonic() - start
+
+            assert accepted.wait(timeout=2), "test server never accepted the connection"
+            assert elapsed < 2.0, f"the hard timeout did not bound the hang (took {elapsed:.2f}s)"
+        finally:
+            server.close()
+            server_thread.join(timeout=3)

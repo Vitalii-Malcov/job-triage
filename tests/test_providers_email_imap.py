@@ -9,6 +9,10 @@ test asserting this package has no means to make an HTTP request at all.
 import email.errors
 import imaplib
 import inspect
+import socket
+import ssl
+import threading
+import time
 from datetime import UTC, datetime
 from email import encoders
 from email.header import Header
@@ -22,7 +26,7 @@ import pytest
 import app.providers.email.base as email_base_module
 import app.providers.email.imap as gmail_imap_module
 from app.providers.email.base import GmailAuthError, GmailConnectionError
-from app.providers.email.imap import GmailImapProvider
+from app.providers.email.imap import IMAP_OPERATION_TIMEOUT_SECONDS, GmailImapProvider
 
 ACCOUNT = "me@example.com"
 
@@ -219,7 +223,7 @@ async def test_login_rejected_raises_auth_error(monkeypatch):
         def login(self, user, password):
             raise imaplib.IMAP4.error("bad credentials")
 
-    def fake_ssl(host, port):
+    def fake_ssl(host, port, **kwargs):
         return RejectingClient()
 
     monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", fake_ssl)
@@ -231,7 +235,7 @@ async def test_login_rejected_raises_auth_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_connect_os_error_raises_connection_error(monkeypatch):
-    def fake_ssl(host, port):
+    def fake_ssl(host, port, **kwargs):
         raise OSError("network unreachable")
 
     monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", fake_ssl)
@@ -313,7 +317,7 @@ async def test_select_is_called_readonly():
 async def test_disconnect_closes_and_logs_out_owned_connections(monkeypatch):
     fake_client = FakeImapClient(messages={})
 
-    def fake_ssl(host, port):
+    def fake_ssl(host, port, **kwargs):
         return fake_client
 
     monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", fake_ssl)
@@ -1048,3 +1052,76 @@ async def test_multipart_related_container_is_not_treated_as_attachment():
     message = result.messages[0]
     assert message.body_plain == "related body text"
     assert message.attachments == ()
+
+
+# ---------------------------------------------------------------------------
+# AUD-001 (TLS certificate verification) / AUD-005 (unbounded IMAP ops).
+# ---------------------------------------------------------------------------
+
+
+class TestConnectSecurityHardening:
+    def test_connect_passes_a_verifying_ssl_context_and_a_finite_timeout(self, monkeypatch):
+        captured = {}
+
+        class _StubClient:
+            def login(self, user, password):
+                return ("OK", [b"LOGIN completed"])
+
+        def _fake_imap4_ssl(host, port, *, ssl_context=None, timeout=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["ssl_context"] = ssl_context
+            captured["timeout"] = timeout
+            return _StubClient()
+
+        monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", _fake_imap4_ssl)
+        provider = _provider(client=None)
+
+        provider._connect()
+
+        assert isinstance(captured["ssl_context"], ssl.SSLContext)
+        assert captured["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+        assert captured["ssl_context"].check_hostname is True
+        assert captured["timeout"] == IMAP_OPERATION_TIMEOUT_SECONDS
+
+    def test_hung_imap_peer_raises_within_bounded_time_not_indefinitely(self, monkeypatch):
+        """A REAL socket, not a mock: a listener that accepts the
+        connection and then sends nothing at all (simulating a
+        black-holed/hung IMAP peer during the TLS handshake). Proves the
+        actual mechanism -- not merely that a `timeout=` kwarg is passed
+        -- raises well within bounds instead of hanging the worker
+        thread indefinitely (AUD-005: an asyncio-level timeout wrapped
+        around a thread running this call could not itself unblock or
+        cancel it)."""
+        monkeypatch.setattr(gmail_imap_module, "IMAP_OPERATION_TIMEOUT_SECONDS", 0.3)
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        accepted = threading.Event()
+
+        def _accept_and_hang():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            accepted.set()
+            time.sleep(2)
+            conn.close()
+
+        server_thread = threading.Thread(target=_accept_and_hang, daemon=True)
+        server_thread.start()
+        try:
+            provider = _provider(client=None, imap_host=host, imap_port=port)
+
+            start = time.monotonic()
+            with pytest.raises(GmailConnectionError):
+                provider._connect()
+            elapsed = time.monotonic() - start
+
+            assert accepted.wait(timeout=2), "test server never accepted the connection"
+            assert elapsed < 2.0, f"the hard timeout did not bound the hang (took {elapsed:.2f}s)"
+        finally:
+            server.close()
+            server_thread.join(timeout=3)

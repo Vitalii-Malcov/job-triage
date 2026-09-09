@@ -10,6 +10,7 @@ adding outbound capability.
 import inspect
 import smtplib
 import socket
+import ssl
 import threading
 import time
 
@@ -284,10 +285,11 @@ class TestHardConnectionTimeout:
             def quit(self):
                 return (221, b"Bye")
 
-        def _fake_smtp_ssl(host, port, timeout=None):
+        def _fake_smtp_ssl(host, port, timeout=None, context=None):
             captured["host"] = host
             captured["port"] = port
             captured["timeout"] = timeout
+            captured["context"] = context
             return _StubClient()
 
         monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", _fake_smtp_ssl)
@@ -296,6 +298,38 @@ class TestHardConnectionTimeout:
         provider.send(_message())
 
         assert captured["timeout"] == SMTP_OPERATION_TIMEOUT_SECONDS
+
+    def test_connect_passes_a_verifying_ssl_context(self, monkeypatch):
+        """AUD-001: smtplib.SMTP_SSL's own default (context=None) resolves
+        to ssl._create_stdlib_context(), which disables certificate
+        verification entirely (verify_mode=CERT_NONE,
+        check_hostname=False) -- a real vulnerability for a connection
+        that authenticates with a real mailbox password. This proves an
+        explicit, verifying context is always supplied instead."""
+        captured = {}
+
+        class _StubClient:
+            def login(self, user, password):
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                return {}
+
+            def quit(self):
+                return (221, b"Bye")
+
+        def _fake_smtp_ssl(host, port, timeout=None, context=None):
+            captured["context"] = context
+            return _StubClient()
+
+        monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", _fake_smtp_ssl)
+        provider = _provider(client=None)
+
+        provider.send(_message())
+
+        assert isinstance(captured["context"], ssl.SSLContext)
+        assert captured["context"].verify_mode == ssl.CERT_REQUIRED
+        assert captured["context"].check_hostname is True
 
     def test_hung_smtp_peer_raises_within_bounded_time_not_indefinitely(self):
         """A REAL socket, not a mock: a listener that accepts the

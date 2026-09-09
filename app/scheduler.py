@@ -76,10 +76,16 @@ async def _poll_loop(settings) -> None:
 
     account_key = settings.automation_scheduler_account_key
     poll_seconds = settings.automation_scheduler_poll_seconds
+    # AUD-010: account_key is an operator's real account identity
+    # (derived from GMAIL_USERNAME/AUTOMATION_SCHEDULER_ACCOUNT_KEY, an
+    # email address in practice -- see app.core.config's own account_key
+    # docstrings) -- it must never be written to startup logs, mirroring
+    # every other account_key-privacy fix already applied to this
+    # module's per-tick digest logging (see run_due_digest_if_claimed's
+    # own docstring). Only non-identifying operational config is logged.
     logger.info(
-        "automation_scheduler_started account_key=%s interval_seconds=%s poll_seconds=%s "
+        "automation_scheduler_started interval_seconds=%s poll_seconds=%s "
         "automation_enabled=%s digest_enabled=%s",
-        account_key,
         settings.automation_scheduler_interval_seconds,
         poll_seconds,
         settings.automation_scheduler_enabled,

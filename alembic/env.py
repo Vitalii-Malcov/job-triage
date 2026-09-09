@@ -29,7 +29,18 @@ if config.config_file_name is not None:
 # A URL already set on the Config object (e.g. by tests or other programmatic
 # callers) takes precedence over the app settings default.
 db_url = config.get_main_option("sqlalchemy.url") or get_settings().database_url
-config.set_main_option("sqlalchemy.url", db_url)
+# AUD-006: alembic.config.Config stores options in a
+# configparser.ConfigParser using BasicInterpolation, which treats "%" as
+# the start of an interpolation token -- a percent-encoded credential in
+# a PostgreSQL URL (e.g. "%40" standing in for a literal "@" in a
+# password) makes set_main_option() raise configparser.InterpolationSyntaxError
+# before a single migration runs. Doubling "%" to "%%" here makes
+# ConfigParser round-trip the value byte-for-byte; SQLAlchemy's own URL
+# parser (which understands percent-encoding) only ever sees the value
+# AFTER interpolation has unescaped "%%" back to a single "%", so the
+# credential is decoded correctly. Never log db_url (raw or escaped) --
+# it may contain a real password either way.
+config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
 
 # add your model's MetaData object here
 # for 'autogenerate' support

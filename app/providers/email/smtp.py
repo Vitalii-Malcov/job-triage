@@ -45,6 +45,7 @@ never received" among post-`send_message()` exceptions.
 
 import logging
 import smtplib
+import ssl
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -212,7 +213,19 @@ class GmailSmtpProvider:
             # rather than blocking indefinitely — see this module's
             # `SMTP_OPERATION_TIMEOUT_SECONDS` docstring for the full
             # rationale and its honest limitation.
-            client = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=self.timeout_seconds)
+            # AUD-001: an explicit verifying SSLContext -- smtplib.SMTP_SSL's
+            # own default (context=None) resolves to
+            # ssl._create_stdlib_context(), which sets verify_mode=CERT_NONE
+            # and check_hostname=False, i.e. no certificate verification at
+            # all despite the connection authenticating with a real mailbox
+            # password.
+            ssl_context = ssl.create_default_context()
+            client = smtplib.SMTP_SSL(
+                self.smtp_host,
+                self.smtp_port,
+                timeout=self.timeout_seconds,
+                context=ssl_context,
+            )
         except OSError as exc:
             # Never interpolate the underlying OSError/host/port into the
             # raised message — same GMAIL-003-style rationale as
