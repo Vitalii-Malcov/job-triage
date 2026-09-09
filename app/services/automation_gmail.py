@@ -53,25 +53,35 @@ undone merely because the Sent sync later fails, and vice versa. The step
 is `"ok"` only if both mailboxes synced cleanly, `"partial"` if exactly
 one failed, `"failed"` if both did.
 
-**Crash-safe Gmail cursor (spec sections 3/4/7/8/9).** See
-`app.db.models.AutomationMailProgressRecord`'s docstring for the full
-rationale. `gmail_after_message_id` anchors progress to
-`GmailMessageRecord.id` (never an in-memory "messages touched this run"
-list, which an IMAP provider's own known-UID skip logic could make lose
-a message permanently across a crash). Every message's FULL pipeline
-(analysis, then response-draft-or-NO_RESPONSE_RECOMMENDED) must succeed
-before the cursor advances past it, via
-`app.db.automation_mail_progress_repository.advance_gmail_cursor`'s CAS
--- advanced ONE message at a time (never batched at the end), so a crash
-immediately after message N's cursor-advance loses at most the
-in-progress message N+1, never N. If message N's pipeline fails (or the
-CAS itself is lost to a newer owner), processing STOPS for this run --
-no message after N is even attempted, and the cursor is never advanced
-past N -- guaranteeing at-least-once retry on the next cycle, never a
+**Crash-safe, per-message Gmail completion marker (spec sections 3/4/7/8/9;
+AUD-004, Astra R3).** Progress used to anchor to a single per-account
+`AutomationMailProgressRecord.gmail_after_message_id` integer watermark
+and select `WHERE id > watermark` -- this assumed `GmailMessageRecord.id`
+allocation order equals commit-visibility order, which PostgreSQL does
+NOT guarantee (a lower-`id` transaction can commit AFTER a higher-`id`
+one), risking a message being PERMANENTLY skipped. Progress now anchors
+to `GmailMessageRecord.automation_processed_at` -- a durable marker on
+the message ROW ITSELF (never an in-memory "messages touched this run"
+list either, which an IMAP provider's own known-UID skip logic could
+make lose a message permanently across a crash) -- see that column's own
+docstring for the full rationale.
+`app.db.gmail_repository.list_unprocessed_messages_for_automation`
+selects every message with this marker still NULL, regardless of `id`,
+so no other message's `id` or processing history can ever cause one to
+be skipped. Every message's FULL pipeline (analysis, then
+response-draft-or-NO_RESPONSE_RECOMMENDED) must succeed before its own
+marker is set, via
+`app.db.gmail_repository.mark_message_automation_processed`'s CAS -- set
+ONE message at a time (never batched at the end), so a crash immediately
+after message N's marker-set loses at most the in-progress message N+1,
+never N. If message N's pipeline fails (or the CAS itself is lost to a
+concurrent processor), processing STOPS for this run -- no message after
+N is even attempted this cycle, but (unlike the old watermark) N and
+every message after it simply remain eligible and are naturally
+reselected on the next cycle, guaranteeing at-least-once retry, never a
 silently skipped message. `NO_RESPONSE_RECOMMENDED` is a normal,
 successfully-processed outcome (Stage 7C's own classification result),
-not a failure -- the cursor advances past it exactly like a real
-proposed draft.
+not a failure -- its marker is set exactly like a real proposed draft's.
 """
 
 import logging
@@ -79,12 +89,11 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.collectors.base import CollectorNotConfiguredError, is_configured
-from app.db.automation_mail_progress_repository import (
-    AutomationMailProgressCASLostError,
-    advance_gmail_cursor,
-    get_or_create_mail_progress,
+from app.db.gmail_repository import (
+    GmailMessageAutomationCASLostError,
+    list_unprocessed_messages_for_automation,
+    mark_message_automation_processed,
 )
-from app.db.gmail_repository import list_messages_by_id_after
 from app.models.automation import AutomationMessageFailure, AutomationMessageItem
 from app.models.gmail import GmailSyncResult
 from app.providers.email.base import normalize_account_key
@@ -224,10 +233,8 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
     succeeded, partially failed, or was not configured -- see module
     docstring's "Partial mailbox failure" section.
     """
-    progress = get_or_create_mail_progress(db, account_key)
-    cursor = progress.gmail_after_message_id
-    messages = list_messages_by_id_after(
-        db, account_key, after_id=cursor, limit=settings.automation_gmail_process_max_per_run
+    messages = list_unprocessed_messages_for_automation(
+        db, account_key, limit=settings.automation_gmail_process_max_per_run
     )
 
     scanned = 0
@@ -334,18 +341,18 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
             else:
                 draft_reused += 1
 
-        advanced = advance_gmail_cursor(
-            db, account_key, expected_cursor=cursor, new_cursor=message.id
-        )
+        advanced = mark_message_automation_processed(db, message.id)
         if not advanced:
-            # S8D-PROGRESS-001 (Codex review): a newer owner already
-            # moved this account's progress -- the message's own
+            # AUD-004/S8D-PROGRESS-001: a concurrent processor already
+            # marked THIS message processed -- the message's own
             # pipeline genuinely succeeded (analysis, and draft-or
             # -outbound-skip), but that success could not be safely
-            # recorded as this account's current position, so it must
-            # NEVER be reported as "ok". Fail closed, never overwrite.
+            # recorded as newly-this-run's doing, so it must NEVER be
+            # reported as "ok". Fail closed, never overwrite.
             failed += 1
-            cas_lost = AutomationMailProgressCASLostError("gmail cursor CAS lost to a newer owner")
+            cas_lost = GmailMessageAutomationCASLostError(
+                "gmail message automation-processed CAS lost to a concurrent processor"
+            )
             logger.warning("automation_gmail_cursor_cas_lost gmail_message_id=%s", message.id)
             failures.append(
                 AutomationMessageFailure(
@@ -380,7 +387,6 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
                 status="ok",
             )
         )
-        cursor = message.id
 
     if scanned == 0 or failed == 0:
         status = "ok"

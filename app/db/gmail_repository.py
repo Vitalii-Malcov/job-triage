@@ -704,28 +704,79 @@ def list_messages(
     return list(db.scalars(stmt).all())
 
 
-def list_messages_by_id_after(
-    db: Session, account_key: str, *, after_id: int | None, limit: int
+class GmailMessageAutomationCASLostError(Exception):
+    """AUD-004 (Astra R3): raised (constructed, never actually thrown --
+    see the one caller, `app.services.automation_gmail`) when
+    `mark_message_automation_processed` returns `False`: some OTHER
+    process already marked this exact message as automation-processed
+    between this call's own pipeline run and its attempt to record that.
+    The message's own analysis/response-draft work already durably
+    committed regardless (idempotent either way) -- only the "who gets to
+    report this as newly done" bookkeeping was lost, mirroring
+    `app.db.automation_mail_progress_repository.AutomationMailProgressCASLostError`'s
+    contract (never folded into a silent "ok").
+    """
+
+
+def list_unprocessed_messages_for_automation(
+    db: Session, account_key: str, *, limit: int
 ) -> list[GmailMessageRecord]:
-    """Stage 8D: deterministic KEYSET pagination by `GmailMessageRecord.id`
-    -- mirrors `app.db.repositories.list_jobs_by_status_after_id`'s own
-    keyset-ordering rationale (S7E-006): ordering ASCENDING by `id`
-    (never `list_messages`' own `received_at DESC` UI-listing order) and
-    filtering `id > after_id` guarantees every message for this account
-    is eventually reached exactly once, regardless of total count, so a
-    new Stage 8D installation naturally starts from the OLDEST stored
-    message and gradually catches up. `after_id=None` means "no lower
-    bound yet" (nothing processed for this account so far).
+    """Stage 8D message selection for `gmail_response_drafts` (AUD-004,
+    Astra R3 fix). Selects every message for this account that has not
+    yet been fully handled (`automation_processed_at IS NULL`) -- NEVER
+    `id > watermark`, which this replaces. See
+    `GmailMessageRecord.automation_processed_at`'s own docstring for why
+    an `id`-ordered watermark is unsafe on PostgreSQL: sequence
+    allocation order is not commit-visibility order, so a lower-`id` row
+    can become visible strictly AFTER a higher-`id` row a watermark had
+    already advanced past -- permanently skipping it. Selecting by this
+    row's OWN completion state instead means no other row's `id` or
+    processing history can ever cause a message to be skipped.
+
+    `id.asc()` orders the scan (oldest-first is a nice, but non
+    -load-bearing, property -- a new installation naturally starts from
+    the oldest stored message and catches up) and `limit` bounds one
+    run's work exactly like the old `list_messages_by_id_after` did; only
+    the INCLUSION predicate changed.
     """
     stmt = (
         select(GmailMessageRecord)
-        .where(GmailMessageRecord.account_key == account_key)
+        .where(
+            GmailMessageRecord.account_key == account_key,
+            GmailMessageRecord.automation_processed_at.is_(None),
+        )
         .order_by(GmailMessageRecord.id.asc())
         .limit(limit)
     )
-    if after_id is not None:
-        stmt = stmt.where(GmailMessageRecord.id > after_id)
     return list(db.scalars(stmt).all())
+
+
+def mark_message_automation_processed(db: Session, message_id: int) -> bool:
+    """Atomic per-message CAS (AUD-004, Astra R3): `UPDATE gmail_messages
+    SET automation_processed_at = :now WHERE id = :message_id AND
+    automation_processed_at IS NULL`. Returns True iff exactly one row
+    was updated -- i.e. THIS call is the one that durably recorded this
+    message as processed. False means it was already marked (a
+    concurrent/duplicate processing attempt, or a retry racing a prior
+    successful mark) -- the caller
+    (`app.services.automation_gmail.prepare_gmail_response_drafts`)
+    treats that exactly like `AutomationMailProgressCASLostError` used to:
+    a non-"ok" outcome for this message, never silently folded into
+    success, even though the underlying analysis/draft work already
+    committed either way.
+    """
+    now = datetime.now(UTC)
+    result = db.execute(
+        update(GmailMessageRecord)
+        .where(
+            GmailMessageRecord.id == message_id,
+            GmailMessageRecord.automation_processed_at.is_(None),
+        )
+        .values(automation_processed_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
 
 
 def get_thread_by_id(db: Session, account_key: str, thread_id: int) -> GmailThreadRecord | None:

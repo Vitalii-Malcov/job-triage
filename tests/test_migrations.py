@@ -912,6 +912,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
         "has_html",
         "attachments_json",
         "created_at",
+        "automation_processed_at",
     }
 
     thread_unique = inspector.get_unique_constraints("gmail_threads")
@@ -2706,3 +2707,183 @@ def test_automation_mail_progress_downgrade_removes_table_then_upgrade_restores_
 
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "automation_mail_progress" in inspector.get_table_names()
+
+
+# ---------------------------------------------------------------------------
+# aff3c7dc6349 (AUD-004, Astra R3: gmail_messages.automation_processed_at)
+# ---------------------------------------------------------------------------
+
+
+def test_automation_processed_at_migration_adds_nullable_column_and_index(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_automation_processed_at_shape.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    columns = {col["name"]: col for col in inspector.get_columns("gmail_messages")}
+    assert "automation_processed_at" in columns
+    assert columns["automation_processed_at"]["nullable"] is True
+
+    indexes = {idx["name"]: idx for idx in inspector.get_indexes("gmail_messages")}
+    assert "ix_gmail_messages_account_key_automation_processed_at" in indexes
+    assert indexes["ix_gmail_messages_account_key_automation_processed_at"]["column_names"] == [
+        "account_key",
+        "automation_processed_at",
+    ]
+
+
+def test_automation_processed_at_migration_never_infers_completion_from_old_watermark(
+    tmp_path: Path,
+) -> None:
+    """HIGH finding (Astra R3 Codex re-review): an earlier version of this
+    migration backfilled `automation_processed_at` for every row whose
+    `id` was `<=` the account's OLD `gmail_after_message_id` watermark.
+    That was wrong -- AUD-004 exists precisely because that watermark can
+    advance past a lower-id row that had not actually finished
+    committing/processing yet, so trusting it during backfill would
+    silently CEMENT a historically-skipped message as if it had been
+    handled.
+
+    Reproduces exactly the scenario the finding describes: message A
+    (id=100) is the historically-skipped late-committer; message B
+    (id=101) is the one the old watermark advanced past to. Both must
+    come out of the migration with `automation_processed_at IS NULL` --
+    and the new runtime selector must then actually discover both.
+    """
+    db_path = tmp_path / "migrations_automation_processed_at_no_false_backfill.db"
+    cfg = _alembic_config(db_path)
+
+    # Pre-migration state, at the OLD head (before this fix existed).
+    upgrade(cfg, "f1a2b3c4d5e6")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="me@example.com", thread_key="<root@a>")
+        # Explicit ids: message A is the lower-id, historically-skipped
+        # late-committer; message B is the higher-id message the old
+        # watermark advanced past to.
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_messages (
+                    id, thread_id, account_key, mailbox, uid_validity, uid,
+                    references_json, to_addresses_json, cc_addresses_json, subject,
+                    received_at, direction, body_plain, body_truncated, has_html,
+                    attachments_json, created_at
+                ) VALUES (
+                    100, 1, 'me@example.com', 'INBOX', 100, 1, '[]', '[]', '[]', 'A',
+                    CURRENT_TIMESTAMP, 'INBOUND', 'hi', 0, 0, '[]', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_messages (
+                    id, thread_id, account_key, mailbox, uid_validity, uid,
+                    references_json, to_addresses_json, cc_addresses_json, subject,
+                    received_at, direction, body_plain, body_truncated, has_html,
+                    attachments_json, created_at
+                ) VALUES (
+                    101, 1, 'me@example.com', 'INBOX', 100, 2, '[]', '[]', '[]', 'B',
+                    CURRENT_TIMESTAMP, 'INBOUND', 'hi', 0, 0, '[]', CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        # The old watermark had already advanced to B (id=101) -- exactly
+        # the AUD-004 scenario: A committed/became visible too late to
+        # ever have actually been scanned under the old id>watermark rule.
+        connection.execute(
+            text(
+                """
+                INSERT INTO automation_mail_progress (
+                    account_key, gmail_after_message_id, created_at, updated_at
+                ) VALUES ('me@example.com', 101, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """
+            )
+        )
+
+    upgrade(cfg, "aff3c7dc6349")
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text("SELECT id, automation_processed_at FROM gmail_messages ORDER BY id")
+        ).all()
+    assert rows == [(100, None), (101, None)], (
+        f"no row may be backfilled as processed from the old, untrustworthy watermark -- got {rows}"
+    )
+
+    # Row data itself (not just the new column) must be preserved intact.
+    with engine.connect() as connection:
+        subjects = connection.execute(
+            text("SELECT id, subject FROM gmail_messages ORDER BY id")
+        ).all()
+    assert subjects == [(100, "A"), (101, "B")]
+
+    # The new runtime selector must actually discover BOTH messages --
+    # this is the recovery guarantee the conservative NULL backfill exists
+    # to provide.
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.gmail_repository import list_unprocessed_messages_for_automation
+
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    session = session_factory()
+    try:
+        discovered = list_unprocessed_messages_for_automation(session, "me@example.com", limit=100)
+        discovered_ids = [message.id for message in discovered]
+        assert discovered_ids == [100, 101]
+    finally:
+        session.close()
+
+
+def test_automation_processed_at_downgrade_removes_column_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_automation_processed_at_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, account_key="me@example.com", thread_key="<root@a>")
+        _insert_gmail_message(connection, thread_id=1, account_key="me@example.com", uid=1)
+
+    downgrade(cfg, "f1a2b3c4d5e6")
+
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
+    assert "automation_processed_at" not in columns
+    indexes = {idx["name"] for idx in inspector.get_indexes("gmail_messages")}
+    assert "ix_gmail_messages_account_key_automation_processed_at" not in indexes
+
+    # Row data survives the downgrade.
+    with engine.connect() as connection:
+        count = connection.execute(text("SELECT COUNT(*) FROM gmail_messages")).scalar()
+    assert count == 1
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    columns = {col["name"] for col in inspector.get_columns("gmail_messages")}
+    assert "automation_processed_at" in columns
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT automation_processed_at FROM gmail_messages")
+        ).scalar()
+    assert row is None
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
+
+
+def test_alembic_has_exactly_one_head() -> None:
+    cfg = _alembic_config(Path("unused-for-this-check.db"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1
+    assert heads[0] == "aff3c7dc6349"
