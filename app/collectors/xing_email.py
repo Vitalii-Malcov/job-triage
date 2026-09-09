@@ -471,14 +471,25 @@ class XingEmailCollector(JobCollector):
                     timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
                 )
         except OSError as exc:
+            # AUD-005 (Codex final review, MEDIUM): never interpolate the
+            # underlying OSError/host/port into the raised message -- an
+            # operator-visible surface (see app/api/routes.py's
+            # `run_xing_collector`, which puts `str(exc)` straight into
+            # an HTTP 502 `detail`) must not leak connection internals or
+            # raw exception text. Mirrors GMAIL-003's sanitization
+            # exactly (app/providers/email/imap.py's `_connect`).
+            # Internal-only diagnosis uses type(exc).__name__, never
+            # str(exc).
+            logger.warning("xing_connect_failed error_type=%s", type(exc).__name__)
             raise XingConnectionError(
-                f"Could not connect to {self.imap_host}:{self.imap_port}: {exc}"
+                "Could not connect to the configured XING mailbox IMAP host"
             ) from exc
 
         try:
             client.login(self.username, self.app_password)
         except imaplib.IMAP4.error as exc:
-            raise XingAuthError(f"XING mailbox IMAP login rejected: {exc}") from exc
+            logger.warning("xing_login_failed error_type=%s", type(exc).__name__)
+            raise XingAuthError("XING mailbox IMAP login was rejected") from exc
         return client
 
     def _disconnect(self, client: ImapClient) -> None:

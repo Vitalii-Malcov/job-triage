@@ -23,17 +23,23 @@ tests/test_collectors_xing_email.py's `test_connect_passes_a_verifying_*`
 tests).
 """
 
+import imaplib
 import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from app.providers.email.imap_deadline import DeadlineIMAP4SSL, ImapSessionDeadline
+from app.providers.email.imap_deadline import (
+    DeadlineIMAP4SSL,
+    ImapSessionDeadline,
+    get_imap_makefile_reader,
+)
 
 
 def _listening_server() -> tuple[socket.socket, tuple[str, int]]:
@@ -475,6 +481,301 @@ def test_deadline_imap4ssl_normal_handshake_and_greeting_still_succeeds(tmp_path
         assert accepted.wait(timeout=2)
         assert deadline.exceeded is False
         client.shutdown()
+    finally:
+        server.close()
+        server_thread.join(timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# Codex final review: (1) imaplib's makefile()-backed reader attribute is
+# named `self.file` on CPython <= 3.13 and `self._file` on 3.14+ --
+# get_imap_makefile_reader must not hard-code either one. (2) closing that
+# reader BEFORE forcing the real socket close can itself deadlock the
+# watchdog thread if a readline() is in flight through it -- the fix must
+# prove it never does, not just reverse the two calls.
+#
+# This project's own runtime (see `sys.version_info` below) is what's
+# actually running these tests; CPython 3.11/3.12/3.13 layouts are
+# exercised synthetically (get_imap_makefile_reader against fake objects,
+# and DeadlineIMAP4SSL subclassed to rename self._file -> self.file after
+# construction) since only one interpreter is installed in this
+# environment -- see this fix's PR report for exactly which version(s)
+# were actually executed.
+# ---------------------------------------------------------------------------
+
+
+def test_running_interpreter_version_is_recorded_for_the_report() -> None:
+    # Not an assertion about behavior -- just makes the actually-executed
+    # interpreter version visible in -q/-v output for the compatibility
+    # report this fix requires.
+    print(f"imap_deadline tests executed under Python {sys.version}")
+    assert sys.version_info >= (3, 11)
+
+
+class TestGetImapMakefileReader:
+    def test_prefers_the_cpython_3_14_style_private_attribute(self) -> None:
+        class _Py314Style:
+            _file = object()
+            file = None  # a 3.14 IMAP4 instance has no `.file` at all;
+            # explicit None here only to prove _file wins if both existed.
+
+        reader = get_imap_makefile_reader(_Py314Style())
+        assert reader is _Py314Style._file
+
+    def test_falls_back_to_the_cpython_3_13_style_public_attribute(self) -> None:
+        class _Py313Style:
+            file = object()
+            # No `_file` attribute at all -- mirrors a real <=3.13
+            # imaplib.IMAP4 instance exactly (see this fix's report for
+            # the confirmed upstream source on 3.11/3.13).
+
+        reader = get_imap_makefile_reader(_Py313Style())
+        assert reader is _Py313Style.file
+
+    def test_returns_none_when_neither_attribute_exists(self) -> None:
+        class _NeitherStyle:
+            pass
+
+        assert get_imap_makefile_reader(_NeitherStyle()) is None
+
+    def test_returns_none_for_a_bare_object_without_makefile_at_all(self) -> None:
+        # A test-injected fake IMAP client (see
+        # tests/test_providers_email_imap.py's FakeImapClient) never has
+        # a real socket or makefile()-backed reader.
+        assert get_imap_makefile_reader(object()) is None
+
+
+class _LegacyAttributeDeadlineIMAP4SSL(DeadlineIMAP4SSL):
+    """Simulates CPython <=3.13's imaplib attribute layout (`self.file`,
+    never `self._file`) on top of this project's actual dev/CI runtime,
+    so the compatibility path is exercised end-to-end (real socket, real
+    TLS, real imaplib greeting parsing, real watchdog firing) without
+    requiring a real 3.13 interpreter to be installed here. Confirms
+    get_imap_makefile_reader's fallback branch is what's actually used,
+    not just that it CAN find a `.file` attribute in isolation.
+
+    CPython 3.14 keeps `IMAP4.file` as a READ-ONLY property (an
+    undocumented back-compat shim that proxies to `self._file`, emitting
+    a RuntimeWarning -- confirmed by reading `imaplib.IMAP4.file.fget`'s
+    source on this runtime). `file = None` here shadows that inherited
+    property with a plain class attribute so `self.file = ...` below is
+    a normal instance assignment instead of hitting a "no setter" error
+    -- <=3.13 has no such property at all, so `self.file` is already a
+    plain instance attribute there and needs no shadowing in reality;
+    this is purely a hoop this SIMULATION has to jump through on 3.14.
+    """
+
+    file = None
+
+    def open(
+        self, host: str = "", port: int = imaplib.IMAP4_SSL_PORT, timeout: float | None = None
+    ) -> None:
+        imaplib.IMAP4.open(self, host, port, timeout)
+        # Rename to mimic <=3.13's layout exactly -- self.file exists,
+        # self._file does not.
+        assert hasattr(self, "_file"), "this runtime's imaplib.IMAP4.open() layout changed"
+        self.file = self._file
+        del self._file
+        self._imap_deadline.bind_socket(self.sock, extra_closable=get_imap_makefile_reader(self))
+
+
+def test_legacy_file_attribute_layout_bounds_constructor_greeting_slow_drip(tmp_path):
+    """Python-3.13-style layout, constructor phase: the greeting/
+    CAPABILITY slow-drip regression, but with the makefile()-backed
+    reader only reachable via `self.file` (never `self._file`)."""
+    cert = _generate_self_signed_cert(tmp_path)
+    if cert is None:
+        pytest.skip("openssl CLI not available to generate a self-signed test certificate")
+    certfile, keyfile = cert
+    stop_drip = threading.Event()
+
+    def _drip_unterminated_greeting(tls_conn: ssl.SSLSocket) -> None:
+        while not stop_drip.is_set():
+            try:
+                tls_conn.send(b"x")
+            except OSError:
+                break
+            time.sleep(0.05)
+
+    server, (host, port), server_thread, accepted = _start_tls_server(
+        certfile, keyfile, _drip_unterminated_greeting
+    )
+    try:
+        deadline = ImapSessionDeadline(0.4)
+        result: dict[str, object] = {}
+
+        def _construct() -> None:
+            try:
+                with deadline:
+                    _LegacyAttributeDeadlineIMAP4SSL(
+                        host,
+                        port,
+                        ssl_context=_relaxed_test_client_ssl_context(),
+                        timeout=5.0,
+                        deadline=deadline,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        start = time.monotonic()
+        worker = threading.Thread(target=_construct, daemon=True)
+        worker.start()
+        worker.join(timeout=3.0)
+        elapsed = time.monotonic() - start
+        stop_drip.set()
+
+        assert accepted.wait(timeout=2)
+        assert not worker.is_alive(), (
+            "legacy self.file layout: constructor was not unblocked by the deadline"
+        )
+        assert elapsed < 2.0, f"not bounded by the deadline (took {elapsed:.2f}s)"
+        assert deadline.exceeded is True
+        assert "error" in result
+    finally:
+        stop_drip.set()
+        server.close()
+        server_thread.join(timeout=3)
+
+
+def test_legacy_file_attribute_layout_bounds_post_constructor_slow_drip(tmp_path):
+    """Python-3.13-style layout, post-constructor phase: construction
+    succeeds normally (real greeting + CAPABILITY exchange), then a
+    LATER read on the same, still-deadline-bound connection (standing in
+    for a SELECT/SEARCH/FETCH response) is slow-dripped. Proves the
+    `self.file`-only binding done in `open()` keeps protecting reads
+    after construction, not just during it."""
+    cert = _generate_self_signed_cert(tmp_path)
+    if cert is None:
+        pytest.skip("openssl CLI not available to generate a self-signed test certificate")
+    certfile, keyfile = cert
+    stop_drip = threading.Event()
+    greeting_sent = threading.Event()
+
+    def _greet_then_drip(tls_conn: ssl.SSLSocket) -> None:
+        tls_conn.sendall(b"* OK IMAP4rev1 Service Ready\r\n")
+        greeting_sent.set()
+        while not stop_drip.is_set():
+            try:
+                tls_conn.send(b"x")
+            except OSError:
+                break
+            time.sleep(0.05)
+
+    server, (host, port), server_thread, accepted = _start_tls_server(
+        certfile, keyfile, _greet_then_drip
+    )
+    try:
+        deadline = ImapSessionDeadline(0.5)
+        result: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                with deadline:
+                    client = _LegacyAttributeDeadlineIMAP4SSL(
+                        host,
+                        port,
+                        ssl_context=_relaxed_test_client_ssl_context(),
+                        timeout=5.0,
+                        deadline=deadline,
+                    )
+                    assert not hasattr(client, "_file")
+                    assert isinstance(get_imap_makefile_reader(client), object)
+                    # Post-constructor read, standing in for a SELECT/
+                    # SEARCH/FETCH response -- the greeting above already
+                    # completed construction successfully; this second
+                    # read is the slow-dripped, never-terminated line.
+                    client.readline()
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        start = time.monotonic()
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=3.0)
+        elapsed = time.monotonic() - start
+        stop_drip.set()
+
+        assert accepted.wait(timeout=2)
+        assert greeting_sent.wait(timeout=2)
+        assert not worker.is_alive(), (
+            "legacy self.file layout: post-constructor read was not unblocked by the deadline"
+        )
+        assert elapsed < 2.0, f"not bounded by the deadline (took {elapsed:.2f}s)"
+        assert deadline.exceeded is True
+        assert "error" in result
+    finally:
+        stop_drip.set()
+        server.close()
+        server_thread.join(timeout=3)
+
+
+def test_watchdog_force_close_does_not_hang_on_an_in_flight_readline(tmp_path):
+    """The exact Codex deadlock concern, tested directly: if a thread is
+    blocked inside `self.file.readline()` (holding io.BufferedReader's
+    internal lock for the whole blocking duration) when the watchdog
+    fires, `ImapSessionDeadline._force_close` itself -- run on the
+    watchdog's OWN thread -- must return promptly. It must NOT be the
+    one left waiting on that same lock forever.
+    """
+    cert = _generate_self_signed_cert(tmp_path)
+    if cert is None:
+        pytest.skip("openssl CLI not available to generate a self-signed test certificate")
+    certfile, keyfile = cert
+
+    def _stay_silent(tls_conn: ssl.SSLSocket) -> None:
+        time.sleep(5)
+
+    server, (host, port), server_thread, accepted = _start_tls_server(
+        certfile, keyfile, _stay_silent
+    )
+    try:
+        raw = socket.create_connection((host, port), timeout=5.0)
+        client_ctx = _relaxed_test_client_ssl_context()
+        tls_client = client_ctx.wrap_socket(
+            raw, server_hostname="localhost", do_handshake_on_connect=False
+        )
+        tls_client.do_handshake()
+        assert accepted.wait(timeout=2)
+        fileobj = tls_client.makefile("rb")  # mirrors imaplib <=3.13's self.file
+
+        reader_result: dict[str, object] = {}
+
+        def _blocked_readline() -> None:
+            try:
+                reader_result["data"] = fileobj.readline(1000)
+            except OSError as exc:
+                reader_result["error"] = exc
+
+        reader = threading.Thread(target=_blocked_readline, daemon=True)
+        reader.start()
+        time.sleep(0.3)  # ensure readline() is genuinely blocked first
+
+        deadline = ImapSessionDeadline(60.0)  # never fires on its own
+        deadline.bind_socket(tls_client, extra_closable=fileobj)
+
+        watchdog_result: dict[str, float] = {}
+
+        def _simulate_watchdog_fire() -> None:
+            start = time.monotonic()
+            deadline._on_fire()
+            watchdog_result["elapsed"] = time.monotonic() - start
+
+        watchdog_thread = threading.Thread(target=_simulate_watchdog_fire, daemon=True)
+        watchdog_thread.start()
+        watchdog_thread.join(timeout=2.0)
+
+        assert not watchdog_thread.is_alive(), (
+            "the watchdog itself hung inside _force_close (blocked on "
+            "extra_closable.close() behind the in-flight readline())"
+        )
+        assert watchdog_result["elapsed"] < 1.0, (
+            f"_force_close took {watchdog_result['elapsed']:.2f}s -- "
+            "too slow to be a safe watchdog callback"
+        )
+
+        reader.join(timeout=2.0)
+        assert not reader.is_alive(), "the blocked readline() was never released"
+        assert "error" in reader_result or reader_result.get("data") == b""
     finally:
         server.close()
         server_thread.join(timeout=3)

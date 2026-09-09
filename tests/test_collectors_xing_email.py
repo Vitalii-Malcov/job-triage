@@ -1,3 +1,4 @@
+import imaplib
 import inspect
 import socket
 import ssl
@@ -511,6 +512,63 @@ class TestConnectSecurityHardening:
         finally:
             server.close()
             server_thread.join(timeout=3)
+
+    def test_connect_os_error_does_not_leak_host_port_or_raw_exception_text(self, monkeypatch):
+        """Codex final review, MEDIUM: `_connect()`'s raised
+        XingConnectionError must never embed the configured host/port or
+        the raw OSError text -- this exception's str() can reach an
+        operator-visible surface (app/api/routes.py's `run_xing_collector`
+        puts `str(exc)` straight into an HTTP 502 `detail`) as well as
+        application logs. Mirrors GmailImapProvider's sanitization
+        exactly (GMAIL-003). Uses deliberately distinctive fake sensitive
+        values so a leak of ANY of them is unambiguous.
+        """
+        sensitive_host = "corp-mailserver-do-not-leak.internal"
+        sensitive_port = 47993
+        sensitive_exc_text = "SECRET_TOKEN_ABC123_LEAKED_IF_VISIBLE"
+
+        def _fake_imap4_ssl(host, port, **kwargs):
+            raise OSError(sensitive_exc_text)
+
+        monkeypatch.setattr(xing_email_module.imaplib, "IMAP4_SSL", _fake_imap4_ssl)
+        collector = XingEmailCollector(
+            imap_host=sensitive_host,
+            imap_port=sensitive_port,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingConnectionError) as exc_info:
+            collector._connect()
+
+        message = str(exc_info.value)
+        assert sensitive_host not in message
+        assert str(sensitive_port) not in message
+        assert sensitive_exc_text not in message
+
+    def test_connect_login_rejected_does_not_leak_raw_exception_text(self, monkeypatch):
+        """Same leak surface as above, for the login-rejected path
+        (imaplib.IMAP4.error can carry server-echoed text)."""
+        sensitive_exc_text = "SECRET_TOKEN_XYZ789_LEAKED_IF_VISIBLE"
+
+        class _RejectingClient:
+            def login(self, user, password):
+                raise imaplib.IMAP4.error(sensitive_exc_text)
+
+        monkeypatch.setattr(
+            xing_email_module.imaplib, "IMAP4_SSL", lambda *a, **kw: _RejectingClient()
+        )
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingAuthError) as exc_info:
+            collector._connect()
+
+        assert sensitive_exc_text not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

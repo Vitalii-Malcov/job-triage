@@ -33,20 +33,39 @@ I/O call itself -- by closing the socket it's blocked on -- guarantees the
 thread returns and its worker-pool slot is freed.
 
 Force-closing must also account for `socket.makefile()` (used by
-`imaplib.IMAP4.open()` to create `self._file`): calling `.makefile()`
-pins an internal reference count on the socket object, so
-`sock.close()` alone silently becomes a no-op "soft close" (a refcount
-decrement, not a real OS-level close) for as long as that makefile()
-derived file object is still open -- confirmed empirically (see this
-fix's test suite): a thread already blocked in `sock.recv()` is NOT
-unblocked by `shutdown()` + `close()` alone once `.makefile()` has been
-called on the same socket, even though neither call raises. `bind_socket`
-below therefore accepts an optional `extra_closable` (imaplib's
-`self._file`) that is closed FIRST, mirroring the ordering
-`imaplib.IMAP4.shutdown()` itself uses (`self._file.close()` before
-`self.sock.shutdown()`/`close()`) -- releasing that reference so the
-socket close actually takes effect and the blocked read is really
-unblocked, not left hanging behind a refcount.
+`imaplib.IMAP4.open()` to create a buffered reader -- `self.file` on
+CPython <= 3.13, `self._file` on 3.14+, see `get_imap_makefile_reader`
+below): calling `.makefile()` pins an internal reference count on the
+socket object, so `sock.close()` alone silently becomes a no-op "soft
+close" (a refcount decrement, not a real OS-level close) for as long as
+that makefile()-derived reader is still open -- confirmed empirically
+(see this fix's test suite): a thread already blocked in `sock.recv()`
+(or, on CPython <= 3.13, in `self.file.readline()`, which reads through
+that same buffered reader) is NOT unblocked by `shutdown()` + `close()`
+alone once `.makefile()` has been called on the same socket, even though
+neither call raises.
+
+Codex's final review caught a real bug in an earlier version of this
+fix, which closed that buffered reader FIRST to release the reference
+before shutting down the socket: CPython's buffered I/O objects
+(`io.BufferedReader`) serialize ALL of their own operations -- including
+`close()` -- through one internal lock, held for the whole duration of
+whatever call is in flight. If a `readline()` is already blocked inside
+that reader when the watchdog fires, `extra_closable.close()` would
+itself block waiting for the SAME lock, forever -- the watchdog thread
+hanging is exactly the failure this whole mechanism exists to prevent
+elsewhere. `_force_close` below therefore NEVER closes `extra_closable`
+first. It shuts down `sock` (a lock-free syscall, always safe to call
+immediately), then forces sock's REAL close by bypassing
+`socket.socket`'s refcount-deferred soft-close directly (via the
+stable, version-independent `_real_close`/`_io_refs` internals of
+`socket.py` itself -- confirmed identical across CPython 3.11-3.14,
+unlike imaplib's `self.file`/`self._file` naming) -- THIS is what
+actually unblocks a thread blocked in `sock.recv()` OR in
+`self.file.readline()` (the real close causes the underlying blocking
+read to fail, which releases the buffered reader's lock naturally, from
+the thread that was already holding it). Only once that has happened is
+it safe to also close `extra_closable`, purely as tidy-up.
 
 Scope: `DeadlineIMAP4SSL` (below) binds the watchdog to the real socket
 from the moment it exists -- the raw TCP socket right after connecting,
@@ -79,7 +98,8 @@ logger = logging.getLogger(__name__)
 
 class HasClose(Protocol):
     """Anything closeable -- in practice, the file object returned by
-    `socket.makefile()` (`imaplib.IMAP4.open()`'s `self._file`)."""
+    `socket.makefile()` (`imaplib.IMAP4.open()`'s `self.file`/
+    `self._file` -- see `get_imap_makefile_reader`)."""
 
     def close(self) -> None: ...
 
@@ -134,9 +154,10 @@ class ImapSessionDeadline:
         session reconnects or progresses to a new socket object.
 
         `extra_closable`: an optional companion object (e.g. imaplib's
-        `self._file`, from `socket.makefile()`) that must ALSO be closed
-        -- see this module's docstring for why `sock.close()` alone can
-        silently fail to release the underlying file descriptor while a
+        `self.file`/`self._file`, from `socket.makefile()`) that is
+        ALSO closed, purely for tidy-up -- see this module's docstring
+        for why `sock.close()` alone can silently fail to release the
+        underlying file descriptor while a
         makefile()-derived object on the same socket is still open.
         """
         with self._lock:
@@ -151,22 +172,66 @@ class ImapSessionDeadline:
         return self._fired.is_set()
 
     def _force_close(self, sock: socket.socket, extra_closable: HasClose | None) -> None:
-        # extra_closable FIRST: releases socket.makefile()'s reference
-        # count on `sock` (see module docstring) so the shutdown()/
-        # close() below actually take effect instead of being deferred.
+        # Codex final review: closing `extra_closable` (a
+        # socket.makefile()-derived buffered reader) FIRST -- the
+        # previous version of this fix -- is itself unsafe: CPython's
+        # buffered I/O objects (`io.BufferedReader`, what `self.file`/
+        # `self._file` actually is) serialize ALL operations, including
+        # close(), through one internal lock. If a readline() is
+        # currently blocked reading from the underlying socket, it is
+        # holding that lock for the whole blocking duration -- calling
+        # `extra_closable.close()` from THIS (watchdog) thread would
+        # then itself block waiting for the same lock, forever, which is
+        # exactly the "watchdog can hang" failure this order must never
+        # produce. Confirmed empirically (see this fix's test suite).
+        #
+        # shutdown() first, unconditionally: cheap, never blocks (a
+        # plain socket-level syscall, no Python-level lock involved), and
+        # on some platforms/situations is already sufficient on its own.
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        # Then force the REAL close of `sock` -- bypassing
+        # socket.socket's `_io_refs`-deferred "soft close" (see module
+        # docstring: a plain `sock.close()` here would silently no-op
+        # while `extra_closable` is still open, since it still holds a
+        # reference). `_real_close`/`_io_refs` are stable, version-
+        # independent socket.py internals (confirmed identical on
+        # CPython 3.11 through 3.14) -- not the imaplib attribute this
+        # fix's Problem 1 is about -- but a missing-attribute fallback is
+        # kept anyway so a hypothetical future rename degrades to the
+        # pre-existing (still finite, per-op-timeout-bounded) behavior
+        # instead of raising.
+        self._force_real_close(sock)
+        # Only NOW -- after the real close, so nothing can still be
+        # legitimately blocked inside it holding its lock -- clean up
+        # the makefile()-derived wrapper. This is cosmetic (releases the
+        # Python-level file object promptly instead of waiting for GC),
+        # not required for the unblocking guarantee above.
         if extra_closable is not None:
             try:
                 extra_closable.close()
             except OSError:
                 pass
-        # shutdown() before close(): the documented, portable way to
-        # unblock a peer thread already parked in a blocking recv()/
-        # send() on this socket. close() alone is not guaranteed to
-        # interrupt a call already in flight on some platforms.
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+
+    def _force_real_close(self, sock: socket.socket) -> None:
+        real_close = getattr(sock, "_real_close", None)
+        if callable(real_close):
+            try:
+                real_close()
+                return
+            except Exception:
+                return
+        # Fallback if a future socket implementation ever removes
+        # _real_close: zero the refcount bookkeeping directly so the
+        # normal close() below performs the real close instead of
+        # deferring it.
+        if hasattr(sock, "_io_refs"):
+            try:
+                sock._io_refs = 0
+            except Exception:
+                pass
         try:
             sock.close()
         except OSError:
@@ -195,6 +260,39 @@ class ImapSessionDeadline:
     ) -> None:
         if self._timer is not None:
             self._timer.cancel()
+
+
+def get_imap_makefile_reader(imap_client: imaplib.IMAP4) -> HasClose | None:
+    """Returns `imaplib.IMAP4`'s internal `socket.makefile()`-backed
+    reader, tolerant of its private-attribute rename across CPython
+    versions this project supports (>=3.11, per pyproject.toml; CI runs
+    3.13):
+
+    * CPython <= 3.13: `self.file`
+    * CPython 3.14+: `self._file`
+
+    Never hard-codes either name alone -- `imaplib.IMAP4.open()`'s
+    docstring/implementation is not a public API contract, so this
+    checks both and returns whichever is actually present, preferring
+    `_file` (the newer name) only because that's what this project's
+    primary development runtime (3.14) uses; the order does not matter
+    functionally since only one of the two ever exists on a given
+    version.
+
+    Returns None if NEITHER attribute exists (a hypothetical future
+    CPython rename this project hasn't seen yet). That is a safe,
+    explicit degrade, not a silent one: `ImapSessionDeadline._force_close`
+    does not need this object to guarantee the core unblocking property
+    (it forces the real socket close directly -- see that method's
+    docstring) -- this reader is only used for a cosmetic follow-up
+    close, so returning None here just skips that cleanup rather than
+    reintroducing any blocking risk.
+    """
+    for attr in ("_file", "file"):
+        candidate = getattr(imap_client, attr, None)
+        if candidate is not None:
+            return candidate
+    return None
 
 
 class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
@@ -231,16 +329,21 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
     instead of leaving it unprotected.
 
     A THIRD bind happens in `open()`, after `IMAP4.open()` (the immediate
-    caller of `_create_socket`) additionally creates `self._file =
-    self.sock.makefile('rb')`. That rebind is not optional decoration --
-    confirmed empirically (see this fix's test suite): `socket.makefile()`
-    pins a reference count on the socket, so `self.sock.close()` alone
-    silently becomes a no-op "soft close" for as long as `self._file` is
-    still open, which is exactly the state the connection is in for the
-    ENTIRE rest of the session (greeting/CAPABILITY, LOGIN,
-    SELECT/SEARCH/FETCH/CLOSE/LOGOUT). Without also closing `self._file`,
-    a deadline fire during any of that would silently fail to unblock the
-    blocked read despite `shutdown()`/`close()` both reporting success.
+    caller of `_create_socket`) additionally creates a makefile()-backed
+    reader for buffered reads -- `self.file` on CPython <= 3.13,
+    `self._file` on CPython 3.14+ (an unannounced private rename between
+    versions; see `get_imap_makefile_reader` below, which this class
+    uses instead of hard-coding either name). That companion object is
+    not optional decoration to track -- confirmed empirically (see this
+    fix's test suite): `socket.makefile()` pins a reference count on the
+    socket, so `self.sock.close()` alone silently becomes a no-op "soft
+    close" for as long as that reader is still open, which is exactly
+    the state the connection is in for the ENTIRE rest of the session
+    (greeting/CAPABILITY, LOGIN, SELECT/SEARCH/FETCH/CLOSE/LOGOUT).
+    `ImapSessionDeadline._force_close` handles releasing that reference
+    safely -- see its docstring for why the ORDER matters (closing the
+    makefile reader before forcing the real socket close can itself
+    deadlock the watchdog thread).
     """
 
     def __init__(
@@ -269,11 +372,13 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
         self, host: str = "", port: int = imaplib.IMAP4_SSL_PORT, timeout: float | None = None
     ) -> None:
         super().open(host, port, timeout)
-        # AUD-005: self.sock is already bound (via _create_socket above),
-        # but self._file (assigned by IMAP4.open() right after
-        # _create_socket returns) is not -- rebind including it so a
-        # deadline fire during the greeting/CAPABILITY read that follows
-        # (and everything after) actually releases the socket instead of
-        # being silently deferred by makefile()'s reference count. See
-        # this class's docstring and ImapSessionDeadline.bind_socket's.
-        self._imap_deadline.bind_socket(self.sock, extra_closable=self._file)
+        # AUD-005 (Codex final review, HIGH): self.sock is already bound
+        # (via _create_socket above), but the makefile()-backed reader
+        # IMAP4.open() just created (self.file on CPython <=3.13,
+        # self._file on 3.14+ -- get_imap_makefile_reader handles the
+        # rename, never hard-coding one) is not -- rebind including it
+        # for the cosmetic cleanup ImapSessionDeadline._force_close does
+        # AFTER forcing the real socket close (see that method's
+        # docstring for why the order matters and why finding this
+        # reader is not required for the core unblocking guarantee).
+        self._imap_deadline.bind_socket(self.sock, extra_closable=get_imap_makefile_reader(self))
