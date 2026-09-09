@@ -181,6 +181,7 @@ class TestRunGmailSync:
             "duplicates": 0,
             "skipped": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
 
     def test_second_run_reports_duplicates(self, client, monkeypatch):
@@ -200,6 +201,7 @@ class TestRunGmailSync:
             "duplicates": 2,
             "skipped": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
 
     def test_sent_mailbox_is_synced_alongside_the_primary_mailbox(self, client, monkeypatch):
@@ -262,6 +264,7 @@ class TestRunGmailSync:
             "duplicates",
             "skipped",
             "failed",
+            "deadline_exceeded",
         }
 
     def test_gmail_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):

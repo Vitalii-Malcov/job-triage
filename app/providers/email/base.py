@@ -253,10 +253,23 @@ class GmailFetchResult:
     MAX_MESSAGES_PER_SYNC) — distinct from a persistence failure, which
     the caller (app.services.gmail_inbox) tracks separately once messages
     reach the database layer.
+
+    `deadline_exceeded` (NEW-001, Astra R4A): True when the total IMAP
+    session deadline (AUD-005) fired before every candidate UID could be
+    fetched. `messages` still contains every message that DID finish
+    fetch+parse before that happened — this result is never discarded or
+    replaced by an exception merely because the deadline expired
+    afterward (see `app.providers.email.imap.GmailImapProvider
+    ._fetch_sync_body`'s own docstring for the full rationale, and
+    `app.services.gmail_inbox.GmailInboxService.sync`/
+    `app.models.gmail.GmailSyncResult.deadline_exceeded` for how this
+    propagates into a truthful non-"ok" sync outcome instead of a false
+    "ok" or a discarded batch).
     """
 
     messages: tuple[ParsedGmailMessage, ...]
     skipped_count: int
+    deadline_exceeded: bool = False
 
 
 class ImapClient(Protocol):

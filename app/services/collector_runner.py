@@ -161,13 +161,38 @@ async def _maybe_auto_research(
     if budget["remaining"] <= 0:
         return
     budget["remaining"] -= 1
+    # NEW-002 (Astra R4A): captured as plain scalars BEFORE the call, not
+    # read from `record` inside the except block below — see that
+    # block's own comment for why.
+    job_id = record.id
+    company = record.company
     try:
         await CompanyResearchService().get_or_run(db, record, settings)
     except Exception as exc:
+        # NEW-002 (Astra R4A): a failure here (e.g. a flush/commit inside
+        # CompanyResearchService.get_or_run's own persistence calls) can
+        # leave `db` — the SAME shared session the caller uses for core
+        # job scoring/persistence — in SQLAlchemy's "pending rollback"
+        # state: any FURTHER use of `db` (the next job's
+        # score_and_persist, a later commit, even this except block's
+        # own `record.id`/`record.company` access) would then raise
+        # PendingRollbackError instead of the real, already-logged
+        # failure, silently aborting the rest of THIS collector run over
+        # what was meant to be a best-effort, isolated failure.
+        # `db.rollback()` here is always safe: `record`'s own write
+        # (app.db.repositories.upsert_job -> _finalize_job_write) already
+        # committed in an EARLIER, separate transaction before this
+        # function was ever called — this rollback can only discard
+        # whatever uncommitted work `get_or_run`'s own failed attempt
+        # left behind in the CURRENT transaction, never that
+        # already-durable job write. `job_id`/`company` were captured as
+        # plain scalars above (not read from `record` here) so this log
+        # line never touches the now-expired ORM object post-rollback.
+        db.rollback()
         logger.warning(
             "company_research_auto_run_failed job_id=%s company=%s error_type=%s",
-            record.id,
-            record.company,
+            job_id,
+            company,
             type(exc).__name__,
         )
 
@@ -469,12 +494,14 @@ async def run_xing(
             mark_message_processed(db, "xing", batch.message_id)
 
     logger.info(
-        "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s "
+        "deadline_exceeded=%s",
         len(jobs),
         created_count,
         updated_count,
         collector.skipped_invalid_count,
         failed_count,
+        collector.deadline_exceeded,
     )
 
     return {
@@ -483,4 +510,11 @@ async def run_xing(
         "updated": updated_count,
         "skipped_invalid": collector.skipped_invalid_count,
         "failed": failed_count,
+        # NEW-001 (Astra R4A): True if the IMAP session's total deadline
+        # fired before every candidate message could be fetched -- see
+        # app.collectors.xing_email.XingEmailCollector.deadline_exceeded.
+        # _run_step (app.services.automation) treats this as forcing a
+        # non-"ok" step status even when every fetched job persisted
+        # cleanly, since real work is still pending for this account.
+        "deadline_exceeded": collector.deadline_exceeded,
     }

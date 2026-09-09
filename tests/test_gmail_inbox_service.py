@@ -55,14 +55,24 @@ def _parsed(uid: int, message_id: str | None = None) -> ParsedGmailMessage:
 
 
 class FakeProvider:
-    def __init__(self, messages: list[ParsedGmailMessage], skipped_count: int = 0) -> None:
+    def __init__(
+        self,
+        messages: list[ParsedGmailMessage],
+        skipped_count: int = 0,
+        deadline_exceeded: bool = False,
+    ) -> None:
         self._messages = tuple(messages)
         self._skipped_count = skipped_count
+        self._deadline_exceeded = deadline_exceeded
         self.fetch_calls = 0
 
     async def fetch(self):
         self.fetch_calls += 1
-        return GmailFetchResult(messages=self._messages, skipped_count=self._skipped_count)
+        return GmailFetchResult(
+            messages=self._messages,
+            skipped_count=self._skipped_count,
+            deadline_exceeded=self._deadline_exceeded,
+        )
 
 
 @pytest.mark.asyncio
@@ -76,6 +86,27 @@ async def test_sync_reports_created_and_skipped_counts(db):
     assert result.duplicates == 0
     assert result.skipped == 3
     assert result.failed == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_persists_completed_messages_and_reports_deadline_exceeded(db):
+    """NEW-001 (Astra R4A): a provider that hit its IMAP session deadline
+    mid-fetch still returns whatever it DID complete -- `sync` must
+    persist all of it (never discard a completed batch merely because
+    the provider also flags `deadline_exceeded`) and must propagate that
+    flag into the returned `GmailSyncResult` so callers can tell this
+    run is not fully caught up, even though every message it DID fetch
+    persisted without any failure.
+    """
+    provider = FakeProvider([_parsed(1), _parsed(2)], deadline_exceeded=True)
+
+    result = await GmailInboxService().sync(db, provider)
+
+    assert result.fetched == 2
+    assert result.created == 2
+    assert result.failed == 0
+    assert result.deadline_exceeded is True
+    assert len(list_messages(db, ACCOUNT, limit=200, offset=0)) == 2
 
 
 @pytest.mark.asyncio
@@ -140,7 +171,14 @@ async def test_sync_result_never_contains_message_content(db):
     result = await GmailInboxService().sync(db, provider)
 
     dumped = result.model_dump()
-    assert set(dumped.keys()) == {"fetched", "created", "duplicates", "skipped", "failed"}
+    assert set(dumped.keys()) == {
+        "fetched",
+        "created",
+        "duplicates",
+        "skipped",
+        "failed",
+        "deadline_exceeded",
+    }
 
 
 @pytest.mark.asyncio

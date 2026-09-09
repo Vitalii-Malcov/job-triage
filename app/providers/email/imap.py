@@ -509,10 +509,31 @@ class GmailImapProvider:
             else:
                 messages.append(parsed)
 
-        if deadline is not None and deadline.exceeded:
-            raise GmailConnectionError("IMAP session exceeded its total operation deadline")
-
-        return GmailFetchResult(messages=tuple(messages), skipped_count=skipped_count)
+        # NEW-001 (Astra R4A): a prior version of this method RAISED
+        # GmailConnectionError here, discarding `messages` entirely --
+        # every message that had already completed fetch+parse before the
+        # deadline fired was silently lost, never persisted, with no
+        # signal to the caller that real work had been done. A backlog
+        # that consistently exceeds the deadline would then repeatedly
+        # re-fetch the same oldest-UID prefix while persisting zero
+        # progress, and those messages could eventually age out of the
+        # lookback window entirely -- a real, permanent data-loss bug, not
+        # a cosmetic one. Returning the completed batch instead (flagged
+        # via `deadline_exceeded`, never silently reported as full
+        # success) lets `app.services.gmail_inbox.GmailInboxService.sync`
+        # persist everything that finished in time and report a truthful
+        # partial outcome. A GENUINE connection/auth failure (the socket
+        # dying during SELECT/STATUS/SEARCH/one message's own FETCH, i.e.
+        # anywhere other than this clean post-loop deadline check) still
+        # raises normally via `_fetch_sync`'s OSError handler below --
+        # this change touches ONLY the case where the loop above already
+        # finished (by exhausting `uids` or breaking cleanly) and nothing
+        # actually failed except running out of time.
+        return GmailFetchResult(
+            messages=tuple(messages),
+            skipped_count=skipped_count,
+            deadline_exceeded=deadline is not None and deadline.exceeded,
+        )
 
     def _read_uid_validity(self, client: ImapClient) -> int:
         typ, data = client.status(self.mailbox, "(UIDVALIDITY)")

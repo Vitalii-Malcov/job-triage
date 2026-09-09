@@ -132,14 +132,25 @@ class AutomationRunAlreadyInProgressError(Exception):
 
 
 class AutomationRunLeaseLostError(Exception):
-    """S8A-002 (Codex re-review): ownership of the run's lease was lost
-    while `run_automation_cycle` was still executing (or in the instant
-    right before its final write) — mapped to 409. The collector steps
-    themselves already ran to completion and their real results (jobs
-    fetched/scored/persisted) are unaffected — this error means only
-    that THIS run's own bookkeeping row could not be safely finalized,
-    because some other process may now own it. Never automatically
-    retried; a fresh `POST /automation/runs` starts a new run.
+    """S8A-002 (Codex re-review); NEW-004 (Astra R4A) extends WHEN this
+    fires. Ownership of the run's lease was lost while
+    `run_automation_cycle` was still executing — mapped to 409.
+
+    NEW-004: this is now raised the INSTANT lease loss is observed,
+    checked before every step/collector `run_automation_cycle` is about
+    to launch (see `_raise_if_lease_lost`), not only once at the very
+    end after every step had already run. A confirmed-lost lease means a
+    replacement worker may already own this account's run; continuing
+    to launch NEW collector calls, external IMAP/HTTP fetches, Telegram
+    notifications, or research runs after that point risks genuine
+    duplicate/overlapping execution against the same account, not just
+    a bookkeeping race. Any step that had ALREADY fully run before loss
+    was detected keeps its real results (jobs fetched/scored/persisted,
+    messages synced, etc. — all committed independently by that step's
+    own code, never rolled back by this error) — only this run's own
+    summary bookkeeping row is abandoned, because some other process may
+    now own it. Never automatically retried; a fresh `POST
+    /automation/runs` starts a new run.
     """
 
 
@@ -213,6 +224,16 @@ async def _run_step(
     elif counters["failed"] == attempted:
         status = "failed"
     else:
+        status = "partial"
+    # NEW-001 (Astra R4A): a collector step whose own IMAP session
+    # deadline fired before every candidate could be fetched (currently
+    # only `run_xing` reports this key -- `run_bundesagentur` has no such
+    # deadline and simply omits it, so `.get(..., False)` is the correct
+    # default there) still has real work pending for this account, even
+    # when every job it DID fetch scored/persisted cleanly (`status`
+    # would otherwise be "ok" above). Reporting "ok" would claim this
+    # source is fully caught up when it is not.
+    if status == "ok" and counters.get("deadline_exceeded", False):
         status = "partial"
     return {"status": status, "counters": counters, "error_type": None}
 
@@ -440,6 +461,29 @@ class _RunLeaseHeartbeat:
         self._thread.join(timeout=self._interval_seconds + 1.0)
 
 
+def _raise_if_lease_lost(heartbeat: _RunLeaseHeartbeat, run_id: int, account_key: str) -> None:
+    """NEW-004 (Astra R4A): the fail-closed gate `run_automation_cycle`
+    calls before every collector/optional step and before returning to
+    finalize the run — see `AutomationRunLeaseLostError`'s own docstring
+    for the full rationale. Checking only ONCE at the very end (the old
+    behavior) let a worker keep launching brand-new collector calls,
+    IMAP/HTTP fetches, Telegram notifications, and research runs for an
+    account it had ALREADY confirmed it no longer owned — a real risk of
+    duplicate/overlapping execution against a replacement worker, not
+    merely a bookkeeping inconsistency. A step already fully in flight
+    when the heartbeat first detects loss is allowed to finish (this is
+    checked BEFORE launching the NEXT one, never by interrupting one
+    already running) — its own results remain valid and durable either
+    way.
+    """
+    if heartbeat.lease_lost.is_set():
+        raise AutomationRunLeaseLostError(
+            f"Lost ownership of automation run id={run_id!r} for account_key="
+            f"{account_key!r} before further work could safely proceed; refusing "
+            "to launch new work."
+        )
+
+
 async def run_automation_cycle(
     db: Session,
     *,
@@ -498,6 +542,9 @@ async def run_automation_cycle(
     try:
         step_results: dict[str, dict] = {}
         for step_name in AUTOMATION_STEPS:
+            # NEW-004: checked before EVERY step, not only once at the
+            # very end — see _raise_if_lease_lost's own docstring.
+            _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results[step_name] = await _run_step(
                 db, step_name, step_callables[step_name], settings, touched_jobs
             )
@@ -508,6 +555,7 @@ async def run_automation_cycle(
         # stays EXACTLY the Stage 8A/8B collector result shape — no fake
         # disabled/skipped step is ever added.
         if settings.automation_auto_prepare_enabled:
+            _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results["shortlist_drafts"] = await _run_shortlist_drafts_step(
                 db, settings, touched_jobs
             )
@@ -521,12 +569,15 @@ async def run_automation_cycle(
         # persisted from this or a previous run — see
         # app.services.automation_gmail's module docstring).
         if settings.automation_gmail_cycle_enabled:
+            _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results["gmail_sync"] = await _run_gmail_sync_step(db, account_key, settings)
+            _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results["gmail_response_drafts"] = await _run_gmail_response_drafts_step(
                 db, account_key, settings
             )
 
         if settings.automation_follow_up_cycle_enabled:
+            _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results["follow_up_proposals"] = await _run_follow_up_proposals_step(
                 db, account_key, settings
             )
@@ -534,15 +585,14 @@ async def run_automation_cycle(
         overall_status = _compute_overall_status(step_results, AUTOMATION_STEPS)
         error_summary = _build_error_summary(step_results)
 
-        if heartbeat.lease_lost.is_set():
-            # S8A-002: exclusivity for this run's own bookkeeping is no
-            # longer provable — fail closed rather than risk overwriting
-            # whatever a new owner has since recorded for this row.
-            raise AutomationRunLeaseLostError(
-                f"Lost ownership of automation run id={run.id!r} for account_key="
-                f"{account_key!r} while it was executing; its outcome could not be "
-                "safely finalized."
-            )
+        # S8A-002: one last check immediately before the final write —
+        # exclusivity for this run's own bookkeeping is no longer
+        # provable once lost, so fail closed rather than risk overwriting
+        # whatever a new owner has since recorded for this row. Every
+        # step above already checked before ITS OWN launch (NEW-004); this
+        # catches the remaining instant between the last step finishing
+        # and this write.
+        _raise_if_lease_lost(heartbeat, run.id, account_key)
 
         finished = finish_run(
             db,

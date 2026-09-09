@@ -68,6 +68,7 @@ class FakeCollector:
         self._error = error
         self._message_id = message_id
         self.skipped_invalid_count = 0
+        self.deadline_exceeded = False
 
     async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
         if self._error is not None:
@@ -178,6 +179,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
 
     def test_second_run_deduplicates_via_fingerprint(self, client, monkeypatch):
@@ -195,6 +197,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
         assert second.json() == {
             "fetched": 1,
@@ -202,6 +205,7 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
 
     def test_second_run_deduplicates_even_with_different_tracking_url(self, client, monkeypatch):
@@ -230,6 +234,7 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
 
     def test_upstream_failure_returns_502(self, client, monkeypatch):
@@ -297,6 +302,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "deadline_exceeded": False,
         }
         assert acknowledged == set()
 
@@ -312,6 +318,7 @@ class TestRunXingCollector:
             "updated": 2,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
         assert acknowledged == {"<fake-digest@mail.xing.com>"}
 
@@ -465,6 +472,7 @@ class TestXingCollectorNotifications:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 3
 
@@ -503,6 +511,7 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "deadline_exceeded": False,
         }
         assert SECRET_TEXT not in caplog.text
         assert SECRET_TEXT not in response.text
@@ -535,6 +544,7 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 1
         assert SECRET_TEXT not in caplog.text

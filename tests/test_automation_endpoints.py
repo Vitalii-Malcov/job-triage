@@ -68,6 +68,7 @@ class FakeXingCollector:
         self._error = error
         self._message_id = message_id
         self.skipped_invalid_count = 0
+        self.deadline_exceeded = False
 
     async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
         if self._error is not None:

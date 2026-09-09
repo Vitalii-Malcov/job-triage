@@ -336,6 +336,15 @@ class XingEmailCollector(JobCollector):
         # to report how many blocks were skipped (mirrors
         # BundesagenturCollector.skipped_invalid_count).
         self.skipped_invalid_count = 0
+        # NEW-001 (Astra R4A): True if the IMAP session's total wall-clock
+        # deadline (AUD-005) fired before every candidate message could be
+        # fetched this run -- set (never raised) by `_fetch_sync_body`, so
+        # every batch that DID complete fetch+parse before that happened
+        # is still returned to the caller instead of being discarded. Read
+        # by callers after awaiting fetch()/fetch_message_batches(),
+        # mirroring `skipped_invalid_count`'s own out-of-band reporting
+        # convention -- see `app.services.collector_runner.run_xing`.
+        self.deadline_exceeded = False
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
         batches = await self.fetch_message_batches(since)
@@ -354,6 +363,7 @@ class XingEmailCollector(JobCollector):
             )
 
         self.skipped_invalid_count = 0
+        self.deadline_exceeded = False
         since_date = since or (datetime.now(UTC) - timedelta(days=self.lookback_days))
 
         # IMAP (imaplib) is synchronous/blocking; run it off the event loop
@@ -430,8 +440,27 @@ class XingEmailCollector(JobCollector):
             if batch is not None:
                 batches.append(batch)
 
+        # NEW-001 (Astra R4A): a prior version of this method RAISED
+        # XingConnectionError here, discarding `batches` entirely -- every
+        # message batch that had already completed fetch+parse before the
+        # deadline fired was silently lost, with no acknowledgment ever
+        # recorded for it (see app.services.collector_runner.run_xing,
+        # which only marks a source message processed after ALL its jobs
+        # persist). A backlog that consistently exceeds the deadline would
+        # then repeatedly re-fetch the same oldest-message prefix while
+        # making zero persisted progress, and those messages could
+        # eventually age out of the lookback window entirely. Recording
+        # the flag instead (never silently reported as full success --
+        # see `run_xing`'s own `deadline_exceeded` counter) lets the
+        # caller persist everything that finished in time and report a
+        # truthful partial outcome. A GENUINE connection/auth failure
+        # (the socket dying during SELECT/SEARCH/one message's own FETCH)
+        # still raises normally via `_fetch_sync`'s OSError handler below
+        # -- this change touches ONLY the case where the loop above
+        # already finished cleanly and nothing failed except running out
+        # of time.
         if deadline is not None and deadline.exceeded:
-            raise XingConnectionError("IMAP session exceeded its total operation deadline")
+            self.deadline_exceeded = True
 
         return batches
 
