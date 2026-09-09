@@ -51,6 +51,7 @@ Beyond that constraint, this collector:
 """
 
 import asyncio
+import contextlib
 import email
 import imaplib
 import logging
@@ -68,6 +69,10 @@ from pydantic import ValidationError
 
 from app.collectors.base import CollectorError, JobCollector, is_configured
 from app.models.job import Job
+from app.providers.email.imap_deadline import (
+    IMAP_SESSION_DEADLINE_SECONDS,
+    ImapSessionDeadline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,38 +372,78 @@ class XingEmailCollector(JobCollector):
     def _fetch_sync(self, since: datetime) -> list[XingEmailBatch]:
         client = self._injected_client
         owns_connection = client is None
-        if client is None:
-            client = self._connect()
+        # AUD-005: a real total wall-clock deadline for this whole session
+        # (login through select/search/fetch/close/logout), not just the
+        # per-read inactivity timeout `timeout=` already gives the socket
+        # -- see app/providers/email/imap_deadline.py's module docstring
+        # for why a slow-drip peer needs this. Only applied when this call
+        # owns the connection: a test-injected client has no real socket
+        # to bound.
+        deadline = ImapSessionDeadline(IMAP_SESSION_DEADLINE_SECONDS) if owns_connection else None
 
-        try:
-            typ, _ = client.select("INBOX", readonly=True)
-            if typ != "OK":
-                raise XingConnectionError(f"IMAP SELECT failed: {typ}")
+        with contextlib.ExitStack() as stack:
+            if deadline is not None:
+                stack.enter_context(deadline)
+            if client is None:
+                client = self._connect(deadline)
+            try:
+                return self._fetch_sync_body(client, since, deadline)
+            except OSError as exc:
+                if deadline is not None and deadline.exceeded:
+                    logger.warning("xing_email_imap_session_deadline_exceeded")
+                else:
+                    logger.warning(
+                        "xing_email_imap_operation_failed error_type=%s", type(exc).__name__
+                    )
+                raise XingConnectionError("IMAP operation failed") from exc
+            finally:
+                if owns_connection:
+                    self._disconnect(client)
 
-            criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
-            typ, data = client.search(None, criteria)
-            if typ != "OK":
-                raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
+    def _fetch_sync_body(
+        self,
+        client: ImapClient,
+        since: datetime,
+        deadline: ImapSessionDeadline | None,
+    ) -> list[XingEmailBatch]:
+        typ, _ = client.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise XingConnectionError(f"IMAP SELECT failed: {typ}")
 
-            message_numbers = data[0].split() if data and data[0] else []
-            batches: list[XingEmailBatch] = []
-            for message_number in message_numbers:
-                batch = self._fetch_and_process_message(client, message_number)
-                if batch is not None:
-                    batches.append(batch)
-            return batches
-        finally:
-            if owns_connection:
-                self._disconnect(client)
+        criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
+        typ, data = client.search(None, criteria)
+        if typ != "OK":
+            raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
 
-    def _connect(self) -> imaplib.IMAP4_SSL:
+        message_numbers = data[0].split() if data and data[0] else []
+        batches: list[XingEmailBatch] = []
+        for message_number in message_numbers:
+            # AUD-005: once the total session deadline has fired, the
+            # connection's socket is already forcibly closed (see
+            # ImapSessionDeadline) -- stop issuing further FETCHes on it
+            # instead of letting each remaining message fail one at a
+            # time.
+            if deadline is not None and deadline.exceeded:
+                break
+            batch = self._fetch_and_process_message(client, message_number)
+            if batch is not None:
+                batches.append(batch)
+
+        if deadline is not None and deadline.exceeded:
+            raise XingConnectionError("IMAP session exceeded its total operation deadline")
+
+        return batches
+
+    def _connect(self, deadline: ImapSessionDeadline | None = None) -> imaplib.IMAP4_SSL:
         try:
             # AUD-001: an explicit verifying SSLContext -- imaplib's own
             # default (ssl_context=None) resolves to
             # ssl._create_stdlib_context(), which sets verify_mode=CERT_NONE
             # and check_hostname=False, i.e. no certificate verification at
-            # all. AUD-005: `timeout=` bounds this connection's underlying
-            # socket for its whole lifetime.
+            # all. AUD-005: `timeout=` bounds each individual blocking
+            # socket read on this connection; the `deadline` bound below
+            # adds a REAL total wall-clock bound on top of that -- see
+            # app/providers/email/imap_deadline.py's module docstring.
             ssl_context = ssl.create_default_context()
             client = imaplib.IMAP4_SSL(
                 self.imap_host,
@@ -410,6 +455,16 @@ class XingEmailCollector(JobCollector):
             raise XingConnectionError(
                 f"Could not connect to {self.imap_host}:{self.imap_port}: {exc}"
             ) from exc
+
+        if deadline is not None:
+            # AUD-005: from here on this connection's socket is watched by
+            # the total-session deadline (login through the caller's later
+            # select/search/fetch/close/logout, all sharing this socket).
+            # getattr, not client.sock: a test-injected fake client (see
+            # tests/test_collectors_xing_email.py) may not expose a real
+            # socket at all -- an unbound deadline is simply a no-op
+            # watchdog for that case.
+            deadline.bind_socket(getattr(client, "sock", None))
 
         try:
             client.login(self.username, self.app_password)

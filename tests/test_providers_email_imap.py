@@ -1125,3 +1125,124 @@ class TestConnectSecurityHardening:
         finally:
             server.close()
             server_thread.join(timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# AUD-005 (total wall-clock session deadline, not just per-read inactivity).
+# The mechanism itself (ImapSessionDeadline: a slow-drip peer bounded by
+# TOTAL elapsed time, and a fully silent peer bounded) is unit-tested
+# directly in tests/test_imap_deadline.py. These tests cover how
+# GmailImapProvider wires that mechanism in.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDeadline:
+    """Stands in for ImapSessionDeadline to prove `_connect` binds the
+    real connection socket to whatever deadline it's given, without
+    depending on ImapSessionDeadline's own (separately tested) internals.
+    """
+
+    def __init__(self) -> None:
+        self.bound_socket = "not called"
+
+    def bind_socket(self, sock):
+        self.bound_socket = sock
+
+
+class _AlreadyExceededDeadline:
+    """Stands in for an ImapSessionDeadline that has already fired by the
+    time the per-UID fetch loop runs -- lets the "deadline exceeded mid
+    session" control-flow path be tested deterministically, without
+    relying on real timing.
+    """
+
+    def __init__(self, _total_seconds: float) -> None:
+        pass
+
+    def bind_socket(self, sock) -> None:
+        pass
+
+    @property
+    def exceeded(self) -> bool:
+        return True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class TestSessionDeadlineWiring:
+    def test_connect_binds_the_real_connection_socket_to_the_given_deadline(self, monkeypatch):
+        sentinel_sock = object()
+
+        class _StubClient:
+            sock = sentinel_sock
+
+            def login(self, user, password):
+                return ("OK", [b"LOGIN completed"])
+
+        monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", lambda *a, **kw: _StubClient())
+        provider = _provider(client=None)
+        deadline = _RecordingDeadline()
+
+        provider._connect(deadline)
+
+        assert deadline.bound_socket is sentinel_sock
+
+    def test_connect_without_a_deadline_does_not_require_one(self, monkeypatch):
+        """`deadline` defaults to None -- existing callers/tests that call
+        `_connect()` with no argument (e.g. the AUD-001 tests above) must
+        keep working unchanged."""
+
+        class _StubClient:
+            def login(self, user, password):
+                return ("OK", [b"LOGIN completed"])
+
+        monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", lambda *a, **kw: _StubClient())
+        provider = _provider(client=None)
+
+        client = provider._connect()
+
+        assert isinstance(client, _StubClient)
+
+    @pytest.mark.asyncio
+    async def test_normal_fetch_succeeds_with_the_session_deadline_active(self, monkeypatch):
+        """Wiring the deadline in for an owned connection must not disturb
+        a normal, fast, successful fetch."""
+        raw = _build_email(plaintext_body="hi")
+        fake_client = FakeImapClient(messages={1: raw})
+        fake_client.sock = object()
+
+        monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", lambda *a, **kw: fake_client)
+        provider = _provider(client=None)
+
+        result = await provider.fetch()
+
+        assert len(result.messages) == 1
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_raises_gmail_connection_error_once_the_session_deadline_is_exceeded(
+        self, monkeypatch
+    ):
+        """If the total session deadline has already fired by the time the
+        per-UID fetch loop runs, the sync must stop and raise rather than
+        keep attempting fetches on a connection whose socket has already
+        been force-closed."""
+        raw = _build_email(plaintext_body="hi")
+        fake_client = FakeImapClient(messages={1: raw})
+        fake_client.sock = object()
+
+        monkeypatch.setattr(gmail_imap_module.imaplib, "IMAP4_SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(gmail_imap_module, "ImapSessionDeadline", _AlreadyExceededDeadline)
+        provider = _provider(client=None)
+
+        with pytest.raises(GmailConnectionError):
+            await provider.fetch()
+
+        # Connection cleanup must still run even though the sync aborted.
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True

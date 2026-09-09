@@ -39,6 +39,7 @@ docstring for why a non-PEEK fetch would itself mutate the mailbox
 """
 
 import asyncio
+import contextlib
 import email
 import imaplib
 import logging
@@ -72,6 +73,10 @@ from app.providers.email.base import (
     ParsedAttachment,
     ParsedGmailMessage,
     normalize_account_key,
+)
+from app.providers.email.imap_deadline import (
+    IMAP_SESSION_DEADLINE_SECONDS,
+    ImapSessionDeadline,
 )
 
 logger = logging.getLogger(__name__)
@@ -381,100 +386,132 @@ class GmailImapProvider:
     def _fetch_sync(self, since: datetime) -> GmailFetchResult:
         client = self._injected_client
         owns_connection = client is None
-        if client is None:
-            client = self._connect()
+        # AUD-005: a real total wall-clock deadline for this whole session
+        # (login through select/search/fetch/close/logout), not just the
+        # per-read inactivity timeout `timeout=` already gives the socket
+        # -- see imap_deadline.py's module docstring for why a slow-drip
+        # peer needs this. Only applied when this call owns the
+        # connection: a test-injected client has no real socket to bound.
+        deadline = ImapSessionDeadline(IMAP_SESSION_DEADLINE_SECONDS) if owns_connection else None
 
-        try:
-            typ, _ = client.select(self.mailbox, readonly=True)
-            if typ != "OK":
-                raise GmailConnectionError("IMAP SELECT failed")
-
-            uid_validity = self._read_uid_validity(client)
-
-            criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
-            typ, data = client.uid("search", None, criteria)
-            if typ != "OK":
-                raise GmailConnectionError("IMAP UID SEARCH failed")
-
-            uids = data[0].split() if data and data[0] else []
-            skipped_count = 0
-
-            # GMAIL-005 starvation fix (GMAIL-012: one bulk lookup, not
-            # one query per UID): filter out UIDs already known to be
-            # persisted BEFORE the cap below is applied — otherwise, once
-            # a backlog exceeds MAX_MESSAGES_PER_SYNC, every sync would
-            # spend its entire budget re-fetching bodies for the same
-            # already-known messages and never reach anything new,
-            # regardless of which end (oldest/newest) is prioritized.
-            # Malformed (non-integer) UID tokens are left in the
-            # candidate list unfiltered — downstream per-message handling
-            # in _fetch_one treats them as malformed the same way it
-            # always has.
-            candidate_uid_ints: list[int] = []
-            for uid_bytes in uids:
-                try:
-                    candidate_uid_ints.append(int(uid_bytes))
-                except ValueError:
-                    continue
-
-            known_uids = (
-                self._get_known_uids(uid_validity, candidate_uid_ints)
-                if candidate_uid_ints
-                else set()
-            )
-
-            not_yet_known = []
-            for uid_bytes in uids:
-                try:
-                    uid_int = int(uid_bytes)
-                except ValueError:
-                    not_yet_known.append(uid_bytes)
-                    continue
-                if uid_int not in known_uids:
-                    not_yet_known.append(uid_bytes)
-            uids = not_yet_known
-
-            # GMAIL-005: bound how many message bodies one sync run will
-            # fetch at all. The OLDEST UIDs (Gmail UIDs are monotonically
-            # increasing within a mailbox) are prioritized, not the
-            # newest — deliberately, to avoid a starvation failure mode:
-            # if arrivals within the lookback window sustainedly exceed
-            # the cap on every single sync, always preferring the newest
-            # UIDs would mean the same tail of older-but-still-in-window
-            # messages is deferred run after run, potentially aging them
-            # completely out of the lookback window before they are ever
-            # fetched — a silent, permanent loss, not just a delay.
-            # Prioritizing the oldest UIDs instead means each capped sync
-            # makes real forward progress on the backlog; messages
-            # deferred this run are still the newest ones, so they remain
-            # within the lookback window (and get retried) on the next
-            # sync as long as sync frequency leaves them enough runway
-            # before GMAIL_LOOKBACK_DAYS. This does not eliminate
-            # starvation in the degenerate case of arrivals perpetually
-            # exceeding the cap forever — no bounded-per-run design can —
-            # but it converts "the same messages always lost" into "the
-            # backlog drains oldest-first," which is the honest, weaker
-            # guarantee this cap actually provides.
-            if len(uids) > MAX_MESSAGES_PER_SYNC:
-                overflow = len(uids) - MAX_MESSAGES_PER_SYNC
-                try:
-                    uids = sorted(uids, key=int)[:MAX_MESSAGES_PER_SYNC]
-                except ValueError:
-                    uids = uids[:MAX_MESSAGES_PER_SYNC]
-                skipped_count += overflow
-                logger.warning("gmail_sync_message_cap_exceeded cap=%s", MAX_MESSAGES_PER_SYNC)
-
-            messages: list[ParsedGmailMessage] = []
-            for uid_bytes in uids:
-                parsed = self._fetch_one(client, uid_bytes, uid_validity)
-                if parsed is None:
-                    skipped_count += 1
+        with contextlib.ExitStack() as stack:
+            if deadline is not None:
+                stack.enter_context(deadline)
+            if client is None:
+                client = self._connect(deadline)
+            try:
+                return self._fetch_sync_body(client, since, deadline)
+            except OSError as exc:
+                if deadline is not None and deadline.exceeded:
+                    logger.warning("gmail_imap_session_deadline_exceeded")
                 else:
-                    messages.append(parsed)
-            return GmailFetchResult(messages=tuple(messages), skipped_count=skipped_count)
-        finally:
-            if owns_connection:
-                self._disconnect(client)
+                    logger.warning("gmail_imap_operation_failed error_type=%s", type(exc).__name__)
+                raise GmailConnectionError("IMAP operation failed") from exc
+            finally:
+                if owns_connection:
+                    self._disconnect(client)
+
+    def _fetch_sync_body(
+        self,
+        client: ImapClient,
+        since: datetime,
+        deadline: ImapSessionDeadline | None,
+    ) -> GmailFetchResult:
+        typ, _ = client.select(self.mailbox, readonly=True)
+        if typ != "OK":
+            raise GmailConnectionError("IMAP SELECT failed")
+
+        uid_validity = self._read_uid_validity(client)
+
+        criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
+        typ, data = client.uid("search", None, criteria)
+        if typ != "OK":
+            raise GmailConnectionError("IMAP UID SEARCH failed")
+
+        uids = data[0].split() if data and data[0] else []
+        skipped_count = 0
+
+        # GMAIL-005 starvation fix (GMAIL-012: one bulk lookup, not
+        # one query per UID): filter out UIDs already known to be
+        # persisted BEFORE the cap below is applied — otherwise, once
+        # a backlog exceeds MAX_MESSAGES_PER_SYNC, every sync would
+        # spend its entire budget re-fetching bodies for the same
+        # already-known messages and never reach anything new,
+        # regardless of which end (oldest/newest) is prioritized.
+        # Malformed (non-integer) UID tokens are left in the
+        # candidate list unfiltered — downstream per-message handling
+        # in _fetch_one treats them as malformed the same way it
+        # always has.
+        candidate_uid_ints: list[int] = []
+        for uid_bytes in uids:
+            try:
+                candidate_uid_ints.append(int(uid_bytes))
+            except ValueError:
+                continue
+
+        known_uids = (
+            self._get_known_uids(uid_validity, candidate_uid_ints) if candidate_uid_ints else set()
+        )
+
+        not_yet_known = []
+        for uid_bytes in uids:
+            try:
+                uid_int = int(uid_bytes)
+            except ValueError:
+                not_yet_known.append(uid_bytes)
+                continue
+            if uid_int not in known_uids:
+                not_yet_known.append(uid_bytes)
+        uids = not_yet_known
+
+        # GMAIL-005: bound how many message bodies one sync run will
+        # fetch at all. The OLDEST UIDs (Gmail UIDs are monotonically
+        # increasing within a mailbox) are prioritized, not the
+        # newest — deliberately, to avoid a starvation failure mode:
+        # if arrivals within the lookback window sustainedly exceed
+        # the cap on every single sync, always preferring the newest
+        # UIDs would mean the same tail of older-but-still-in-window
+        # messages is deferred run after run, potentially aging them
+        # completely out of the lookback window before they are ever
+        # fetched — a silent, permanent loss, not just a delay.
+        # Prioritizing the oldest UIDs instead means each capped sync
+        # makes real forward progress on the backlog; messages
+        # deferred this run are still the newest ones, so they remain
+        # within the lookback window (and get retried) on the next
+        # sync as long as sync frequency leaves them enough runway
+        # before GMAIL_LOOKBACK_DAYS. This does not eliminate
+        # starvation in the degenerate case of arrivals perpetually
+        # exceeding the cap forever — no bounded-per-run design can —
+        # but it converts "the same messages always lost" into "the
+        # backlog drains oldest-first," which is the honest, weaker
+        # guarantee this cap actually provides.
+        if len(uids) > MAX_MESSAGES_PER_SYNC:
+            overflow = len(uids) - MAX_MESSAGES_PER_SYNC
+            try:
+                uids = sorted(uids, key=int)[:MAX_MESSAGES_PER_SYNC]
+            except ValueError:
+                uids = uids[:MAX_MESSAGES_PER_SYNC]
+            skipped_count += overflow
+            logger.warning("gmail_sync_message_cap_exceeded cap=%s", MAX_MESSAGES_PER_SYNC)
+
+        messages: list[ParsedGmailMessage] = []
+        for uid_bytes in uids:
+            # AUD-005: once the total session deadline has fired, the
+            # connection's socket is already forcibly closed (see
+            # ImapSessionDeadline) -- stop issuing further FETCHes on it
+            # instead of letting each remaining UID fail one at a time.
+            if deadline is not None and deadline.exceeded:
+                break
+            parsed = self._fetch_one(client, uid_bytes, uid_validity)
+            if parsed is None:
+                skipped_count += 1
+            else:
+                messages.append(parsed)
+
+        if deadline is not None and deadline.exceeded:
+            raise GmailConnectionError("IMAP session exceeded its total operation deadline")
+
+        return GmailFetchResult(messages=tuple(messages), skipped_count=skipped_count)
 
     def _read_uid_validity(self, client: ImapClient) -> int:
         typ, data = client.status(self.mailbox, "(UIDVALIDITY)")
@@ -527,7 +564,7 @@ class GmailImapProvider:
                 return int(match.group(1))
         return None
 
-    def _connect(self) -> imaplib.IMAP4_SSL:
+    def _connect(self, deadline: ImapSessionDeadline | None = None) -> imaplib.IMAP4_SSL:
         try:
             # AUD-001: imaplib.IMAP4_SSL's default ssl_context (when None)
             # is built via ssl._create_stdlib_context(), which -- unlike
@@ -536,8 +573,10 @@ class GmailImapProvider:
             # context, this connection would accept ANY certificate,
             # including a forged one from a MITM peer, over a channel
             # that authenticates with a real mailbox password. AUD-005:
-            # `timeout=` bounds this connection's underlying socket for
-            # its whole lifetime (see IMAP_OPERATION_TIMEOUT_SECONDS).
+            # `timeout=` bounds each individual blocking socket read on
+            # this connection (see IMAP_OPERATION_TIMEOUT_SECONDS); the
+            # `deadline` bound below adds a REAL total wall-clock bound on
+            # top of that -- see imap_deadline.py's module docstring.
             ssl_context = ssl.create_default_context()
             client = imaplib.IMAP4_SSL(
                 self.imap_host,
@@ -553,6 +592,16 @@ class GmailImapProvider:
             raise GmailConnectionError(
                 "Could not connect to the configured Gmail IMAP host"
             ) from exc
+
+        if deadline is not None:
+            # AUD-005: from here on this connection's socket is watched by
+            # the total-session deadline (login through the caller's later
+            # select/search/fetch/close/logout, all sharing this socket).
+            # getattr, not client.sock: a test-injected fake client (see
+            # tests/test_providers_email_imap.py) may not expose a real
+            # socket at all -- an unbound deadline is simply a no-op
+            # watchdog for that case.
+            deadline.bind_socket(getattr(client, "sock", None))
 
         try:
             client.login(self.username, self.app_password)
