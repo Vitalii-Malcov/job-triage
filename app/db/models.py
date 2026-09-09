@@ -373,6 +373,27 @@ class GmailMessageRecord(Base):
     negative values are never valid IMAP identifiers), and `direction`
     must be one of the two known values — defense in depth against any
     insert path that bypasses app/db/gmail_repository.py.
+
+    **`automation_processed_at` (AUD-004, Astra R3): a durable PER-MESSAGE
+    completion marker, not a global monotonic `id` watermark.** Stage 8D's
+    `gmail_response_drafts` step used to track progress as a single
+    per-account `AutomationMailProgressRecord.gmail_after_message_id`
+    integer cursor and select `WHERE id > :cursor` — this assumed `id`
+    allocation order equals commit-visibility order, which PostgreSQL does
+    NOT guarantee: transaction A can obtain a LOWER `id` but commit AFTER
+    transaction B, which obtained a HIGHER `id` and committed first. If the
+    cursor had already advanced to B's `id` before A's row became visible,
+    `id > cursor` would PERMANENTLY skip A — a real data-loss bug, not a
+    cosmetic one. `automation_processed_at` fixes this by making inclusion
+    depend on nothing but this row's own state: NULL means "not yet fully
+    handled by Stage 8D" and is eligible for every future scan for this
+    account regardless of `id`, no matter what any OTHER row's `id` or
+    processing history looks like. See
+    `app.db.gmail_repository.list_unprocessed_messages_for_automation`/
+    `mark_message_automation_processed` for the selection query and the
+    atomic per-message CAS that sets it exactly once. `id.asc()` is still
+    used to ORDER the scan (oldest-first is a nice property, never a
+    correctness requirement) but never to EXCLUDE a row.
     """
 
     __tablename__ = "gmail_messages"
@@ -388,6 +409,11 @@ class GmailMessageRecord(Base):
         CheckConstraint("uid_validity > 0", name="ck_gmail_messages_uid_validity_positive"),
         CheckConstraint(
             "direction IN ('INBOUND', 'OUTBOUND')", name="ck_gmail_messages_direction_valid"
+        ),
+        Index(
+            "ix_gmail_messages_account_key_automation_processed_at",
+            "account_key",
+            "automation_processed_at",
         ),
     )
 
@@ -484,6 +510,16 @@ class GmailMessageRecord(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+    # AUD-004 (Astra R3): see the class docstring's own section on this
+    # column for the full rationale. NULL = not yet fully processed by
+    # Stage 8D's gmail_response_drafts step (analysis + response-draft-or
+    # -NO_RESPONSE_RECOMMENDED-or-OUTBOUND-skip) — eligible for every
+    # future scan regardless of `id`. Set exactly once, atomically, by
+    # `app.db.gmail_repository.mark_message_automation_processed`.
+    automation_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     thread: Mapped["GmailThreadRecord"] = relationship(back_populates="messages")
@@ -2091,17 +2127,18 @@ class AutomationMailProgressRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(320), nullable=False)
 
-    # The largest GmailMessageRecord.id fully processed (analyzed +
-    # response-draft-or-NO_RESPONSE_RECOMMENDED persisted) so far, for
-    # this account. NULL means "no message ever fully processed yet" --
-    # the next scan starts from the oldest stored message
-    # (`id > NULL` is never true in SQL, so
-    # app.db.gmail_repository's Stage 8D scan helper treats NULL as "no
-    # lower bound" in Python, not as a literal SQL comparison). NEVER
-    # reset to NULL once advanced -- unlike follow_up_after_job_id below,
-    # this cursor is a one-directional catch-up scan; new messages always
-    # get larger ids and are naturally reached without ever needing a
-    # wrap-around.
+    # AUD-004 (Astra R3): NO LONGER READ OR WRITTEN by
+    # app.services.automation_gmail.prepare_gmail_response_drafts -- an
+    # `id`-ordered watermark is unsafe under PostgreSQL's
+    # commit-visibility semantics (a lower-`id` row can commit after a
+    # higher-`id` one, permanently skipping it under `id > watermark`).
+    # Message completion tracking moved to a durable PER-MESSAGE marker,
+    # `GmailMessageRecord.automation_processed_at` (see that column's own
+    # docstring). This column/its CAS primitive (`advance_gmail_cursor`)
+    # are kept, unchanged and still tested, purely as a still-valid
+    # generic building block -- dropping either would be a destructive
+    # migration for zero benefit; nothing in this project's runtime path
+    # relies on this column's value anymore.
     gmail_after_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # The largest JobRecord.id (status=APPLIED) fully evaluated for

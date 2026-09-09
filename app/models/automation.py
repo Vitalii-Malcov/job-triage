@@ -118,12 +118,14 @@ class AutomationMessageFailure(BaseModel):
     Gmail message — persisted in AutomationRunStepResult.failures,
     mirroring `AutomationJobFailure`'s shape but keyed by
     `gmail_message_id` instead of `job_id` (a Gmail message is never a
-    `JobRecord`). `"cursor"` (S8D-PROGRESS-001, Codex review) is used
-    when the message's own analysis/draft pipeline fully succeeded but
-    the CAS advancing `gmail_after_message_id` past it was lost to a
-    newer owner — the work is real and durable, but bookkeeping could
-    not be safely recorded, so this is still a failure, never `"ok"`.
-    `error_type` only — NEVER `str(exc)`/`repr(exc)`/a traceback.
+    `JobRecord`). `"cursor"` (S8D-PROGRESS-001, Codex review; retargeted
+    by AUD-004/Astra R3) is used when the message's own analysis/draft
+    pipeline fully succeeded but the CAS marking
+    `GmailMessageRecord.automation_processed_at` was lost to a
+    concurrent processor — the work is real and durable, but bookkeeping
+    could not be safely recorded as newly done, so this is still a
+    failure, never `"ok"`. `error_type` only — NEVER
+    `str(exc)`/`repr(exc)`/a traceback.
     """
 
     gmail_message_id: int

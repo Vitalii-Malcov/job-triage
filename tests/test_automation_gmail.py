@@ -27,7 +27,13 @@ from app.db.automation_mail_progress_repository import (
 )
 from app.db.base import Base
 from app.db.gmail_repository import upsert_message
-from app.db.models import GmailMessageAnalysisRecord, JobRecord, ResponseDraftRecord
+from app.db.models import (
+    GmailMessageAnalysisRecord,
+    GmailMessageRecord,
+    GmailThreadRecord,
+    JobRecord,
+    ResponseDraftRecord,
+)
 from app.models.automation import AutomationRun, AutomationRunStepResult
 from app.models.gmail import GmailSyncResult
 from app.providers.email.base import ParsedGmailMessage
@@ -114,6 +120,15 @@ def _run_gmail_drafts(db, settings, account_key=ACCOUNT) -> dict:
 
 def _run_gmail_sync(db, settings, account_key=ACCOUNT) -> dict:
     return asyncio.run(prepare_gmail_sync(db, account_key=account_key, settings=settings))
+
+
+def _is_processed(db, message_id) -> bool:
+    """AUD-004: the durable per-message completion marker this project's
+    Stage 8D selection now relies on -- see
+    `app.db.models.GmailMessageRecord.automation_processed_at`.
+    """
+    db.expire_all()
+    return db.get(GmailMessageRecord, message_id).automation_processed_at is not None
 
 
 # --- A. Disabled by default ------------------------------------------------
@@ -270,8 +285,9 @@ class TestHistoricalBacklogAndBoundedProcessing:
             processed_ids = [item["gmail_message_id"] for item in first["items"]]
             assert processed_ids == [messages[0].id, messages[1].id]
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == messages[1].id
+            assert _is_processed(db, messages[0].id)
+            assert _is_processed(db, messages[1].id)
+            assert not _is_processed(db, messages[2].id)
 
             second = _run_gmail_drafts(db, settings)
             processed_ids_2 = [item["gmail_message_id"] for item in second["items"]]
@@ -281,7 +297,7 @@ class TestHistoricalBacklogAndBoundedProcessing:
 
 
 class TestGmailSuccessCursor:
-    def test_analysis_and_draft_success_advances_cursor(self, session_factory):
+    def test_analysis_and_draft_success_marks_message_processed(self, session_factory):
         db = session_factory()
         try:
             message = _seed_message(db, body_plain=OFFER_BODY)
@@ -292,8 +308,7 @@ class TestGmailSuccessCursor:
             assert result["items"][0]["status"] == "ok"
             assert result["items"][0]["response_status"] == "PROPOSED"
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == message.id
+            assert _is_processed(db, message.id)
         finally:
             db.close()
 
@@ -333,8 +348,9 @@ class TestGmailFailure:
             assert failure["phase"] == "analysis"
             assert failure["error_type"] == "RuntimeError"
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == first_message.id
+            assert _is_processed(db, first_message.id)
+            assert not _is_processed(db, failing_message.id)
+            assert not _is_processed(db, never_reached.id)
 
             assert "secret-analysis-detail" not in json.dumps(result)
         finally:
@@ -369,7 +385,9 @@ class TestGmailFailure:
 
 
 class TestDraftFailureAfterSuccessfulAnalysis:
-    def test_cursor_not_advanced_and_next_cycle_reuses_analysis(self, session_factory, monkeypatch):
+    def test_message_not_marked_processed_and_next_cycle_reuses_analysis(
+        self, session_factory, monkeypatch
+    ):
         db = session_factory()
         try:
             message = _seed_message(db, body_plain=OFFER_BODY)
@@ -388,8 +406,7 @@ class TestDraftFailureAfterSuccessfulAnalysis:
             assert first["items"][0]["phase"] == "response_draft"
             assert "secret-draft-detail" not in json.dumps(first)
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id is None  # not advanced
+            assert not _is_processed(db, message.id)  # not marked
 
             call_count = 0
             import app.services.automation_gmail as gmail_module
@@ -414,14 +431,13 @@ class TestDraftFailureAfterSuccessfulAnalysis:
             assert second["items"][0]["analysis_created"] is False  # reused, not recomputed
             assert second["items"][0]["response_draft_id"] is not None
 
-            progress_after = get_mail_progress(db, ACCOUNT)
-            assert progress_after.gmail_after_message_id == message.id
+            assert _is_processed(db, message.id)
         finally:
             db.close()
 
 
 class TestNoResponseRecommended:
-    def test_counts_as_processed_and_advances_cursor(self, session_factory):
+    def test_counts_as_processed_and_marks_message_processed(self, session_factory):
         db = session_factory()
         try:
             message = _seed_message(db, body_plain=UNKNOWN_BODY)
@@ -431,8 +447,7 @@ class TestNoResponseRecommended:
             assert result["counters"]["no_response_recommended"] == 1
             assert result["items"][0]["response_status"] == "NO_RESPONSE_RECOMMENDED"
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == message.id
+            assert _is_processed(db, message.id)
         finally:
             db.close()
 
@@ -690,12 +705,13 @@ class TestBackwardCompatibility:
 class TestGmailCursorCASLossIsNonOk:
     def test_cas_loss_after_successful_pipeline_is_non_ok(self, session_factory, monkeypatch):
         monkeypatch.setattr(
-            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+            "app.services.automation_gmail.mark_message_automation_processed",
+            lambda *a, **kw: False,
         )
 
         db = session_factory()
         try:
-            _seed_message(db, body_plain=OFFER_BODY)
+            message = _seed_message(db, body_plain=OFFER_BODY)
             result = _run_gmail_drafts(db, _settings())
 
             assert result["status"] != "ok"
@@ -703,18 +719,17 @@ class TestGmailCursorCASLossIsNonOk:
 
             failure = result["failures"][0]
             assert failure["phase"] == "cursor"
-            assert failure["error_type"] == "AutomationMailProgressCASLostError"
+            assert failure["error_type"] == "GmailMessageAutomationCASLostError"
 
             item = result["items"][0]
             assert item["status"] == "failed"
             assert item["phase"] == "cursor"
             # Truthful: the underlying work (analysis + draft) really did
-            # commit -- only the cursor bookkeeping was lost.
+            # commit -- only the per-message marker CAS was lost.
             assert item["analysis_id"] is not None
             assert item["response_draft_id"] is not None
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id is None  # never advanced
+            assert not _is_processed(db, message.id)  # never marked
         finally:
             db.close()
 
@@ -722,29 +737,28 @@ class TestGmailCursorCASLossIsNonOk:
         db = session_factory()
         try:
             first = _seed_message(db, body_plain=OFFER_BODY)
-            _seed_message(db, body_plain=OFFER_BODY)
+            second_message = _seed_message(db, body_plain=OFFER_BODY)
 
             import app.services.automation_gmail as gmail_module
 
-            original = gmail_module.advance_gmail_cursor
+            original = gmail_module.mark_message_automation_processed
 
-            def _fail_on_second(db, account_key, *, expected_cursor, new_cursor):
-                if expected_cursor == first.id:
+            def _fail_on_second(db, message_id):
+                if message_id == second_message.id:
                     return False
-                return original(
-                    db, account_key, expected_cursor=expected_cursor, new_cursor=new_cursor
-                )
+                return original(db, message_id)
 
             monkeypatch.setattr(
-                "app.services.automation_gmail.advance_gmail_cursor", _fail_on_second
+                "app.services.automation_gmail.mark_message_automation_processed",
+                _fail_on_second,
             )
 
             result = _run_gmail_drafts(db, _settings())
             assert result["status"] == "partial"
             assert result["counters"]["failed"] == 1
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == first.id
+            assert _is_processed(db, first.id)
+            assert not _is_processed(db, second_message.id)
         finally:
             db.close()
 
@@ -916,7 +930,8 @@ class TestPrivacyNoAccountKeyInGmailLogs:
         self, session_factory, monkeypatch, caplog
     ):
         monkeypatch.setattr(
-            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+            "app.services.automation_gmail.mark_message_automation_processed",
+            lambda *a, **kw: False,
         )
         db = session_factory()
         try:
@@ -956,8 +971,7 @@ class TestOutboundMessageAnalysisOnly:
             assert db.query(GmailMessageAnalysisRecord).count() == 1
             assert db.query(ResponseDraftRecord).count() == 0
 
-            progress = get_mail_progress(db, ACCOUNT)
-            assert progress.gmail_after_message_id == message.id
+            assert _is_processed(db, message.id)
         finally:
             db.close()
 
@@ -999,7 +1013,8 @@ class TestCASFailurePropagatesToOverallPartial:
         monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
         monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
         monkeypatch.setattr(
-            "app.services.automation_gmail.advance_gmail_cursor", lambda *a, **kw: False
+            "app.services.automation_gmail.mark_message_automation_processed",
+            lambda *a, **kw: False,
         )
 
         db = session_factory()
@@ -1010,5 +1025,172 @@ class TestCASFailurePropagatesToOverallPartial:
             assert run.status == "PARTIAL"
             results = json.loads(run.results_json)
             assert results["gmail_response_drafts"]["status"] != "ok"
+        finally:
+            db.close()
+
+
+# --- AUD-004 (Astra R3): PostgreSQL sequence-allocation-vs-commit-order ------
+# --- watermark race -----------------------------------------------------------
+
+
+def _make_thread(db, *, account_key=ACCOUNT, thread_key="watermark-race-thread"):
+    thread = GmailThreadRecord(thread_key=thread_key, subject="subj", account_key=account_key)
+    db.add(thread)
+    db.commit()
+    db.refresh(thread)
+    return thread
+
+
+def _make_message_with_explicit_id(
+    db, *, id, thread_id, account_key=ACCOUNT, uid, subject, body_plain=OFFER_BODY
+):
+    """AUD-004 test helper: constructs a `GmailMessageRecord` with an
+    EXPLICIT `id` (bypassing `upsert_message`'s autoincrement) so a test
+    can control id-vs-commit-order directly -- see
+    `TestPostgresCommitOrderWatermarkRace`'s class docstring for why this
+    is necessary to deterministically reproduce the AUD-004 end state on
+    SQLite.
+    """
+    message = GmailMessageRecord(
+        id=id,
+        thread_id=thread_id,
+        account_key=account_key,
+        mailbox="INBOX",
+        uid_validity=100,
+        uid=uid,
+        message_id_header=f"<{uid}@watermark-race.example.com>",
+        references_json="[]",
+        to_addresses_json="[]",
+        cc_addresses_json="[]",
+        subject=subject,
+        direction="INBOUND",
+        body_plain=body_plain,
+        body_truncated=False,
+        has_html=False,
+        attachments_json="[]",
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+class TestPostgresCommitOrderWatermarkRace:
+    """AUD-004 (Astra R3) regression: PostgreSQL sequence allocation order
+    is NOT commit-visibility order -- a transaction that obtains a LOWER
+    `id` can commit strictly AFTER another transaction that obtained a
+    HIGHER `id` and already committed. Concretely:
+
+        Transaction A: INSERTs message A, obtains id=100, does NOT commit yet.
+        Transaction B: INSERTs message B, obtains id=101, COMMITS first.
+        Automation runs -- sees (and, under the old watermark, would mark
+        past) only message B.
+        Transaction A commits.
+
+    Required result: message A must still be discovered and processed --
+    NEVER permanently skipped merely because a HIGHER-id message was
+    already scanned before A ever became visible.
+
+    **What this proves (SQLite) vs. what it does not.** SQLite's
+    single-writer lock means a second connection's INSERT genuinely
+    BLOCKS until the first transaction commits or rolls back -- so SQLite
+    itself cannot produce "a lower-id row commits after a higher-id one"
+    via two REAL concurrent transactions the way PostgreSQL can. This
+    test instead constructs the exact same OBSERVABLE end state directly
+    (a lower-id row becomes visible strictly after a higher-id row was
+    already scanned/processed) via explicit-id inserts, and proves the
+    FIX's selection query -- `automation_processed_at IS NULL`, never an
+    `id` comparison -- discovers message A regardless. This is a
+    deterministic, repository/service-level simulation of the checkpoint
+    logic's independence from commit ordering, exactly as it would behave
+    under a genuine PostgreSQL race, but it does not exercise real
+    PostgreSQL transaction/MVCC machinery. See
+    tests/integration/test_gmail_watermark_postgres_concurrency.py for
+    the matching proof against a REAL PostgreSQL server with two
+    genuinely concurrent transactions -- skipped locally without
+    `TEST_POSTGRES_URL`, always run in CI's `scheduler-postgres` job.
+    """
+
+    def test_lower_id_message_committed_after_higher_id_message_is_still_discovered(
+        self, session_factory
+    ):
+        db = session_factory()
+        try:
+            thread = _make_thread(db)
+
+            # "Transaction B": the higher id, committed FIRST -- the only
+            # message automation sees (and fully processes) on its first
+            # run.
+            message_b = _make_message_with_explicit_id(
+                db, id=101, thread_id=thread.id, uid=2, subject="B (higher id, commits first)"
+            )
+            first = _run_gmail_drafts(db, _settings())
+            assert first["counters"]["scanned"] == 1
+            assert first["items"][0]["gmail_message_id"] == message_b.id
+            assert _is_processed(db, message_b.id)
+
+            # "Transaction A": the LOWER id, but only becomes visible
+            # (commits) AFTER automation already scanned/processed B --
+            # exactly the observable end state a PostgreSQL
+            # sequence-allocation-vs-commit-order race produces.
+            message_a = _make_message_with_explicit_id(
+                db, id=100, thread_id=thread.id, uid=1, subject="A (lower id, commits later)"
+            )
+            assert message_a.id < message_b.id
+
+            # Required invariant: A is still discovered and processed on
+            # the very next scan -- never permanently skipped.
+            second = _run_gmail_drafts(db, _settings())
+            assert second["counters"]["scanned"] == 1
+            assert second["items"][0]["gmail_message_id"] == message_a.id
+            assert second["items"][0]["status"] == "ok"
+            assert _is_processed(db, message_a.id)
+
+            # A third scan finds nothing new -- both messages fully
+            # processed exactly once, no duplicate side effects.
+            third = _run_gmail_drafts(db, _settings())
+            assert third["counters"]["scanned"] == 0
+            assert db.query(GmailMessageAnalysisRecord).count() == 2
+            assert db.query(ResponseDraftRecord).count() == 2
+        finally:
+            db.close()
+
+    def test_zero_eligible_messages_is_a_clean_ok_noop(self, session_factory):
+        db = session_factory()
+        try:
+            result = _run_gmail_drafts(db, _settings())
+            assert result["counters"]["scanned"] == 0
+            assert result["counters"]["failed"] == 0
+            assert result["status"] == "ok"
+            assert result["items"] == []
+            assert result["failures"] == []
+        finally:
+            db.close()
+
+    def test_account_isolation_holds_for_the_new_marker_based_selection(self, session_factory):
+        """AUD-004's new selection query filters by `account_key` exactly
+        like the old one did -- a message committed out of id-order for
+        ONE account must never be discovered by a scan scoped to a
+        DIFFERENT account.
+        """
+        db = session_factory()
+        try:
+            thread_a = _make_thread(db, account_key=ACCOUNT, thread_key="race-thread-a")
+            thread_b = _make_thread(db, account_key=OTHER_ACCOUNT, thread_key="race-thread-b")
+
+            message_b_other_account = _make_message_with_explicit_id(
+                db, id=201, thread_id=thread_b.id, account_key=OTHER_ACCOUNT, uid=2, subject="B"
+            )
+            _run_gmail_drafts(db, _settings(), account_key=OTHER_ACCOUNT)
+            assert _is_processed(db, message_b_other_account.id)
+
+            message_a_this_account = _make_message_with_explicit_id(
+                db, id=200, thread_id=thread_a.id, account_key=ACCOUNT, uid=1, subject="A"
+            )
+
+            result = _run_gmail_drafts(db, _settings(), account_key=ACCOUNT)
+            assert result["counters"]["scanned"] == 1
+            assert result["items"][0]["gmail_message_id"] == message_a_this_account.id
+            assert _is_processed(db, message_a_this_account.id)
         finally:
             db.close()

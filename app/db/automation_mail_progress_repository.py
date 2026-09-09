@@ -8,6 +8,22 @@ progress, or has a newer owner already moved past it". Mirrors
 `UPDATE ... WHERE <observed value> ...` idiom for the CAS itself -- see
 `app.db.models.AutomationMailProgressRecord`'s docstring for the full
 concurrency/crash-safety rationale.
+
+**`advance_gmail_cursor`/`gmail_after_message_id` (AUD-004, Astra R3):**
+`app.services.automation_gmail.prepare_gmail_response_drafts` no longer
+calls this -- a single per-account `id`-ordered watermark is not safe
+under PostgreSQL's commit-visibility semantics (see
+`app.db.models.GmailMessageRecord.automation_processed_at`'s docstring
+for the full rationale). Selection/completion tracking moved to a
+durable PER-MESSAGE marker (`app.db.gmail_repository.
+list_unprocessed_messages_for_automation`/`mark_message_automation_processed`).
+`advance_gmail_cursor`/`gmail_after_message_id` are kept here, UNCHANGED
+and still tested (`tests/test_automation_gmail.py`'s
+`TestGmailCursorCASRace`), purely as a still-valid generic CAS
+primitive/column -- dropping either would be a destructive migration for
+zero benefit. `follow_up_after_job_id`/`advance_follow_up_cursor` are
+entirely unaffected (a different cursor over `JobRecord.id`, out of
+AUD-004's scope).
 """
 
 from datetime import UTC, datetime
