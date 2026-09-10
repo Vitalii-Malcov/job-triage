@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db.datetime_utils import ensure_utc
 from app.db.models import AutomationRunRecord
 from app.models.automation import AutomationRun, AutomationRunStepResult
 
@@ -63,23 +64,8 @@ def get_running_run_for_account(db: Session, account_key: str) -> AutomationRunR
     )
 
 
-def _ensure_utc(value: datetime) -> datetime:
-    """SQLite (unlike Postgres) doesn't preserve tzinfo through a
-    `DateTime(timezone=True)` round-trip — a value stored as UTC comes
-    back naive, which would otherwise raise `TypeError: can't compare
-    offset-naive and offset-aware datetimes` when compared against a
-    tz-aware `now` in pure Python (as opposed to inside a SQL WHERE
-    clause, which compares as text and is unaffected). Every
-    `lease_expires_at` this module ever writes is UTC (see
-    `_insert_running_run`/`renew_run_lease`), so a naive read is always
-    safe to reattach as UTC — mirrors
-    app.db.follow_up_repository._ensure_utc exactly.
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-
-
 def _is_lease_expired(record: AutomationRunRecord, now: datetime) -> bool:
-    return record.lease_expires_at is None or _ensure_utc(record.lease_expires_at) < now
+    return record.lease_expires_at is None or ensure_utc(record.lease_expires_at) < now
 
 
 def _insert_running_run(

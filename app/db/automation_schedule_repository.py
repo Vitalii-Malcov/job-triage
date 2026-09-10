@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.db.datetime_utils import ensure_utc
 from app.db.models import AutomationScheduleRecord
 
 
@@ -26,18 +27,6 @@ class AutomationScheduleRepositoryConsistencyError(Exception):
     IntegrityError implies must exist comes back None. Mirrors
     app.db.automation_repository.AutomationRepositoryConsistencyError.
     """
-
-
-def _ensure_utc(value: datetime) -> datetime:
-    """SQLite (unlike Postgres) doesn't preserve tzinfo through a
-    `DateTime(timezone=True)` round-trip -- a value stored as UTC comes
-    back naive, which would otherwise raise `TypeError: can't compare
-    offset-naive and offset-aware datetimes` when compared against a
-    tz-aware `now` in pure Python. Every `next_run_at` this module ever
-    writes is UTC, so a naive read is always safe to reattach as UTC --
-    mirrors app.db.automation_repository._ensure_utc exactly.
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def get_schedule(db: Session, account_key: str) -> AutomationScheduleRecord | None:
@@ -132,7 +121,7 @@ def claim_due_schedule(
 
     effective_now = now if now is not None else datetime.now(UTC)
     observed_next_run_at = schedule.next_run_at
-    if _ensure_utc(observed_next_run_at) > effective_now:
+    if ensure_utc(observed_next_run_at) > effective_now:
         return None  # not due yet -- no point even attempting the UPDATE
 
     new_next_run_at = effective_now + timedelta(seconds=interval_seconds)

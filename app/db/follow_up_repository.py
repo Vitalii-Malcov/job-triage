@@ -8,12 +8,12 @@ every read).
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
+from app.db.datetime_utils import ensure_utc
 from app.db.models import (
     FollowUpProposalRecord,
     GmailMessageAnalysisRecord,
@@ -182,7 +182,7 @@ def get_thread_message_infos(
                 ThreadMessageInfo(
                     gmail_message_id=record.id,
                     direction=record.direction,
-                    timestamp=_ensure_utc(record.provider_arrival_at),
+                    timestamp=ensure_utc(record.provider_arrival_at),
                     timestamp_is_trusted=record.provider_arrival_is_trusted,
                 )
             )
@@ -226,21 +226,6 @@ def get_matched_job_ids_for_thread(
         .limit(limit)
     ).all()
     return frozenset(row[0] for row in rows)
-
-
-def _ensure_utc(value: datetime) -> datetime:
-    """SQLite (unlike Postgres) doesn't preserve tzinfo through a
-    `DateTime(timezone=True)` round-trip — a value stored as UTC comes
-    back naive, which would otherwise raise
-    `TypeError: can't compare offset-naive and offset-aware datetimes`
-    the moment app.services.follow_up_eligibility compares it against a
-    tz-aware `now`. Every `sent_at`/`received_at` value this project ever
-    writes is UTC (see app/providers/email/imap.py and
-    GmailMessageRecord's `default=lambda: datetime.now(UTC)`), so a naive
-    read is always safe to reattach as UTC — mirrors the identical fix in
-    app.services.company_research.CompanyResearchService._is_fresh.
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def get_follow_up_proposal_by_anchor_and_fingerprint(

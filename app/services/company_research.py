@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.datetime_utils import ensure_utc
 from app.db.models import CompanyResearchRecord, JobRecord
 from app.db.repositories import (
     AmbiguousCompanyIdentityError,
@@ -131,15 +132,11 @@ class CompanyResearchService:
             return False
         if record.researched_at is None:
             return False
-        researched_at = record.researched_at
-        if researched_at.tzinfo is None:
-            # SQLite (unlike Postgres) doesn't preserve tzinfo through a
-            # DateTime(timezone=True) round-trip — a value stored as UTC
-            # comes back naive. Every value this project ever writes to
-            # researched_at is UTC (see upsert_company_research), so a
-            # naive read is always safe to reattach as UTC rather than a
-            # sign of a genuinely ambiguous timestamp.
-            researched_at = researched_at.replace(tzinfo=UTC)
+        # Every value this project ever writes to researched_at is UTC
+        # (see upsert_company_research); ensure_utc's own docstring covers
+        # why a naive read here is always safe to reattach as UTC rather
+        # than a sign of a genuinely ambiguous timestamp.
+        researched_at = ensure_utc(record.researched_at)
         age = datetime.now(UTC) - researched_at
         return age < timedelta(hours=settings.company_research_ttl_hours)
 
