@@ -629,11 +629,18 @@ async def run_xing(
                 new_watermark = uid
             else:
                 break
+        # Codex gate follow-up (Astra R4A MEDIUM take 3, UIDVALIDITY CAS):
+        # the epoch THIS run actually observed at the top of the function
+        # (before deciding scan_from_uid/computing new_watermark) -- the
+        # baseline `advance_xing_scan_progress`'s reset CAS is contingent
+        # on, not `collector.uid_validity` (the freshly-observed target).
+        observed_uid_validity = scan_progress.uid_validity if scan_progress is not None else None
         advance_xing_scan_progress(
             db,
             uid_validity=collector.uid_validity,
             confirmed_upto_uid=new_watermark,
             mailbox_scope=mailbox_scope,
+            observed_uid_validity=observed_uid_validity,
         )
 
     logger.info(

@@ -245,7 +245,11 @@ async def test_uid_validity_mismatch_resets_watermark_instead_of_skipping_blindl
     """
     settings = _settings()
     advance_xing_scan_progress(
-        db, uid_validity=999, confirmed_upto_uid=6, mailbox_scope=_mailbox_scope(settings)
+        db,
+        uid_validity=999,
+        confirmed_upto_uid=6,
+        mailbox_scope=_mailbox_scope(settings),
+        observed_uid_validity=None,  # seeding a brand-new row
     )
     _seed_already_processed(db, OLD_UIDS[:1])  # only uid 1 actually processed already
     monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
@@ -403,7 +407,11 @@ async def test_mailbox_scope_isolates_watermark_between_mailboxes(db, monkeypatc
     # run that scanned all the way through uid 6, at the SAME
     # FAKE_UID_VALIDITY mailbox B's fake collector will also report.
     advance_xing_scan_progress(
-        db, uid_validity=FAKE_UID_VALIDITY, confirmed_upto_uid=6, mailbox_scope=scope_a
+        db,
+        uid_validity=FAKE_UID_VALIDITY,
+        confirmed_upto_uid=6,
+        mailbox_scope=scope_a,
+        observed_uid_validity=None,  # seeding a brand-new row
     )
 
     captured: dict[str, object] = {}
@@ -479,7 +487,9 @@ async def test_advance_xing_scan_progress_never_regresses_under_concurrent_stale
     monotonic guard lives in the SQL `WHERE` clause itself.
     """
     scope = "concurrency-scope"
-    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope)
+    advance_xing_scan_progress(
+        db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope, observed_uid_validity=None
+    )
 
     # Simulates "worker B" observing the row while it still read
     # confirmed_upto_uid=5 -- a stale snapshot from before "worker A"
@@ -488,11 +498,13 @@ async def test_advance_xing_scan_progress_never_regresses_under_concurrent_stale
     assert stale_existing.confirmed_upto_uid == 5
 
     # Worker A advances first and commits a higher watermark.
-    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=10, mailbox_scope=scope)
+    advance_xing_scan_progress(
+        db, uid_validity=1, confirmed_upto_uid=10, mailbox_scope=scope, observed_uid_validity=1
+    )
 
     # Worker B now persists its own (smaller, computed from the stale
     # read) value using the snapshot it captured before A's commit.
-    _advance_existing(db, stale_existing, uid_validity=1, new=8)
+    _advance_existing(db, stale_existing, uid_validity=1, new=8, observed_uid_validity=1)
 
     progress = get_xing_scan_progress(db, mailbox_scope=scope)
     assert progress.confirmed_upto_uid == 10  # must NOT regress to 8
@@ -507,11 +519,69 @@ async def test_advance_xing_scan_progress_stale_writer_can_still_advance_further
     snapshot.
     """
     scope = "concurrency-scope-advance"
-    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope)
+    advance_xing_scan_progress(
+        db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope, observed_uid_validity=None
+    )
 
     stale_existing = get_xing_scan_progress(db, mailbox_scope=scope)
 
-    _advance_existing(db, stale_existing, uid_validity=1, new=12)
+    _advance_existing(db, stale_existing, uid_validity=1, new=12, observed_uid_validity=1)
 
     progress = get_xing_scan_progress(db, mailbox_scope=scope)
     assert progress.confirmed_upto_uid == 12
+
+
+@pytest.mark.asyncio
+async def test_stale_epoch_1_writer_never_clobbers_committed_epoch_2(db):
+    """Codex gate follow-up (Astra R4A MEDIUM take 3, UIDVALIDITY CAS)
+    regression: a prior fix made the epoch-reset condition "stored
+    uid_validity differs from the NEW value" -- too broad, because it
+    ALSO matches a row that has already moved to a newer epoch than the
+    writer knows about.
+
+    Scenario: worker B takes a snapshot while the row is still at epoch
+    1. Before B writes anything, worker A observes that same epoch-1
+    row, decides the mailbox was recreated, and CAS-transitions it to
+    epoch 2 with watermark 10 -- and commits. B, still only aware of
+    epoch 1, now tries to persist its own (stale) belief: epoch 1,
+    watermark 8. The old broad condition would see "stored (2) != B's
+    target (1)" and let B's UPDATE overwrite A's committed epoch-2 row
+    right back down to epoch 1 -- resurrecting a stale epoch and losing
+    A's already-confirmed progress. The fixed CAS in `_advance_existing`
+    only matches when the row is STILL at `observed_uid_validity` (the
+    epoch B actually read, 1) -- since the live row is now epoch 2, B's
+    write must no-op, and the final state must remain exactly what A
+    committed: epoch 2, watermark 10.
+    """
+    scope = "uidvalidity-cas-scope"
+    # Seed the row at epoch 1 -- what both A and B will have observed.
+    advance_xing_scan_progress(
+        db, uid_validity=1, confirmed_upto_uid=3, mailbox_scope=scope, observed_uid_validity=None
+    )
+
+    # Worker B's stale snapshot: taken while the row is still epoch 1.
+    stale_existing = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert stale_existing.uid_validity == 1
+
+    # Worker A observes epoch 1 too, but is the one that actually acts
+    # first: mailbox was recreated, CAS-transitions epoch 1 -> 2 with a
+    # fresh watermark, and commits.
+    advance_xing_scan_progress(
+        db,
+        uid_validity=2,
+        confirmed_upto_uid=10,
+        mailbox_scope=scope,
+        observed_uid_validity=1,
+    )
+    committed = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert committed.uid_validity == 2
+    assert committed.confirmed_upto_uid == 10
+
+    # Worker B, unaware of A's transition, now persists its own stale
+    # belief: still epoch 1, watermark 8. This must no-op, not restore
+    # epoch 1 or regress the watermark.
+    _advance_existing(db, stale_existing, uid_validity=1, new=8, observed_uid_validity=1)
+
+    final = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert final.uid_validity == 2
+    assert final.confirmed_upto_uid == 10

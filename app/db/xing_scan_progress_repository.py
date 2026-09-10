@@ -7,26 +7,26 @@ rationale, including why an IMAP UID is a safe watermark where AUD-004
 already proved a PostgreSQL row id is not.
 
 Mirrors `app.db.automation_mail_progress_repository`'s INSERT +
-IntegrityError-catch idiom for first-row creation. Unlike that module's
-CAS primitives, `advance_xing_scan_progress` does not need an
-`expected_cursor` compare-and-swap: XING has exactly one configured
-mailbox and `run_xing` is never invoked concurrently for it within this
-project's automation model (unlike Gmail's per-account fan-out).
-Nevertheless (Codex gate follow-up, Astra R4A MEDIUM: concurrency), the
-advance itself is monotonic-safe at the SQL level -- not merely by
-Python-side branching on a possibly-stale in-process read -- via
-`_advance_existing`'s conditional `UPDATE ... WHERE`, evaluated by the
-database against the row's live committed state: it can only ever move
-`confirmed_upto_uid` forward or reset it on a genuine `UIDVALIDITY`
-change, never backward, even under an unexpected concurrent overlap.
-See `_advance_existing`'s own docstring for the exact race this closes.
+IntegrityError-catch idiom for first-row creation, AND (Codex gate
+follow-up, Astra R4A MEDIUM take 3: UIDVALIDITY CAS) that same module's
+`_cas_advance` idea of a `WHERE`-clause compare-and-swap against the
+caller's own observed baseline, rather than trusting a Python-side
+branch on a possibly-stale in-process read. XING has exactly one
+configured mailbox and `run_xing` is never invoked concurrently for it
+within this project's automation model (unlike Gmail's per-account
+fan-out) -- but the advance is still made monotonic/CAS-safe at the SQL
+level as defense in depth: it can only ever move `confirmed_upto_uid`
+forward within an epoch, or transition to a new `UIDVALIDITY` epoch via
+a CAS against the epoch the caller actually observed, never silently
+regressing either one under an unexpected concurrent overlap. See
+`_advance_existing`'s own docstring for the exact races this closes.
 """
 
 import hashlib
 import json
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -129,30 +129,39 @@ def advance_xing_scan_progress(
     uid_validity: int | None,
     confirmed_upto_uid: int | None,
     mailbox_scope: str,
+    observed_uid_validity: int | None,
     source: str = XING_SCAN_PROGRESS_SOURCE,
 ) -> None:
     """Persist how far this run confirmed the scan can safely resume from.
 
     `uid_validity`/`confirmed_upto_uid` are the caller's freshly computed
     values for THIS run (see `run_xing`'s own contiguous-prefix
-    computation) -- never partial/unvalidated data. Semantics:
+    computation) -- never partial/unvalidated data. `observed_uid_validity`
+    is the epoch the caller read from THIS row (via `get_xing_scan_progress`)
+    BEFORE it decided `scan_from_uid`/computed these new values -- i.e. the
+    epoch this write is contingent on, not necessarily the row's current
+    state (which may have moved on concurrently). Semantics:
 
     - No row yet: create one with the given values.
-    - Stored `uid_validity` differs from the given one (mailbox
-      recreated): the old watermark is no longer meaningful for the new
-      UID space -- overwrite both columns with the given values
-      unconditionally (this is a reset, not an advance).
-    - Same `uid_validity`: only move `confirmed_upto_uid` forward, never
-      backward -- a run that (for whatever reason) computed a smaller
-      confirmed prefix than a previous run already persisted must never
-      regress the watermark and force wasted rescanning.
+    - `uid_validity != observed_uid_validity` (mailbox recreated, as THIS
+      caller understood it): the old watermark is no longer meaningful for
+      the new UID space -- overwrite both columns with the given values,
+      but (Codex gate follow-up, Astra R4A MEDIUM take 3: UIDVALIDITY CAS)
+      ONLY if the row is still in the `observed_uid_validity` epoch this
+      caller actually read -- see `_advance_existing`'s own docstring for
+      why a broad "differs from the new value" check is unsafe here.
+    - `uid_validity == observed_uid_validity` (same epoch): only move
+      `confirmed_upto_uid` forward, never backward -- a run that (for
+      whatever reason) computed a smaller confirmed prefix than a
+      previous run already persisted must never regress the watermark
+      and force wasted rescanning.
 
-    Codex gate follow-up (Astra R4A MEDIUM, concurrency): the
-    forward-only guard is enforced by `_advance_existing`'s `UPDATE ...
-    WHERE` clause itself, evaluated by the database against the row's
-    CURRENT committed state at execution time -- not by this function's
-    own `existing` snapshot, which may already be stale under a
-    concurrent writer. See `_advance_existing`'s own docstring.
+    Codex gate follow-up (Astra R4A MEDIUM, concurrency): both guards are
+    enforced by `_advance_existing`'s `UPDATE ... WHERE` clause itself,
+    evaluated by the database against the row's CURRENT committed state
+    at execution time -- not by this function's own `existing` snapshot,
+    which may already be stale under a concurrent writer. See
+    `_advance_existing`'s own docstring.
     """
     existing = get_xing_scan_progress(db, mailbox_scope=mailbox_scope, source=source)
     if existing is None:
@@ -169,10 +178,33 @@ def advance_xing_scan_progress(
             db.rollback()
             existing = get_xing_scan_progress(db, mailbox_scope=mailbox_scope, source=source)
             if existing is not None:
-                _advance_existing(db, existing, uid_validity=uid_validity, new=confirmed_upto_uid)
+                _advance_existing(
+                    db,
+                    existing,
+                    uid_validity=uid_validity,
+                    new=confirmed_upto_uid,
+                    observed_uid_validity=observed_uid_validity,
+                )
         return
 
-    _advance_existing(db, existing, uid_validity=uid_validity, new=confirmed_upto_uid)
+    _advance_existing(
+        db,
+        existing,
+        uid_validity=uid_validity,
+        new=confirmed_upto_uid,
+        observed_uid_validity=observed_uid_validity,
+    )
+
+
+def _uid_validity_eq_clause(value: int | None):
+    """`col IS NULL` for `value is None`, `col == value` otherwise --
+    plain SQL `= NULL` never matches (unlike Python's `is None`), so this
+    must be explicit. Mirrors
+    `app.db.automation_mail_progress_repository._cas_advance`'s identical
+    NULL-handling idiom for its own CAS `WHERE` clause.
+    """
+    col = XingScanProgressRecord.uid_validity
+    return col.is_(None) if value is None else col == value
 
 
 def _advance_existing(
@@ -181,54 +213,73 @@ def _advance_existing(
     *,
     uid_validity: int | None,
     new: int | None,
+    observed_uid_validity: int | None,
 ) -> None:
     """Atomically/monotonically advance `existing`'s row via a single
     conditional `UPDATE ... WHERE` (Codex gate follow-up, Astra R4A
-    MEDIUM: concurrency).
+    MEDIUM: concurrency; take 3: UIDVALIDITY CAS).
 
-    **The race this closes.** The previous version branched in Python on
-    `existing.uid_validity`/`existing.confirmed_upto_uid` -- a snapshot
-    read by the caller (`advance_xing_scan_progress`) BEFORE this
+    **The race this closes (concurrency, take 2).** An earlier version
+    branched in Python on `existing.uid_validity`/`existing.
+    confirmed_upto_uid` -- a snapshot read by the caller BEFORE this
     function runs -- and then issued an unconditional `UPDATE ... WHERE
     id = :id`. Two concurrent writers that both read the same stale
-    snapshot (e.g. both observe `confirmed_upto_uid=5` before either
-    commits) each independently decide "yes, my new value is forward
+    snapshot each independently decide "my new value is forward
     progress" and both issue an unconditional UPDATE; whichever COMMITS
-    LAST wins regardless of which value is actually larger -- a writer
-    computing a smaller `new` than one that already committed a larger
-    value can silently regress the watermark.
+    LAST wins regardless of which value is actually larger, silently
+    regressing the watermark. Fixed by moving the decision INTO the
+    `WHERE` clause, evaluated against the row's live committed state.
 
-    **The fix.** The forward-only (and reset-on-`uid_validity`-change)
-    decision is moved INTO the `WHERE` clause itself, so it is evaluated
-    by the database against the row's CURRENT committed state at
-    execution time, not this function's possibly-stale `existing`
-    snapshot. Under any standard isolation level, a concurrent UPDATE
-    against the same row serializes on the row lock: the second writer's
-    `WHERE` is (re-)evaluated only after the first writer's UPDATE has
-    committed and released the lock, so it always sees the winner's
-    already-advanced value and correctly no-ops if its own `new` would
-    regress it. `existing.id` is the only field from the snapshot this
-    still relies on, which is safe -- a row's primary key never changes.
+    **The race THIS still left open (UIDVALIDITY CAS, take 3).** That
+    fix's reset condition was "stored `uid_validity` differs from the
+    NEW value" -- too broad: it also matches a row that has ALREADY been
+    advanced to a NEWER epoch than this writer knows about. Concretely:
+    worker A observes epoch 1, decides to reset to epoch 2 (mailbox
+    recreated) with watermark 10, and commits. A stale worker B -- which
+    also observed epoch 1 before A committed -- separately decides to
+    reset to (its own, different) epoch with watermark 8. Under the
+    broad condition, B's target epoch differs from the NOW-current
+    stored epoch (2), so `validity_changed` is STILL true and B's UPDATE
+    would overwrite A's epoch-2 row right back down to B's stale epoch
+    and a lower watermark -- silently losing A's already-confirmed
+    progress and resurrecting an epoch that no longer matches the actual
+    mailbox.
+
+    **The fix.** The reset branch is now a genuine compare-and-swap
+    against `observed_uid_validity` -- the epoch THIS caller actually
+    read before computing `uid_validity`/`new` -- not against the target
+    `uid_validity` it wants to write. The UPDATE's `WHERE` only matches
+    if the row's live `uid_validity` still equals `observed_uid_validity`
+    exactly: a stale writer whose observed epoch has already been
+    superseded (by ANY newer state, whether that's a further epoch
+    change or just a same-epoch watermark advance the writer never saw)
+    no-ops instead of restoring stale state. The same-epoch monotonic
+    branch additionally re-checks `uid_validity == observed_uid_validity`
+    against the row's live state too, guarding against a concurrent
+    epoch transition landing between this writer's read and this UPDATE.
     """
-    if uid_validity is None:
-        validity_changed = XingScanProgressRecord.uid_validity.is_not(None)
-    else:
-        validity_changed = or_(
-            XingScanProgressRecord.uid_validity.is_(None),
-            XingScanProgressRecord.uid_validity != uid_validity,
+    if uid_validity == observed_uid_validity:
+        # Same epoch as this worker's own baseline: forward-only advance
+        # -- but the WHERE still re-confirms the row is STILL at that
+        # baseline epoch (not just "any" epoch), so a concurrent reset
+        # that lands in between causes this UPDATE to no-op rather than
+        # writing a confirmed_upto_uid that belongs to the OLD epoch.
+        if new is None:
+            return
+        condition = and_(
+            _uid_validity_eq_clause(observed_uid_validity),
+            or_(
+                XingScanProgressRecord.confirmed_upto_uid.is_(None),
+                XingScanProgressRecord.confirmed_upto_uid < new,
+            ),
         )
-
-    if new is None:
-        # Same semantics as before: nothing to advance to unless this is
-        # a genuine uid_validity reset (which overwrites confirmed_upto_uid
-        # with None too, matching the "no watermark yet" state).
-        condition = validity_changed
     else:
-        condition = or_(
-            validity_changed,
-            XingScanProgressRecord.confirmed_upto_uid.is_(None),
-            XingScanProgressRecord.confirmed_upto_uid < new,
-        )
+        # Epoch transition: CAS against the OLD epoch this worker
+        # actually observed. Succeeds only if the row is still in that
+        # expected prior epoch -- a row already moved to a newer epoch
+        # (by this same transition or any other writer) must never be
+        # clobbered back to a stale one.
+        condition = _uid_validity_eq_clause(observed_uid_validity)
 
     db.execute(
         update(XingScanProgressRecord)
