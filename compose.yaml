@@ -1,0 +1,80 @@
+# Initial single-server deployment target: PostgreSQL + FastAPI (1 worker)
+# + an optional, separate scheduler process. See docs/DEPLOYMENT.md for
+# the full topology and docs/DOCKER.md for the design rationale.
+#
+# Usage:
+#   cp .env.example .env            # fill in real values, never commit .env
+#   docker compose build
+#   docker compose up -d db
+#   docker compose run --rm web alembic upgrade head   # explicit, not automatic
+#   docker compose up -d web
+#   docker compose --profile scheduler up -d scheduler # optional, opt-in
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jobtriage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-jobtriage}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobtriage} -d ${POSTGRES_DB:-jobtriage}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Overrides .env's DATABASE_URL (which defaults to SQLite for local
+      # dev) so the container always targets the compose-network Postgres
+      # service by name. ALEMBIC_AUTO_UPGRADE stays false here on
+      # purpose -- migrations are an explicit `docker compose run` step,
+      # never automatic on boot (see docs/DOCKER.md).
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jobtriage}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobtriage}
+      ALEMBIC_AUTO_UPGRADE: "false"
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Opt-in: only needed if AUTOMATION_SCHEDULER_ENABLED or
+  # TELEGRAM_DAILY_DIGEST_ENABLED is set in .env. Must never be scaled
+  # beyond one replica (see docs/DEPLOYMENT.md) -- the app's own design
+  # already keeps this out of the `web` service's lifespan specifically
+  # so it stays a single, independent process regardless of how `web` is
+  # scaled.
+  scheduler:
+    build: .
+    command: ["python", "-m", "app.scheduler"]
+    # on-failure, not unless-stopped: `python -m app.scheduler` exits 0
+    # (not an error) when both AUTOMATION_SCHEDULER_ENABLED and
+    # TELEGRAM_DAILY_DIGEST_ENABLED are false -- confirmed by local
+    # smoke test (docs/DOCKER.md). unless-stopped would restart-loop
+    # that clean exit forever; on-failure only restarts a real crash.
+    restart: on-failure
+    profiles: ["scheduler"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jobtriage}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobtriage}
+      ALEMBIC_AUTO_UPGRADE: "false"
+
+volumes:
+  pgdata:
