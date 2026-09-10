@@ -79,6 +79,7 @@ from app.providers.email.imap_deadline import (
     DeadlineIMAP4SSL,
     ImapSessionDeadline,
 )
+from app.providers.email.mime_utils import decode_mime_part
 
 logger = logging.getLogger(__name__)
 
@@ -206,17 +207,6 @@ def _parse_internal_date(fetch_header: bytes) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _decode_part(part: Message) -> str:
-    payload = part.get_payload(decode=True)
-    if not payload:
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except LookupError:
-        return payload.decode("utf-8", errors="replace")
-
-
 def _attachment_metadata(part: Message, filename: str | None) -> ParsedAttachment:
     decoded_filename = _decode_mime_words(filename).strip()[:255] if filename else None
     content_type = part.get_content_type()
@@ -283,7 +273,7 @@ def _walk_body_and_attachments(
 
     content_type = part.get_content_type()
     if content_type == "text/plain" and not state["body_plain"]:
-        state["body_plain"] = _decode_part(part)
+        state["body_plain"] = decode_mime_part(part)
     elif content_type == "text/html":
         state["has_html"] = True
 

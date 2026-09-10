@@ -74,6 +74,7 @@ from app.providers.email.imap_deadline import (
     DeadlineIMAP4SSL,
     ImapSessionDeadline,
 )
+from app.providers.email.mime_utils import decode_mime_part
 
 logger = logging.getLogger(__name__)
 
@@ -239,17 +240,6 @@ def _is_job_digest_subject(subject: str) -> bool:
     return any(pattern.search(subject) for pattern in _SUBJECT_PATTERNS)
 
 
-def _decode_part(part: Message) -> str:
-    payload = part.get_payload(decode=True)
-    if not payload:
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except LookupError:
-        return payload.decode("utf-8", errors="replace")
-
-
 def _extract_plaintext_body(msg: Message) -> str:
     # Plaintext is used instead of the HTML part on purpose — confirmed
     # against real digest emails to be substantially cleaner (no markup,
@@ -259,10 +249,10 @@ def _extract_plaintext_body(msg: Message) -> str:
         for part in msg.walk():
             disposition = str(part.get("Content-Disposition") or "")
             if part.get_content_type() == "text/plain" and "attachment" not in disposition:
-                return _decode_part(part)
+                return decode_mime_part(part)
         return ""
     if msg.get_content_type() == "text/plain":
-        return _decode_part(msg)
+        return decode_mime_part(msg)
     return ""
 
 
