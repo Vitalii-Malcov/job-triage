@@ -73,7 +73,7 @@ jobs:
         run: |
           python -m alembic upgrade head
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "b4f6a1c9e7d2 (head)" /tmp/alembic_current.txt
+          grep -q "c7d3f9a1e5b8 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py

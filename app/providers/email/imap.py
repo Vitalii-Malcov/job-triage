@@ -704,17 +704,29 @@ class GmailImapProvider:
     ) -> tuple[ParsedGmailMessage | None, str | None]:
         """Returns `(parsed, permanent_skip_reason)`.
 
-        `permanent_skip_reason` is non-None (FINAL-004, Astra R5A) only
-        when `parsed is None` AND the reason is about this message's own
-        CONTENT (oversized, unparseable MIME, an invalid UID value) --
-        deterministic given the same bytes, so retrying can never
-        succeed. Every OTHER `parsed is None` case (a non-OK FETCH,
-        malformed response shape, or any other transport/protocol
-        hiccup) returns `permanent_skip_reason=None`: those are
-        transient by nature (a different attempt against the same
-        mailbox could plausibly behave differently) and must stay
-        eligible for retry on the next sync, never be recorded as
-        permanently unfetchable. See
+        `permanent_skip_reason` is non-None (FINAL-004, Astra R5A) ONLY
+        for a narrow set of cases that are a pure, deterministic
+        function of this message's own immutable CONTENT: an oversized
+        raw size, an invalid UID value, or `email.message_from_bytes`
+        itself failing to parse the raw bytes into a Message object at
+        all (confirmed empirically: this is notoriously lenient and
+        essentially never raises in practice, but when it does, it is a
+        pure function of the bytes). Retrying can never change any of
+        these outcomes, so they are safe to durably record.
+
+        Astra correction: this deliberately does NOT extend to an
+        exception from OUR OWN downstream extraction logic
+        (`_parse_message` and everything it calls, after
+        `email.message_from_bytes` already succeeded) -- an internal
+        programming bug in that code is far more likely than a genuine
+        property of the message, and durably recording it as permanent
+        would mean a future bugfix could never recover a message that
+        was only ever "unparseable" because of OUR bug. Those cases
+        (see the outer except below) return `permanent_skip_reason=None`
+        and stay eligible for retry indefinitely, exactly like every
+        OTHER transient `parsed is None` case (a non-OK FETCH, malformed
+        response shape, or any other transport/protocol hiccup) already
+        does. See
         app.providers.email.base.GmailFetchResult.permanently_skipped
         and app.db.models.GmailPermanentSkipRecord for how the caller
         uses this distinction.
@@ -787,7 +799,27 @@ class GmailImapProvider:
                 else None
             )
 
-            msg = email.message_from_bytes(bytes(raw_email))
+            # FINAL-004 (Astra R5A correction): ONLY a failure parsing
+            # the raw bytes themselves into a Message object is
+            # classified PERMANENT -- a genuinely deterministic property
+            # of these exact immutable bytes (email.message_from_bytes
+            # is notoriously lenient and essentially never raises in
+            # practice, confirmed empirically, but IS a pure function of
+            # the bytes when it does). Any exception from OUR OWN
+            # downstream extraction logic below (_parse_message and
+            # everything it calls) is deliberately NOT classified
+            # permanent -- it is far more likely to be an internal bug
+            # in this project's own parsing code than an inherent
+            # property of the message's content, and durably recording
+            # it as permanent would mean a future bugfix could never
+            # recover a message that was only ever unparseable because
+            # of OUR bug, not its own content.
+            try:
+                msg = email.message_from_bytes(bytes(raw_email))
+            except Exception as exc:
+                logger.warning("gmail_message_bytes_unparseable error_type=%s", type(exc).__name__)
+                return None, PERMANENT_SKIP_REASON_PARSE_FAILED
+
             parsed = self._parse_message(
                 msg,
                 uid=uid,
@@ -796,15 +828,17 @@ class GmailImapProvider:
             )
             return parsed, None
         except Exception as exc:
-            # Any malformed-MIME/parse failure is a skip, never a crash of
-            # the whole sync — one bad message must not stop the rest of
-            # an otherwise-successful mailbox read. FINAL-004 (Astra
-            # R5A): this message's own raw bytes are already fully in
-            # hand at this point (the FETCH itself succeeded) and failed
-            # to parse -- deterministic given the same bytes, so this is
-            # PERMANENT, not a transient fetch/transport hiccup.
+            # GMAIL-010: everything above (validating msg_data[0]'s
+            # shape, and OUR OWN _parse_message extraction logic) stays
+            # inside this single per-message try/except, so a malformed/
+            # unexpected FETCH response shape or an internal bug in our
+            # own parsing code can never propagate out of _fetch_one and
+            # abort the rest of the sync -- but (see the narrower
+            # try/except above) this is deliberately NOT classified as
+            # a permanent skip: an internal programming error must stay
+            # retryable, never durably blamed on the message's content.
             logger.warning("gmail_message_parse_failed error_type=%s", type(exc).__name__)
-            return None, PERMANENT_SKIP_REASON_PARSE_FAILED
+            return None, None
 
     def _parse_message(
         self,

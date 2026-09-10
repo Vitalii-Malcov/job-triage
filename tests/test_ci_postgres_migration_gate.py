@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 INTEGRATION_DIR = PROJECT_ROOT / "tests" / "integration"
 
-EXPECTED_ALEMBIC_HEAD = "b4f6a1c9e7d2"
+EXPECTED_ALEMBIC_HEAD = "c7d3f9a1e5b8"
 # The actual `run:` step invocation, not just any mention of the path --
 # the job's own explanatory comments reference this path too, earlier in
 # the file, which would otherwise produce a false "before" ordering.

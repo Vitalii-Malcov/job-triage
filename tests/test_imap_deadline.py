@@ -24,6 +24,7 @@ tests).
 """
 
 import imaplib
+import multiprocessing
 import shutil
 import socket
 import ssl
@@ -349,7 +350,20 @@ def test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadl
         certfile, keyfile, _drip_unterminated_greeting
     )
     try:
-        deadline = ImapSessionDeadline(0.4)
+        # FINAL-003 (Astra R5A): DeadlineIMAP4SSL's construction now
+        # ALSO includes DNS resolution via a genuinely terminable child
+        # PROCESS (see ImapSessionDeadline.resolve_addrinfo_bounded) --
+        # spawning that process costs real, measurable, somewhat
+        # load-dependent wall-clock time on this machine (confirmed
+        # empirically: ~150-400ms in isolation, more under load), which
+        # a pre-FINAL-003 0.4s deadline did not need to budget for at
+        # all (DNS resolution used to be effectively instant, delegated
+        # straight to the OS resolver in-process). 2.0s leaves ample
+        # margin for that spawn cost to complete BEFORE this test's own
+        # intended scenario (the greeting slow-drip) even begins to
+        # matter, so the deadline reliably fires during the DRIP, not
+        # during DNS resolution itself.
+        deadline = ImapSessionDeadline(2.0)
         result: dict[str, object] = {}
 
         def _construct() -> None:
@@ -368,7 +382,7 @@ def test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadl
         start = time.monotonic()
         worker = threading.Thread(target=_construct, daemon=True)
         worker.start()
-        worker.join(timeout=3.0)
+        worker.join(timeout=5.0)
         elapsed = time.monotonic() - start
         stop_drip.set()
 
@@ -377,7 +391,7 @@ def test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadl
             "the constructor (blocked reading the greeting/CAPABILITY response) "
             "was not unblocked by the total session deadline"
         )
-        assert elapsed < 2.0, (
+        assert elapsed < 4.0, (
             f"construction was not bounded by the total deadline (took {elapsed:.2f}s)"
         )
         assert deadline.exceeded is True
@@ -405,7 +419,12 @@ def test_constructor_silent_peer_after_handshake_is_bounded_by_the_total_deadlin
         certfile, keyfile, _stay_silent
     )
     try:
-        deadline = ImapSessionDeadline(0.4)
+        # FINAL-003 (Astra R5A): see the identical comment in
+        # test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadline
+        # above -- DNS resolution now spawns a genuinely terminable
+        # child process, which costs real wall-clock time a
+        # pre-FINAL-003 0.4s deadline never had to budget for.
+        deadline = ImapSessionDeadline(2.0)
         result: dict[str, object] = {}
 
         def _construct() -> None:
@@ -424,7 +443,7 @@ def test_constructor_silent_peer_after_handshake_is_bounded_by_the_total_deadlin
         start = time.monotonic()
         worker = threading.Thread(target=_construct, daemon=True)
         worker.start()
-        worker.join(timeout=3.0)
+        worker.join(timeout=5.0)
         elapsed = time.monotonic() - start
 
         assert accepted.wait(timeout=2), "test TLS server never completed the handshake"
@@ -432,7 +451,7 @@ def test_constructor_silent_peer_after_handshake_is_bounded_by_the_total_deadlin
             "the constructor (blocked reading the greeting) was not unblocked "
             "by the total session deadline"
         )
-        assert elapsed < 2.0, (
+        assert elapsed < 4.0, (
             f"construction was not bounded by the total deadline (took {elapsed:.2f}s)"
         )
         assert deadline.exceeded is True
@@ -627,7 +646,12 @@ def test_legacy_file_attribute_layout_bounds_constructor_greeting_slow_drip(tmp_
         certfile, keyfile, _drip_unterminated_greeting
     )
     try:
-        deadline = ImapSessionDeadline(0.4)
+        # FINAL-003 (Astra R5A): see the identical comment in
+        # test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadline
+        # -- DNS resolution now spawns a genuinely terminable child
+        # process, which costs real wall-clock time a pre-FINAL-003 0.4s
+        # deadline never had to budget for.
+        deadline = ImapSessionDeadline(2.0)
         result: dict[str, object] = {}
 
         def _construct() -> None:
@@ -646,7 +670,7 @@ def test_legacy_file_attribute_layout_bounds_constructor_greeting_slow_drip(tmp_
         start = time.monotonic()
         worker = threading.Thread(target=_construct, daemon=True)
         worker.start()
-        worker.join(timeout=3.0)
+        worker.join(timeout=5.0)
         elapsed = time.monotonic() - start
         stop_drip.set()
 
@@ -654,7 +678,7 @@ def test_legacy_file_attribute_layout_bounds_constructor_greeting_slow_drip(tmp_
         assert not worker.is_alive(), (
             "legacy self.file layout: constructor was not unblocked by the deadline"
         )
-        assert elapsed < 2.0, f"not bounded by the deadline (took {elapsed:.2f}s)"
+        assert elapsed < 4.0, f"not bounded by the deadline (took {elapsed:.2f}s)"
         assert deadline.exceeded is True
         assert "error" in result
     finally:
@@ -691,7 +715,16 @@ def test_legacy_file_attribute_layout_bounds_post_constructor_slow_drip(tmp_path
         certfile, keyfile, _greet_then_drip
     )
     try:
-        deadline = ImapSessionDeadline(0.5)
+        # FINAL-003 (Astra R5A): see the identical comment in
+        # test_constructor_greeting_capability_slow_drip_is_bounded_by_the_total_deadline
+        # -- DNS resolution now spawns a genuinely terminable child
+        # process, which costs real wall-clock time a pre-FINAL-003 0.5s
+        # deadline never had to budget for. This test needs even MORE
+        # margin than the others: construction must fully SUCCEED (real
+        # DNS resolution + TCP connect + TLS handshake + greeting/
+        # CAPABILITY exchange) BEFORE the post-constructor drip phase
+        # this test actually exercises even begins.
+        deadline = ImapSessionDeadline(2.5)
         result: dict[str, object] = {}
 
         def _run() -> None:
@@ -717,7 +750,7 @@ def test_legacy_file_attribute_layout_bounds_post_constructor_slow_drip(tmp_path
         start = time.monotonic()
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
-        worker.join(timeout=3.0)
+        worker.join(timeout=6.0)
         elapsed = time.monotonic() - start
         stop_drip.set()
 
@@ -726,7 +759,7 @@ def test_legacy_file_attribute_layout_bounds_post_constructor_slow_drip(tmp_path
         assert not worker.is_alive(), (
             "legacy self.file layout: post-constructor read was not unblocked by the deadline"
         )
-        assert elapsed < 2.0, f"not bounded by the deadline (took {elapsed:.2f}s)"
+        assert elapsed < 4.5, f"not bounded by the deadline (took {elapsed:.2f}s)"
         assert deadline.exceeded is True
         assert "error" in result
     finally:
@@ -808,158 +841,242 @@ def test_watchdog_force_close_does_not_hang_on_an_in_flight_readline(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# FINAL-003 (Astra R5A): the total session deadline must also bound DNS
-# resolution / TCP connect establishment -- the phase BEFORE any socket
-# exists for bind_socket/_force_close to act on. ImapSessionDeadline
-# .run_bounded closes this gap; see its own docstring for the full
-# rationale (and for why this is NOT the "spawn an unbounded resolver
-# thread and walk away" anti-pattern it deliberately avoids).
+# FINAL-003 (Astra R5A, corrected after Codex re-review): the total
+# session deadline must also bound DNS resolution -- the phase BEFORE any
+# socket exists for bind_socket/_force_close to act on -- AND the worker
+# actually PERFORMING that resolution must itself be genuinely bounded,
+# not merely abandoned behind a timeout. The first version of this fix
+# used a background daemon THREAD and was rejected: Python cannot
+# forcibly interrupt a thread blocked inside a C-level blocking syscall,
+# so "abandoning" it just left the real getaddrinfo() call running for
+# however long the OS took -- an unbounded WORKER even though the
+# CALLING thread was bounded. ImapSessionDeadline.resolve_addrinfo_bounded
+# closes this via a genuinely terminable, isolated child PROCESS instead
+# -- see its own docstring for the full rationale.
 # ---------------------------------------------------------------------------
 
 
-class TestRunBounded:
-    def test_returns_the_result_when_fn_completes_in_time(self):
+def _hang_forever_dns_worker(_host, _port, _conn) -> None:
+    """Test-only worker target -- MUST be a real importable module-level
+    function (never a lambda/closure): `multiprocessing`'s "spawn"
+    context re-imports the target module fresh in the child process, so
+    only a by-reference-picklable function works. Simulates a
+    `getaddrinfo()` call that never returns (e.g. an unresponsive DNS
+    server) by blocking on a real, long sleep -- deliberately never
+    touching `_conn` at all, so the parent's `poll()` genuinely times
+    out rather than being fed a result.
+    """
+    time.sleep(10_000)
+
+
+def _raise_specific_error_dns_worker(_host, _port, conn) -> None:
+    """Test-only worker target: deterministically reports a specific,
+    recognizable `OSError` back to the parent -- used instead of
+    resolving a real (possibly flaky, possibly differently-handled by
+    different CI network environments) nonexistent hostname, so the
+    "a genuine DNS failure propagates" regression is fully
+    network-independent.
+    """
+    try:
+        conn.send(("error", OSError("simulated getaddrinfo failure, deterministic for tests")))
+    finally:
+        conn.close()
+
+
+class TestResolveAddrinfoBounded:
+    def test_returns_the_result_when_dns_completes_in_time(self):
+        """Normal resolution succeeds -- the common case must be
+        unaffected by the bounding mechanism."""
         deadline = ImapSessionDeadline(5.0)
-        sentinel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            with deadline:
-                result = deadline.run_bounded(lambda: sentinel_sock)
-            assert result is sentinel_sock
-            assert deadline.exceeded is False
-        finally:
-            sentinel_sock.close()
-
-    def test_reraises_whatever_fn_itself_raises_when_it_completes_in_time(self):
-        """Success and failure of `fn` ITSELF (as opposed to a deadline
-        timeout) must propagate exactly like a normal blocking call --
-        run_bounded must never swallow or reshape a real connect failure
-        into a generic timeout."""
-
-        def _boom():
-            raise OSError("simulated connect refused")
-
-        deadline = ImapSessionDeadline(5.0)
-        with deadline, pytest.raises(OSError, match="simulated connect refused"):
-            deadline.run_bounded(_boom)
+        with deadline:
+            result = deadline.resolve_addrinfo_bounded("127.0.0.1", 993)
+        assert result, "expected at least one resolved address"
+        _family, _socktype, _proto, _canonname, sockaddr = result[0]
+        assert sockaddr[0] == "127.0.0.1"
+        assert sockaddr[1] == 993
         assert deadline.exceeded is False
 
-    def test_bounds_the_calling_thread_when_fn_blocks_past_the_deadline(self):
-        """The core FINAL-003 fix: `fn` blocking (standing in for a hung
-        DNS resolution + connect) must not block the CALLING thread past
-        the deadline's own remaining time, even though no socket exists
-        yet. Before this fix, nothing at all bounded this phase."""
-        release_event = threading.Event()
-        entered_fn = threading.Event()
+    def test_reraises_whatever_getaddrinfo_itself_raises_when_it_completes_in_time(self):
+        """A genuine DNS failure (not a timeout) must propagate to the
+        caller exactly like calling `socket.getaddrinfo()` directly
+        would -- never swallowed or reshaped into a generic timeout."""
+        deadline = ImapSessionDeadline(5.0)
+        with deadline, pytest.raises(OSError, match="simulated getaddrinfo failure"):
+            deadline.resolve_addrinfo_bounded(
+                "irrelevant.example", 993, _worker=_raise_specific_error_dns_worker
+            )
+        assert deadline.exceeded is False
 
-        def _hangs_until_released():
-            entered_fn.set()
-            release_event.wait(timeout=10)
-            return socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
+    def test_caller_returns_by_the_deadline_when_dns_hangs(self):
+        """FINAL-003's core requirement: the CALLING thread must never
+        block past the deadline's own remaining time, even when the
+        underlying DNS resolution itself never returns. The tightened
+        `_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS` ceiling (0.5s, from
+        this fix's own correction) keeps the total bounded close to the
+        configured deadline -- not "eventually", but within a small,
+        fixed, documented additive constant.
+        """
         deadline = ImapSessionDeadline(0.3)
         start = time.monotonic()
-        try:
-            with deadline, pytest.raises(TimeoutError):
-                deadline.run_bounded(_hangs_until_released)
-            elapsed = time.monotonic() - start
-        finally:
-            release_event.set()
-
-        assert entered_fn.wait(timeout=2), "fn was never actually invoked"
-        assert elapsed < 2.0, f"run_bounded blocked past the deadline (took {elapsed:.2f}s)"
+        with deadline, pytest.raises(TimeoutError):
+            deadline.resolve_addrinfo_bounded(
+                "hangs.invalid", 993, _worker=_hang_forever_dns_worker
+            )
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.5, (
+            f"did not return within a tight bound of the 0.3s deadline (took {elapsed:.2f}s) "
+            "-- cleanup itself must never add seconds of latency"
+        )
         assert deadline.exceeded is True
 
-    def test_closes_the_late_arriving_socket_instead_of_leaking_it(self):
-        """The other half of the fix: once the caller has already given
-        up, `fn`'s eventual result must never be silently leaked -- it
-        must be closed. Proven with a REAL socket pair (not a mock) so a
-        broken fix (e.g. one that just drops the late result on the
-        floor) is actually caught: the server side must observe a real
-        TCP close (recv() returning b""), not hang forever.
+    def test_dns_worker_process_is_confirmed_dead_before_the_call_returns(self):
+        """The actual Codex correction, proven directly (not just
+        inferred from timing): the resolver WORKER PROCESS must itself
+        be terminated and its death CONFIRMED before
+        `resolve_addrinfo_bounded` returns/raises -- not merely asked to
+        stop and left running. `multiprocessing.active_children()`
+        reflects genuinely-still-alive child processes this test
+        process has started (and reaps/prunes already-finished ones as
+        a side effect of being called) -- if the worker were only
+        abandoned (the pre-correction thread-based design's actual
+        flaw), a process-based equivalent of that mistake would still
+        show up here.
         """
-        release_event = threading.Event()
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
-        host, port = server.getsockname()
-        accepted: list[socket.socket] = []
+        before = set(multiprocessing.active_children())
 
-        def _accept() -> None:
-            conn, _ = server.accept()
-            accepted.append(conn)
-
-        accept_thread = threading.Thread(target=_accept, daemon=True)
-        accept_thread.start()
-
-        def _late_connect() -> socket.socket:
-            release_event.wait(timeout=10)
-            return socket.create_connection((host, port), timeout=5)
-
-        deadline = ImapSessionDeadline(0.2)
-        try:
-            with deadline, pytest.raises(TimeoutError):
-                deadline.run_bounded(_late_connect)
-
-            # Now let the "slow DNS/connect" finally complete -- run_bounded
-            # already gave up and raised above.
-            release_event.set()
-            accept_thread.join(timeout=3)
-            assert accepted, "server never accepted the late connection"
-            server_side = accepted[0]
-            server_side.settimeout(3.0)
-            try:
-                data = server_side.recv(1)
-            except OSError:
-                pytest.fail(
-                    "the late-arriving socket was never closed within the "
-                    "timeout -- leaked instead of being cleaned up"
-                )
-            assert data == b"", (
-                "expected a clean close (recv() -> b'') from the late-arriving "
-                "socket having been force-closed, got real data instead"
+        deadline = ImapSessionDeadline(0.3)
+        with deadline, pytest.raises(TimeoutError):
+            deadline.resolve_addrinfo_bounded(
+                "hangs.invalid", 993, _worker=_hang_forever_dns_worker
             )
-        finally:
-            release_event.set()
-            server.close()
-            for conn in accepted:
-                conn.close()
+
+        after = set(multiprocessing.active_children())
+        lingering = after - before
+        assert not lingering, (
+            f"DNS resolution worker process(es) still alive after the deadline "
+            f"fired and resolve_addrinfo_bounded returned: {lingering}"
+        )
+
+    def test_no_abandoned_resolver_process_remains_across_repeated_timeouts(self):
+        """Same guarantee as above, proven across several consecutive
+        timeouts -- guards against a subtler bug where cleanup happens
+        to work on the first call (e.g. by luck of scheduling) but
+        leaks on a later one."""
+        before = set(multiprocessing.active_children())
+
+        for _ in range(3):
+            deadline = ImapSessionDeadline(0.2)
+            with deadline, pytest.raises(TimeoutError):
+                deadline.resolve_addrinfo_bounded(
+                    "hangs.invalid", 993, _worker=_hang_forever_dns_worker
+                )
+
+        after = set(multiprocessing.active_children())
+        assert not (after - before), "a DNS resolution worker leaked across repeated timeouts"
 
 
-def test_deadline_imap4ssl_construction_is_bounded_even_when_create_socket_hangs(monkeypatch):
-    """FINAL-003 (Astra R5A) integration-level proof: constructing
-    `DeadlineIMAP4SSL` itself -- not just `ImapSessionDeadline.run_bounded`
-    in isolation -- is bounded even when `imaplib.IMAP4._create_socket`
-    (DNS resolution + TCP connect) hangs. Before this fix, nothing bounded
-    this phase: no socket existed yet for `bind_socket`/`_force_close` to
-    act on, so a slow/unresponsive DNS resolver could block the
-    constructor call -- and the worker thread running it -- indefinitely.
+def test_deadline_imap4ssl_construction_is_bounded_when_dns_resolution_hangs(monkeypatch):
+    """FINAL-003 (Astra R5A, corrected) integration-level proof:
+    constructing `DeadlineIMAP4SSL` itself -- not just
+    `ImapSessionDeadline.resolve_addrinfo_bounded` in isolation -- is
+    bounded even when DNS resolution hangs, going through the REAL
+    constructor path with no test-only parameter needed at that layer.
+    Monkeypatching the MODULE-level `_resolve_addrinfo_worker` is picked
+    up transparently (see `resolve_addrinfo_bounded`'s own docstring for
+    why: the default is looked up from the module's current namespace at
+    CALL time, not captured at function-definition time).
     """
-    release_event = threading.Event()
-    entered = threading.Event()
-    real_create_socket = imaplib.IMAP4._create_socket
+    import app.providers.email.imap_deadline as imap_deadline_module
 
-    def _hanging_create_socket(self, timeout):
-        entered.set()
-        release_event.wait(timeout=10)
-        return real_create_socket(self, timeout)
+    monkeypatch.setattr(imap_deadline_module, "_resolve_addrinfo_worker", _hang_forever_dns_worker)
 
-    monkeypatch.setattr(imaplib.IMAP4, "_create_socket", _hanging_create_socket)
-
+    before = set(multiprocessing.active_children())
     deadline = ImapSessionDeadline(0.3)
     start = time.monotonic()
+    with deadline, pytest.raises(TimeoutError):
+        DeadlineIMAP4SSL(
+            "hangs.invalid",
+            993,
+            ssl_context=_relaxed_test_client_ssl_context(),
+            timeout=5.0,
+            deadline=deadline,
+        )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.5, f"construction blocked past a tight bound (took {elapsed:.2f}s)"
+    assert deadline.exceeded is True
+    after = set(multiprocessing.active_children())
+    assert not (after - before), "DNS resolution worker still alive after construction aborted"
+
+
+def test_tcp_socket_is_registered_before_connect_and_normal_construction_still_succeeds(
+    tmp_path, monkeypatch
+):
+    """Combines two FINAL-003 checklist items in one real end-to-end
+    run: (1) the raw TCP socket must be registered with the deadline
+    watchdog BEFORE `connect()` is even attempted on it -- otherwise a
+    hang during connect() itself would never be interruptible; (2) the
+    normal, real IMAP-over-TLS construction path (DNS resolution -> TCP
+    connect -> TLS handshake -> greeting/CAPABILITY) must still succeed
+    completely unaffected by any of this fix's changes.
+
+    `socket.socket.connect` is spied on (not replaced -- the real
+    connect still runs) purely to observe, at the exact moment connect()
+    is invoked, whether the deadline already has THIS socket instance
+    registered -- the precise ordering guarantee this test exists to
+    prove.
+    """
+    cert = _generate_self_signed_cert(tmp_path)
+    if cert is None:
+        pytest.skip("openssl CLI not available to generate a self-signed test certificate")
+    certfile, keyfile = cert
+
+    def _reply_normally(tls_conn: ssl.SSLSocket) -> None:
+        tls_conn.sendall(b"* OK IMAP4rev1 Service Ready\r\n")
+        request = b""
+        while not request.endswith(b"\r\n"):
+            chunk = tls_conn.recv(4096)
+            if not chunk:
+                return
+            request += chunk
+        tag = request.split(b" ", 1)[0]
+        tls_conn.sendall(b"* CAPABILITY IMAP4rev1\r\n" + tag + b" OK CAPABILITY completed\r\n")
+        time.sleep(0.2)
+
+    server, (host, port), server_thread, accepted = _start_tls_server(
+        certfile, keyfile, _reply_normally
+    )
+
+    holder: dict[str, ImapSessionDeadline] = {}
+    observed: dict[str, bool] = {}
+    real_connect = socket.socket.connect
+
+    def _spying_connect(self, address):
+        observed["registered_before_connect"] = holder["deadline"]._socket is self
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", _spying_connect)
+
     try:
-        with deadline, pytest.raises(TimeoutError):
-            DeadlineIMAP4SSL(
-                "127.0.0.1",
-                1,
+        deadline = ImapSessionDeadline(5.0)
+        holder["deadline"] = deadline
+        with deadline:
+            client = DeadlineIMAP4SSL(
+                host,
+                port,
                 ssl_context=_relaxed_test_client_ssl_context(),
                 timeout=5.0,
                 deadline=deadline,
             )
-        elapsed = time.monotonic() - start
+        assert accepted.wait(timeout=2)
+        assert deadline.exceeded is False
+        client.shutdown()
     finally:
-        release_event.set()
+        server.close()
+        server_thread.join(timeout=3)
 
-    assert entered.wait(timeout=2), "_create_socket was never actually invoked"
-    assert elapsed < 2.0, f"construction blocked past the deadline (took {elapsed:.2f}s)"
-    assert deadline.exceeded is True
+    assert "registered_before_connect" in observed, "connect() spy was never invoked"
+    assert observed["registered_before_connect"] is True, (
+        "the raw TCP socket was not registered with the deadline watchdog BEFORE "
+        "connect() was attempted -- a hang during connect() itself would be unbounded"
+    )

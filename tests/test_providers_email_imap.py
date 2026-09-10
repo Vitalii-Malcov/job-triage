@@ -604,6 +604,38 @@ async def test_transport_failure_is_not_reported_as_permanently_skipped():
 
 
 @pytest.mark.asyncio
+async def test_internal_parsing_bug_is_not_durably_marked_as_permanent(monkeypatch):
+    """FINAL-004 (Astra R5A correction): an exception from OUR OWN
+    downstream extraction logic (_parse_message and everything it
+    calls) -- standing in for a real internal programming bug, not a
+    property of the message's content -- must NEVER be classified
+    permanent. email.message_from_bytes itself succeeding (the raw
+    bytes ARE parseable) is what draws the line: everything after that
+    point is this project's own code, and a bug there must stay
+    retryable so a future bugfix can still recover the message, instead
+    of the message being durably (and wrongly) blamed on its own
+    content forever.
+    """
+    raw = _build_email(plaintext_body="perfectly normal, parseable content")
+    client = FakeImapClient(messages={1: raw})
+    provider = _provider(client)
+
+    def _boom(self, msg, *, uid, uid_validity, provider_arrival_at):
+        raise AttributeError("simulated internal programming bug, not a content problem")
+
+    monkeypatch.setattr(gmail_imap_module.GmailImapProvider, "_parse_message", _boom)
+
+    result = await provider.fetch()
+
+    assert result.messages == ()
+    assert result.skipped_count == 1
+    assert result.permanently_skipped == (), (
+        "an internal bug in our own parsing code must never be durably recorded as a "
+        "permanent, content-specific skip"
+    )
+
+
+@pytest.mark.asyncio
 async def test_permanent_skips_do_not_starve_later_valid_uids_across_syncs(monkeypatch):
     """FINAL-004 (Astra R5A): the exact Astra scenario -- a prefix of
     permanently-unfetchable messages (here: oversized, standing in for

@@ -83,31 +83,102 @@ alive indefinitely, exactly the class of bug this module exists to close.
 from inside `_create_socket`, which `IMAP4.open()` calls (setting
 `self.sock`) BEFORE `IMAP4.__init__` ever calls `IMAP4._connect()`.
 
-FINAL-003 (Astra R5A): `_create_socket` itself still had an unbounded
-gap -- `imaplib.IMAP4._create_socket` calls `socket.create_connection()`,
-which does DNS resolution (`socket.getaddrinfo()`) followed by the TCP
-`connect()`, and there is no socket at all yet for `bind_socket`/
-`_force_close` to act on during that phase. `ImapSessionDeadline
-.run_bounded` closes this: it runs that call on a background thread and
-bounds the CALLING thread's wait to the deadline's own remaining time,
-without ever leaving the background thread's eventual result
-unhandled -- see its own docstring for the full detail and for why this
-is not the "spawn an unbounded resolver thread and walk away" anti
--pattern it deliberately avoids.
+FINAL-003 (Astra R5A, corrected after Codex re-review): `_create_socket`
+itself still had an unbounded gap -- `imaplib.IMAP4._create_socket` calls
+`socket.create_connection()`, which does DNS resolution
+(`socket.getaddrinfo()`) followed by the TCP `connect()`, and there is no
+socket at all yet for `bind_socket`/`_force_close` to act on during that
+phase. The first version of this fix ran `getaddrinfo()`+`connect()` on a
+background daemon THREAD and merely stopped waiting on it after the
+deadline -- Codex correctly rejected this: Python cannot forcibly
+interrupt a thread blocked inside a C-level blocking syscall (the GIL is
+released for the duration, and there is no portable way to inject a
+signal into one specific thread), so an "abandoned" thread just keeps
+running the real `getaddrinfo()` call for however long the OS resolver
+actually takes -- unbounded WORKER lifetime, even though the CALLING
+thread was bounded.
+
+The corrected fix (`ImapSessionDeadline.resolve_addrinfo_bounded`) moves
+ONLY the DNS resolution step to an isolated child PROCESS, not a thread:
+`multiprocessing.Process.terminate()`/`.kill()` sends a real OS-level
+signal (SIGTERM/SIGKILL on POSIX, TerminateProcess on Windows) that the
+OS itself enforces against the WHOLE process, including whatever
+blocking syscall it is in -- this is the one primitive Python actually
+has for genuinely cancelling an uninterruptible blocking call, and it is
+verified by this fix's own test suite: the worker process's
+`is_alive()` is confirmed False after a timeout, not merely abandoned.
+Only small, plain, picklable data (resolved addresses, or an `OSError`)
+crosses the process boundary -- deliberately NOT a live connected
+socket, which would require platform-fragile raw file-descriptor
+-passing machinery with its own cancellation race conditions. The
+actual TCP `connect()` happens back in THIS process afterward (see
+`DeadlineIMAP4SSL._create_socket`), against each resolved candidate
+address in turn, using the SAME socket-registration-before-connect +
+`_force_close` mechanism already proven for the TLS handshake/greeting
+phases below -- a real socket object exists in this process from the
+moment it is created, so it is immediately interruptible by the
+existing mechanism with no new primitive needed, and it shares the
+SAME absolute total-session deadline the rest of this class already
+enforces (no separate sub-budget for the connect phase).
 """
 
 from __future__ import annotations
 
 import imaplib
 import logging
+import multiprocessing
 import socket
+import sys
 import threading
 import time
-from collections.abc import Callable
 from types import TracebackType
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+# FINAL-003 (Astra R5A): "spawn" is used explicitly rather than relying
+# on the platform default -- this module's DNS-resolution call always
+# runs from inside a worker thread (see app.collectors.xing_email
+# .fetch_message_batches's asyncio.to_thread / app.providers.email.imap
+# .GmailImapProvider.fetch's own docstring), so the calling process is
+# always multi-threaded by the time a child process would be forked.
+# "fork" on POSIX only duplicates the CALLING thread -- any lock held by
+# a DIFFERENT thread at that exact moment (e.g. the logging module's own
+# internal lock) is duplicated in a permanently-locked state in the
+# child, a well-known fork+threads hazard. "spawn" starts a fresh
+# interpreter instead, sidestepping that entirely, and is already the
+# only option on Windows (this project's local dev runtime) -- using it
+# explicitly everywhere keeps behavior identical across platforms
+# instead of silently depending on which one happens to be the default.
+_MP_CONTEXT = multiprocessing.get_context("spawn")
+
+
+def _resolve_addrinfo_worker(host: str | None, port: int, conn) -> None:
+    """Runs in an isolated child PROCESS -- see
+    `ImapSessionDeadline.resolve_addrinfo_bounded`'s own docstring for
+    why a process, not a thread, is required for genuine cancellation.
+    Sends only plain, picklable data back to the parent (never a live
+    socket): `("ok", addrinfo)` on success, `("error", exc)` if
+    `socket.getaddrinfo` itself raised. Uses a `multiprocessing.Pipe`
+    `Connection.send()` (a synchronous write, not `multiprocessing
+    .Queue`'s buffered-and-flushed-by-a-background-thread `put()`) so
+    the result is guaranteed to have actually reached the OS-level pipe
+    before this function returns and the process exits -- a `Queue`
+    here would risk silently losing the result if the process exited
+    before its internal feeder thread finished flushing.
+    """
+    try:
+        addrinfo = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        try:
+            conn.send(("error", exc))
+        finally:
+            conn.close()
+        return
+    try:
+        conn.send(("ok", addrinfo))
+    finally:
+        conn.close()
 
 
 class HasClose(Protocol):
@@ -125,6 +196,20 @@ class HasClose(Protocol):
 # fixed, finite ceiling instead of "as long as it keeps sending any bytes
 # at all".
 IMAP_SESSION_DEADLINE_SECONDS = 300.0
+
+# FINAL-003 (Astra R5A, corrected): ceiling for how long
+# ImapSessionDeadline._terminate_and_confirm_dead waits, per escalation
+# step, for the DNS resolution worker PROCESS to actually die -- see
+# that method's own docstring for why this is a safety-margin ceiling
+# (OS-level process termination is normally observable within low
+# milliseconds), not an expected-case duration, and for the exact
+# worst-case total additive latency this bounds
+# (2 * this constant, across the terminate()-then-kill() escalation).
+# Deliberately small: a short-lived resolver worker being reaped is not
+# something that should ever legitimately need seconds, and this must
+# never let a short configured session deadline return many seconds
+# late just because cleanup used an overly generous timeout.
+_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS = 0.5
 
 
 class ImapSessionDeadline:
@@ -158,9 +243,9 @@ class ImapSessionDeadline:
         self._extra_closable: HasClose | None = None
         self._fired = threading.Event()
         self._timer: threading.Timer | None = None
-        # FINAL-003: set in __enter__, read by run_bounded's own
-        # remaining-time wait -- the SAME reference point self._timer
-        # uses, so the pre-socket connect phase never gets a budget
+        # FINAL-003: set in __enter__, read by resolve_addrinfo_bounded's
+        # own remaining-time wait -- the SAME reference point self._timer
+        # uses, so the pre-socket DNS/connect phase never gets a budget
         # larger than the total session deadline.
         self._deadline_at: float | None = None
 
@@ -192,117 +277,140 @@ class ImapSessionDeadline:
 
     def _remaining_seconds(self) -> float:
         if self._deadline_at is None:
-            # Defensive only -- run_bounded is only ever called from
-            # inside a `with deadline:` block in practice, where
-            # __enter__ has always already set this. Treat "never
+            # Defensive only -- resolve_addrinfo_bounded is only ever
+            # called from inside a `with deadline:` block in practice,
+            # where __enter__ has always already set this. Treat "never
             # entered" as no time left rather than blocking
             # indefinitely.
             return 0.0
         return max(0.0, self._deadline_at - time.monotonic())
 
-    def run_bounded(self, fn: Callable[[], socket.socket]) -> socket.socket:
-        """FINAL-003: bounds a blocking call that PRODUCES a socket (in
-        practice, `imaplib.IMAP4._create_socket` -- DNS resolution via
-        `socket.getaddrinfo()` followed by the TCP `connect()`) by this
-        deadline's own remaining wall-clock budget, closing the gap left
-        by `bind_socket`/`_force_close` alone: those can only ever
-        interrupt a socket that already exists, so before this method
-        existed, the entire DNS-resolution-plus-connect phase ran
-        completely unbounded by the session deadline -- a slow/
-        unresponsive DNS resolver could block the calling thread
-        indefinitely, with no socket yet for the watchdog to force-close.
+    def resolve_addrinfo_bounded(
+        self, host: str | None, port: int, *, _worker: object = None
+    ) -> list[tuple]:
+        """FINAL-003 (Astra R5A, corrected): bounds `socket.getaddrinfo`
+        (DNS resolution) by this deadline's own remaining wall-clock
+        budget, using a genuinely terminable, isolated child PROCESS --
+        not a thread. See this module's own docstring for the full
+        rationale for why a process is required (a thread stuck inside
+        a blocking C-level syscall cannot be forcibly interrupted from
+        another thread in Python; a process CAN be, via a real OS-level
+        signal).
 
-        Python cannot forcibly interrupt a blocking `getaddrinfo()`/
-        `connect()` syscall from another thread -- there is no portable
-        equivalent of `_force_close`'s socket-shutdown trick for a
-        socket that doesn't exist yet, and a signal-based approach
-        (`signal.alarm`) is POSIX-only and would not work on this
-        project's Windows dev runtime. So `fn` genuinely does run on a
-        background daemon thread for however long the underlying OS
-        call actually takes -- exactly like any other blocking Python
-        call. What this method actually guarantees, and what makes it
-        NOT "spawn a resolver thread and abandon it":
+        Guarantees, all verified by this fix's own test suite:
 
-        1. This method itself always returns or raises within
-           (approximately) the deadline's remaining time -- the calling
-           thread is never blocked past the total session deadline just
-           because no socket existed yet.
-        2. If `fn` only succeeds AFTER this method has already given up
-           and raised, the resulting socket is closed immediately by the
-           background thread itself -- never silently handed back, never
-           left open and unmanaged/leaked.
-
-        Exactly one side of a lock-guarded phase handoff "wins" this
-        race -- the same proven pattern as the SMTP total-deadline fix's
-        `gate_lock`/phase state machine
-        (app/providers/email/smtp.py's `send()`), applied here to a
-        socket-producing call instead of a send.
+        1. This method always returns or raises within (approximately)
+           the deadline's remaining time.
+        2. If the deadline's remaining time elapses before resolution
+           completes, the worker PROCESS is `.terminate()`d (escalating
+           to `.kill()` if it hasn't died within a few seconds) and its
+           death is confirmed via `.join()` BEFORE this method raises --
+           never left running. This is the actual fix for the Codex
+           finding that the first version of this method (a background
+           THREAD merely abandoned after a timeout) left the resolver
+           WORKER's lifetime unbounded even though the caller's own wait
+           was bounded.
+        3. Only plain, picklable data (a list of `getaddrinfo()`
+           5-tuples, or an `OSError`) ever crosses the process boundary
+           -- never a live socket, which would require platform-fragile
+           raw file-descriptor-passing with its own handoff race. There
+           is therefore no "late socket" this method itself could ever
+           leak; see `DeadlineIMAP4SSL._create_socket` for how the
+           actual TCP connect (which DOES need late-socket cancellation
+           handling) reuses the existing, already-proven
+           `bind_socket`/`_force_close` mechanism instead of needing a
+           new one here.
 
         Raises `TimeoutError` (a `socket.OSError`/`socket.timeout`
         subclass -- every existing `except OSError` call site in
         app.collectors.xing_email / app.providers.email.imap already
         covers it, unchanged) if the deadline's remaining time elapses
-        before `fn` completes. Re-raises whatever `fn` itself raised if
-        it completes in time.
+        before resolution completes. Re-raises whatever `OSError`
+        `socket.getaddrinfo` itself raised if it completes in time.
+
+        `_worker` (test-only seam, never passed by production code):
+        overrides which target function the child process runs, so a
+        test can deterministically simulate a hung/failing resolver
+        without depending on real, possibly-flaky DNS. Defaults to the
+        real `_resolve_addrinfo_worker`, looked up from this MODULE's
+        own current namespace at call time (not captured at function
+        -definition time) so `monkeypatch.setattr(imap_deadline_module,
+        "_resolve_addrinfo_worker", ...)` also works transparently for
+        an end-to-end test that goes through `DeadlineIMAP4SSL`'s real
+        constructor, which has no seam of its own to pass `_worker`
+        through (it overrides `imaplib.IMAP4_SSL._create_socket`'s fixed
+        signature). A replacement MUST itself be an importable
+        module-level function (never a lambda/closure) -- `spawn`
+        re-imports the target module fresh in the child process, so only
+        a real, by-reference-picklable function works.
         """
-        phase_lock = threading.Lock()
-        state = {"phase": "pending"}
-        outcome: dict[str, object] = {}
-        done = threading.Event()
-
-        def _worker() -> None:
-            try:
-                sock = fn()
-            except Exception as exc:  # noqa: BLE001 -- forwarded to the caller verbatim
-                with phase_lock:
-                    delivered = state["phase"] == "pending"
-                    if delivered:
-                        outcome["error"] = exc
-                        state["phase"] = "delivered"
-                if delivered:
-                    done.set()
-                return
-            with phase_lock:
-                delivered = state["phase"] == "pending"
-                if delivered:
-                    outcome["sock"] = sock
-                    state["phase"] = "delivered"
-            if delivered:
-                done.set()
-                return
-            # The caller already gave up (deadline exceeded) by the time
-            # this connect finally completed -- close the now-orphaned
-            # socket instead of leaking an open, unmanaged connection.
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-        finished = done.wait(timeout=self._remaining_seconds())
-        if not finished:
-            with phase_lock:
-                # Only claim the timeout if the worker has not ALREADY
-                # delivered a result in the tiny window between wait()
-                # timing out and this thread acquiring the lock -- if it
-                # has, use that real result instead of falsely reporting
-                # a timeout.
-                still_pending = state["phase"] == "pending"
-                if still_pending:
-                    state["phase"] = "abandoned_by_caller"
-            if still_pending:
+        worker = _worker if _worker is not None else _resolve_addrinfo_worker
+        parent_conn, child_conn = _MP_CONTEXT.Pipe(duplex=False)
+        process = _MP_CONTEXT.Process(target=worker, args=(host, port, child_conn), daemon=True)
+        process.start()
+        # This process's own reference to the child's write end must be
+        # closed too (mirrors the standard os.pipe()-after-fork pattern)
+        # -- otherwise it stays open here even after the child process
+        # itself exits/is killed, which is unnecessary fd/handle upkeep
+        # this method has no use for (it never waits on pipe EOF as a
+        # signal; the process's own lifecycle -- start/join/terminate --
+        # is what's tracked and bounded, not the pipe's state).
+        child_conn.close()
+        try:
+            if parent_conn.poll(self._remaining_seconds()):
+                status, payload = parent_conn.recv()
+            else:
                 self._fired.set()
-                logger.warning("imap_session_deadline_exceeded_before_connect")
-                raise TimeoutError(
-                    "IMAP session deadline exceeded before a connection could be established"
-                )
+                logger.warning("imap_session_deadline_exceeded_during_dns_resolution")
+                self._terminate_and_confirm_dead(process)
+                raise TimeoutError("IMAP session deadline exceeded before DNS resolution completed")
+        finally:
+            parent_conn.close()
+            # Defensive: normally already exited after sending its
+            # result, but if it somehow didn't (e.g. sent then hung
+            # before its own natural exit), never leave it running past
+            # this method returning.
+            if process.is_alive():
+                self._terminate_and_confirm_dead(process)
 
-        if "error" in outcome:
-            raise outcome["error"]  # type: ignore[misc]
-        sock = outcome["sock"]
-        assert isinstance(sock, socket.socket)
-        return sock
+        if status == "error":
+            raise payload
+        assert status == "ok"
+        return payload
+
+    def _terminate_and_confirm_dead(self, process: multiprocessing.Process) -> None:
+        """Terminates `process` and BLOCKS until its death is confirmed
+        -- the actual FINAL-003 correction: a worker must never merely
+        be asked to stop and then forgotten about. `.terminate()` (a
+        real OS-level SIGTERM/TerminateProcess) is escalated to
+        `.kill()` (SIGKILL, not interceptable) if the process hasn't
+        died within `_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS`.
+
+        Bounded total added latency, not just "usually fast": OS-level
+        process termination for a process blocked in a syscall (no
+        installed signal handler intercepts SIGTERM by default, and
+        `TerminateProcess` on Windows is not interceptable at all) is
+        normally observable within low milliseconds -- these join()
+        timeouts are safety-margin CEILINGS, not expected-case
+        durations. Worst case (both `.terminate()` AND the `.kill()`
+        escalation each need their full budget, itself already an
+        unusual/pathological outcome) this method adds at most
+        `2 * _WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS` of wall-clock
+        time on top of whatever the session deadline itself already
+        allowed -- a small, fixed, provably bounded constant, never
+        several seconds, regardless of how short the configured total
+        session deadline is.
+        """
+        process.terminate()
+        process.join(timeout=_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS)
+        if process.is_alive():
+            # Should be unreachable (SIGKILL/TerminateProcess cannot be
+            # blocked by user-level code) -- logged, never silently
+            # swallowed, if the OS itself somehow failed to reap it.
+            logger.warning("imap_dns_resolution_worker_still_alive_after_kill")
 
     def _force_close(self, sock: socket.socket, extra_closable: HasClose | None) -> None:
         # Codex final review: closing `extra_closable` (a
@@ -447,9 +555,13 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
     This subclass overrides `_create_socket` -- called by `IMAP4.open()`
     to produce the value assigned to `self.sock`, itself called from
     `IMAP4.__init__` BEFORE `IMAP4._connect()` runs -- to bind the
-    watchdog to the real socket at each stage as soon as it exists: the
-    raw TCP socket immediately after connecting, then the TLS-wrapped
-    socket immediately after the handshake completes (`do_handshake_on_connect=False`
+    watchdog to the real socket at each stage as soon as it exists: DNS
+    resolution first (via `ImapSessionDeadline.resolve_addrinfo_bounded`
+    -- see FINAL-003 in this module's own docstring), then the raw TCP
+    socket is registered BEFORE `connect()` is even attempted on it (so
+    a hang during connect() itself is bounded too, not just phases after
+    it succeeds), then the TLS-wrapped socket immediately after the
+    handshake completes (`do_handshake_on_connect=False`
     defers the handshake until AFTER the final socket object is
     registered, so a slow-drip peer during the handshake itself is
     bounded too -- not just the greeting/CAPABILITY/command exchange that
@@ -493,23 +605,67 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
         super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
 
     def _create_socket(self, timeout: float | None) -> socket.socket:
-        # FINAL-003: imaplib.IMAP4._create_socket does socket.getaddrinfo()
-        # (DNS resolution) followed by connect() -- see
-        # ImapSessionDeadline.run_bounded's own docstring for why that
-        # whole phase was previously completely unbounded by the session
-        # deadline (no socket exists yet for bind_socket/_force_close to
-        # act on) and how run_bounded closes that gap without spawning an
-        # abandoned resolver thread.
-        raw_sock = self._imap_deadline.run_bounded(
-            lambda: imaplib.IMAP4._create_socket(self, timeout)
-        )
-        self._imap_deadline.bind_socket(raw_sock)
-        ssl_sock = self.ssl_context.wrap_socket(
-            raw_sock, server_hostname=self.host, do_handshake_on_connect=False
-        )
-        self._imap_deadline.bind_socket(ssl_sock)
-        ssl_sock.do_handshake()
-        return ssl_sock
+        # FINAL-003 (Astra R5A, corrected): reimplements
+        # imaplib.IMAP4._create_socket / socket.create_connection's own
+        # getaddrinfo()-then-connect() logic (rather than delegating to
+        # either) so DNS resolution can be bounded via a genuinely
+        # terminable child process (see
+        # ImapSessionDeadline.resolve_addrinfo_bounded's own docstring)
+        # while the TCP connect below stays in THIS process, using the
+        # same bind_socket-before-connect + _force_close mechanism
+        # already proven for the TLS handshake/greeting phases -- a real
+        # socket object exists here from the moment it's created, so a
+        # hang during connect() itself is bounded by the EXISTING
+        # mechanism, sharing the same absolute total-session deadline;
+        # no new primitive or separate sub-budget is needed for this
+        # phase.
+        #
+        # sys.audit parity: imaplib.IMAP4._create_socket calls this
+        # exact audit event before connecting -- preserved here since
+        # this method no longer delegates to it at all.
+        sys.audit("imaplib.open", self, self.host, self.port)
+
+        host = None if not self.host else self.host
+        addrinfo = self._imap_deadline.resolve_addrinfo_bounded(host, self.port)
+
+        last_exc: OSError | None = None
+        for family, socktype, proto, _canonname, sockaddr in addrinfo:
+            if self._imap_deadline.exceeded:
+                # The deadline already fired (e.g. while resolving, or
+                # while a PRIOR candidate's connect() attempt was
+                # force-closed below) -- every further candidate would
+                # just be force-closed the instant it's registered (see
+                # bind_socket's own already-fired handling), so stop
+                # here instead of needlessly cycling through the rest.
+                break
+            raw_sock: socket.socket | None = None
+            try:
+                raw_sock = socket.socket(family, socktype, proto)
+                if timeout is not None:
+                    raw_sock.settimeout(timeout)
+                # Registered BEFORE connect() is attempted -- exactly
+                # the same ordering already used for the TLS handshake
+                # below, so a hang inside connect() itself is bounded by
+                # the existing force-close mechanism, not just reads
+                # after the socket is already established.
+                self._imap_deadline.bind_socket(raw_sock)
+                raw_sock.connect(sockaddr)
+            except OSError as exc:
+                last_exc = exc
+                if raw_sock is not None:
+                    raw_sock.close()
+                continue
+
+            ssl_sock = self.ssl_context.wrap_socket(
+                raw_sock, server_hostname=self.host, do_handshake_on_connect=False
+            )
+            self._imap_deadline.bind_socket(ssl_sock)
+            ssl_sock.do_handshake()
+            return ssl_sock
+
+        if last_exc is not None:
+            raise last_exc
+        raise OSError(f"getaddrinfo({self.host!r}) returned no usable address")
 
     def open(
         self, host: str = "", port: int = imaplib.IMAP4_SSL_PORT, timeout: float | None = None
