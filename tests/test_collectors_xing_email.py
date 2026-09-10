@@ -94,10 +94,32 @@ class FakeImapClient:
     uses. No real socket/network I/O anywhere in this class.
     """
 
-    def __init__(self, messages: list[bytes]) -> None:
+    def __init__(
+        self,
+        messages: list[bytes],
+        *,
+        raise_oserror_on_message_set: set[bytes] | None = None,
+        uid_validity: int = 1,
+    ) -> None:
         self._messages = messages
+        # Codex gate follow-up (Astra R4A HIGH): a fetch for any
+        # message_set in this set raises OSError -- lets a test
+        # deterministically simulate a transport-level failure
+        # (including "the deadline watchdog force-closed the socket
+        # mid-FETCH") without any real socket/timing involved.
+        self._raise_oserror_on_message_set = raise_oserror_on_message_set or set()
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): this fake
+        # uses UID == 1-based list index throughout (both `.uid("search",
+        # ...)` and `.uid("fetch", ...)` delegate straight to the
+        # existing `search`/`fetch` below) -- realistic enough to
+        # exercise the real collector's UID-based scan-position logic
+        # while keeping every existing byte-string assertion in this
+        # file (e.g. `fetch_calls == [b"1", b"1"]`) meaningful unchanged.
+        self.uid_validity = uid_validity
         self.select_calls: list[tuple[str, bool]] = []
         self.search_calls: list[tuple[str, ...]] = []
+        self.fetch_calls: list = []
+        self.status_calls: list[tuple[str, str]] = []
         self.closed = False
         self.logged_out = False
 
@@ -108,15 +130,36 @@ class FakeImapClient:
         self.select_calls.append((mailbox, readonly))
         return ("OK", [str(len(self._messages)).encode()])
 
+    def status(self, mailbox: str, names: str) -> tuple[str, list[bytes]]:
+        self.status_calls.append((mailbox, names))
+        line = f"INBOX (UIDVALIDITY {self.uid_validity})".encode()
+        return ("OK", [line])
+
     def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
         self.search_calls.append(criteria)
         numbers = b" ".join(str(i + 1).encode() for i in range(len(self._messages)))
         return ("OK", [numbers])
 
     def fetch(self, message_set, message_parts: str) -> tuple[str, list]:
+        self.fetch_calls.append(message_set)
+        if message_set in self._raise_oserror_on_message_set:
+            raise OSError("simulated transport failure")
         index = int(message_set) - 1
         raw = self._messages[index]
         return ("OK", [(b"1 (RFC822 {%d}" % len(raw), raw)])
+
+    def uid(self, command: str, *args) -> tuple[str, list]:
+        if command == "search":
+            # args = (charset, criteria...) -- same shape `search` takes.
+            return self.search(*args)
+        if command == "fetch":
+            # Deliberately NOT decoding `message_set` -- it stays exactly
+            # the bytes the production collector passed (e.g. b"1"), so
+            # `fetch_calls`/`raise_oserror_on_message_set` behave
+            # identically to before this fake gained UID support.
+            message_set, message_parts = args
+            return self.fetch(message_set, message_parts)
+        raise NotImplementedError(f"FakeImapClient.uid: unsupported command {command!r}")
 
     def close(self) -> tuple[str, list[bytes]]:
         self.closed = True
@@ -695,6 +738,69 @@ class _AlreadyExceededDeadline:
         return False
 
 
+class _ExceedsAfterFirstCheckDeadline:
+    """NEW-001 (Astra R4A): stands in for a deadline that has NOT yet
+    fired for the loop's first iteration, but HAS by the second -- lets
+    "one message batch completed, then the deadline fires before the
+    next" be tested deterministically. `.exceeded` is read once per loop
+    iteration (top-of-loop check) plus once more in the post-loop check,
+    so returning False only for the very first read and True for every
+    read after that reproduces exactly "message 1 was already in
+    flight/done when time ran out for message 2".
+    """
+
+    def __init__(self, _total_seconds: float) -> None:
+        self._check_count = 0
+
+    def bind_socket(self, sock, *, extra_closable=None) -> None:
+        pass
+
+    @property
+    def exceeded(self) -> bool:
+        self._check_count += 1
+        return self._check_count > 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _make_exceeds_after_n_checks_deadline_class(threshold: int):
+    """Codex gate follow-up (Astra R4A HIGH): generalizes
+    `_ExceedsAfterFirstCheckDeadline` to an arbitrary threshold -- lets a
+    test place the deadline's transition to "exceeded" at an exact call
+    number, e.g. to prove "message 1's own top-of-loop check reads
+    False, message 2's ALSO reads False (so a fetch is genuinely
+    attempted), and only the except-handler's read -- checked after a
+    simulated mid-FETCH OSError -- reads True". Returns a class (not an
+    instance) so it can directly replace `ImapSessionDeadline` via
+    monkeypatch, exactly like `_AlreadyExceededDeadline`/
+    `_ExceedsAfterFirstCheckDeadline` above.
+    """
+
+    class _Deadline:
+        def __init__(self, _total_seconds: float) -> None:
+            self._check_count = 0
+
+        def bind_socket(self, sock, *, extra_closable=None) -> None:
+            pass
+
+        @property
+        def exceeded(self) -> bool:
+            self._check_count += 1
+            return self._check_count > threshold
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    return _Deadline
+
+
 class TestSessionDeadlineWiring:
     def test_connect_passes_a_verifying_ssl_context_to_deadline_imap4ssl(self, monkeypatch):
         """AUD-001 must remain true for the path production actually uses
@@ -778,13 +884,21 @@ class TestSessionDeadlineWiring:
         assert fake_client.logged_out is True
 
     @pytest.mark.asyncio
-    async def test_fetch_raises_xing_connection_error_once_the_session_deadline_is_exceeded(
-        self, monkeypatch
-    ):
-        """If the total session deadline has already fired by the time the
-        per-message fetch loop runs, the sync must stop and raise rather
-        than keep attempting fetches on a connection whose socket has
-        already been force-closed."""
+    async def test_fetch_returns_empty_result_when_deadline_already_exceeded(self, monkeypatch):
+        """NEW-001 (Astra R4A): if the total session deadline has already
+        fired by the time the per-message fetch loop runs, the sync must
+        stop -- but must NOT raise. It returns no batches (nothing could
+        complete) and sets `collector.deadline_exceeded = True`, never a
+        discarded/opaque exception. A prior version of this collector
+        raised `XingConnectionError` here; that silently discarded any
+        work that DID complete before the deadline in the general case
+        (see the partial-batch test below) -- even in this
+        zero-messages-completed edge case, an explicit flagged empty
+        result is more honest than an exception, since the caller
+        (app.services.collector_runner.run_xing) can now distinguish
+        "genuinely nothing got done, time ran out" from a real
+        connection/auth failure.
+        """
         body = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
         raw = _build_email(XING_SENDER, "3 neue Stellenangebote für Python", body)
         fake_client = FakeImapClient([raw])
@@ -798,9 +912,237 @@ class TestSessionDeadlineWiring:
             app_password="app-password",
         )
 
-        with pytest.raises(XingConnectionError):
-            await collector.fetch()
+        jobs = await collector.fetch()
 
-        # Connection cleanup must still run even though the sync aborted.
+        assert jobs == []
+        assert collector.deadline_exceeded is True
+
+        # Connection cleanup must still run even though the fetch loop
+        # never got to run.
         assert fake_client.closed is True
         assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_persists_completed_batches_when_deadline_fires_mid_loop(self, monkeypatch):
+        """NEW-001 (Astra R4A) core regression: two digest messages are
+        due; the deadline fires only AFTER the first one has already
+        completed fetch+parse. That completed batch's jobs must still
+        come back -- never discarded merely because the SECOND message's
+        turn never arrived before time ran out.
+        """
+        body1 = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
+        body2 = _digest_body(BLOCK_WITH_ALL_OPTIONAL_FIELDS)
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            body1,
+            message_id="<first@mail.xing.com>",
+        )
+        raw2 = _build_email(
+            XING_SENDER,
+            "5 neue Stellenangebote für Python",
+            body2,
+            message_id="<second@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1, raw2])
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(
+            xing_email_module, "ImapSessionDeadline", _ExceedsAfterFirstCheckDeadline
+        )
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        batches = await collector.fetch_message_batches()
+
+        assert len(batches) == 1
+        assert batches[0].message_id == "<first@mail.xing.com>"
+        assert len(batches[0].jobs) == 1
+        assert collector.deadline_exceeded is True
+        # Message 2 was never even attempted -- the loop broke before it.
+        # Message 1 sees TWO fetch calls: the cheap Message-ID pre-check
+        # (Codex gate follow-up) followed by the real full-body fetch.
+        assert fake_client.fetch_calls == [b"1", b"1"]
+
+        # Connection cleanup must still run.
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_next_cycle_retries_only_the_deadline_skipped_message(self, monkeypatch):
+        """NEW-001 (Astra R4A): after a deadline-partial fetch, the NEXT
+        cycle must not re-fetch (and so must not risk duplicating) the
+        message that already completed and was acknowledged -- only the
+        message the deadline left behind is attempted again.
+        `is_message_processed` is exactly the existing acknowledgment
+        mechanism (app.db.repositories.mark_message_processed, driven by
+        app.services.collector_runner.run_xing after every job in a
+        batch persists); this proves the NEW-001 fix composes with it
+        correctly rather than needing a new idempotency mechanism.
+        """
+        body1 = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
+        body2 = _digest_body(BLOCK_WITH_ALL_OPTIONAL_FIELDS)
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            body1,
+            message_id="<first@mail.xing.com>",
+        )
+        raw2 = _build_email(
+            XING_SENDER,
+            "5 neue Stellenangebote für Python",
+            body2,
+            message_id="<second@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1, raw2])
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # No deadline pressure this time -- simulates the retry cycle,
+        # with message 1 now reported as already-acknowledged (persisted
+        # by the prior, deadline-truncated run).
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+            is_message_processed=lambda message_id: message_id == "<first@mail.xing.com>",
+        )
+
+        batches = await collector.fetch_message_batches()
+
+        assert len(batches) == 1
+        assert batches[0].message_id == "<second@mail.xing.com>"
+        assert collector.deadline_exceeded is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_batches_when_deadline_fires_mid_fetch(self, monkeypatch):
+        """Codex gate follow-up (Astra R4A HIGH): unlike the
+        between-iterations case above, here the deadline fires WHILE a
+        FETCH is already blocked in flight -- the watchdog force-closes
+        the socket mid-call, so `client.fetch(...)` itself raises
+        OSError rather than the top-of-loop `.exceeded` check catching
+        it cleanly beforehand. Message 1 must still complete normally,
+        and message 1's batch must still be returned -- never discarded
+        merely because message 2's in-flight FETCH is what actually
+        observed the deadline.
+        """
+        body1 = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            body1,
+            message_id="<first@mail.xing.com>",
+        )
+        raw2 = _build_email(
+            XING_SENDER,
+            "5 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITH_ALL_OPTIONAL_FIELDS),
+            message_id="<second@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1, raw2], raise_oserror_on_message_set={b"2"})
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # Both messages' own top-of-loop checks read False (a fetch is
+        # genuinely attempted for each) -- only the except-handler's
+        # read, right after message 2's simulated mid-FETCH OSError,
+        # reads True.
+        monkeypatch.setattr(
+            xing_email_module,
+            "ImapSessionDeadline",
+            _make_exceeds_after_n_checks_deadline_class(2),
+        )
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        batches = await collector.fetch_message_batches()
+
+        assert len(batches) == 1
+        assert batches[0].message_id == "<first@mail.xing.com>"
+        assert collector.deadline_exceeded is True
+
+    @pytest.mark.asyncio
+    async def test_genuine_transport_failure_without_deadline_still_raises(self, monkeypatch):
+        """Codex gate follow-up (Astra R4A HIGH): a real, unexpected
+        connection failure mid-FETCH -- NOT caused by the session
+        deadline -- must still raise `XingConnectionError` normally,
+        exactly like before either NEW-001 or this follow-up fix. The
+        deadline-preservation behavior above must never mask a genuine
+        transport/protocol failure as a harmless partial result.
+        """
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS),
+            message_id="<first@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1], raise_oserror_on_message_set={b"1"})
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # A real ImapSessionDeadline (never fires within this fast test)
+        # -- `.exceeded` stays False throughout, so the OSError below is
+        # unambiguously a genuine failure, not a deadline artifact.
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingConnectionError):
+            await collector.fetch_message_batches()
+
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_already_processed_message_skips_full_body_fetch(self, monkeypatch):
+        """Codex gate follow-up (Astra R4A HIGH, starvation): an
+        already-acknowledged message must be recognized via the cheap
+        Message-ID pre-check and skipped WITHOUT ever transferring its
+        full RFC822 body -- otherwise a backlog dominated by
+        already-processed messages would spend its entire per-run fetch
+        budget re-transferring their full bodies before ever reaching a
+        genuinely new one, starving it. Message 1 (already processed)
+        must see exactly ONE fetch call (the header pre-check); message
+        2 (new) must see two (pre-check + full body).
+        """
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS),
+            message_id="<first@mail.xing.com>",
+        )
+        raw2 = _build_email(
+            XING_SENDER,
+            "5 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITH_ALL_OPTIONAL_FIELDS),
+            message_id="<second@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1, raw2])
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+            imap_client=fake_client,
+            is_message_processed=lambda message_id: message_id == "<first@mail.xing.com>",
+        )
+
+        batches = await collector.fetch_message_batches()
+
+        assert len(batches) == 1
+        assert batches[0].message_id == "<second@mail.xing.com>"
+        message_1_fetch_calls = [call for call in fake_client.fetch_calls if call == b"1"]
+        message_2_fetch_calls = [call for call in fake_client.fetch_calls if call == b"2"]
+        assert len(message_1_fetch_calls) == 1, (
+            "an already-processed message must never reach the full-body fetch"
+        )
+        assert len(message_2_fetch_calls) == 2

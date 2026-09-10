@@ -110,6 +110,17 @@ class GmailThreadDetail(GmailThread):
 class GmailSyncResult(BaseModel):
     """Structured summary of one POST /gmail/sync run. Never includes any
     message content — only counts (spec section 14).
+
+    `deadline_exceeded` (NEW-001, Astra R4A): True if the IMAP session's
+    total wall-clock deadline (AUD-005) fired before every candidate
+    message could be fetched this run — see
+    `app.providers.email.base.GmailFetchResult.deadline_exceeded`.
+    `fetched`/`created`/etc. still faithfully count whatever DID complete
+    before that happened (never discarded); this flag exists so a caller
+    can tell "everything currently due was handled" apart from "time ran
+    out with more work still pending" even when `failed == 0` for the
+    messages that were attempted — the two are not the same outcome and
+    must not both be reported as unqualified success.
     """
 
     fetched: int
@@ -117,3 +128,4 @@ class GmailSyncResult(BaseModel):
     duplicates: int
     skipped: int
     failed: int
+    deadline_exceeded: bool = False

@@ -61,7 +61,7 @@ def session_factory(tmp_path):
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-async def _noop_collector(db, settings, *, touched_jobs=None):
+async def _noop_collector(db, settings, *, touched_jobs=None, is_lease_lost=None):
     return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
 
@@ -900,6 +900,52 @@ class TestGmailSyncCountsFailuresHonestly:
             assert result["status"] == "ok"
             assert result["counters"]["fetched"] == 10
             assert result["counters"]["failed"] == 0
+        finally:
+            db.close()
+
+    def test_deadline_exceeded_with_zero_failures_is_partial_not_ok(
+        self, session_factory, monkeypatch
+    ):
+        """NEW-001 (Astra R4A): every message that WAS fetched persisted
+        cleanly (failed == 0), but the IMAP session deadline fired before
+        the mailbox could be fully drained -- this must never be reported
+        as "ok", since more work is still pending for this account and
+        claiming full success would hide that.
+        """
+
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            if mailbox == settings.gmail_mailbox:
+                return GmailSyncResult(
+                    fetched=5, created=5, duplicates=0, skipped=0, failed=0, deadline_exceeded=True
+                )
+            return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "partial"
+            assert result["counters"]["failed"] == 0
+            assert result["counters"]["deadline_exceeded"] is True
+        finally:
+            db.close()
+
+    def test_deadline_not_exceeded_and_zero_failures_still_ok(self, session_factory, monkeypatch):
+        """Sanity counterpart to the above -- the new deadline_exceeded
+        check must not accidentally downgrade a genuinely complete run.
+        """
+
+        async def _fake_sync_mailbox(db, settings, account_key, mailbox, *, trusted_outbound):
+            return GmailSyncResult(fetched=1, created=1, duplicates=0, skipped=0, failed=0)
+
+        monkeypatch.setattr("app.services.automation_gmail.sync_mailbox", _fake_sync_mailbox)
+
+        db = session_factory()
+        try:
+            result = _run_gmail_sync(db, _settings())
+            assert result["status"] == "ok"
+            assert result["counters"]["deadline_exceeded"] is False
         finally:
             db.close()
 

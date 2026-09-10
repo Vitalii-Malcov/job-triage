@@ -52,6 +52,7 @@ class FakeImapClient:
         search_uids: list[int] | None = None,
         size_override: dict[int, int] | None = None,
         internal_dates: dict[int, str] | None = None,
+        raise_oserror_on_uid: set[int] | None = None,
     ) -> None:
         self._messages = messages or {}
         self._uid_validity = uid_validity
@@ -61,6 +62,12 @@ class FakeImapClient:
         self._search_uids = search_uids
         self._size_override = size_override or {}
         self._internal_dates = internal_dates or {}
+        # Codex gate follow-up (Astra R4A MEDIUM): a fetch for any UID in
+        # this set raises OSError -- lets a test deterministically
+        # simulate a transport-level failure (including "the deadline
+        # watchdog force-closed the socket mid-FETCH") without any real
+        # socket/timing involved.
+        self._raise_oserror_on_uid = raise_oserror_on_uid or set()
         self.select_calls: list[tuple[str, bool]] = []
         self.uid_calls: list[tuple[str, tuple]] = []
         self.closed = False
@@ -95,6 +102,8 @@ class FakeImapClient:
             if "RFC822.SIZE" in item_spec:
                 size = self._size_override.get(uid, len(raw))
                 return ("OK", [f"{uid} (UID {uid} RFC822.SIZE {size})".encode()])
+            if uid in self._raise_oserror_on_uid:
+                raise OSError("simulated transport failure")
             internal_date = self._internal_dates.get(uid)
             if internal_date is not None:
                 header = b'%d (UID %d INTERNALDATE "%s" BODY[] {%d}' % (
@@ -1265,6 +1274,67 @@ class _AlreadyExceededDeadline:
         return False
 
 
+class _ExceedsAfterFirstCheckDeadline:
+    """NEW-001 (Astra R4A): stands in for a deadline that has NOT yet
+    fired for the loop's first iteration, but HAS by the second -- lets
+    "one message completed, then the deadline fires before the next"
+    be tested deterministically. `.exceeded` is read once per loop
+    iteration (top-of-loop check) plus once more in the post-loop check,
+    so returning False only for the very first read and True for every
+    read after that reproduces exactly "UID 1 was already in flight/done
+    when time ran out for UID 2".
+    """
+
+    def __init__(self, _total_seconds: float) -> None:
+        self._check_count = 0
+
+    def bind_socket(self, sock, *, extra_closable=None) -> None:
+        pass
+
+    @property
+    def exceeded(self) -> bool:
+        self._check_count += 1
+        return self._check_count > 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _make_exceeds_after_n_checks_deadline_class(threshold: int):
+    """Codex gate follow-up (Astra R4A MEDIUM): generalizes
+    `_ExceedsAfterFirstCheckDeadline` to an arbitrary threshold -- lets a
+    test place the deadline's transition to "exceeded" at an exact call
+    number, e.g. to prove "UID 1's own top-of-loop check reads False,
+    UID 2's ALSO reads False (so a fetch is genuinely attempted), and
+    only the except-handler's read -- checked after a simulated
+    mid-FETCH OSError -- reads True". Returns a class (not an instance)
+    so it can directly replace `ImapSessionDeadline` via monkeypatch.
+    """
+
+    class _Deadline:
+        def __init__(self, _total_seconds: float) -> None:
+            self._check_count = 0
+
+        def bind_socket(self, sock, *, extra_closable=None) -> None:
+            pass
+
+        @property
+        def exceeded(self) -> bool:
+            self._check_count += 1
+            return self._check_count > threshold
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    return _Deadline
+
+
 class TestSessionDeadlineWiring:
     def test_connect_passes_a_verifying_ssl_context_to_deadline_imap4ssl(self, monkeypatch):
         """AUD-001 must remain true for the path production actually uses
@@ -1332,13 +1402,22 @@ class TestSessionDeadlineWiring:
         assert fake_client.logged_out is True
 
     @pytest.mark.asyncio
-    async def test_fetch_raises_gmail_connection_error_once_the_session_deadline_is_exceeded(
+    async def test_fetch_returns_empty_partial_result_when_deadline_already_exceeded(
         self, monkeypatch
     ):
-        """If the total session deadline has already fired by the time the
-        per-UID fetch loop runs, the sync must stop and raise rather than
-        keep attempting fetches on a connection whose socket has already
-        been force-closed."""
+        """NEW-001 (Astra R4A): if the total session deadline has already
+        fired by the time the per-UID fetch loop runs, the sync must stop
+        -- but must NOT raise. It returns a `GmailFetchResult` with no
+        messages (nothing could complete) and `deadline_exceeded=True`,
+        never a discarded/opaque exception. A prior version of this
+        provider raised `GmailConnectionError` here; that silently
+        discarded any work that DID complete before the deadline in the
+        general case (see the partial-batch test below) -- even in this
+        zero-messages-completed edge case, an explicit partial result is
+        more honest than an exception, since the caller
+        (app.services.gmail_inbox) can now distinguish "genuinely nothing
+        got done, time ran out" from a real connection/auth failure.
+        """
         raw = _build_email(plaintext_body="hi")
         fake_client = FakeImapClient(messages={1: raw})
 
@@ -1346,9 +1425,145 @@ class TestSessionDeadlineWiring:
         monkeypatch.setattr(gmail_imap_module, "ImapSessionDeadline", _AlreadyExceededDeadline)
         provider = _provider(client=None)
 
+        result = await provider.fetch()
+
+        assert result.messages == ()
+        assert result.deadline_exceeded is True
+
+        # Connection cleanup must still run even though the fetch loop
+        # never got to run.
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_persists_completed_messages_when_deadline_fires_mid_loop(
+        self, monkeypatch
+    ):
+        """NEW-001 (Astra R4A) core regression: two messages are due; the
+        deadline fires only AFTER the first one has already completed
+        fetch+parse. That completed message must still come back in
+        `result.messages` -- never discarded merely because the SECOND
+        message's turn never arrived before time ran out.
+        """
+        raw1 = _build_email(plaintext_body="first", message_id="<msg1@example.com>")
+        raw2 = _build_email(plaintext_body="second", message_id="<msg2@example.com>")
+        fake_client = FakeImapClient(messages={1: raw1, 2: raw2})
+
+        monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(
+            gmail_imap_module, "ImapSessionDeadline", _ExceedsAfterFirstCheckDeadline
+        )
+        provider = _provider(client=None)
+
+        result = await provider.fetch()
+
+        assert len(result.messages) == 1
+        assert result.messages[0].body_plain == "first"
+        assert result.deadline_exceeded is True
+        # UID 2 was never even attempted -- the loop broke before it.
+        fetch_uids = [args[0] for command, args in fake_client.uid_calls if command == "fetch"]
+        assert b"2" not in fetch_uids
+
+        # Connection cleanup must still run.
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_next_cycle_retries_only_the_deadline_skipped_uid(self, monkeypatch):
+        """NEW-001 (Astra R4A): after a deadline-partial fetch, the NEXT
+        sync must not re-fetch (and so must not risk duplicating) the
+        message that already completed and was persisted -- only the
+        UID the deadline left behind is attempted again. `get_known_uids`
+        is exactly the existing GMAIL-005/012 starvation-protection
+        closure `app.services.gmail_sync.make_gmail_provider` binds to
+        already-persisted UIDs; this proves the NEW-001 fix composes with
+        it correctly rather than needing a new idempotency mechanism.
+        """
+        raw1 = _build_email(plaintext_body="first", message_id="<msg1@example.com>")
+        raw2 = _build_email(plaintext_body="second", message_id="<msg2@example.com>")
+        fake_client = FakeImapClient(messages={1: raw1, 2: raw2})
+
+        monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # No deadline pressure this time -- simulates the retry cycle,
+        # with UID 1 now reported as already-known (persisted by the
+        # prior, deadline-truncated run).
+        provider = _provider(client=None, get_known_uids=lambda _uid_validity, _uids: {1})
+
+        result = await provider.fetch()
+
+        assert len(result.messages) == 1
+        assert result.messages[0].body_plain == "second"
+        fetch_uids = [args[0] for command, args in fake_client.uid_calls if command == "fetch"]
+        assert b"1" not in fetch_uids
+        assert b"2" in fetch_uids
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_messages_when_deadline_fires_mid_fetch(self, monkeypatch):
+        """Codex gate follow-up (Astra R4A MEDIUM): unlike the
+        between-iterations case above, here the deadline fires WHILE a
+        FETCH is already blocked in flight -- the watchdog force-closes
+        the socket mid-call, so `client.uid("fetch", ...)` itself raises
+        OSError rather than the top-of-loop `.exceeded` check catching
+        it cleanly beforehand. UID 1 must still complete normally, and
+        UID 1's message must still be returned -- never discarded merely
+        because UID 2's in-flight FETCH is what actually observed the
+        deadline. Critically, UID 2 must be reported as `skipped_count
+        == 0` (deadline-truncated, still pending, will be retried), NOT
+        folded into an ordinary "unparseable message" skip count -- a
+        prior version of `_fetch_one` swallowed ANY exception (including
+        OSError) as a plain skip, which happened to still preserve UID
+        1's message in this exact scenario but silently mis-classified a
+        real transport failure as "message 2 was bad" instead of "time
+        ran out" (see `test_genuine_transport_failure_without_deadline_
+        still_raises` below for the case that actually distinguishes the
+        swallowing bug on its own).
+        """
+        raw1 = _build_email(plaintext_body="first", message_id="<msg1@example.com>")
+        raw2 = _build_email(plaintext_body="second", message_id="<msg2@example.com>")
+        fake_client = FakeImapClient(messages={1: raw1, 2: raw2}, raise_oserror_on_uid={2})
+
+        monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # Both UIDs' own top-of-loop checks read False (a fetch is
+        # genuinely attempted for each) -- only the except-handler's
+        # read, right after UID 2's simulated mid-FETCH OSError, reads
+        # True.
+        monkeypatch.setattr(
+            gmail_imap_module,
+            "ImapSessionDeadline",
+            _make_exceeds_after_n_checks_deadline_class(2),
+        )
+        provider = _provider(client=None)
+
+        result = await provider.fetch()
+
+        assert len(result.messages) == 1
+        assert result.messages[0].body_plain == "first"
+        assert result.deadline_exceeded is True
+        assert result.skipped_count == 0, (
+            "UID 2 must be treated as deadline-truncated (never attempted a full "
+            "classification), never counted as an ordinary skipped/unparseable message"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_transport_failure_without_deadline_still_raises(self, monkeypatch):
+        """Codex gate follow-up (Astra R4A MEDIUM): a real, unexpected
+        connection failure mid-FETCH -- NOT caused by the session
+        deadline -- must still raise `GmailConnectionError` normally.
+        The deadline-preservation behavior above must never mask a
+        genuine transport/protocol failure as an ordinary skipped
+        message.
+        """
+        raw1 = _build_email(plaintext_body="first", message_id="<msg1@example.com>")
+        fake_client = FakeImapClient(messages={1: raw1}, raise_oserror_on_uid={1})
+
+        monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # A real ImapSessionDeadline (never fires within this fast test)
+        # -- `.exceeded` stays False throughout, so the OSError below is
+        # unambiguously a genuine failure, not a deadline artifact.
+        provider = _provider(client=None)
+
         with pytest.raises(GmailConnectionError):
             await provider.fetch()
 
-        # Connection cleanup must still run even though the sync aborted.
         assert fake_client.closed is True
         assert fake_client.logged_out is True

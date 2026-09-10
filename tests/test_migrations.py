@@ -2886,4 +2886,4 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    assert heads[0] == "aff3c7dc6349"
+    assert heads[0] == "b4f6a1c9e7d2"

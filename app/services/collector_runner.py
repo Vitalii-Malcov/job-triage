@@ -38,6 +38,7 @@ public contract, not an implementation detail of routes.py.
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -56,6 +57,11 @@ from app.db.repositories import (
     mark_message_processed,
     profile_skills,
     upsert_job,
+)
+from app.db.xing_scan_progress_repository import (
+    advance_xing_scan_progress,
+    compute_mailbox_scope,
+    get_xing_scan_progress,
 )
 from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
@@ -138,6 +144,8 @@ async def _maybe_auto_research(
     record: JobRecord,
     result: JobScore,
     budget: dict[str, int],
+    *,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> None:
     """Best-effort, opt-in company research for a just-persisted high-score job.
 
@@ -155,25 +163,71 @@ async def _maybe_auto_research(
     APPLY jobs it produces, so a large batch can't silently fan out into an
     unbounded number of research runs. Manual triggers (POST
     /jobs/{id}/research, Telegram /research) are unaffected by this budget.
+
+    Codex gate follow-up (Astra R4A, lease-loss MEDIUM): `is_lease_lost`
+    is an OPTIONAL callback (`None` for every standalone caller -- the
+    manual endpoint, Telegram bot command; only
+    `app.services.automation.run_automation_cycle` ever passes one, bound
+    to `heartbeat.lease_lost.is_set`). `run_automation_cycle`'s own
+    between-STEP checks (`_raise_if_lease_lost`) cannot see a lease lost
+    mid-way through a SINGLE step's own per-job loop -- a collector run
+    can process up to `MAX_MESSAGES_PER_SYNC`/many jobs, each potentially
+    making a real external research call, so ownership can be confirmed
+    lost partway through one step's own execution. Checked here (never
+    inside the job-scoring/persistence path itself, which stays durable
+    and idempotent either way) so a lease-lost worker stops launching NEW
+    external research calls immediately, without needing to wait for the
+    whole step to return.
     """
+    if is_lease_lost is not None and is_lease_lost():
+        return
     if not settings.company_research_auto_enabled or result.recommendation != "APPLY":
         return
     if budget["remaining"] <= 0:
         return
     budget["remaining"] -= 1
+    # NEW-002 (Astra R4A): captured as plain scalars BEFORE the call, not
+    # read from `record` inside the except block below — see that
+    # block's own comment for why.
+    job_id = record.id
+    company = record.company
     try:
         await CompanyResearchService().get_or_run(db, record, settings)
     except Exception as exc:
+        # NEW-002 (Astra R4A): a failure here (e.g. a flush/commit inside
+        # CompanyResearchService.get_or_run's own persistence calls) can
+        # leave `db` — the SAME shared session the caller uses for core
+        # job scoring/persistence — in SQLAlchemy's "pending rollback"
+        # state: any FURTHER use of `db` (the next job's
+        # score_and_persist, a later commit, even this except block's
+        # own `record.id`/`record.company` access) would then raise
+        # PendingRollbackError instead of the real, already-logged
+        # failure, silently aborting the rest of THIS collector run over
+        # what was meant to be a best-effort, isolated failure.
+        # `db.rollback()` here is always safe: `record`'s own write
+        # (app.db.repositories.upsert_job -> _finalize_job_write) already
+        # committed in an EARLIER, separate transaction before this
+        # function was ever called — this rollback can only discard
+        # whatever uncommitted work `get_or_run`'s own failed attempt
+        # left behind in the CURRENT transaction, never that
+        # already-durable job write. `job_id`/`company` were captured as
+        # plain scalars above (not read from `record` here) so this log
+        # line never touches the now-expired ORM object post-rollback.
+        db.rollback()
         logger.warning(
             "company_research_auto_run_failed job_id=%s company=%s error_type=%s",
-            record.id,
-            record.company,
+            job_id,
+            company,
             type(exc).__name__,
         )
 
 
 async def run_bundesagentur(
-    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+    db: Session,
+    settings,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> dict[str, int]:
     """Fetch + score + persist one Bundesagentur collector run.
 
@@ -195,6 +249,18 @@ async def run_bundesagentur(
     `except Exception` branch's `continue` above the touch point).
     Existing callers (the API endpoint, the Telegram bot command) omit
     this parameter entirely and see no behavior change whatsoever.
+
+    `is_lease_lost` (Codex gate follow-up, Astra R4A lease-loss MEDIUM):
+    optional kw-only callback, `None` for every standalone caller (the
+    API endpoint, the Telegram bot command) -- only
+    `app.services.automation.run_automation_cycle` passes one. Checked
+    before each job's auto-research/Telegram-notification calls (never
+    before its own scoring/persistence, which stays durable and
+    idempotent regardless of lease ownership) so a worker that has
+    already confirmed it lost the automation lease stops launching NEW
+    external side-effect calls immediately, without waiting for this
+    whole run to return. See `_maybe_auto_research`'s own docstring for
+    the full rationale.
     """
     if not is_api_key_configured(settings.bundesagentur_api_key):
         raise CollectorNotConfiguredError(
@@ -307,7 +373,9 @@ async def run_bundesagentur(
                 )
             )
 
-        await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+        await _maybe_auto_research(
+            db, settings, job_record, result, auto_research_budget, is_lease_lost=is_lease_lost
+        )
 
         if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
             # Notification delivery is best-effort orchestration on top of
@@ -315,23 +383,34 @@ async def run_bundesagentur(
             # affect created/updated/failed counts or abort the run.
             if notified_count > 0:
                 await asyncio.sleep(1)
-            try:
-                sent = await notifier.send_job(job, result)
-            except Exception as exc:
-                logger.warning(
-                    "bundesagentur_notification_error title=%s company=%s error_type=%s",
-                    job.title,
-                    job.company,
-                    type(exc).__name__,
-                )
-            else:
-                if not sent:
+            # Codex gate follow-up (Astra R4A lease-loss MEDIUM, take 2):
+            # rechecked HERE, immediately before send_job() -- covers both
+            # "lease lost during the pacing sleep above" (the bug: the
+            # previous version checked is_lease_lost() only BEFORE that
+            # `await asyncio.sleep(1)`, so a lease lost during the sleep
+            # still let send_job() run) and, when no sleep happened at
+            # all, the ordinary immediate case. See
+            # `_maybe_auto_research`'s own docstring for the full
+            # rationale (`is_lease_lost` is None for every standalone
+            # caller, so this is always a no-op there).
+            if is_lease_lost is None or not is_lease_lost():
+                try:
+                    sent = await notifier.send_job(job, result)
+                except Exception as exc:
                     logger.warning(
-                        "bundesagentur_notification_failed title=%s company=%s",
+                        "bundesagentur_notification_error title=%s company=%s error_type=%s",
                         job.title,
                         job.company,
+                        type(exc).__name__,
                     )
-            notified_count += 1
+                else:
+                    if not sent:
+                        logger.warning(
+                            "bundesagentur_notification_failed title=%s company=%s",
+                            job.title,
+                            job.company,
+                        )
+                notified_count += 1
 
     logger.info(
         "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
@@ -352,14 +431,19 @@ async def run_bundesagentur(
 
 
 async def run_xing(
-    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+    db: Session,
+    settings,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> dict[str, int]:
     """Fetch + score + persist one XING mailbox collector run.
 
     Shared by POST /collectors/xing/run, the Telegram control center's
     `/run xing` command, and Stage 8A's automation orchestrator — see
     `run_bundesagentur` above for the same rationale, including
-    `touched_jobs`'s exact semantics (S8C-POOL-001).
+    `touched_jobs`'s exact semantics (S8C-POOL-001) and `is_lease_lost`'s
+    (Codex gate follow-up, Astra R4A lease-loss MEDIUM).
     """
     if not is_configured(settings.xing_mailbox_username) or not is_configured(
         settings.xing_mailbox_app_password
@@ -369,6 +453,37 @@ async def run_xing(
             "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
         )
 
+    # Codex gate follow-up (Astra R4A MEDIUM, starvation): the persisted
+    # scan watermark from the LAST run -- see
+    # app.db.models.XingScanProgressRecord's docstring. `scan_progress`
+    # may be None (brand-new installation) or have both fields unset
+    # (never successfully advanced yet); either way `XingEmailCollector`
+    # treats that identically to "scan everything in the search window",
+    # same as before this fix existed.
+    # Codex gate follow-up (Astra R4A MEDIUM, mailbox scope): scopes the
+    # watermark row to THIS configured mailbox -- see
+    # `compute_mailbox_scope`'s own docstring for why `source="xing"`
+    # alone is not a safe key (two different mailboxes can coincidentally
+    # share a `UIDVALIDITY`).
+    mailbox_scope = compute_mailbox_scope(
+        settings.xing_mailbox_imap_host,
+        settings.xing_mailbox_imap_port,
+        settings.xing_mailbox_username,
+    )
+    scan_progress = get_xing_scan_progress(db, mailbox_scope=mailbox_scope)
+    # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar capture):
+    # captured HERE, as a plain scalar, immediately after the read and
+    # BEFORE any of this run's persistence commits below (score_and_persist,
+    # mark_message_processed, ...). `scan_progress` is a SQLAlchemy ORM
+    # object bound to `db` -- under the default `expire_on_commit=True`
+    # session behavior, every one of those commits expires its attributes,
+    # so a LATE `scan_progress.uid_validity` access would silently
+    # re-SELECT the row's CURRENT (possibly already-changed-by-another-
+    # writer) state instead of the epoch this run actually observed at
+    # start -- defeating the whole point of `advance_xing_scan_progress`'s
+    # CAS baseline. `scan_progress.uid_validity` must never be read again
+    # after this point; every later use goes through this saved scalar.
+    observed_uid_validity = scan_progress.uid_validity if scan_progress is not None else None
     collector = XingEmailCollector(
         imap_host=settings.xing_mailbox_imap_host,
         imap_port=settings.xing_mailbox_imap_port,
@@ -379,6 +494,8 @@ async def run_xing(
         # passed as a constructor `db` param, so the collector itself stays
         # decoupled from SQLAlchemy — see XingEmailCollector's docstring.
         is_message_processed=lambda message_id: is_message_processed(db, "xing", message_id),
+        scan_from_uid=scan_progress.confirmed_upto_uid if scan_progress is not None else None,
+        expected_uid_validity=observed_uid_validity,
     )
 
     message_batches = await collector.fetch_message_batches()
@@ -398,6 +515,13 @@ async def run_xing(
     failed_count = 0
     notified_count = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
+    # Codex gate follow-up (Astra R4A MEDIUM, starvation): per-batch
+    # persistence outcome, keyed by the batch's own IMAP UID -- combined
+    # with `collector.confirmed_uids` below to compute the new
+    # contiguous confirmed-handled prefix once every batch has been
+    # attempted. Only a batch whose `mark_message_processed` actually ran
+    # (i.e. every job in it persisted) counts as "handled" here.
+    batch_uid_outcomes: dict[int, bool] = {}
     for batch in message_batches:
         batch_failed = False
         for job in batch.jobs:
@@ -436,7 +560,14 @@ async def run_xing(
                     )
                 )
 
-            await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+            await _maybe_auto_research(
+                db,
+                settings,
+                job_record,
+                result,
+                auto_research_budget,
+                is_lease_lost=is_lease_lost,
+            )
 
             if (
                 result.recommendation == "APPLY"
@@ -447,34 +578,101 @@ async def run_xing(
                 # persistence and must not affect counts or abort the run.
                 if notified_count > 0:
                     await asyncio.sleep(1)
-                try:
-                    sent = await notifier.send_job(job, result)
-                except Exception as exc:
-                    logger.warning(
-                        "xing_notification_error title=%s company=%s error_type=%s",
-                        job.title,
-                        job.company,
-                        type(exc).__name__,
-                    )
-                else:
-                    if not sent:
+                # Codex gate follow-up (Astra R4A lease-loss MEDIUM, take
+                # 2): see run_bundesagentur's identical, rechecked-right-
+                # before-send_job() guard -- fixes the same "lost during
+                # the pacing sleep" gap here too.
+                if is_lease_lost is None or not is_lease_lost():
+                    try:
+                        sent = await notifier.send_job(job, result)
+                    except Exception as exc:
                         logger.warning(
-                            "xing_notification_failed title=%s company=%s",
+                            "xing_notification_error title=%s company=%s error_type=%s",
                             job.title,
                             job.company,
+                            type(exc).__name__,
                         )
-                notified_count += 1
+                    else:
+                        if not sent:
+                            logger.warning(
+                                "xing_notification_failed title=%s company=%s",
+                                job.title,
+                                job.company,
+                            )
+                    notified_count += 1
 
         if not batch_failed:
             mark_message_processed(db, "xing", batch.message_id)
+        batch_uid_outcomes[batch.uid] = not batch_failed
+
+    # Codex gate follow-up (Astra R4A HIGH, watermark gap): compute and
+    # persist how far the scan can safely resume from next run.
+    # `handled_uids` combines every UID this run either (a) confirmed
+    # safe to skip without ever yielding a batch (`collector.confirmed_uids`)
+    # or (b) yielded a batch that just finished persisting above
+    # (`batch_uid_outcomes`, True only if `mark_message_processed` ran).
+    #
+    # The walk MUST iterate `collector.candidate_uids` -- the full ordered
+    # list of UIDs this run considered, INCLUDING ones neither confirmed
+    # nor batched (a non-OK FETCH per `_fetch_and_process_message`'s
+    # `(None, False)` return, or a UID the session deadline never reached)
+    # -- and not merely `sorted(handled_uids)`. A prior version walked
+    # `sorted(handled_uids)`: since an unresolved UID is absent from that
+    # dict entirely (neither key nor False value), sorting its keys
+    # silently DELETED the gap instead of stopping at it, letting a later
+    # successfully-handled UID advance the watermark straight past an
+    # earlier UID whose FETCH failed -- permanently losing that message
+    # (it would never be retried, since the watermark already skips past
+    # it). Walking the full ordered candidate list and treating "absent
+    # from handled_uids" the same as "present but False" (`.get(uid)` is
+    # falsy either way) guarantees the watermark stops at the FIRST
+    # unresolved/failed/unreached UID, exactly like a present-and-False
+    # entry already did.
+    if collector.uid_validity is not None:
+        handled_uids: dict[int, bool] = {uid: True for uid in collector.confirmed_uids}
+        handled_uids.update(batch_uid_outcomes)
+        # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar
+        # capture): compares against `observed_uid_validity` (captured
+        # BEFORE this run's commits, above) rather than a late
+        # `scan_progress.uid_validity` access -- see that capture's own
+        # comment for why a late read here would be unsafe.
+        baseline_uid = (
+            scan_progress.confirmed_upto_uid
+            if scan_progress is not None and observed_uid_validity == collector.uid_validity
+            else None
+        )
+        new_watermark = baseline_uid
+        for uid in collector.candidate_uids:
+            if handled_uids.get(uid):
+                new_watermark = uid
+            else:
+                break
+        # Codex gate follow-up (Astra R4A MEDIUM take 3, UIDVALIDITY CAS):
+        # the epoch THIS run actually observed at the top of the function
+        # (before deciding scan_from_uid/computing new_watermark) -- the
+        # baseline `advance_xing_scan_progress`'s reset CAS is contingent
+        # on, not `collector.uid_validity` (the freshly-observed target).
+        # Uses the SAME early-captured `observed_uid_validity` scalar as
+        # `baseline_uid` above -- not a fresh read of `scan_progress.
+        # uid_validity` here, which would be stale/re-fetchable by this
+        # point (see that capture's own comment).
+        advance_xing_scan_progress(
+            db,
+            uid_validity=collector.uid_validity,
+            confirmed_upto_uid=new_watermark,
+            mailbox_scope=mailbox_scope,
+            observed_uid_validity=observed_uid_validity,
+        )
 
     logger.info(
-        "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s "
+        "deadline_exceeded=%s",
         len(jobs),
         created_count,
         updated_count,
         collector.skipped_invalid_count,
         failed_count,
+        collector.deadline_exceeded,
     )
 
     return {
@@ -483,4 +681,11 @@ async def run_xing(
         "updated": updated_count,
         "skipped_invalid": collector.skipped_invalid_count,
         "failed": failed_count,
+        # NEW-001 (Astra R4A): True if the IMAP session's total deadline
+        # fired before every candidate message could be fetched -- see
+        # app.collectors.xing_email.XingEmailCollector.deadline_exceeded.
+        # _run_step (app.services.automation) treats this as forcing a
+        # non-"ok" step status even when every fetched job persisted
+        # cleanly, since real work is still pending for this account.
+        "deadline_exceeded": collector.deadline_exceeded,
     }

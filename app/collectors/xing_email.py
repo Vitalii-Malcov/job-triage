@@ -95,6 +95,16 @@ _SUBJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^Entdecke\s+ähnliche\s+Jobs\s+wie\b", re.IGNORECASE),
 )
 
+# Codex gate follow-up (Astra R4A HIGH): extracts a bare "Message-ID:"
+# header value from a HEADER.FIELDS-scoped FETCH response -- see
+# `_read_message_id_header`'s own docstring.
+_MESSAGE_ID_HEADER_RE = re.compile(rb"Message-ID:\s*(.+)", re.IGNORECASE)
+
+# Codex gate follow-up (Astra R4A MEDIUM, starvation): extracts the
+# numeric UIDVALIDITY value from a `STATUS INBOX (UIDVALIDITY)` response
+# line -- see `_parse_uid_validity`'s own docstring.
+_UID_VALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)")
+
 # One or more consecutive separator lines act as a single block boundary —
 # real digests observed with both one and two stacked dash lines between
 # postings. 10+ dashes distinguishes a separator line from any incidental
@@ -155,10 +165,37 @@ class XingConnectionError(CollectorError):
 
 @dataclass(frozen=True)
 class XingEmailBatch:
-    """Jobs parsed from one XING digest message, kept with its Message-ID."""
+    """Jobs parsed from one XING digest message, kept with its Message-ID.
+
+    `uid` (Codex gate follow-up, Astra R4A MEDIUM starvation fix): the
+    message's IMAP UID within this run's `UIDVALIDITY` epoch -- lets
+    `app.services.collector_runner.run_xing` compute the contiguous
+    confirmed-handled prefix it persists via `advance_xing_scan_progress`
+    once it knows whether this batch's jobs actually persisted. Not used
+    for deduplication (that is still `message_id`, via
+    `ProcessedEmailMessage`) -- purely a scan-position bookkeeping value.
+    """
 
     message_id: str
     jobs: tuple[Job, ...]
+    uid: int
+
+
+def _parse_uid_validity(status_data: list) -> int | None:
+    """Extracts the numeric UIDVALIDITY from a `STATUS INBOX
+    (UIDVALIDITY)` response. Returns None if it could not be determined
+    (some fakes/edge cases) -- callers then treat any previously
+    persisted scan watermark as not applicable this run (same
+    fail-safe-to-full-rescan behavior as an actual UIDVALIDITY mismatch),
+    never as a reason to skip messages without evidence.
+    """
+    for item in status_data or []:
+        if not isinstance(item, bytes | bytearray):
+            continue
+        match = _UID_VALIDITY_RE.search(bytes(item))
+        if match:
+            return int(match.group(1))
+    return None
 
 
 class ImapClient(Protocol):
@@ -176,6 +213,10 @@ class ImapClient(Protocol):
     def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]: ...
 
     def fetch(self, message_set: str, message_parts: str) -> tuple[str, list]: ...
+
+    def uid(self, command: str, *args) -> tuple[str, list]: ...
+
+    def status(self, mailbox: str, names: str) -> tuple[str, list[bytes]]: ...
 
     def close(self) -> tuple[str, list[bytes]]: ...
 
@@ -317,12 +358,24 @@ class XingEmailCollector(JobCollector):
         lookback_days: int = 7,
         imap_client: ImapClient | None = None,
         is_message_processed: Callable[[str], bool] | None = None,
+        scan_from_uid: int | None = None,
+        expected_uid_validity: int | None = None,
     ) -> None:
         self.imap_host = imap_host
         self.imap_port = imap_port
         self.username = username
         self.app_password = app_password
         self.lookback_days = lookback_days
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): durable
+        # scan-position inputs from the caller's persisted
+        # `XingScanProgressRecord` (see app.db.models for the full
+        # rationale) -- `scan_from_uid` is only honored if this run's own
+        # observed `UIDVALIDITY` (read fresh every call, never trusted
+        # from a prior run) equals `expected_uid_validity`; otherwise the
+        # stored watermark is silently ignored and every candidate is
+        # scanned, exactly like a brand-new installation.
+        self._scan_from_uid = scan_from_uid
+        self._expected_uid_validity = expected_uid_validity
         # Injected only by tests, to avoid a real IMAP connection; production
         # code always opens (and closes) its own connection in _fetch_sync.
         self._injected_client = imap_client
@@ -336,6 +389,42 @@ class XingEmailCollector(JobCollector):
         # to report how many blocks were skipped (mirrors
         # BundesagenturCollector.skipped_invalid_count).
         self.skipped_invalid_count = 0
+        # NEW-001 (Astra R4A): True if the IMAP session's total wall-clock
+        # deadline (AUD-005) fired before every candidate message could be
+        # fetched this run -- set (never raised) by `_fetch_sync_body`, so
+        # every batch that DID complete fetch+parse before that happened
+        # is still returned to the caller instead of being discarded. Read
+        # by callers after awaiting fetch()/fetch_message_batches(),
+        # mirroring `skipped_invalid_count`'s own out-of-band reporting
+        # convention -- see `app.services.collector_runner.run_xing`.
+        self.deadline_exceeded = False
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): this run's
+        # observed mailbox UIDVALIDITY (set in `_fetch_sync_body`, always
+        # freshly read -- never inherited from `expected_uid_validity`)
+        # and the ascending list of UIDs this run confirmed are safe to
+        # never look at again (already-acknowledged via the Message-ID
+        # pre-check, or confirmed not a job digest at all). Read by
+        # `app.services.collector_runner.run_xing` after awaiting
+        # fetch_message_batches() to compute the new persisted watermark
+        # -- see `XingEmailBatch.uid`'s own docstring for why a UID that
+        # DID yield a batch is deliberately NOT included here (its
+        # safety to skip next time depends on whether the caller's own
+        # persistence succeeded, which this collector has no visibility
+        # into).
+        self.uid_validity: int | None = None
+        self.confirmed_uids: list[int] = []
+        # Codex gate follow-up (Astra R4A HIGH, watermark gap): the FULL
+        # ordered (ascending) list of UIDs this run considered candidates
+        # -- set once in `_fetch_sync_body` before the per-UID loop, and
+        # never mutated afterward, so it also includes UIDs the loop never
+        # reached (session deadline) or that failed FETCH outright (not in
+        # `confirmed_uids`, no batch produced). `run_xing` walks this list
+        # in order -- not `confirmed_uids`/its own persisted-batch map
+        # keys alone -- so a UID that is neither confirmed-skippable nor a
+        # successfully persisted batch stops the watermark computation
+        # immediately, instead of simply being absent and silently
+        # stepped over by a later UID that DID resolve.
+        self.candidate_uids: list[int] = []
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
         batches = await self.fetch_message_batches(since)
@@ -354,6 +443,10 @@ class XingEmailCollector(JobCollector):
             )
 
         self.skipped_invalid_count = 0
+        self.deadline_exceeded = False
+        self.uid_validity = None
+        self.confirmed_uids = []
+        self.candidate_uids = []
         since_date = since or (datetime.now(UTC) - timedelta(days=self.lookback_days))
 
         # IMAP (imaplib) is synchronous/blocking; run it off the event loop
@@ -411,14 +504,50 @@ class XingEmailCollector(JobCollector):
         if typ != "OK":
             raise XingConnectionError(f"IMAP SELECT failed: {typ}")
 
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): read this
+        # run's REAL UIDVALIDITY before trusting any persisted watermark
+        # -- see `_parse_uid_validity`'s own docstring for why a mismatch
+        # (or an undetermined value) must make the stored
+        # `scan_from_uid` inert rather than risk skipping reused UIDs.
+        typ, status_data = client.status("INBOX", "(UIDVALIDITY)")
+        self.uid_validity = _parse_uid_validity(status_data) if typ == "OK" else None
+
         criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
-        typ, data = client.search(None, criteria)
+        # UID SEARCH (not plain SEARCH/sequence numbers): a persisted
+        # scan-position watermark is only meaningful against an
+        # identifier RFC 3501 guarantees never shifts or gets reused
+        # within one UIDVALIDITY epoch -- see
+        # app.db.models.XingScanProgressRecord's docstring for why a
+        # sequence-number- or DB-row-id-based watermark would not be
+        # safe here.
+        typ, data = client.uid("search", None, criteria)
         if typ != "OK":
             raise XingConnectionError(f"IMAP SEARCH failed: {typ}")
 
-        message_numbers = data[0].split() if data and data[0] else []
+        all_uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
+        scan_from_uid = None
+        if self.uid_validity is not None and self.uid_validity == self._expected_uid_validity:
+            scan_from_uid = self._scan_from_uid
+        if scan_from_uid is None:
+            candidate_uids = all_uids
+        else:
+            # The actual starvation fix: a confirmed-handled prefix is
+            # dropped here, client-side, BEFORE issuing a single IMAP
+            # call for any of it -- not merely before the expensive
+            # RFC822 body transfer (the earlier Message-ID pre-check
+            # fix), which still paid for one header FETCH per already
+            # -processed message every run.
+            candidate_uids = [uid for uid in all_uids if uid > scan_from_uid]
+
+        # Codex gate follow-up (Astra R4A HIGH, watermark gap): captured
+        # BEFORE the loop runs, and never mutated afterward -- see
+        # `self.candidate_uids`'s own docstring in `__init__` for why
+        # `run_xing` needs the full ordered candidate list, not just the
+        # subset that ended up in `confirmed_uids`/produced a batch.
+        self.candidate_uids = candidate_uids
+
         batches: list[XingEmailBatch] = []
-        for message_number in message_numbers:
+        for uid in candidate_uids:
             # AUD-005: once the total session deadline has fired, the
             # connection's socket is already forcibly closed (see
             # ImapSessionDeadline) -- stop issuing further FETCHes on it
@@ -426,12 +555,63 @@ class XingEmailCollector(JobCollector):
             # time.
             if deadline is not None and deadline.exceeded:
                 break
-            batch = self._fetch_and_process_message(client, message_number)
+            uid_bytes = str(uid).encode("ascii")
+            try:
+                batch, confirmed = self._fetch_and_process_message(client, uid_bytes, uid)
+            except OSError:
+                # Codex gate follow-up (Astra R4A HIGH): a transport
+                # -level failure mid-FETCH (the exact case the earlier
+                # NEW-001 fix's between-iterations `break` above did NOT
+                # cover -- the deadline watchdog can force-close the
+                # socket WHILE a FETCH is already blocked in flight,
+                # raising OSError from inside
+                # _fetch_and_process_message rather than being observed
+                # cleanly at the top of the next iteration). If the
+                # deadline is what caused this, stop cleanly here and let
+                # the SAME post-loop logic below return the batches
+                # already completed, flagged via `deadline_exceeded` --
+                # never silently discarded. If the deadline did NOT
+                # cause it (a genuine, unexpected connection failure),
+                # re-raise so `_fetch_sync`'s existing outer handler logs
+                # and raises `XingConnectionError`, unchanged.
+                if deadline is not None and deadline.exceeded:
+                    break
+                raise
             if batch is not None:
                 batches.append(batch)
+            elif confirmed:
+                # Codex gate follow-up (Astra R4A MEDIUM, starvation):
+                # provably safe to never look at again (already
+                # -acknowledged, or confirmed not a job digest at all) --
+                # NOT a transient fetch failure (`confirmed=False` for
+                # that case, see `_fetch_and_process_message`), so a
+                # later run is free to skip straight past this UID
+                # without even a header FETCH once
+                # `app.services.collector_runner.run_xing` persists it
+                # as part of the confirmed contiguous prefix.
+                self.confirmed_uids.append(uid)
 
+        # NEW-001 (Astra R4A): a prior version of this method RAISED
+        # XingConnectionError here, discarding `batches` entirely -- every
+        # message batch that had already completed fetch+parse before the
+        # deadline fired was silently lost, with no acknowledgment ever
+        # recorded for it (see app.services.collector_runner.run_xing,
+        # which only marks a source message processed after ALL its jobs
+        # persist). A backlog that consistently exceeds the deadline would
+        # then repeatedly re-fetch the same oldest-message prefix while
+        # making zero persisted progress, and those messages could
+        # eventually age out of the lookback window entirely. Recording
+        # the flag instead (never silently reported as full success --
+        # see `run_xing`'s own `deadline_exceeded` counter) lets the
+        # caller persist everything that finished in time and report a
+        # truthful partial outcome. A GENUINE connection/auth failure
+        # (the socket dying during SELECT/SEARCH/one message's own FETCH)
+        # still raises normally via `_fetch_sync`'s OSError handler below
+        # -- this change touches ONLY the case where the loop above
+        # already finished cleanly and nothing failed except running out
+        # of time.
         if deadline is not None and deadline.exceeded:
-            raise XingConnectionError("IMAP session exceeded its total operation deadline")
+            self.deadline_exceeded = True
 
         return batches
 
@@ -508,39 +688,100 @@ class XingEmailCollector(JobCollector):
         except Exception:
             logger.warning("xing_email_imap_logout_failed", exc_info=True)
 
-    def _fetch_and_process_message(
-        self, client: ImapClient, message_number: bytes
-    ) -> XingEmailBatch | None:
-        typ, msg_data = client.fetch(message_number, "(RFC822)")
-        if typ != "OK" or not msg_data or msg_data[0] is None:
-            logger.warning("xing_email_message_fetch_failed message_number=%s", message_number)
+    def _read_message_id_header(self, client: ImapClient, uid: bytes) -> str | None:
+        """Codex gate follow-up (Astra R4A HIGH): a lightweight pre-check
+        -- mirrors `app.providers.email.imap.GmailImapProvider
+        ._read_message_size`'s "cheap probe before the expensive
+        transfer" pattern -- that fetches ONLY the Message-ID header via
+        `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]` instead of the full
+        RFC822 body. This is what lets `_fetch_and_process_message` skip
+        an already-acknowledged message WITHOUT paying for a full-body
+        transfer at all (the starvation this closes: a backlog where
+        most messages are already-processed used to spend the ENTIRE
+        per-run fetch budget re-transferring their full bodies before
+        ever reaching a genuinely new message).
+
+        Returns None if the header could not be determined (some
+        servers/fakes may omit or malform it, or a real transport error
+        occurred) -- the caller then falls back to the full fetch rather
+        than failing closed, an honest documented gap exactly like
+        `_read_message_size`'s own. `OSError` is NOT swallowed here: a
+        transport-level failure (including the deadline watchdog forcing
+        the socket closed mid-read) must propagate to
+        `_fetch_and_process_message`'s own caller, never be silently
+        reinterpreted as "header absent, fall back to full fetch".
+        """
+        try:
+            typ, data = client.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        except OSError:
+            raise
+        except Exception:
             return None
+        if typ != "OK" or not data:
+            return None
+        for item in data:
+            candidate = item[1] if isinstance(item, tuple) else item
+            if not isinstance(candidate, bytes | bytearray):
+                continue
+            match = _MESSAGE_ID_HEADER_RE.search(bytes(candidate))
+            if match:
+                return match.group(1).decode("ascii", errors="replace").strip()
+        return None
+
+    def _fetch_and_process_message(
+        self, client: ImapClient, uid: bytes, uid_int: int
+    ) -> tuple[XingEmailBatch | None, bool]:
+        """Returns `(batch, confirmed)`. `confirmed=True` iff this UID is
+        provably safe to skip on every future run without looking at it
+        again (Codex gate follow-up, Astra R4A MEDIUM starvation fix) --
+        `batch is None and confirmed is False` means a transient fetch
+        failure instead, which must be retried, never remembered as
+        handled. `batch is not None` (`confirmed` is then always False,
+        unused) leaves the "is this UID safe to skip later" decision to
+        the caller, which alone knows whether persisting this batch's
+        jobs actually succeeded -- see `XingEmailBatch.uid`'s docstring.
+        """
+        # Codex gate follow-up (Astra R4A HIGH): skip already-acknowledged
+        # messages BEFORE transferring their full RFC822 body -- see
+        # `_read_message_id_header`'s own docstring for the starvation
+        # this prevents. A pre-check that couldn't determine the header
+        # (None) falls through to the normal full fetch below, where
+        # `_process_message`'s own (pre-existing, unchanged)
+        # `is_message_processed` check still applies as a safety net.
+        precheck_message_id = self._read_message_id_header(client, uid)
+        if precheck_message_id and self._is_message_processed(precheck_message_id):
+            return None, True
+
+        typ, msg_data = client.uid("fetch", uid, "(RFC822)")
+        if typ != "OK" or not msg_data or msg_data[0] is None:
+            logger.warning("xing_email_message_fetch_failed uid=%s", uid)
+            return None, False
 
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
-        return self._process_message(msg)
+        return self._process_message(msg, uid_int)
 
-    def _process_message(self, msg: Message) -> XingEmailBatch | None:
+    def _process_message(self, msg: Message, uid: int) -> tuple[XingEmailBatch | None, bool]:
         sender = parseaddr(msg.get("From", ""))[1].casefold()
         if sender != XING_DIGEST_SENDER:
-            return None
+            return None, True
 
         subject = _decode_subject(msg.get("Subject", ""))
         if not _is_job_digest_subject(subject):
             logger.info("xing_email_skipped_subject subject=%s", subject)
-            return None
+            return None, True
 
         message_id = (msg.get("Message-ID") or "").strip()
         if not message_id:
             logger.warning("xing_email_skipped_missing_message_id subject=%s", subject)
-            return None
+            return None, True
         if self._is_message_processed(message_id):
-            return None
+            return None, True
 
         body = _extract_plaintext_body(msg)
         if not body:
             logger.warning("xing_email_no_plaintext_body message_id=%s", message_id)
-            return XingEmailBatch(message_id=message_id, jobs=())
+            return XingEmailBatch(message_id=message_id, jobs=(), uid=uid), False
 
         jobs: list[Job] = []
         for block in _split_blocks(body):
@@ -553,4 +794,4 @@ class XingEmailCollector(JobCollector):
         if not jobs:
             logger.warning("xing_email_no_valid_job_blocks message_id=%s", message_id)
 
-        return XingEmailBatch(message_id=message_id, jobs=tuple(jobs))
+        return XingEmailBatch(message_id=message_id, jobs=tuple(jobs), uid=uid), False

@@ -66,12 +66,14 @@ class GmailInboxService:
                 duplicates += 1
 
         logger.info(
-            "gmail_sync_run fetched=%s created=%s duplicates=%s skipped=%s failed=%s",
+            "gmail_sync_run fetched=%s created=%s duplicates=%s skipped=%s failed=%s "
+            "deadline_exceeded=%s",
             len(fetch_result.messages),
             created,
             duplicates,
             fetch_result.skipped_count,
             failed,
+            fetch_result.deadline_exceeded,
         )
 
         return GmailSyncResult(
@@ -80,4 +82,5 @@ class GmailInboxService:
             duplicates=duplicates,
             skipped=fetch_result.skipped_count,
             failed=failed,
+            deadline_exceeded=fetch_result.deadline_exceeded,
         )

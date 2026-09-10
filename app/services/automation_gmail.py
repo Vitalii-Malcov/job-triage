@@ -161,6 +161,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
 
     inbox_r = inbox_result or _EMPTY_SYNC_RESULT
     sent_r = sent_result or _EMPTY_SYNC_RESULT
+    deadline_exceeded = inbox_r.deadline_exceeded or sent_r.deadline_exceeded
     counters = {
         "fetched": inbox_r.fetched + sent_r.fetched,
         "created": inbox_r.created + sent_r.created,
@@ -177,6 +178,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         "sent_duplicates": sent_r.duplicates,
         "sent_skipped": sent_r.skipped,
         "sent_failed": sent_r.failed,
+        "deadline_exceeded": deadline_exceeded,
     }
 
     # S8D-SYNC-001/002 (Codex review): honest ok/partial/failed derivation --
@@ -203,18 +205,28 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         status = "failed"
     elif counters["failed"] > 0:
         status = "partial"
+    elif deadline_exceeded:
+        # NEW-001 (Astra R4A): the IMAP session's total wall-clock
+        # deadline fired before every candidate message could be fetched
+        # -- whatever WAS fetched persisted cleanly (failed == 0 here by
+        # construction), but more work is still pending for this account.
+        # Reporting "ok" would claim the mailbox is fully caught up when
+        # it is not; this must never be silently indistinguishable from a
+        # genuinely complete run.
+        status = "partial"
     else:
         status = "ok"
 
     logger.info(
         "automation_gmail_sync_finished status=%s fetched=%s created=%s "
-        "duplicates=%s skipped=%s failed=%s",
+        "duplicates=%s skipped=%s failed=%s deadline_exceeded=%s",
         status,
         counters["fetched"],
         counters["created"],
         counters["duplicates"],
         counters["skipped"],
         counters["failed"],
+        deadline_exceeded,
     )
 
     return {

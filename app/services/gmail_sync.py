@@ -104,6 +104,10 @@ def _sum_gmail_sync_results(a: GmailSyncResult, b: GmailSyncResult) -> GmailSync
         duplicates=a.duplicates + b.duplicates,
         skipped=a.skipped + b.skipped,
         failed=a.failed + b.failed,
+        # NEW-001: either mailbox hitting its own session deadline makes
+        # the COMBINED run non-fully-complete, even if the other mailbox
+        # finished cleanly.
+        deadline_exceeded=a.deadline_exceeded or b.deadline_exceeded,
     )
 
 

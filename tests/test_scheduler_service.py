@@ -46,7 +46,7 @@ def session_factory(tmp_path):
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-async def _noop_collector(db, settings, *, touched_jobs=None):
+async def _noop_collector(db, settings, *, touched_jobs=None, is_lease_lost=None):
     return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
 
@@ -81,11 +81,11 @@ class TestStage8AReuse:
     ):
         calls: list[tuple[object, str]] = []
 
-        async def _tracking_bundesagentur(db, settings, *, touched_jobs=None):
+        async def _tracking_bundesagentur(db, settings, *, touched_jobs=None, is_lease_lost=None):
             calls.append((db, "bundesagentur"))
             return await _noop_collector(db, settings)
 
-        async def _tracking_xing(db, settings, *, touched_jobs=None):
+        async def _tracking_xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
             calls.append((db, "xing"))
             return await _noop_collector(db, settings)
 
@@ -113,7 +113,7 @@ class TestStage8AReuse:
     def test_not_due_slot_never_calls_run_automation_cycle(self, session_factory, monkeypatch):
         called = False
 
-        async def _should_not_run(db, settings, *, touched_jobs=None):
+        async def _should_not_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
             nonlocal called
             called = True
             return await _noop_collector(db, settings)
@@ -260,7 +260,7 @@ class TestUnexpectedExceptionFailureIsolation:
         branch (S8B-TEST-002 Part C).
         """
 
-        async def _boom(db, settings, *, touched_jobs=None):
+        async def _boom(db, settings, *, touched_jobs=None, is_lease_lost=None):
             raise RuntimeError("secret-db-detail-should-never-leak")
 
         monkeypatch.setattr("app.services.automation.run_bundesagentur", _boom)

@@ -247,3 +247,124 @@ def test_auto_research_failure_does_not_leak_exception_text(client, monkeypatch,
     assert SECRET_TEXT not in caplog.text
     assert SECRET_TEXT not in response.text
     assert "RuntimeError" in caplog.text
+
+
+class _SessionPoisoningResearchService:
+    """NEW-002 (Astra R4A): simulates a research failure that leaves the
+    SHARED SQLAlchemy session needing an explicit rollback before any
+    further use — e.g. a real DB-level error mid-FLUSH inside
+    `CompanyResearchService.get_or_run`'s own persistence calls
+    (`app.db.repositories.upsert_company_research`/
+    `record_failed_attempt`, both of which `db.add(...)` then
+    `db.commit()`). A plain `raise RuntimeError(...)` (as
+    `_FailingResearchService` above does) never actually touches `db`,
+    and a plain failing `db.execute(text(...))` (confirmed empirically)
+    does NOT put SQLAlchemy's Session into "pending rollback" either --
+    only a genuine ORM FLUSH failure does. This fake reproduces that
+    precisely: it stages an ORM object that violates a real DB
+    constraint and commits it, so the session enters SQLAlchemy's
+    "pending rollback" state exactly like a real persistence failure
+    inside `get_or_run` would.
+    """
+
+    call_count = 0
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def get_or_run(self, db, job, settings, *, force_refresh=False):
+        _SessionPoisoningResearchService.call_count += 1
+        from app.db.models import GmailMessageRecord
+
+        # ck_gmail_messages_uid_positive requires uid > 0 -- this insert
+        # fails at flush/commit time with a real IntegrityError, exactly
+        # the class of failure a genuine research-persistence bug would
+        # produce, and leaves `db` needing an explicit rollback.
+        db.add(
+            GmailMessageRecord(
+                thread_id=999999,
+                account_key="me@example.com",
+                mailbox="INBOX",
+                uid_validity=100,
+                uid=-1,
+                references_json="[]",
+                to_addresses_json="[]",
+                cc_addresses_json="[]",
+                subject="x",
+                direction="INBOUND",
+                body_plain="",
+                body_truncated=False,
+                has_html=False,
+                attachments_json="[]",
+            )
+        )
+        db.commit()
+
+
+def test_research_session_poisoning_does_not_abort_later_job_persistence(
+    client, monkeypatch, caplog
+):
+    """NEW-002 (Astra R4A): a research failure that leaves the shared
+    session needing rollback must never invalidate LATER, unrelated core
+    job scoring/persistence on that same session. Two jobs are fetched;
+    the auto-research call for job 1 poisons the session. Without an
+    explicit `db.rollback()` in `_maybe_auto_research`'s except block,
+    job 2's own `score_and_persist` call would raise
+    `PendingRollbackError` (caught one level up by `run_bundesagentur`'s
+    own per-job try/except, which itself calls `db.rollback()` and
+    counts job 2 as `failed`) — wrongly reporting a real, scorable job as
+    failed purely because of the earlier, unrelated best-effort research
+    failure. Both jobs must persist cleanly, and the response/logs must
+    never surface a raw PendingRollbackError.
+    """
+    jobs = [
+        Job(
+            source="bundesagentur",
+            title="Python Developer",
+            company="First Company",
+            url="https://www.arbeitsagentur.de/jobsuche/jobdetail/first",
+            description="",
+        ),
+        Job(
+            source="bundesagentur",
+            title="Backend Engineer",
+            company="Second Company",
+            url="https://www.arbeitsagentur.de/jobsuche/jobdetail/second",
+            description="",
+        ),
+    ]
+    monkeypatch.setattr(
+        "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    _SessionPoisoningResearchService.call_count = 0
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _SessionPoisoningResearchService
+    )
+
+    with caplog.at_level("DEBUG"):
+        response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    # Both jobs scored/persisted successfully -- the poisoned research
+    # attempt for job 1 must never abort job 2's own persistence.
+    assert body["created"] == 2
+    assert body["failed"] == 0
+    assert _SessionPoisoningResearchService.call_count == 2
+    assert "PendingRollbackError" not in caplog.text
+    assert "PendingRollbackError" not in response.text
+    assert "IntegrityError" in caplog.text  # sanitized type-name-only logging
+
+    # Core job persistence is genuinely durable -- re-query via a brand
+    # new request, which gets a completely fresh session from the SAME
+    # overridden `get_db` dependency (see the `client` fixture above),
+    # proving the rows survived beyond the original request's own session
+    # rather than merely appearing durable via in-session object state.
+    list_response = client.get("/api/v1/jobs", headers=_auth_headers())
+    assert list_response.status_code == 200
+    titles = {job["title"] for job in list_response.json()}
+    assert {"Python Developer", "Backend Engineer"} <= titles

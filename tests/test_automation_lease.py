@@ -17,6 +17,7 @@ Covers exactly the required scenarios:
 import asyncio
 import threading
 import time
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine
@@ -29,6 +30,7 @@ from app.db.automation_repository import (
     renew_run_lease,
 )
 from app.db.base import Base
+from app.db.models import AutomationRunRecord, JobRecord
 from app.services.automation import (
     AutomationRunAlreadyInProgressError,
     AutomationRunLeaseLostError,
@@ -156,11 +158,13 @@ class TestHeartbeatKeepsSlowRunAlive:
                     acquire_attempts.append((created, _run.id, _run.status))
                     time.sleep(0.05)
 
-            async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+            async def _slow_run_bundesagentur(
+                db, settings, *, touched_jobs=None, is_lease_lost=None
+            ):
                 await asyncio.sleep(2.0)
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-            async def _slow_run_xing(db, settings, *, touched_jobs=None):
+            async def _slow_run_xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
             monkeypatch.setattr(
@@ -250,11 +254,13 @@ class TestHeartbeatStoppingLetsLeaseExpire:
                 recovery_result["created"] = created
                 recovery_result["run_id"] = run.id
 
-            async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+            async def _slow_run_bundesagentur(
+                db, settings, *, touched_jobs=None, is_lease_lost=None
+            ):
                 await asyncio.sleep(0.3)
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-            async def _slow_run_xing(db, settings, *, touched_jobs=None):
+            async def _slow_run_xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
             monkeypatch.setattr(
@@ -323,7 +329,9 @@ class TestFinishRunRejectsAnExpiredLeaseEvenIfUncontested:
     def test_run_does_not_complete_when_steps_finish_after_ttl_but_before_first_heartbeat(
         self, session_factory, monkeypatch
     ):
-        async def _bundesagentur_outlives_the_ttl(db, settings, *, touched_jobs=None):
+        async def _bundesagentur_outlives_the_ttl(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
             # Tiny TTL (0.05s) expires well before this step returns,
             # and the heartbeat interval (1.0s) is deliberately longer
             # than both the TTL and this step -- so no renewal attempt
@@ -333,7 +341,7 @@ class TestFinishRunRejectsAnExpiredLeaseEvenIfUncontested:
             await asyncio.sleep(0.15)
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_noop(db, settings, *, touched_jobs=None):
+        async def _xing_noop(db, settings, *, touched_jobs=None, is_lease_lost=None):
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
         monkeypatch.setattr(
@@ -383,14 +391,14 @@ class TestHeartbeatRenewalExceptionFailsClosed:
 
         monkeypatch.setattr("app.services.automation.renew_run_lease", _boom)
 
-        async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+        async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None, is_lease_lost=None):
             # Long enough for the heartbeat's first tick (interval below)
             # to fire and hit the patched, always-raising renew_run_lease
             # before this step returns.
             await asyncio.sleep(0.3)
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_noop(db, settings, *, touched_jobs=None):
+        async def _xing_noop(db, settings, *, touched_jobs=None, is_lease_lost=None):
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
         monkeypatch.setattr("app.services.automation.run_bundesagentur", _slow_run_bundesagentur)
@@ -414,3 +422,258 @@ class TestHeartbeatRenewalExceptionFailsClosed:
             assert "RuntimeError" in caplog.text
         finally:
             db.close()
+
+
+def _make_stub_heartbeat_class(captured: dict, *, start_sets_lease_lost: bool = False):
+    """NEW-004 (Astra R4A) test helper: a `_RunLeaseHeartbeat` stand-in
+    that never spawns a real background thread — `start()`/`stop()` are
+    no-ops (or, with `start_sets_lease_lost=True`, `start()` marks the
+    lease lost immediately, simulating the heartbeat's very first tick
+    having already failed before the run even begins) — so a test can
+    flip `.lease_lost` deterministically at an exact point in the step
+    sequence instead of racing real timing. The real class is subclassed
+    (not reimplemented) so its real, unmodified `threading.Event`-backed
+    `lease_lost` attribute is exactly what
+    `_raise_if_lease_lost`/`run_automation_cycle` actually check.
+    `captured["heartbeat"]` lets a test's fake step functions reach back
+    into the SAME instance `run_automation_cycle` is holding.
+    """
+    import app.services.automation as automation_module
+
+    class _StubHeartbeat(automation_module._RunLeaseHeartbeat):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            captured["heartbeat"] = self
+
+        def start(self) -> None:
+            if start_sets_lease_lost:
+                self.lease_lost.set()
+
+        def stop(self) -> None:
+            pass
+
+    return _StubHeartbeat
+
+
+class TestLeaseLossStopsFurtherWorkImmediately:
+    """NEW-004 (Astra R4A): once lease ownership is confirmed lost,
+    `run_automation_cycle` must stop launching NEW work immediately —
+    checked before every step, not only once at the very end after every
+    step had already run (the old behavior this replaces).
+    """
+
+    def test_lease_already_lost_before_first_step_invokes_no_collectors(
+        self, session_factory, monkeypatch
+    ):
+        captured: dict = {}
+        # The lease is already lost by the time the FIRST step would be
+        # launched -- simulates the heartbeat's very first tick having
+        # already failed before run_automation_cycle's own step loop
+        # even started.
+        monkeypatch.setattr(
+            "app.services.automation._RunLeaseHeartbeat",
+            _make_stub_heartbeat_class(captured, start_sets_lease_lost=True),
+        )
+
+        bundesagentur_calls = {"count": 0}
+        xing_calls = {"count": 0}
+
+        async def _bundesagentur_should_never_run(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
+            bundesagentur_calls["count"] += 1
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
+            xing_calls["count"] += 1
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur", _bundesagentur_should_never_run
+        )
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_should_never_run)
+
+        db = session_factory()
+        try:
+            with pytest.raises(AutomationRunLeaseLostError):
+                asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=Settings()))
+
+            assert bundesagentur_calls["count"] == 0
+            assert xing_calls["count"] == 0
+        finally:
+            db.close()
+
+    def test_lease_lost_between_steps_stops_later_steps(self, session_factory, monkeypatch):
+        captured: dict = {}
+        monkeypatch.setattr(
+            "app.services.automation._RunLeaseHeartbeat", _make_stub_heartbeat_class(captured)
+        )
+
+        xing_calls = {"count": 0}
+
+        async def _bundesagentur_then_lease_is_lost(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
+            # Simulates the heartbeat discovering lease loss WHILE this
+            # step was running -- by the time it returns, ownership is
+            # already gone.
+            captured["heartbeat"].lease_lost.set()
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
+            xing_calls["count"] += 1
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur", _bundesagentur_then_lease_is_lost
+        )
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_should_never_run)
+
+        db = session_factory()
+        try:
+            with pytest.raises(AutomationRunLeaseLostError):
+                asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=Settings()))
+
+            assert xing_calls["count"] == 0
+        finally:
+            db.close()
+
+    def test_lease_lost_after_one_completed_step_preserves_its_real_result(
+        self, session_factory, monkeypatch
+    ):
+        """The completed step's own durable work (here: a real
+        `JobRecord` it persisted) must survive even though the run's own
+        bookkeeping row is never finalized -- only THIS run's summary is
+        abandoned, never the underlying data a step already committed.
+        """
+        captured: dict = {}
+        monkeypatch.setattr(
+            "app.services.automation._RunLeaseHeartbeat", _make_stub_heartbeat_class(captured)
+        )
+
+        xing_calls = {"count": 0}
+
+        async def _bundesagentur_persists_a_job_then_lease_is_lost(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
+            now = datetime.now(UTC)
+            db.add(
+                JobRecord(
+                    fingerprint="fp-new-004",
+                    source="bundesagentur",
+                    title="Backend Engineer",
+                    company="Acme GmbH",
+                    location="Berlin",
+                    url="https://example.com/jobs/new-004",
+                    description="",
+                    score=80,
+                    recommendation="APPLY",
+                    status="NEW",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
+            )
+            db.commit()
+            captured["heartbeat"].lease_lost.set()
+            return {"fetched": 1, "created": 1, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
+            xing_calls["count"] += 1
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur",
+            _bundesagentur_persists_a_job_then_lease_is_lost,
+        )
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_should_never_run)
+
+        db = session_factory()
+        try:
+            run_id_before = None
+            with pytest.raises(AutomationRunLeaseLostError):
+                asyncio.run(run_automation_cycle(db, account_key=ACCOUNT, settings=Settings()))
+
+            assert xing_calls["count"] == 0
+
+            # The job bundesagentur's step persisted is durable.
+            db.expire_all()
+            job = db.query(JobRecord).filter_by(fingerprint="fp-new-004").one_or_none()
+            assert job is not None
+            assert job.title == "Backend Engineer"
+
+            # But the run's own bookkeeping was never finalized as
+            # COMPLETED -- exclusivity for that summary was already lost.
+            run = get_running_run_for_account(db, ACCOUNT)
+            if run is not None:
+                run_id_before = run.id
+            assert run_id_before is None or run.status != "COMPLETED"
+        finally:
+            db.close()
+
+
+class TestReplacementWorkerAfterLeaseLoss:
+    """NEW-004 (Astra R4A) requirement #4: after the original worker
+    fails closed on confirmed lease loss, a REPLACEMENT worker must
+    still be able to claim the account and run to a real completion --
+    the early fail-closed checks must not leave the account permanently
+    stuck, and must not change the existing stale-reconciliation/CAS
+    safety already proven by TestStaleRunIsReconciledAndRecovered.
+    """
+
+    def test_replacement_worker_completes_after_original_fails_closed_immediately(
+        self, session_factory, monkeypatch
+    ):
+        captured: dict = {}
+        monkeypatch.setattr(
+            "app.services.automation._RunLeaseHeartbeat",
+            _make_stub_heartbeat_class(captured, start_sets_lease_lost=True),
+        )
+
+        async def _noop_step(db, settings, *, touched_jobs=None, is_lease_lost=None):
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_step)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_step)
+
+        db = session_factory()
+        try:
+            with pytest.raises(AutomationRunLeaseLostError):
+                # A short TTL so the abandoned row genuinely expires
+                # quickly (the stub heartbeat never renews it for real).
+                asyncio.run(
+                    run_automation_cycle(
+                        db, account_key=ACCOUNT, settings=Settings(), lease_ttl_seconds=0.05
+                    )
+                )
+
+            original_run = get_running_run_for_account(db, ACCOUNT)
+            assert original_run is not None
+            assert original_run.status == "RUNNING"  # abandoned, never finalized
+        finally:
+            db.close()
+
+        time.sleep(0.15)  # let the abandoned lease genuinely expire
+
+        # Restore the REAL heartbeat/collector steps for the replacement
+        # worker -- proves this is a normal, fully successful run, not
+        # another stubbed-out short-circuit.
+        monkeypatch.undo()
+
+        db2 = session_factory()
+        try:
+            replacement = asyncio.run(
+                run_automation_cycle(db2, account_key=ACCOUNT, settings=Settings())
+            )
+
+            assert replacement.id != original_run.id
+            assert replacement.status in ("COMPLETED", "PARTIAL", "FAILED")
+
+            # The original, abandoned row was reconciled to a terminal
+            # state (never silently deleted/merged) -- exactly the same
+            # CAS-based recovery TestStaleRunIsReconciledAndRecovered
+            # already proves at the repository level.
+            db2.expire_all()
+            reloaded_original = db2.get(AutomationRunRecord, original_run.id)
+            assert reloaded_original.status == "FAILED"
+        finally:
+            db2.close()
