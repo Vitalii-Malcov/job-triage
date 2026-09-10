@@ -639,10 +639,14 @@ async def run_automation_cycle(
                 "another process may now own it."
             )
 
+        # Codex gate follow-up (Astra R4B, AUD-010 LOW): account_key is a
+        # normalized email address and must never appear in runtime logs
+        # -- run.id (this run's own surrogate key) already identifies the
+        # row without it, mirroring app.services.scheduler's identical
+        # fix for run_due_cycle_if_claimed's own logging.
         logger.info(
-            "automation_run_finished run_id=%s account_key=%s status=%s",
+            "automation_run_finished run_id=%s status=%s",
             run.id,
-            account_key,
             overall_status,
         )
         return finished

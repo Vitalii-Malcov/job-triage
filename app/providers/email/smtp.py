@@ -45,6 +45,7 @@ never received" among post-`send_message()` exceptions.
 
 import logging
 import smtplib
+import socket
 import ssl
 import threading
 from collections.abc import Callable
@@ -329,6 +330,22 @@ class GmailSmtpProvider:
                 state["phase"] = "cancelled"
             client = state["client"]
 
+        # Codex gate follow-up (Astra R4B, NEW-006 take 3: SMTP
+        # lifecycle). Actively abort the live transport on ANY total
+        # deadline -- pre-send (belt-and-braces alongside the atomic
+        # `gate_lock` above: even a real, genuinely hung connect/login is
+        # now unblocked, not merely logically prevented from proceeding)
+        # AND post-send (the outcome is ALREADY classified UNCERTAIN
+        # either way; there is no reason to let a possibly-doomed worker
+        # linger indefinitely on its own natural per-operation timeout
+        # just because we can't improve on "unknown" by waiting longer).
+        # `worker.join(...)` afterward gives real assurance -- not just
+        # hope -- that the worker actually exits promptly once its
+        # transport is gone, before this call returns to the caller.
+        if client is not None:
+            self._force_close(client)
+            worker.join(timeout=1.0)
+
         if already_sending:
             logger.warning("outbound_smtp_total_deadline_exceeded_after_send_attempted")
             raise EmailSendOutcomeUnknownError(
@@ -336,12 +353,6 @@ class GmailSmtpProvider:
                 "after transmission may have begun"
             )
 
-        # Won the race pre-transmission: actively interrupt the live
-        # transport (if one exists yet) rather than merely abandoning the
-        # thread -- see this method's own comment above and
-        # `_force_close`'s docstring.
-        if client is not None:
-            self._force_close(client)
         logger.warning("outbound_smtp_total_deadline_exceeded_before_send")
         raise EmailSendConnectionError("Total send deadline exceeded before transmission began")
 
@@ -431,27 +442,51 @@ class GmailSmtpProvider:
             logger.warning("outbound_smtp_quit_failed error_type=%s", type(exc).__name__)
 
     def _force_close(self, client: SmtpClient) -> None:
-        """Codex gate follow-up (Astra R4B, NEW-006 take 2): actively
-        interrupts a live transport `send()`'s total-deadline watchdog
-        has decided to abandon PRE-transmission -- closes the underlying
-        socket directly (not `client.quit()`/`client.close()`, which do
-        their own request/reply exchange or mutate `client`'s own
-        `sock`/`file` attributes, either of which is unsafe to run
-        concurrently with whatever the WORKER thread is doing to the same
-        object) so a genuinely blocked real recv/send call (e.g. a hung
-        `login()`) raises almost immediately instead of running to its
-        own natural `SMTP_OPERATION_TIMEOUT_SECONDS`.
+        """Codex gate follow-up (Astra R4B, NEW-006 take 3: SMTP
+        lifecycle): actively aborts a live transport `send()`'s
+        total-deadline watchdog has decided to abandon, whether that's
+        PRE-transmission (belt-and-braces alongside `send()`'s own
+        `gate_lock`, which is the actual correctness guarantee that
+        `send_message()` is never reached -- this is what makes a
+        genuinely hung real connect/login unblock promptly instead of
+        running to its own natural `SMTP_OPERATION_TIMEOUT_SECONDS`) or
+        POST-transmission (the outcome is already UNCERTAIN either way;
+        this just stops the worker thread from lingering).
+
+        **`shutdown()` before `close()` -- not `close()` alone.**
+        `smtplib`'s own `client.file` (from `sock.makefile(...)`, used
+        internally by `getreply()` to read each server response line)
+        holds an INDEPENDENT reference to the same socket -- `socket`'s
+        own reference-counting means a bare `sock.close()` here only
+        decrements a Python-level refcount; the underlying OS-level file
+        descriptor stays open (and any `recv()` already blocked on it,
+        including one happening via that buffered file object rather
+        than the socket object directly, stays blocked) until
+        `client.file` is ALSO closed -- which only the WORKER thread
+        does, and only AFTER its own blocked call already returns. That
+        is exactly the deadlock this method exists to prevent, so
+        `close()` alone is not reliable here. `shutdown(SHUT_RDWR)`
+        operates at the OS socket level, independent of how many Python
+        wrapper objects reference the fd -- it reliably makes ANY
+        blocked recv() on this socket, from ANY thread and through ANY
+        wrapper (raw socket or `makefile()`-backed buffered reader),
+        return immediately (typically 0 bytes, or `ConnectionError`).
 
         Best-effort only: an injected test double (or any `SmtpClient`
-        with no real `.sock`) is silently tolerated -- this is a
-        defense-in-depth speed-up, not the actual correctness guarantee.
-        The guarantee that `send_message()` is never reached after
-        cancellation comes from `send()`'s own `gate_lock`, independent
-        of whether this succeeds.
+        with no real `.sock`) is silently tolerated -- for a real
+        transport this is a genuine correctness step for the
+        post-transmission/worker-termination case (not merely a
+        defense-in-depth speed-up the way it was pre-transmission, where
+        `gate_lock` alone already guarantees `send_message()` is never
+        reached).
         """
         sock = getattr(client, "sock", None)
         if sock is None:
             return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             sock.close()
         except OSError:
