@@ -288,13 +288,37 @@ async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
     )
 
     if created and result.score >= settings.min_job_score_to_notify:
+        # Codex gate follow-up (Astra R4B, NEW-005: Telegram isolation):
+        # `record`/`result` above are ALREADY durably committed by
+        # `score_and_persist` -- notification is best-effort orchestration
+        # on top of that, exactly like every collector run's own
+        # send_job() call (see app.services.collector_runner.run_xing/
+        # run_bundesagentur's identical try/except). This was the one
+        # send_job() call site NOT wrapped: an uncaught exception here
+        # would propagate past this endpoint's return and turn an
+        # already-successful score+persist into an HTTP 500, discarding
+        # `result` the caller would otherwise have received.
+        # `TelegramNotifier.send_job` itself never raises for ordinary
+        # network/API failures (see app.services.telegram's outcome
+        # classification), but this must fail closed regardless of that
+        # internal contract, not rely on it.
         notifier = TelegramNotifier(
             bot_token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
             timeout_seconds=settings.telegram_timeout_seconds,
             max_retries=settings.telegram_max_retries,
         )
-        await notifier.send_job(job, result)
+        try:
+            sent = await notifier.send_job(job, result)
+        except Exception as exc:
+            logger.warning(
+                "job_score_notification_error job_id=%s error_type=%s",
+                record.id,
+                type(exc).__name__,
+            )
+        else:
+            if not sent:
+                logger.warning("job_score_notification_failed job_id=%s", record.id)
 
     return result
 
@@ -1052,7 +1076,20 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     except CollectorError as exc:
-        logger.exception("xing_collector_run_failed")
+        # Codex gate follow-up (Astra R4B, NEW-003: XING log leakage):
+        # `logger.exception(...)` implies `exc_info=True` -- it logs the
+        # FULL traceback, including "the above exception was the direct
+        # cause of the following exception" and the ORIGINAL chained
+        # exception's own str() (see app.collectors.xing_email's AUD-005
+        # comments: a raw OSError/imaplib.IMAP4.error `__cause__` here can
+        # carry host/port/server-controlled text). `exc`'s OWN message is
+        # already deliberately sanitized by the collector before it ever
+        # reaches here -- the `detail=f"...: {exc}"` below is safe -- but
+        # `logger.exception` would print that PLUS everything the
+        # sanitization was meant to keep out of logs. `type(exc).__name__`
+        # alone matches every other CollectorError log site in this
+        # project (see app.services.automation's S8A-004 convention).
+        logger.warning("xing_collector_run_failed error_type=%s", type(exc).__name__)
         raise HTTPException(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
             detail=f"XING mailbox collector request failed: {exc}",

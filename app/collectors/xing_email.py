@@ -679,14 +679,23 @@ class XingEmailCollector(JobCollector):
         return client
 
     def _disconnect(self, client: ImapClient) -> None:
+        # Codex gate follow-up (Astra R4B, NEW-003: XING log leakage):
+        # `exc_info=True` logs the FULL traceback, including the
+        # exception's own str(exc) -- for a close/logout failure that can
+        # be a raw imaplib.IMAP4.error/OSError carrying server-controlled
+        # or connection-internal text, exactly what AUD-005's
+        # `type(exc).__name__`-only convention exists to keep out of logs
+        # (see `_connect`'s identical rationale above). Mirrors
+        # `app.providers.email.imap.GmailImapProvider._disconnect`
+        # (GMAIL-003) exactly.
         try:
             client.close()
-        except Exception:
-            logger.warning("xing_email_imap_close_failed", exc_info=True)
+        except Exception as exc:
+            logger.warning("xing_email_imap_close_failed error_type=%s", type(exc).__name__)
         try:
             client.logout()
-        except Exception:
-            logger.warning("xing_email_imap_logout_failed", exc_info=True)
+        except Exception as exc:
+            logger.warning("xing_email_imap_logout_failed error_type=%s", type(exc).__name__)
 
     def _read_message_id_header(self, client: ImapClient, uid: bytes) -> str | None:
         """Codex gate follow-up (Astra R4A HIGH): a lightweight pre-check

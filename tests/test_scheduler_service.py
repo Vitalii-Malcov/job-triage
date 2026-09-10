@@ -418,8 +418,16 @@ class TestLeaseLostDoesNotRetryImmediately:
             # Sanitized logging: the fixed, hardcoded event message only
             # -- this branch never touches str(exc) in the first place,
             # so there is nothing exception-specific to leak.
+            #
+            # AUD-010 LOW (Codex gate follow-up, Astra R4B): account_key
+            # is a normalized email address and must never appear in
+            # runtime scheduler logs -- schedule_id (a non-identity
+            # surrogate key) is the correlator instead, mirroring
+            # run_due_digest_if_claimed's existing delivery_id
+            # convention (S8E-PRIVACY-001).
             assert "automation_scheduler_run_lease_lost" in caplog.text
-            assert f"account_key={ACCOUNT}" in caplog.text
+            assert "schedule_id=" in caplog.text
+            assert ACCOUNT not in caplog.text
 
             # The slot remains advanced -- no immediate retry.
             schedule = get_schedule(db, ACCOUNT)
@@ -433,6 +441,117 @@ class TestLeaseLostDoesNotRetryImmediately:
 
             # Session remains usable.
             assert get_schedule(db, ACCOUNT) is not None
+        finally:
+            db.close()
+
+
+class TestSchedulerLogsNeverIncludeAccountIdentity:
+    """AUD-010 LOW (Codex gate follow-up, Astra R4B, take 2) regression:
+    `account_key` is a normalized email address
+    (`AutomationScheduleRecord`'s own docstring) -- neither
+    `run_due_cycle_if_claimed` (app.services.scheduler) NOR
+    `run_automation_cycle`'s shared "automation_run_finished" completion
+    log (app.services.automation, called BY the scheduler on every
+    triggered cycle) may write it into a log line, on ANY branch --
+    exactly like `run_due_digest_if_claimed` already never logs it
+    (S8E-PRIVACY-001).
+
+    These assertions deliberately use the FULL, unfiltered `caplog.text`
+    -- not a `record.name == "app.services.scheduler"` filter -- because
+    the actual regression this take 2 closes was `app.services.
+    automation`'s OWN separate `account_key=...` log line firing on the
+    exact same scheduler-triggered call path; filtering it out would
+    have hidden that leak instead of proving its absence. This is the
+    COMPLETE scheduler-triggered log path, not just one module's slice
+    of it.
+    """
+
+    def test_already_in_progress_log_omits_account_key(self, session_factory, monkeypatch, caplog):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        db = session_factory()
+        other_session = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+            create_running_run(other_session, account_key=ACCOUNT, holder="other-holder")
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            assert "automation_scheduler_run_already_in_progress" in caplog.text
+            assert "schedule_id=" in caplog.text
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+            other_session.close()
+
+    def test_successful_run_triggered_log_omits_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        """The real regression this take 2 exists for: BEFORE the
+        automation.py fix, this exact scenario logged
+        `automation_run_finished run_id=1 account_key=me@example.com
+        status=COMPLETED` from `app.services.automation` -- a completely
+        separate log line from anything `app.services.scheduler` itself
+        emits, so a scheduler-only-filtered assertion would never have
+        caught it.
+        """
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        db = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            assert "automation_scheduler_run_triggered" in caplog.text
+            assert "schedule_id=" in caplog.text
+            assert "run_id=" in caplog.text
+            # The shared automation-runtime completion log fired too --
+            # confirm it, and confirm it ALSO carries no account identity.
+            assert "automation_run_finished" in caplog.text
+            assert ACCOUNT not in caplog.text
+        finally:
+            db.close()
+
+    def test_record_last_run_failure_log_omits_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        def _boom(db, account_key, *, run_id, now=None):
+            raise RuntimeError("secret-detail-must-not-leak")
+
+        monkeypatch.setattr("app.services.scheduler.record_last_run", _boom)
+
+        db = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            assert "automation_scheduler_record_last_run_failed" in caplog.text
+            assert "schedule_id=" in caplog.text
+            assert "secret-detail-must-not-leak" not in caplog.text
+            assert "automation_run_finished" in caplog.text
+            assert ACCOUNT not in caplog.text
         finally:
             db.close()
 
