@@ -80,3 +80,33 @@ jobs:
           tests/integration/test_gmail_watermark_postgres_concurrency.py
         env:
           TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
+
+  # docs/DOCKER.md / docs/DEPLOYMENT.md: a lightweight build+config smoke
+  # gate, not a deployment pipeline. Only proves the Dockerfile still
+  # builds and compose.yaml is still syntactically/referentially valid --
+  # deliberately does NOT start containers, run migrations against a
+  # real database, or contact any external service (see the local
+  # smoke-test evidence in docs/DOCKER.md for that deeper validation,
+  # which is intentionally kept manual/local rather than duplicated in
+  # CI). The throwaway .env below exists only so `docker compose config`
+  # has values to resolve required ${VAR:?...} placeholders -- it holds
+  # no real secret, is never used to start a container, and is removed
+  # at the end of the job.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t jobtriage-web:ci .
+      - name: Prepare throwaway .env for compose config validation only
+        run: |
+          cp .env.example .env
+          sed -i 's/^API_KEY=.*/API_KEY=ci-validation-only/' .env
+          sed -i 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-validation-only/' .env
+      - name: Validate compose config (both profiles)
+        run: |
+          docker compose config
+          docker compose --profile scheduler config --services
+      - name: Remove throwaway .env
+        if: always()
+        run: rm -f .env
