@@ -85,6 +85,8 @@ from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import urlparse
 
+from app.utils.text import truncate_with_ellipsis
+
 MatchType = Literal["APPLICATION", "JOB_ONLY", "AMBIGUOUS", "UNMATCHED"]
 Confidence = Literal["HIGH", "MEDIUM", "LOW"]
 
@@ -335,10 +337,7 @@ def _truncate(fragment: str) -> str:
     joining/combining it with other data does not bound the combined
     result.
     """
-    fragment = fragment.strip()
-    if len(fragment) <= EVIDENCE_FRAGMENT_MAX_LENGTH:
-        return fragment
-    return fragment[:EVIDENCE_FRAGMENT_MAX_LENGTH].rstrip() + "..."
+    return truncate_with_ellipsis(fragment, EVIDENCE_FRAGMENT_MAX_LENGTH)
 
 
 def normalize_company_name(name: str) -> str:

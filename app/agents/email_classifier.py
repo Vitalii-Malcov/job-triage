@@ -49,6 +49,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from app.utils.text import truncate_with_ellipsis
+
 EmailCategory = Literal[
     "APPLICATION_RECEIVED",
     "REQUEST_FOR_INFORMATION",
@@ -277,10 +279,7 @@ def _sentences(text: str) -> list[str]:
 
 
 def _truncate(fragment: str) -> str:
-    fragment = fragment.strip()
-    if len(fragment) <= EVIDENCE_FRAGMENT_MAX_LENGTH:
-        return fragment
-    return fragment[:EVIDENCE_FRAGMENT_MAX_LENGTH].rstrip() + "..."
+    return truncate_with_ellipsis(fragment, EVIDENCE_FRAGMENT_MAX_LENGTH)
 
 
 # Codex remediation round 1 (negation/punctuation hardening): a clause
