@@ -195,15 +195,29 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(_build_jobs_reply(records))
 
 
+async def _parse_int_arg(update: Update, raw: str, usage: str) -> int | None:
+    """Parses `raw` (a command's first argument) as an int, replying with
+    the standard "<usage> (id must be a number)" message and returning
+    None on failure -- consolidates the identical try/except-ValueError +
+    reply_text pattern previously duplicated across /job, /status, and
+    /research. The caller is still responsible for its own "were there
+    enough args at all" check before calling this (that check's usage
+    message differs per command in wording, not just substitution).
+    """
+    try:
+        return int(raw)
+    except ValueError:
+        await update.message.reply_text(f"{usage} (id must be a number)")
+        return None
+
+
 @require_authorized
 async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Usage: /job <id>")
         return
-    try:
-        job_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Usage: /job <id> (id must be a number)")
+    job_id = await _parse_int_arg(update, context.args[0], "Usage: /job <id>")
+    if job_id is None:
         return
 
     db = SessionLocal()
@@ -232,10 +246,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /status <id> <new_status>")
         return
-    try:
-        job_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Usage: /status <id> <new_status> (id must be a number)")
+    job_id = await _parse_int_arg(update, context.args[0], "Usage: /status <id> <new_status>")
+    if job_id is None:
         return
     try:
         new_status = ApplicationStatus(context.args[1].upper())
@@ -319,10 +331,8 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         await update.message.reply_text("Usage: /research <job_id>")
         return
-    try:
-        job_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Usage: /research <job_id> (id must be a number)")
+    job_id = await _parse_int_arg(update, context.args[0], "Usage: /research <job_id>")
+    if job_id is None:
         return
 
     settings = get_settings()
