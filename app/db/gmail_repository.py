@@ -44,7 +44,12 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import GmailMessageIdClaimRecord, GmailMessageRecord, GmailThreadRecord
+from app.db.models import (
+    GmailMessageIdClaimRecord,
+    GmailMessageRecord,
+    GmailPermanentSkipRecord,
+    GmailThreadRecord,
+)
 from app.models.gmail import (
     GmailAttachment,
     GmailMessage,
@@ -305,15 +310,18 @@ def get_known_uids(
     uid_validity: int,
     candidate_uids: Collection[int],
 ) -> set[int]:
-    """Bulk membership check (GMAIL-012): which of `candidate_uids` are
-    already persisted for this (account_key, mailbox, uid_validity)
-    generation.
+    """Bulk membership check (GMAIL-012): which of `candidate_uids` should
+    never be fetched again for this (account_key, mailbox, uid_validity)
+    generation — either already persisted, OR (FINAL-004, Astra R5A)
+    permanently skipped because the message's own content makes it
+    unpersistable (see `GmailPermanentSkipRecord`'s docstring for the
+    starvation bug this second half closes).
 
     Bound into `GmailImapProvider` via closure as `get_known_uids` (see
-    app/api/routes.py's `_run_gmail_sync`) so the provider can filter
-    already-synced UIDs out BEFORE applying MAX_MESSAGES_PER_SYNC
+    app/services/gmail_sync.py's `make_gmail_provider`) so the provider
+    can filter these UIDs out BEFORE applying MAX_MESSAGES_PER_SYNC
     (GMAIL-005 starvation fix — see app/providers/email/imap.py's
-    `_fetch_sync`), using ONE query per
+    `_fetch_sync_body`), using ONE query per table per
     `KNOWN_UIDS_QUERY_CHUNK_SIZE`-sized chunk of candidates — never one
     query per UID, regardless of how many UIDs IMAP SEARCH returns.
     """
@@ -330,7 +338,59 @@ def get_known_uids(
             )
         ).all()
         known.update(rows)
+        skip_rows = db.scalars(
+            select(GmailPermanentSkipRecord.uid).where(
+                GmailPermanentSkipRecord.account_key == account_key,
+                GmailPermanentSkipRecord.mailbox == mailbox,
+                GmailPermanentSkipRecord.uid_validity == uid_validity,
+                GmailPermanentSkipRecord.uid.in_(chunk),
+            )
+        ).all()
+        known.update(skip_rows)
     return known
+
+
+def record_permanent_skips(
+    db: Session,
+    account_key: str,
+    mailbox: str,
+    uid_validity: int,
+    skips: Collection[tuple[int, str]],
+) -> None:
+    """FINAL-004 (Astra R5A): durably records each `(uid, reason)` in
+    `skips` as permanently unfetchable for this (account_key, mailbox,
+    uid_validity) generation — see `GmailPermanentSkipRecord`'s docstring
+    for why this is required to make forward progress past a prefix of
+    permanently-bad messages, and `get_known_uids` above for how these
+    rows are excluded from future candidate lists.
+
+    Each UID is inserted and committed independently (mirrors
+    `upsert_message`'s own per-row isolation): one UID's insert failure
+    (including a UNIQUE-constraint collision from a concurrent or
+    repeated sync recording the SAME uid — expected and harmless, not an
+    error) never prevents the others from being recorded, and never
+    rolls back any message persistence this sync run already committed
+    via `upsert_message`. Callers (`app.services.gmail_inbox
+    .GmailInboxService.sync`) treat a total failure here as best-effort:
+    it can never turn an otherwise-successful sync into a failure, only
+    mean this same UID is (harmlessly, just wastefully) reconsidered on
+    the next run.
+    """
+    for uid, reason in skips:
+        record = GmailPermanentSkipRecord(
+            account_key=account_key,
+            mailbox=mailbox,
+            uid_validity=uid_validity,
+            uid=uid,
+            reason=reason,
+        )
+        db.add(record)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Already recorded (a prior run, or a concurrent one) — not
+            # an error, nothing further to do for this uid.
+            db.rollback()
 
 
 def get_message_by_identity(

@@ -82,6 +82,18 @@ alive indefinitely, exactly the class of bug this module exists to close.
 `DeadlineIMAP4SSL` closes that gap by binding the deadline to the socket
 from inside `_create_socket`, which `IMAP4.open()` calls (setting
 `self.sock`) BEFORE `IMAP4.__init__` ever calls `IMAP4._connect()`.
+
+FINAL-003 (Astra R5A): `_create_socket` itself still had an unbounded
+gap -- `imaplib.IMAP4._create_socket` calls `socket.create_connection()`,
+which does DNS resolution (`socket.getaddrinfo()`) followed by the TCP
+`connect()`, and there is no socket at all yet for `bind_socket`/
+`_force_close` to act on during that phase. `ImapSessionDeadline
+.run_bounded` closes this: it runs that call on a background thread and
+bounds the CALLING thread's wait to the deadline's own remaining time,
+without ever leaving the background thread's eventual result
+unhandled -- see its own docstring for the full detail and for why this
+is not the "spawn an unbounded resolver thread and walk away" anti
+-pattern it deliberately avoids.
 """
 
 from __future__ import annotations
@@ -90,6 +102,8 @@ import imaplib
 import logging
 import socket
 import threading
+import time
+from collections.abc import Callable
 from types import TracebackType
 from typing import Protocol
 
@@ -144,6 +158,11 @@ class ImapSessionDeadline:
         self._extra_closable: HasClose | None = None
         self._fired = threading.Event()
         self._timer: threading.Timer | None = None
+        # FINAL-003: set in __enter__, read by run_bounded's own
+        # remaining-time wait -- the SAME reference point self._timer
+        # uses, so the pre-socket connect phase never gets a budget
+        # larger than the total session deadline.
+        self._deadline_at: float | None = None
 
     def bind_socket(
         self, sock: socket.socket | None, *, extra_closable: HasClose | None = None
@@ -170,6 +189,120 @@ class ImapSessionDeadline:
     @property
     def exceeded(self) -> bool:
         return self._fired.is_set()
+
+    def _remaining_seconds(self) -> float:
+        if self._deadline_at is None:
+            # Defensive only -- run_bounded is only ever called from
+            # inside a `with deadline:` block in practice, where
+            # __enter__ has always already set this. Treat "never
+            # entered" as no time left rather than blocking
+            # indefinitely.
+            return 0.0
+        return max(0.0, self._deadline_at - time.monotonic())
+
+    def run_bounded(self, fn: Callable[[], socket.socket]) -> socket.socket:
+        """FINAL-003: bounds a blocking call that PRODUCES a socket (in
+        practice, `imaplib.IMAP4._create_socket` -- DNS resolution via
+        `socket.getaddrinfo()` followed by the TCP `connect()`) by this
+        deadline's own remaining wall-clock budget, closing the gap left
+        by `bind_socket`/`_force_close` alone: those can only ever
+        interrupt a socket that already exists, so before this method
+        existed, the entire DNS-resolution-plus-connect phase ran
+        completely unbounded by the session deadline -- a slow/
+        unresponsive DNS resolver could block the calling thread
+        indefinitely, with no socket yet for the watchdog to force-close.
+
+        Python cannot forcibly interrupt a blocking `getaddrinfo()`/
+        `connect()` syscall from another thread -- there is no portable
+        equivalent of `_force_close`'s socket-shutdown trick for a
+        socket that doesn't exist yet, and a signal-based approach
+        (`signal.alarm`) is POSIX-only and would not work on this
+        project's Windows dev runtime. So `fn` genuinely does run on a
+        background daemon thread for however long the underlying OS
+        call actually takes -- exactly like any other blocking Python
+        call. What this method actually guarantees, and what makes it
+        NOT "spawn a resolver thread and abandon it":
+
+        1. This method itself always returns or raises within
+           (approximately) the deadline's remaining time -- the calling
+           thread is never blocked past the total session deadline just
+           because no socket existed yet.
+        2. If `fn` only succeeds AFTER this method has already given up
+           and raised, the resulting socket is closed immediately by the
+           background thread itself -- never silently handed back, never
+           left open and unmanaged/leaked.
+
+        Exactly one side of a lock-guarded phase handoff "wins" this
+        race -- the same proven pattern as the SMTP total-deadline fix's
+        `gate_lock`/phase state machine
+        (app/providers/email/smtp.py's `send()`), applied here to a
+        socket-producing call instead of a send.
+
+        Raises `TimeoutError` (a `socket.OSError`/`socket.timeout`
+        subclass -- every existing `except OSError` call site in
+        app.collectors.xing_email / app.providers.email.imap already
+        covers it, unchanged) if the deadline's remaining time elapses
+        before `fn` completes. Re-raises whatever `fn` itself raised if
+        it completes in time.
+        """
+        phase_lock = threading.Lock()
+        state = {"phase": "pending"}
+        outcome: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                sock = fn()
+            except Exception as exc:  # noqa: BLE001 -- forwarded to the caller verbatim
+                with phase_lock:
+                    delivered = state["phase"] == "pending"
+                    if delivered:
+                        outcome["error"] = exc
+                        state["phase"] = "delivered"
+                if delivered:
+                    done.set()
+                return
+            with phase_lock:
+                delivered = state["phase"] == "pending"
+                if delivered:
+                    outcome["sock"] = sock
+                    state["phase"] = "delivered"
+            if delivered:
+                done.set()
+                return
+            # The caller already gave up (deadline exceeded) by the time
+            # this connect finally completed -- close the now-orphaned
+            # socket instead of leaking an open, unmanaged connection.
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        finished = done.wait(timeout=self._remaining_seconds())
+        if not finished:
+            with phase_lock:
+                # Only claim the timeout if the worker has not ALREADY
+                # delivered a result in the tiny window between wait()
+                # timing out and this thread acquiring the lock -- if it
+                # has, use that real result instead of falsely reporting
+                # a timeout.
+                still_pending = state["phase"] == "pending"
+                if still_pending:
+                    state["phase"] = "abandoned_by_caller"
+            if still_pending:
+                self._fired.set()
+                logger.warning("imap_session_deadline_exceeded_before_connect")
+                raise TimeoutError(
+                    "IMAP session deadline exceeded before a connection could be established"
+                )
+
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        sock = outcome["sock"]
+        assert isinstance(sock, socket.socket)
+        return sock
 
     def _force_close(self, sock: socket.socket, extra_closable: HasClose | None) -> None:
         # Codex final review: closing `extra_closable` (a
@@ -247,6 +380,7 @@ class ImapSessionDeadline:
             self._force_close(sock, extra_closable)
 
     def __enter__(self) -> ImapSessionDeadline:
+        self._deadline_at = time.monotonic() + self._total_seconds
         self._timer = threading.Timer(self._total_seconds, self._on_fire)
         self._timer.daemon = True
         self._timer.start()
@@ -359,7 +493,16 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
         super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
 
     def _create_socket(self, timeout: float | None) -> socket.socket:
-        raw_sock = imaplib.IMAP4._create_socket(self, timeout)
+        # FINAL-003: imaplib.IMAP4._create_socket does socket.getaddrinfo()
+        # (DNS resolution) followed by connect() -- see
+        # ImapSessionDeadline.run_bounded's own docstring for why that
+        # whole phase was previously completely unbounded by the session
+        # deadline (no socket exists yet for bind_socket/_force_close to
+        # act on) and how run_bounded closes that gap without spawning an
+        # abandoned resolver thread.
+        raw_sock = self._imap_deadline.run_bounded(
+            lambda: imaplib.IMAP4._create_socket(self, timeout)
+        )
         self._imap_deadline.bind_socket(raw_sock)
         ssl_sock = self.ssl_context.wrap_socket(
             raw_sock, server_hostname=self.host, do_handshake_on_connect=False

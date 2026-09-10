@@ -265,11 +265,30 @@ class GmailFetchResult:
     `app.models.gmail.GmailSyncResult.deadline_exceeded` for how this
     propagates into a truthful non-"ok" sync outcome instead of a false
     "ok" or a discarded batch).
+
+    `uid_validity` (FINAL-004, Astra R5A): this run's resolved mailbox
+    UIDVALIDITY — always set (`_read_uid_validity` runs unconditionally
+    before any per-UID work), needed by the caller to scope
+    `permanently_skipped` correctly.
+
+    `permanently_skipped` (FINAL-004, Astra R5A): `(uid, reason)` pairs
+    for every UID this run determined is permanently unfetchable because
+    the MESSAGE'S OWN CONTENT is what's wrong (oversized past
+    MAX_RAW_MESSAGE_SIZE, or a MIME structure that fails to parse) — as
+    opposed to a transient FETCH/transport failure, which is never
+    included here and stays a plain, retryable `skipped_count` increment.
+    The caller (`app.services.gmail_inbox.GmailInboxService.sync`)
+    persists these via `app.db.gmail_repository.record_permanent_skips`
+    so a future sync's `get_known_uids` call excludes them from its
+    candidate list — see `app.db.models.GmailPermanentSkipRecord`'s
+    docstring for the exact starvation bug this closes.
     """
 
     messages: tuple[ParsedGmailMessage, ...]
     skipped_count: int
     deadline_exceeded: bool = False
+    uid_validity: int | None = None
+    permanently_skipped: tuple[tuple[int, str], ...] = ()
 
 
 class ImapClient(Protocol):

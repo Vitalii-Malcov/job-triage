@@ -682,6 +682,77 @@ class GmailMessageIdClaimRecord(Base):
     )
 
 
+class GmailPermanentSkipRecord(Base):
+    """FINAL-004 (Astra R5A): a durable, per-message "never fetch this
+    UID again" marker for a Gmail IMAP message whose CONTENT itself makes
+    it permanently unpersistable -- oversized past MAX_RAW_MESSAGE_SIZE,
+    or a MIME structure that fails to parse -- as distinct from a
+    transient FETCH/transport failure (deadline mid-fetch, a malformed
+    FETCH response shape, a non-OK `typ`), which is never recorded here
+    and stays eligible for retry on the next sync.
+
+    **Why this table exists.** `app.db.gmail_repository.get_known_uids`
+    already excludes already-PERSISTED UIDs from a sync's candidate list
+    before `app.providers.email.base.MAX_MESSAGES_PER_SYNC` is applied
+    (GMAIL-005/012) — but a message that is skipped every single run
+    (never persisted, since its content itself is what's wrong) was NEVER
+    excluded that way: it remained a "new" candidate on every future sync
+    forever. Combined with oldest-UID-first prioritization (see
+    `app.providers.email.imap.GmailImapProvider._fetch_sync_body`'s own
+    comment on why oldest-first is deliberate), a prefix of permanently
+    -bad messages at least as large as `MAX_MESSAGES_PER_SYNC` would
+    consume the ENTIRE budget of every future sync re-attempting (and
+    re-failing) the exact same oldest messages, permanently starving
+    every genuinely valid message newer than that prefix — a real,
+    silent, unrecoverable data-loss bug, not a cosmetic one. This table
+    closes that: `get_known_uids` (see that function's own docstring) now
+    also excludes UIDs recorded here, so a permanent skip behaves exactly
+    like an already-persisted message for the purpose of never consuming
+    sync budget again.
+
+    Same dedup identity shape as `GmailMessageRecord`
+    (`account_key`, `mailbox`, `uid_validity`, `uid`) for the SAME reason
+    (GMAIL-002 account isolation, GMAIL-009 UIDVALIDITY-scoped identity):
+    a UIDVALIDITY change on the mailbox silently makes every row for the
+    OLD `uid_validity` irrelevant (never matched again by a query scoped
+    to the CURRENT `uid_validity`) — identical safety property to
+    `GmailMessageRecord`'s own dedup identity, no separate cleanup logic
+    needed.
+
+    `reason` is diagnostic only (e.g. "OVERSIZED", "PARSE_FAILED",
+    "INVALID_UID") — never itself part of the uniqueness/lookup identity.
+    """
+
+    __tablename__ = "gmail_permanent_skips"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key",
+            "mailbox",
+            "uid_validity",
+            "uid",
+            name="uq_gmail_permanent_skips_account_provider_identity",
+        ),
+        CheckConstraint("uid > 0", name="ck_gmail_permanent_skips_uid_positive"),
+        CheckConstraint("uid_validity > 0", name="ck_gmail_permanent_skips_uid_validity_positive"),
+        Index(
+            "ix_gmail_permanent_skips_account_mailbox_uid_validity",
+            "account_key",
+            "mailbox",
+            "uid_validity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
+    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
 class GmailMessageAnalysisRecord(Base):
     """Immutable Stage 7B analysis result: deterministic, evidence-based
     job/application matching + correspondence classification for one

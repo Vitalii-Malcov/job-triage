@@ -2882,8 +2882,85 @@ def test_automation_processed_at_downgrade_removes_column_then_upgrade_restores_
     assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
 
 
+def test_gmail_permanent_skips_migration_creates_table_and_indexes(tmp_path: Path) -> None:
+    """FINAL-004 (Astra R5A): see app.db.models.GmailPermanentSkipRecord's
+    docstring for the starvation bug this table closes."""
+    db_path = tmp_path / "migrations_gmail_permanent_skips.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    assert "gmail_permanent_skips" in inspector.get_table_names()
+
+    columns = {col["name"] for col in inspector.get_columns("gmail_permanent_skips")}
+    assert columns == {
+        "id",
+        "account_key",
+        "mailbox",
+        "uid_validity",
+        "uid",
+        "reason",
+        "created_at",
+    }
+
+    unique_constraints = inspector.get_unique_constraints("gmail_permanent_skips")
+    assert any(
+        uc["column_names"] == ["account_key", "mailbox", "uid_validity", "uid"]
+        for uc in unique_constraints
+    )
+
+    indexes = {tuple(idx["column_names"]) for idx in inspector.get_indexes("gmail_permanent_skips")}
+    assert ("account_key", "mailbox", "uid_validity") in indexes
+
+
+def test_gmail_permanent_skips_rejects_duplicate_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "migrations_gmail_permanent_skips_unique.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert_sql = text(
+        """
+        INSERT INTO gmail_permanent_skips (
+            account_key, mailbox, uid_validity, uid, reason, created_at
+        ) VALUES ('a@example.com', 'INBOX', 100, 1, 'OVERSIZED', CURRENT_TIMESTAMP)
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert_sql)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(insert_sql)
+
+
+def test_gmail_permanent_skips_downgrade_removes_table_then_upgrade_restores_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_gmail_permanent_skips_downgrade.db"
+    cfg = _alembic_config(db_path)
+
+    upgrade(cfg, "head")
+    downgrade(cfg, "b4f6a1c9e7d2")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    assert "gmail_permanent_skips" not in tables
+    # Downgrading one step must not touch the previous (XING scan
+    # progress) migration's own tables.
+    assert "xing_scan_progress" in tables
+
+    upgrade(cfg, "head")
+
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    assert "gmail_permanent_skips" in inspector.get_table_names()
+
+
 def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    assert heads[0] == "b4f6a1c9e7d2"
+    assert heads[0] == "c7d3f9a1e5b8"

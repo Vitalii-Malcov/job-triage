@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.gmail_repository import list_messages
-from app.db.models import JobRecord
+from app.db.models import GmailPermanentSkipRecord, JobRecord
 from app.providers.email.base import GmailFetchResult, ParsedGmailMessage
 from app.services.gmail_inbox import GmailInboxService
 
@@ -60,10 +60,21 @@ class FakeProvider:
         messages: list[ParsedGmailMessage],
         skipped_count: int = 0,
         deadline_exceeded: bool = False,
+        # FINAL-004 (Astra R5A): account_key/mailbox mirror the real
+        # GmailImapProvider's own attributes -- GmailInboxService.sync
+        # reads them to scope record_permanent_skips correctly.
+        account_key: str = ACCOUNT,
+        mailbox: str = "INBOX",
+        uid_validity: int | None = None,
+        permanently_skipped: tuple[tuple[int, str], ...] = (),
     ) -> None:
         self._messages = tuple(messages)
         self._skipped_count = skipped_count
         self._deadline_exceeded = deadline_exceeded
+        self.account_key = account_key
+        self.mailbox = mailbox
+        self._uid_validity = uid_validity
+        self._permanently_skipped = permanently_skipped
         self.fetch_calls = 0
 
     async def fetch(self):
@@ -72,6 +83,8 @@ class FakeProvider:
             messages=self._messages,
             skipped_count=self._skipped_count,
             deadline_exceeded=self._deadline_exceeded,
+            uid_validity=self._uid_validity,
+            permanently_skipped=self._permanently_skipped,
         )
 
 
@@ -212,3 +225,68 @@ async def test_persist_failure_never_logs_exception_text_or_pii(db, monkeypatch,
     log_text = caplog.text
     for marker in secret_markers:
         assert marker not in log_text
+
+
+# ---------------------------------------------------------------------------
+# FINAL-004 (Astra R5A): sync persists GmailFetchResult.permanently_skipped
+# via record_permanent_skips — see that field's own docstring and
+# app.db.models.GmailPermanentSkipRecord for the starvation bug this closes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_persists_permanently_skipped_uids(db):
+    provider = FakeProvider(
+        [_parsed(1)],
+        skipped_count=2,
+        uid_validity=100,
+        permanently_skipped=((2, "OVERSIZED"), (3, "PARSE_FAILED")),
+    )
+
+    result = await GmailInboxService().sync(db, provider)
+
+    assert result.fetched == 1
+    assert result.skipped == 2
+    rows = (
+        db.query(GmailPermanentSkipRecord)
+        .filter(GmailPermanentSkipRecord.account_key == ACCOUNT)
+        .order_by(GmailPermanentSkipRecord.uid)
+        .all()
+    )
+    assert [(r.mailbox, r.uid_validity, r.uid, r.reason) for r in rows] == [
+        ("INBOX", 100, 2, "OVERSIZED"),
+        ("INBOX", 100, 3, "PARSE_FAILED"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_permanent_skip_persist_failure_does_not_fail_the_sync(db, monkeypatch):
+    """Best-effort, like every other persistence isolation in this
+    service: a failure recording permanent skips must never turn an
+    otherwise-successful sync (the message counts below) into a failure,
+    and must never roll back the messages this same sync already
+    persisted via upsert_message."""
+    import app.services.gmail_inbox as service_module
+
+    def poisoned_record_permanent_skips(*args, **kwargs):
+        raise RuntimeError("simulated permanent-skip persistence failure")
+
+    monkeypatch.setattr(service_module, "record_permanent_skips", poisoned_record_permanent_skips)
+
+    provider = FakeProvider(
+        [_parsed(1), _parsed(2)],
+        uid_validity=100,
+        permanently_skipped=((3, "OVERSIZED"),),
+    )
+
+    result = await GmailInboxService().sync(db, provider)
+
+    assert result.created == 2
+    assert result.failed == 0
+    assert len(list_messages(db, ACCOUNT, limit=200, offset=0)) == 2
+    assert (
+        db.query(GmailPermanentSkipRecord)
+        .filter(GmailPermanentSkipRecord.account_key == ACCOUNT)
+        .count()
+        == 0
+    )

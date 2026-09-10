@@ -482,7 +482,32 @@ class XingEmailCollector(JobCollector):
                 client = self._connect(deadline)
             try:
                 return self._fetch_sync_body(client, since, deadline)
-            except OSError as exc:
+            except (OSError, imaplib.IMAP4.abort) as exc:
+                # FINAL-001 (Astra R5A): imaplib.IMAP4.abort -- NOT an
+                # OSError, it subclasses imaplib.IMAP4.error -- is exactly
+                # what a deadline-forced socket close surfaces as here.
+                # imaplib.readline()'s own implementation catches the
+                # ConnectionError from the interrupted recv() and treats
+                # it as a clean EOF, so _get_line() raises
+                # `self.abort('socket error: EOF')` instead of letting the
+                # original OSError propagate (confirmed by reading
+                # imaplib.IMAP4.readline/_get_line's source on this
+                # runtime). Before this fix, that abort was not an
+                # OSError, so this except clause never caught it: it
+                # escaped uncaught all the way past
+                # app.api.routes.run_xing_collector's `except
+                # CollectorError` handler (never a CollectorError itself)
+                # into FastAPI/Starlette's default unhandled-exception
+                # path, which logs the full traceback via the ASGI
+                # server's own error logger -- including this exception's
+                # str(), which imaplib's own abort messages can populate
+                # with raw, potentially server-controlled bytes (e.g.
+                # `"socket error: unterminated line: %r" % line`). Caught
+                # here alongside OSError, it gets the exact same
+                # sanitized-message handling: only type(exc).__name__ is
+                # ever logged, and the caller only ever sees the static
+                # XingConnectionError text below -- never abort's own
+                # str().
                 if deadline is not None and deadline.exceeded:
                     logger.warning("xing_email_imap_session_deadline_exceeded")
                 else:
@@ -558,13 +583,13 @@ class XingEmailCollector(JobCollector):
             uid_bytes = str(uid).encode("ascii")
             try:
                 batch, confirmed = self._fetch_and_process_message(client, uid_bytes, uid)
-            except OSError:
+            except (OSError, imaplib.IMAP4.abort):
                 # Codex gate follow-up (Astra R4A HIGH): a transport
                 # -level failure mid-FETCH (the exact case the earlier
                 # NEW-001 fix's between-iterations `break` above did NOT
                 # cover -- the deadline watchdog can force-close the
                 # socket WHILE a FETCH is already blocked in flight,
-                # raising OSError from inside
+                # raising an exception from inside
                 # _fetch_and_process_message rather than being observed
                 # cleanly at the top of the next iteration). If the
                 # deadline is what caused this, stop cleanly here and let
@@ -574,6 +599,19 @@ class XingEmailCollector(JobCollector):
                 # cause it (a genuine, unexpected connection failure),
                 # re-raise so `_fetch_sync`'s existing outer handler logs
                 # and raises `XingConnectionError`, unchanged.
+                #
+                # FINAL-001 (Astra R5A): imaplib.IMAP4.abort is caught
+                # alongside OSError -- it is NOT an OSError subclass, but
+                # it is exactly what a deadline-forced socket close
+                # surfaces as when it interrupts imaplib's own buffered
+                # readline() mid-FETCH (imaplib's readline() catches the
+                # underlying ConnectionError itself and turns it into a
+                # clean-EOF abort -- see `_fetch_sync`'s own except clause
+                # for the confirmed source-level detail). Without this,
+                # a mid-FETCH deadline abort would skip this whole
+                # preserve-completed-batches path and propagate raw,
+                # exactly like the OSError gap this comment already
+                # describes.
                 if deadline is not None and deadline.exceeded:
                     break
                 raise
@@ -714,15 +752,18 @@ class XingEmailCollector(JobCollector):
         servers/fakes may omit or malform it, or a real transport error
         occurred) -- the caller then falls back to the full fetch rather
         than failing closed, an honest documented gap exactly like
-        `_read_message_size`'s own. `OSError` is NOT swallowed here: a
-        transport-level failure (including the deadline watchdog forcing
-        the socket closed mid-read) must propagate to
-        `_fetch_and_process_message`'s own caller, never be silently
-        reinterpreted as "header absent, fall back to full fetch".
+        `_read_message_size`'s own. `OSError` and `imaplib.IMAP4.abort`
+        are NOT swallowed here: a transport-level failure (including the
+        deadline watchdog forcing the socket closed mid-read -- which
+        imaplib's own readline() surfaces as `abort`, not `OSError`; see
+        `_fetch_sync`'s except clause for the confirmed source-level
+        detail, FINAL-001) must propagate to `_fetch_and_process_message`
+        's own caller, never be silently reinterpreted as "header absent,
+        fall back to full fetch".
         """
         try:
             typ, data = client.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-        except OSError:
+        except (OSError, imaplib.IMAP4.abort):
             raise
         except Exception:
             return None

@@ -24,12 +24,13 @@ from app.db.gmail_repository import (
     list_messages,
     list_messages_for_thread,
     list_threads_with_counts,
+    record_permanent_skips,
     release_thread_lock,
     resolve_thread_anchor,
     to_gmail_thread,
     upsert_message,
 )
-from app.db.models import GmailMessageRecord
+from app.db.models import GmailMessageRecord, GmailPermanentSkipRecord
 from app.providers.email.base import ParsedGmailMessage
 
 ACCOUNT_A = "a@example.com"
@@ -717,26 +718,32 @@ def _count_select_statements(engine, action) -> int:
     return len(executed)
 
 
-def test_get_known_uids_issues_one_query_for_a_single_candidate(db):
+def test_get_known_uids_issues_one_query_per_table_for_a_single_candidate(db):
+    # FINAL-004 (Astra R5A): get_known_uids now checks TWO tables per
+    # chunk (GmailMessageRecord — already-persisted — and
+    # GmailPermanentSkipRecord — permanently unfetchable, see that
+    # model's docstring) instead of one; the GMAIL-012 bound this
+    # guards is "one query per table per chunk", never one query per UID.
     engine = db.get_bind()
     query_count = _count_select_statements(
         engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, [1])
     )
-    assert query_count == 1
+    assert query_count == 2
 
 
-def test_get_known_uids_issues_one_query_for_100_candidates(db):
+def test_get_known_uids_issues_one_query_per_table_for_100_candidates(db):
     engine = db.get_bind()
     query_count = _count_select_statements(
         engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, list(range(1, 101)))
     )
-    assert query_count == 1
+    assert query_count == 2
 
 
 def test_get_known_uids_issues_bounded_chunked_queries_for_10000_candidates(db):
     """The critical GMAIL-012 regression: 10,000 candidate UIDs must
     never produce anywhere close to 10,000 SELECTs — only
-    ceil(10000 / KNOWN_UIDS_QUERY_CHUNK_SIZE) chunk queries.
+    2 * ceil(10000 / KNOWN_UIDS_QUERY_CHUNK_SIZE) chunk queries (one per
+    table — see FINAL-004's two-table note above — per chunk).
     """
     from app.db.gmail_repository import KNOWN_UIDS_QUERY_CHUNK_SIZE
 
@@ -746,7 +753,7 @@ def test_get_known_uids_issues_bounded_chunked_queries_for_10000_candidates(db):
         engine, lambda: get_known_uids(db, ACCOUNT_A, "INBOX", 100, candidate_uids)
     )
     expected_chunks = -(-len(candidate_uids) // KNOWN_UIDS_QUERY_CHUNK_SIZE)  # ceil div
-    assert query_count == expected_chunks
+    assert query_count == expected_chunks * 2
     assert query_count < 100  # nowhere close to one-query-per-UID
 
 
@@ -767,6 +774,80 @@ def test_get_known_uids_is_scoped_by_account_mailbox_and_uid_validity(db):
     assert get_known_uids(db, ACCOUNT_B, "INBOX", 100, [1]) == {1}
     assert get_known_uids(db, ACCOUNT_A, "INBOX", 200, [1]) == set()
     assert get_known_uids(db, ACCOUNT_A, "OTHERBOX", 100, [1]) == set()
+
+
+# ---------------------------------------------------------------------------
+# FINAL-004 (Astra R5A): record_permanent_skips / get_known_uids's
+# permanent-skip half — see app.db.models.GmailPermanentSkipRecord's
+# docstring for the starvation bug this closes.
+# ---------------------------------------------------------------------------
+
+
+def test_record_permanent_skips_persists_rows_with_reason(db):
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(5, "OVERSIZED"), (6, "PARSE_FAILED")])
+
+    rows = (
+        db.query(GmailPermanentSkipRecord)
+        .filter(GmailPermanentSkipRecord.account_key == ACCOUNT_A)
+        .order_by(GmailPermanentSkipRecord.uid)
+        .all()
+    )
+    assert [(r.uid, r.reason) for r in rows] == [(5, "OVERSIZED"), (6, "PARSE_FAILED")]
+
+
+def test_get_known_uids_excludes_permanently_skipped_uids(db):
+    """The actual forward-progress mechanism: a permanently-skipped UID
+    must be excluded from a future sync's candidate list exactly like an
+    already-PERSISTED message already is — see get_known_uids's own
+    docstring."""
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(7, "OVERSIZED")])
+
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 100, [7, 8]) == {7}
+
+
+def test_record_permanent_skips_is_idempotent_across_repeated_runs(db):
+    """A UID recorded as permanently skipped on one sync run must not
+    raise or duplicate when the SAME uid is (harmlessly) reported again
+    by a later run before its exclusion has taken effect for that run —
+    mirrors upsert_message's own IntegrityError-tolerant idempotency."""
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(9, "OVERSIZED")])
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(9, "OVERSIZED")])
+
+    rows = (
+        db.query(GmailPermanentSkipRecord)
+        .filter(
+            GmailPermanentSkipRecord.account_key == ACCOUNT_A,
+            GmailPermanentSkipRecord.uid == 9,
+        )
+        .all()
+    )
+    assert len(rows) == 1
+
+
+def test_permanent_skips_are_scoped_by_account_mailbox_and_uid_validity(db):
+    """Same scoping guarantee as GmailMessageRecord's own dedup identity
+    (GMAIL-002 account isolation, GMAIL-009 UIDVALIDITY safety) — a
+    UIDVALIDITY change or a different account/mailbox must never let one
+    permanent-skip record incorrectly suppress an unrelated UID."""
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(11, "OVERSIZED")])
+
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 100, [11]) == {11}
+    assert get_known_uids(db, ACCOUNT_B, "INBOX", 100, [11]) == set()
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 200, [11]) == set()
+    assert get_known_uids(db, ACCOUNT_A, "OTHERBOX", 100, [11]) == set()
+
+
+def test_record_permanent_skips_one_bad_row_does_not_block_the_rest(db):
+    """Mirrors upsert_message's per-row isolation: one uid's insert
+    failing must never prevent the others in the same call from being
+    recorded."""
+    # Pre-existing row for uid=13 makes that specific insert collide;
+    # uid=14 in the SAME call must still be recorded.
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(13, "OVERSIZED")])
+
+    record_permanent_skips(db, ACCOUNT_A, "INBOX", 100, [(13, "OVERSIZED"), (14, "PARSE_FAILED")])
+
+    assert get_known_uids(db, ACCOUNT_A, "INBOX", 100, [13, 14]) == {13, 14}
 
 
 def test_get_thread_message_count_single_thread(db):

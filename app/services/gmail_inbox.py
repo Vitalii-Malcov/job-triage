@@ -28,7 +28,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.db.gmail_repository import upsert_message
+from app.db.gmail_repository import record_permanent_skips, upsert_message
 from app.models.gmail import GmailSyncResult
 from app.providers.email.imap import GmailImapProvider
 
@@ -64,6 +64,35 @@ class GmailInboxService:
                 created += 1
             else:
                 duplicates += 1
+
+        # FINAL-004 (Astra R5A): durably record every UID this run
+        # determined is permanently unfetchable (message content itself
+        # is the problem — see GmailFetchResult.permanently_skipped's
+        # docstring) so a future sync's candidate list excludes it,
+        # exactly like an already-persisted message already is — closing
+        # a starvation bug where a prefix of such messages at least as
+        # large as MAX_MESSAGES_PER_SYNC would otherwise consume every
+        # future sync's entire budget forever. Best-effort: never allowed
+        # to turn an otherwise-successful sync (the created/duplicates/
+        # failed counts above) into a failure — see
+        # `record_permanent_skips`'s own per-row isolation.
+        if fetch_result.permanently_skipped:
+            assert fetch_result.uid_validity is not None
+            try:
+                record_permanent_skips(
+                    db,
+                    provider.account_key,
+                    provider.mailbox,
+                    fetch_result.uid_validity,
+                    fetch_result.permanently_skipped,
+                )
+            except Exception as exc:
+                # GMAIL-003: type only, never the exception's own message
+                # text (a driver-level error can embed row content).
+                db.rollback()
+                logger.warning(
+                    "gmail_permanent_skip_persist_failed error_type=%s", type(exc).__name__
+                )
 
         logger.info(
             "gmail_sync_run fetched=%s created=%s duplicates=%s skipped=%s failed=%s "

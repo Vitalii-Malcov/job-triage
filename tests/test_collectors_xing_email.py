@@ -99,6 +99,7 @@ class FakeImapClient:
         messages: list[bytes],
         *,
         raise_oserror_on_message_set: set[bytes] | None = None,
+        raise_abort_on_message_set: set[bytes] | None = None,
         uid_validity: int = 1,
     ) -> None:
         self._messages = messages
@@ -108,6 +109,15 @@ class FakeImapClient:
         # (including "the deadline watchdog force-closed the socket
         # mid-FETCH") without any real socket/timing involved.
         self._raise_oserror_on_message_set = raise_oserror_on_message_set or set()
+        # FINAL-001 (Astra R5A): same idea, but raises imaplib.IMAP4.abort
+        # instead -- NOT an OSError subclass, but exactly what a real
+        # deadline-forced socket close surfaces as when it interrupts
+        # imaplib's own buffered readline() mid-FETCH (imaplib's
+        # readline() catches the underlying ConnectionError itself and
+        # turns it into a clean-EOF abort -- see
+        # app.collectors.xing_email._fetch_sync's own except clause for
+        # the confirmed source-level detail).
+        self._raise_abort_on_message_set = raise_abort_on_message_set or set()
         # Codex gate follow-up (Astra R4A MEDIUM, starvation): this fake
         # uses UID == 1-based list index throughout (both `.uid("search",
         # ...)` and `.uid("fetch", ...)` delegate straight to the
@@ -144,6 +154,8 @@ class FakeImapClient:
         self.fetch_calls.append(message_set)
         if message_set in self._raise_oserror_on_message_set:
             raise OSError("simulated transport failure")
+        if message_set in self._raise_abort_on_message_set:
+            raise imaplib.IMAP4.abort("simulated deadline-forced abort")
         index = int(message_set) - 1
         raw = self._messages[index]
         return ("OK", [(b"1 (RFC822 {%d}" % len(raw), raw)])
@@ -1171,6 +1183,117 @@ class TestSessionDeadlineWiring:
         with pytest.raises(XingConnectionError):
             await collector.fetch_message_batches()
 
+        assert fake_client.closed is True
+        assert fake_client.logged_out is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_batches_when_deadline_fires_mid_fetch_via_imap4_abort(
+        self, monkeypatch
+    ):
+        """FINAL-001 (Astra R5A): the exact same scenario as
+        `test_fetch_preserves_batches_when_deadline_fires_mid_fetch`
+        above, but the deadline-forced socket close surfaces as
+        `imaplib.IMAP4.abort` instead of `OSError` -- confirmed as the
+        REAL symptom by reading imaplib's own readline()/`_get_line`
+        source (readline() catches the interrupted recv()'s
+        ConnectionError itself and turns it into a clean-EOF abort, not
+        a propagated OSError). Before this fix, `except OSError:` alone
+        in `_fetch_sync_body`'s per-UID loop never caught this, so it
+        escaped uncaught past this whole preserve-completed-batches path
+        -- message 1's already-completed batch must still be preserved
+        here exactly like the OSError case.
+        """
+        body1 = _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS)
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            body1,
+            message_id="<first@mail.xing.com>",
+        )
+        raw2 = _build_email(
+            XING_SENDER,
+            "5 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITH_ALL_OPTIONAL_FIELDS),
+            message_id="<second@mail.xing.com>",
+        )
+        fake_client = FakeImapClient([raw1, raw2], raise_abort_on_message_set={b"2"})
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        monkeypatch.setattr(
+            xing_email_module,
+            "ImapSessionDeadline",
+            _make_exceeds_after_n_checks_deadline_class(2),
+        )
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        batches = await collector.fetch_message_batches()
+
+        assert len(batches) == 1
+        assert batches[0].message_id == "<first@mail.xing.com>"
+        assert collector.deadline_exceeded is True
+        # Message 2's abort must have been observed on its very FIRST
+        # fetch attempt (the cheap Message-ID header pre-check via
+        # _read_message_id_header) -- proving that method's own
+        # `except (OSError, imaplib.IMAP4.abort): raise` propagates the
+        # abort immediately, never silently swallowing it as "header
+        # absent, fall back to the full RFC822 fetch" (which would show
+        # up here as TWO fetch_calls entries for b"2" instead of one).
+        assert fake_client.fetch_calls.count(b"2") == 1
+
+    @pytest.mark.asyncio
+    async def test_genuine_imap4_abort_without_deadline_raises_sanitized_connection_error(
+        self, monkeypatch, caplog
+    ):
+        """FINAL-001 (Astra R5A): a real, unexpected `imaplib.IMAP4.abort`
+        mid-FETCH -- NOT caused by the session deadline -- must still
+        raise a sanitized `XingConnectionError` (never the raw abort
+        object/message escaping uncaught into
+        app.api.routes.run_xing_collector's generic-exception path,
+        which would otherwise reach FastAPI/Starlette's own unhandled
+        -exception traceback logging -- see
+        app.collectors.xing_email._fetch_sync's own except clause for
+        the full rationale) and must never log the abort's own raw,
+        potentially server-controlled message text -- only
+        `type(exc).__name__`.
+        """
+        sensitive_exc_text = "SECRET_RAW_ABORT_TEXT_MUST_NOT_LEAK"
+        raw1 = _build_email(
+            XING_SENDER,
+            "3 neue Stellenangebote für Python",
+            _digest_body(BLOCK_WITHOUT_OPTIONAL_FIELDS),
+            message_id="<first@mail.xing.com>",
+        )
+
+        class _AbortingClient(FakeImapClient):
+            def fetch(self, message_set, message_parts: str) -> tuple[str, list]:
+                self.fetch_calls.append(message_set)
+                if message_set == b"1":
+                    raise imaplib.IMAP4.abort(sensitive_exc_text)
+                return super().fetch(message_set, message_parts)
+
+        fake_client = _AbortingClient([raw1])
+
+        monkeypatch.setattr(xing_email_module, "DeadlineIMAP4SSL", lambda *a, **kw: fake_client)
+        # A real ImapSessionDeadline (never fires within this fast test)
+        # -- `.exceeded` stays False throughout, so the abort below is
+        # unambiguously a genuine failure, not a deadline artifact.
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with pytest.raises(XingConnectionError) as exc_info:
+            await collector.fetch_message_batches()
+
+        assert sensitive_exc_text not in str(exc_info.value)
+        assert sensitive_exc_text not in caplog.text
         assert fake_client.closed is True
         assert fake_client.logged_out is True
 

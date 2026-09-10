@@ -563,6 +563,105 @@ async def test_oversized_message_is_skipped_before_body_fetch():
 
 
 @pytest.mark.asyncio
+async def test_oversized_message_is_reported_as_permanently_skipped():
+    """FINAL-004 (Astra R5A): an oversized message's content will always
+    be oversized on every future attempt too -- it must be reported via
+    `GmailFetchResult.permanently_skipped`, not just counted in the
+    plain (retryable) `skipped_count`, so the caller can durably record
+    it via `app.db.gmail_repository.record_permanent_skips` and never
+    re-select it as a candidate again (see
+    `app.db.models.GmailPermanentSkipRecord`'s docstring for the
+    starvation this closes)."""
+    raw = _build_email(plaintext_body="small body")
+    client = FakeImapClient(messages={1: raw}, size_override={1: 10_000_000}, uid_validity=555)
+    provider = _provider(client)
+
+    result = await provider.fetch()
+
+    assert result.permanently_skipped == ((1, "OVERSIZED"),)
+    assert result.uid_validity == 555
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_not_reported_as_permanently_skipped():
+    """The other half of the same distinction: a transient transport
+    failure (a different attempt could plausibly succeed) must NEVER be
+    recorded as permanent -- it must stay eligible for retry on the next
+    sync, exactly like before this fix existed."""
+    raw = _build_email(plaintext_body="hi")
+    client = FakeImapClient(messages={1: raw}, raise_oserror_on_uid={1})
+    provider = _provider(client)
+
+    with pytest.raises(GmailConnectionError):
+        await provider.fetch()
+
+    # The OSError propagated (a genuine, non-deadline transport failure)
+    # rather than being swallowed into a GmailFetchResult -- confirming
+    # this failure mode was never at risk of being misclassified as
+    # permanent in the first place (there is no GmailFetchResult to
+    # inspect here at all, which is itself the correct, unchanged
+    # behavior for a real connection failure).
+
+
+@pytest.mark.asyncio
+async def test_permanent_skips_do_not_starve_later_valid_uids_across_syncs(monkeypatch):
+    """FINAL-004 (Astra R5A): the exact Astra scenario -- a prefix of
+    permanently-unfetchable messages (here: oversized, standing in for
+    "500 permanent skips" at a scale a unit test can actually run) must
+    not consume every future sync's entire MAX_MESSAGES_PER_SYNC budget
+    forever. Mirrors
+    `test_messages_per_sync_cap_drains_backlog_across_syncs_via_get_known_uids`
+    above exactly (same oldest-first-prioritization-alone-is-not
+    -sufficient structure) but with PERMANENTLY bad messages as the
+    prefix instead of merely not-yet-persisted ones -- proving the
+    starvation fix also covers messages that can never be persisted at
+    all, not just ones that eventually get persisted.
+
+    `known` here plays the same role `app.db.gmail_repository
+    .get_known_uids`'s real UNION of GmailMessageRecord and
+    GmailPermanentSkipRecord plays in production (see that function's
+    own docstring) -- updated from `result.permanently_skipped` exactly
+    like `app.services.gmail_inbox.GmailInboxService.sync` updates the
+    real DB via `record_permanent_skips` between sync runs.
+    """
+    monkeypatch.setattr(gmail_imap_module, "MAX_MESSAGES_PER_SYNC", 2)
+    known: set[int] = set()
+    # UIDs 1, 2: permanently oversized -- will NEVER be persisted, no
+    # matter how many times a sync attempts them.
+    # UID 3: a genuinely valid, fetchable message.
+    messages = {
+        1: _build_email(message_id="<1@example.com>", plaintext_body="oversized-1"),
+        2: _build_email(message_id="<2@example.com>", plaintext_body="oversized-2"),
+        3: _build_email(message_id="<3@example.com>", plaintext_body="valid"),
+    }
+    size_override = {1: 10_000_000, 2: 10_000_000}
+    client = FakeImapClient(messages=messages, size_override=size_override)
+    provider = _provider(
+        client,
+        get_known_uids=lambda uid_validity, candidate_uids: known & set(candidate_uids),
+    )
+
+    first_run = await provider.fetch()
+    # The cap (2) is entirely consumed by the two permanently-oversized
+    # UIDs -- UID 3 is never even attempted this run, exactly the
+    # starvation-in-progress state before the fix's caller-side
+    # exclusion kicks in.
+    assert first_run.messages == ()
+    assert {uid for uid, _reason in first_run.permanently_skipped} == {1, 2}
+    # Simulates GmailInboxService.sync persisting these via
+    # record_permanent_skips, then a later sync's get_known_uids
+    # (backed by the real UNION query) excluding them.
+    known.update(uid for uid, _reason in first_run.permanently_skipped)
+
+    second_run = await provider.fetch()
+    # UID 3 is NOW reached -- forward progress was made past the
+    # permanently-bad prefix instead of the same two UIDs being
+    # reselected and re-consuming the cap forever.
+    assert {msg.uid for msg in second_run.messages} == {3}
+    assert second_run.permanently_skipped == ()
+
+
+@pytest.mark.asyncio
 async def test_unknown_size_proceeds_to_fetch_body():
     """A server/fake that can't report RFC822.SIZE cleanly must not fail
     closed — size gating is a best-effort optimization on top of the

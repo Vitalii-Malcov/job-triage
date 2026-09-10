@@ -98,6 +98,17 @@ _UIDVALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)")
 _RFC822_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
 _INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 
+# FINAL-004 (Astra R5A): reasons `_fetch_one` classifies as PERMANENT --
+# the message's own content is what's wrong, so retrying will fail
+# identically forever -- as opposed to every other `_fetch_one` `None`
+# return (fetch failed, malformed response shape, transport error),
+# which is a transient/retryable skip and never recorded via these. See
+# app.db.models.GmailPermanentSkipRecord's docstring for why this
+# distinction is what makes durable forward progress possible.
+PERMANENT_SKIP_REASON_OVERSIZED = "OVERSIZED"
+PERMANENT_SKIP_REASON_PARSE_FAILED = "PARSE_FAILED"
+PERMANENT_SKIP_REASON_INVALID_UID = "INVALID_UID"
+
 
 def _decode_mime_words(raw: str) -> str:
     """Decode an RFC 2047 encoded-word header value (Subject, display
@@ -496,6 +507,14 @@ class GmailImapProvider:
             logger.warning("gmail_sync_message_cap_exceeded cap=%s", MAX_MESSAGES_PER_SYNC)
 
         messages: list[ParsedGmailMessage] = []
+        # FINAL-004 (Astra R5A): (uid, reason) pairs for every UID this
+        # run determined is PERMANENTLY unfetchable (message content
+        # itself is the problem) -- see GmailFetchResult.permanently_skipped
+        # and app.db.models.GmailPermanentSkipRecord for how the caller
+        # persists these so a future sync's candidate list excludes them,
+        # closing the starvation bug a never-recorded permanent skip
+        # would otherwise cause.
+        permanently_skipped: list[tuple[int, str]] = []
         for uid_bytes in uids:
             # AUD-005: once the total session deadline has fired, the
             # connection's socket is already forcibly closed (see
@@ -504,7 +523,7 @@ class GmailImapProvider:
             if deadline is not None and deadline.exceeded:
                 break
             try:
-                parsed = self._fetch_one(client, uid_bytes, uid_validity)
+                parsed, permanent_skip_reason = self._fetch_one(client, uid_bytes, uid_validity)
             except OSError:
                 # Codex gate follow-up (Astra R4A MEDIUM): a transport
                 # -level failure mid-FETCH (the between-iterations
@@ -525,6 +544,8 @@ class GmailImapProvider:
                 raise
             if parsed is None:
                 skipped_count += 1
+                if permanent_skip_reason is not None:
+                    permanently_skipped.append((int(uid_bytes), permanent_skip_reason))
             else:
                 messages.append(parsed)
 
@@ -552,6 +573,8 @@ class GmailImapProvider:
             messages=tuple(messages),
             skipped_count=skipped_count,
             deadline_exceeded=deadline is not None and deadline.exceeded,
+            uid_validity=uid_validity,
+            permanently_skipped=tuple(permanently_skipped),
         )
 
     def _read_uid_validity(self, client: ImapClient) -> int:
@@ -678,14 +701,31 @@ class GmailImapProvider:
 
     def _fetch_one(
         self, client: ImapClient, uid_bytes: bytes, uid_validity: int
-    ) -> ParsedGmailMessage | None:
+    ) -> tuple[ParsedGmailMessage | None, str | None]:
+        """Returns `(parsed, permanent_skip_reason)`.
+
+        `permanent_skip_reason` is non-None (FINAL-004, Astra R5A) only
+        when `parsed is None` AND the reason is about this message's own
+        CONTENT (oversized, unparseable MIME, an invalid UID value) --
+        deterministic given the same bytes, so retrying can never
+        succeed. Every OTHER `parsed is None` case (a non-OK FETCH,
+        malformed response shape, or any other transport/protocol
+        hiccup) returns `permanent_skip_reason=None`: those are
+        transient by nature (a different attempt against the same
+        mailbox could plausibly behave differently) and must stay
+        eligible for retry on the next sync, never be recorded as
+        permanently unfetchable. See
+        app.providers.email.base.GmailFetchResult.permanently_skipped
+        and app.db.models.GmailPermanentSkipRecord for how the caller
+        uses this distinction.
+        """
         # GMAIL-005: check the server-reported size BEFORE transferring
         # the body at all. An unknown size (None) proceeds rather than
         # failing closed — see _read_message_size's docstring.
         size = self._read_message_size(client, uid_bytes)
         if size is not None and size > MAX_RAW_MESSAGE_SIZE:
             logger.warning("gmail_message_oversized")
-            return None
+            return None, PERMANENT_SKIP_REASON_OVERSIZED
 
         try:
             # GMAIL-001: BODY.PEEK[] fetches the full message without
@@ -715,10 +755,10 @@ class GmailImapProvider:
             raise
         except Exception as exc:
             logger.warning("gmail_message_fetch_error error_type=%s", type(exc).__name__)
-            return None
+            return None, None
         if typ != "OK" or not msg_data or msg_data[0] is None:
             logger.warning("gmail_message_fetch_failed")
-            return None
+            return None, None
 
         # GMAIL-010: everything from here — including validating the
         # shape of `msg_data[0]` itself — stays inside this single
@@ -729,16 +769,16 @@ class GmailImapProvider:
             uid = int(uid_bytes)
             if uid <= 0:
                 logger.warning("gmail_message_invalid_uid")
-                return None
+                return None, PERMANENT_SKIP_REASON_INVALID_UID
 
             item = msg_data[0]
             if not isinstance(item, tuple) or len(item) < 2:
                 logger.warning("gmail_message_fetch_response_malformed")
-                return None
+                return None, None
             raw_email = item[1]
             if not isinstance(raw_email, bytes | bytearray):
                 logger.warning("gmail_message_fetch_response_malformed")
-                return None
+                return None, None
 
             fetch_header = item[0]
             provider_arrival_at = (
@@ -748,18 +788,23 @@ class GmailImapProvider:
             )
 
             msg = email.message_from_bytes(bytes(raw_email))
-            return self._parse_message(
+            parsed = self._parse_message(
                 msg,
                 uid=uid,
                 uid_validity=uid_validity,
                 provider_arrival_at=provider_arrival_at,
             )
+            return parsed, None
         except Exception as exc:
             # Any malformed-MIME/parse failure is a skip, never a crash of
             # the whole sync — one bad message must not stop the rest of
-            # an otherwise-successful mailbox read.
+            # an otherwise-successful mailbox read. FINAL-004 (Astra
+            # R5A): this message's own raw bytes are already fully in
+            # hand at this point (the FETCH itself succeeded) and failed
+            # to parse -- deterministic given the same bytes, so this is
+            # PERMANENT, not a transient fetch/transport hiccup.
             logger.warning("gmail_message_parse_failed error_type=%s", type(exc).__name__)
-            return None
+            return None, PERMANENT_SKIP_REASON_PARSE_FAILED
 
     def _parse_message(
         self,
