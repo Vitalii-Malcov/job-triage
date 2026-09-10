@@ -9,12 +9,16 @@ the SQLite proofs this mirrors).
 **Local execution:** skipped automatically unless `TEST_POSTGRES_URL` is
 set (e.g. `postgresql+psycopg://user:password@localhost:5432/dbname`) --
 this project's default dev/test setup is SQLite-only and does not assume
-a local PostgreSQL server is available.
+a local PostgreSQL server is available. If you do set it locally, run
+`alembic upgrade head` (with `DATABASE_URL` pointed at that same
+database) first -- NEW-007 removed this module's own
+`Base.metadata.create_all` fallback (see `pg_session_factory` below), so
+the schema must already exist via the real migration chain.
 
 **CI:** `.github/workflows/ci.yml`'s dedicated `scheduler-postgres` job
-starts a real `postgres:16` service container and always sets
-`TEST_POSTGRES_URL`, so this module actually runs there on every push/PR
--- never silently skipped in CI.
+starts a real `postgres:16` service container, runs `alembic upgrade
+head` against it, and always sets `TEST_POSTGRES_URL`, so this module
+actually runs there on every push/PR -- never silently skipped in CI.
 
 This module never duplicates the CAS SQL itself -- it calls the REAL
 `claim_due_schedule`/`get_or_create_schedule`, synchronized with a
@@ -37,7 +41,6 @@ from app.db.automation_schedule_repository import (
     get_or_create_schedule,
     get_schedule,
 )
-from app.db.base import Base
 from app.db.models import AutomationScheduleRecord
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
@@ -81,8 +84,13 @@ def _make_barrier_synced_get_schedule(original, barrier: threading.Barrier):
 
 @pytest.fixture()
 def pg_session_factory():
+    # NEW-007: no Base.metadata.create_all here -- the schema must come
+    # from the real Alembic migration chain (CI's scheduler-postgres job
+    # runs `alembic upgrade head` before this module executes; see the
+    # module docstring for the local-execution equivalent). A missing
+    # table here means the migration chain is broken and must fail
+    # loudly, not be silently papered over by ORM metadata creation.
     engine = create_engine(TEST_POSTGRES_URL, future=True)
-    Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     yield factory
     with engine.begin() as conn:
