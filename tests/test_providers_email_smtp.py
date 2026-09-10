@@ -280,6 +280,11 @@ class TestHardConnectionTimeout:
         captured = {}
 
         class _StubClient:
+            def connect(self, host, port):
+                captured["host"] = host
+                captured["port"] = port
+                return (220, b"Hello")
+
             def login(self, user, password):
                 return (235, b"OK")
 
@@ -289,9 +294,10 @@ class TestHardConnectionTimeout:
             def quit(self):
                 return (221, b"Bye")
 
-        def _fake_smtp_ssl(host, port, timeout=None, context=None):
-            captured["host"] = host
-            captured["port"] = port
+        def _fake_smtp_ssl(*, timeout=None, context=None):
+            # NEW-006 take 4: SMTP_SSL is now constructed WITHOUT
+            # host/port (deferred connect) -- see GmailSmtpProvider.
+            # _connect's own docstring.
             captured["timeout"] = timeout
             captured["context"] = context
             return _StubClient()
@@ -302,6 +308,8 @@ class TestHardConnectionTimeout:
         provider.send(_message())
 
         assert captured["timeout"] == SMTP_OPERATION_TIMEOUT_SECONDS
+        assert captured["host"] == provider.smtp_host
+        assert captured["port"] == provider.smtp_port
 
     def test_connect_passes_a_verifying_ssl_context(self, monkeypatch):
         """AUD-001: smtplib.SMTP_SSL's own default (context=None) resolves
@@ -313,6 +321,9 @@ class TestHardConnectionTimeout:
         captured = {}
 
         class _StubClient:
+            def connect(self, host, port):
+                return (220, b"Hello")
+
             def login(self, user, password):
                 return (235, b"OK")
 
@@ -322,7 +333,7 @@ class TestHardConnectionTimeout:
             def quit(self):
                 return (221, b"Bye")
 
-        def _fake_smtp_ssl(host, port, timeout=None, context=None):
+        def _fake_smtp_ssl(*, timeout=None, context=None):
             captured["context"] = context
             return _StubClient()
 
@@ -390,6 +401,9 @@ class TestHardConnectionTimeout:
         handle."""
 
         class _HangingLoginClient:
+            def connect(self, host, port):
+                return (220, b"Hello")
+
             def login(self, user, password):
                 raise TimeoutError("timed out waiting for login response")
 
@@ -495,6 +509,9 @@ class TestTotalSendDeadline:
         module — never misclassified as ambiguous."""
 
         class _NeverReturningLoginClient:
+            def connect(self, host, port):
+                return (220, b"Hello")
+
             def login(self, user, password):
                 time.sleep(5)
                 return (235, b"OK")
@@ -525,6 +542,9 @@ class TestTotalSendDeadline:
         failure — the peer may have already accepted the message."""
 
         class _NeverReturningSendClient:
+            def connect(self, host, port):
+                return (220, b"Hello")
+
             def login(self, user, password):
                 return (235, b"OK")
 
@@ -588,6 +608,9 @@ class TestTotalSendDeadline:
         class _BlockingThenReleasingLoginClient:
             def __init__(self) -> None:
                 self.send_message_called = False
+
+            def connect(self, host, port):
+                return (220, b"Hello")
 
             def login(self, user, password):
                 # Blocks until the test explicitly releases it -- models
@@ -687,6 +710,11 @@ class TestTotalSendDeadline:
                 def __init__(self) -> None:
                     self.send_message_called = False
 
+                def connect(self, host, port):
+                    # Already connected -- the test set up `raw_client_sock`
+                    # itself before this client was even constructed.
+                    return (220, b"Hello")
+
                 def login(self, user, password):
                     raw_client_sock.settimeout(SMTP_OPERATION_TIMEOUT_SECONDS)
                     raw_client_sock.recv(1)  # blocks until closed or timed out
@@ -725,6 +753,115 @@ class TestTotalSendDeadline:
             assert connection_closed.wait(timeout=4.0), (
                 "server never observed the client socket close -- "
                 "_force_close did not actively interrupt the real blocked read"
+            )
+        finally:
+            server.close()
+            server_thread.join(timeout=3)
+
+    def test_watchdog_can_abort_during_a_blocking_greeting_in_explicit_connect(self, monkeypatch):
+        """Codex gate follow-up (Astra R4B, NEW-006 take 4) REQUIRED
+        regression: the exact constructor-time gap this take closes.
+
+        Before take 4, `_connect()` called `smtplib.SMTP_SSL(host, port,
+        ...)` -- which performs the ENTIRE TCP connect + TLS handshake +
+        SMTP greeting read INSIDE its own constructor -- so `send()`'s
+        deadline watchdog had NO client object to register (and
+        therefore nothing to `_force_close`) for that whole call. A peer
+        that accepts the connection but never sends its greeting banner
+        (blocking the read `connect()` does internally via `getreply()`)
+        could hold the worker hostage with no way for the watchdog to
+        intervene.
+
+        This fixture's fake client's `connect()` method itself performs
+        the blocking read (simulating that exact "greeting never
+        arrives" scenario) -- and the fake is registered with the
+        watchdog via `on_connected` BEFORE `connect()` is ever called
+        (see `_connect`'s own docstring), so the deadline can abort it
+        mid-`connect()`. Proves: deadline fires -> the watchdog can
+        already reach the registered client -> the blocked greeting read
+        unblocks -> the worker exits promptly -> `login()`/
+        `send_message()` are never reached.
+        """
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        connection_closed = threading.Event()
+
+        def _accept_then_detect_close():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(SMTP_OPERATION_TIMEOUT_SECONDS)
+                # Never sends a greeting -- blocks until the peer
+                # shuts down/closes (recv returns b"") or this generous
+                # per-op timeout fires; the test asserts the FORMER
+                # happens first, well before the latter ever could.
+                data = conn.recv(1)
+                if data == b"":
+                    connection_closed.set()
+            except OSError:
+                connection_closed.set()
+            finally:
+                conn.close()
+
+        server_thread = threading.Thread(target=_accept_then_detect_close, daemon=True)
+        server_thread.start()
+        try:
+            raw_client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_client_sock.connect((host, port))
+
+            class _BlockingGreetingClient:
+                """`smtplib.SMTP_SSL`-shaped double whose `connect()`
+                itself blocks on a REAL socket read -- models
+                `smtplib.SMTP.connect()`'s own internal `getreply()`
+                hanging on a greeting that never arrives."""
+
+                sock = raw_client_sock
+
+                def __init__(self) -> None:
+                    self.login_called = False
+                    self.send_message_called = False
+
+                def connect(self, host, port):
+                    raw_client_sock.settimeout(SMTP_OPERATION_TIMEOUT_SECONDS)
+                    raw_client_sock.recv(1)  # blocks -- server never replies
+                    return (220, b"Hello")
+
+                def login(self, user, password):
+                    self.login_called = True
+                    return (235, b"OK")
+
+                def send_message(self, msg):
+                    self.send_message_called = True
+                    return {}
+
+                def quit(self):
+                    return (221, b"Bye")
+
+            fake_client = _BlockingGreetingClient()
+            monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", lambda **kw: fake_client)
+            provider = GmailSmtpProvider(
+                smtp_host=host,
+                smtp_port=port,
+                username=ACCOUNT,
+                app_password="app-password",
+                total_deadline_seconds=1.5,
+            )
+
+            start = time.monotonic()
+            with pytest.raises(EmailSendConnectionError):
+                provider.send(_message())
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 4.0
+            assert fake_client.login_called is False
+            assert fake_client.send_message_called is False
+            assert connection_closed.wait(timeout=4.0), (
+                "server never observed the client connection close -- the "
+                "watchdog could not reach/abort the client during connect()"
             )
         finally:
             server.close()
@@ -802,6 +939,9 @@ class TestTotalSendDeadline:
 
                 def __init__(self) -> None:
                     self.send_message_called = False
+
+                def connect(self, host, port):
+                    return (220, b"Hello")
 
                 def login(self, user, password):
                     client_file.readline()  # blocks -- server never replies
@@ -887,6 +1027,9 @@ class TestTotalSendDeadline:
             class _BlockingSendMessageClient:
                 sock = raw_client_sock
 
+                def connect(self, host, port):
+                    return (220, b"Hello")
+
                 def login(self, user, password):
                     return (235, b"OK")
 
@@ -925,3 +1068,56 @@ class TestTotalSendDeadline:
                 client_file.close()
             server.close()
             server_thread.join(timeout=3)
+
+    def test_worker_still_alive_after_abort_is_logged_not_silently_claimed_terminated(
+        self, monkeypatch, caplog
+    ):
+        """Codex gate follow-up (Astra R4B, NEW-006 take 4) required
+        follow-up: `send()` must not silently assume the worker
+        terminated just because it called `_force_close` -- if
+        `worker.join(timeout=1.0)` returns with the worker STILL alive
+        (e.g. its transport resists the abort, or is blocked on
+        something `_force_close` cannot reach at all), that must be
+        logged, not hidden. The correct classification (DEFINITE
+        pre-transmission failure here) must still be returned regardless.
+        """
+        release_login = threading.Event()
+
+        class _UnkillableTransport:
+            def shutdown(self, how):
+                pass  # does nothing -- does not actually unblock anything
+
+            def close(self):
+                pass
+
+        class _StuckClient:
+            sock = _UnkillableTransport()
+
+            def connect(self, host, port):
+                return (220, b"Hello")
+
+            def login(self, user, password):
+                # Never released within this test -- models a transport
+                # `_force_close` genuinely cannot interrupt.
+                release_login.wait(timeout=10)
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                return {}
+
+            def quit(self):
+                return (221, b"Bye")
+
+        monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", lambda **kw: _StuckClient())
+        # Comfortably above ssl.create_default_context()'s own real cost
+        # (see other tests' identical rationale) -- the deadline must
+        # fire AFTER the client is constructed/registered, or this test
+        # would never even reach the _force_close/join/is_alive path it
+        # means to exercise.
+        provider = _provider(client=None, total_deadline_seconds=1.5)
+
+        with caplog.at_level("DEBUG"):
+            with pytest.raises(EmailSendConnectionError):
+                provider.send(_message())
+
+        assert "outbound_smtp_worker_still_alive_after_abort" in caplog.text
