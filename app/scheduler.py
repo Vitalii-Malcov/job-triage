@@ -27,11 +27,13 @@ This module is intentionally thin: all real logic (configuration
 validation, the claim, calling `run_automation_cycle`, outcome handling)
 lives in `app.services.scheduler`/`app.db.automation_schedule_repository`.
 This file only wires Settings + logging + a Session per tick + the
-sleep/poll loop + clean shutdown on Ctrl+C together.
+sleep/poll loop + clean shutdown on Ctrl+C (SIGINT) or `docker stop`
+(SIGTERM, see `_handle_sigterm`/AUD-008) together.
 """
 
 import asyncio
 import logging
+import signal
 import sys
 
 from pydantic import ValidationError
@@ -56,6 +58,22 @@ logger = logging.getLogger(__name__)
 # stdout/stderr or a log line -- only `type(exc).__name__` is safe (see
 # each `except` branch in `main()` below).
 _CONFIGURATION_ERROR_MESSAGE = "Automation scheduler configuration error. Check scheduler settings."
+
+
+class _ShutdownRequested(Exception):
+    """Raised by `_handle_sigterm` below so a container's `docker stop`
+    (which sends SIGTERM, not SIGINT) shuts this worker down through the
+    exact same clean-exit path Ctrl+C (SIGINT -> KeyboardInterrupt)
+    already uses -- see AUD-008. Correctness never depended on this: an
+    unhandled hard kill is already tolerated by the lease/CAS design
+    (see this module's own docstring); this only turns the common,
+    intentional `docker stop` case into a clean logged stop instead of a
+    silent hard kill.
+    """
+
+
+def _handle_sigterm(signum, frame) -> None:
+    raise _ShutdownRequested()
 
 
 async def _poll_loop(settings) -> None:
@@ -140,6 +158,7 @@ async def _poll_loop(settings) -> None:
 
 def main() -> int:
     configure_logging()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         settings = get_settings()
     except ValidationError as exc:
@@ -188,6 +207,9 @@ def main() -> int:
         asyncio.run(_poll_loop(settings))
     except KeyboardInterrupt:
         logger.info("automation_scheduler_stopped_keyboard_interrupt")
+        print("Automation scheduler stopped.")
+    except _ShutdownRequested:
+        logger.info("automation_scheduler_stopped_sigterm")
         print("Automation scheduler stopped.")
     return 0
 

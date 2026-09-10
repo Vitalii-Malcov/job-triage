@@ -8,7 +8,14 @@ from app.core.config import get_settings
 
 settings = get_settings()
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=connect_args)
+# AUD-007: pool_pre_ping issues a lightweight "is this connection still
+# alive" check before handing a pooled connection to a request, so a
+# connection that went stale while idle (DB restart, firewall/load-
+# balancer idle timeout, managed-Postgres connection recycling) is
+# transparently detected and replaced instead of surfacing as an
+# unhandled OperationalError on the next query. A no-op for SQLite (no
+# such failure mode there), harmless to set unconditionally.
+engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
