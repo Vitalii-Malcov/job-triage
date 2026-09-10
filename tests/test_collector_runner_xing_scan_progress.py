@@ -585,3 +585,116 @@ async def test_stale_epoch_1_writer_never_clobbers_committed_epoch_2(db):
     final = get_xing_scan_progress(db, mailbox_scope=scope)
     assert final.uid_validity == 2
     assert final.confirmed_upto_uid == 10
+
+
+@pytest.mark.asyncio
+async def test_run_xing_uses_early_captured_epoch_not_late_reread_after_commits(db, monkeypatch):
+    """Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar
+    capture) regression.
+
+    `run_xing` must capture `observed_uid_validity` as a plain scalar
+    IMMEDIATELY after `get_xing_scan_progress`, before any of this run's
+    own persistence commits -- not read `scan_progress.uid_validity`
+    again afterward. Under the default `expire_on_commit=True` session
+    behavior, this run's OWN commits (job persistence,
+    `mark_message_processed`) expire `scan_progress`'s ORM attributes;
+    a LATE `scan_progress.uid_validity` access re-SELECTs the row's
+    CURRENT state -- which, if another writer changed the row mid-run,
+    is no longer the epoch this run actually made its decisions against.
+
+    Simulates that concurrent change via a genuinely SEPARATE
+    session/commit against the same SQLite file (not a Python-side
+    mutation `run_xing`'s own session would already see) while the fake
+    collector's `fetch_message_batches` runs -- i.e. strictly BETWEEN
+    `run_xing`'s initial `get_xing_scan_progress` read and its own later
+    commits.
+
+    Before the fix: the late re-read would observe the OTHER worker's
+    epoch 2 and treat this run's own epoch-1 write as an "epoch
+    transition" FROM 2, whose CAS then matches the (also epoch-2) row
+    and incorrectly overwrites it back down to epoch 1 -- clobbering the
+    other worker's already-committed epoch 2 / watermark 10.
+
+    After the fix: `observed_uid_validity` stays pinned at the TRUE
+    baseline (epoch 1, captured before any commit), so this run's own
+    write is a same-epoch advance whose CAS requires the row to still be
+    epoch 1 -- it no longer is, so the write correctly no-ops and the
+    other worker's epoch 2 / watermark 10 survives untouched.
+    """
+    settings = _settings()
+    scope = _mailbox_scope(settings)
+
+    # Seed the row at epoch 1 -- what run_xing's own get_xing_scan_progress
+    # will observe at the very top of the function.
+    advance_xing_scan_progress(
+        db, uid_validity=1, confirmed_upto_uid=3, mailbox_scope=scope, observed_uid_validity=None
+    )
+
+    other_session_factory = sessionmaker(bind=db.get_bind())
+
+    class _FakeCollectorRowChangesMidRun:
+        def __init__(self, **kwargs) -> None:
+            self.skipped_invalid_count = 0
+            self.deadline_exceeded = False
+            self._is_message_processed = kwargs["is_message_processed"]
+            self.uid_validity: int | None = None
+            self.confirmed_uids: list[int] = []
+            self.candidate_uids: list[int] = []
+
+        async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
+            # This worker's own live IMAP observation: still epoch 1 --
+            # it has no way to know another writer is about to move the
+            # row to epoch 2 while this call is in flight.
+            self.uid_validity = 1
+
+            # Simulates a genuinely concurrent writer moving the row to a
+            # newer epoch mid-run, via a SEPARATE session/commit -- this
+            # is what makes `db`'s own cached `scan_progress` object
+            # SQLAlchemy-expired-and-stale, not merely logically stale.
+            other_session = other_session_factory()
+            try:
+                advance_xing_scan_progress(
+                    other_session,
+                    uid_validity=2,
+                    confirmed_upto_uid=10,
+                    mailbox_scope=scope,
+                    observed_uid_validity=1,
+                )
+            finally:
+                other_session.close()
+
+            uid = 7
+            self.candidate_uids = [uid]
+            message_id = f"<uid-{uid}@mail.xing.com>"
+            job = Job(
+                source="xing",
+                title="Job 7",
+                company="Company 7",
+                url="https://example.com/jobs/7",
+                description="",
+                skills=[],
+            )
+            return [XingEmailBatch(message_id=message_id, jobs=(job,), uid=uid)]
+
+    monkeypatch.setattr(
+        "app.services.collector_runner.XingEmailCollector", _FakeCollectorRowChangesMidRun
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _NoOpResearchService
+    )
+
+    result = await run_xing(db, settings)
+
+    assert result["created"] == 1  # uid 7's job still persisted regardless
+
+    # The row must remain exactly what the OTHER worker committed -- this
+    # run's own watermark write must have no-opped rather than clobbering
+    # it back down to epoch 1.
+    progress = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert progress.uid_validity == 2
+    assert progress.confirmed_upto_uid == 10

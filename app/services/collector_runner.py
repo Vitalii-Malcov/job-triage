@@ -471,6 +471,19 @@ async def run_xing(
         settings.xing_mailbox_username,
     )
     scan_progress = get_xing_scan_progress(db, mailbox_scope=mailbox_scope)
+    # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar capture):
+    # captured HERE, as a plain scalar, immediately after the read and
+    # BEFORE any of this run's persistence commits below (score_and_persist,
+    # mark_message_processed, ...). `scan_progress` is a SQLAlchemy ORM
+    # object bound to `db` -- under the default `expire_on_commit=True`
+    # session behavior, every one of those commits expires its attributes,
+    # so a LATE `scan_progress.uid_validity` access would silently
+    # re-SELECT the row's CURRENT (possibly already-changed-by-another-
+    # writer) state instead of the epoch this run actually observed at
+    # start -- defeating the whole point of `advance_xing_scan_progress`'s
+    # CAS baseline. `scan_progress.uid_validity` must never be read again
+    # after this point; every later use goes through this saved scalar.
+    observed_uid_validity = scan_progress.uid_validity if scan_progress is not None else None
     collector = XingEmailCollector(
         imap_host=settings.xing_mailbox_imap_host,
         imap_port=settings.xing_mailbox_imap_port,
@@ -482,7 +495,7 @@ async def run_xing(
         # decoupled from SQLAlchemy — see XingEmailCollector's docstring.
         is_message_processed=lambda message_id: is_message_processed(db, "xing", message_id),
         scan_from_uid=scan_progress.confirmed_upto_uid if scan_progress is not None else None,
-        expected_uid_validity=scan_progress.uid_validity if scan_progress is not None else None,
+        expected_uid_validity=observed_uid_validity,
     )
 
     message_batches = await collector.fetch_message_batches()
@@ -618,9 +631,14 @@ async def run_xing(
     if collector.uid_validity is not None:
         handled_uids: dict[int, bool] = {uid: True for uid in collector.confirmed_uids}
         handled_uids.update(batch_uid_outcomes)
+        # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar
+        # capture): compares against `observed_uid_validity` (captured
+        # BEFORE this run's commits, above) rather than a late
+        # `scan_progress.uid_validity` access -- see that capture's own
+        # comment for why a late read here would be unsafe.
         baseline_uid = (
             scan_progress.confirmed_upto_uid
-            if scan_progress is not None and scan_progress.uid_validity == collector.uid_validity
+            if scan_progress is not None and observed_uid_validity == collector.uid_validity
             else None
         )
         new_watermark = baseline_uid
@@ -634,7 +652,10 @@ async def run_xing(
         # (before deciding scan_from_uid/computing new_watermark) -- the
         # baseline `advance_xing_scan_progress`'s reset CAS is contingent
         # on, not `collector.uid_validity` (the freshly-observed target).
-        observed_uid_validity = scan_progress.uid_validity if scan_progress is not None else None
+        # Uses the SAME early-captured `observed_uid_validity` scalar as
+        # `baseline_uid` above -- not a fresh read of `scan_progress.
+        # uid_validity` here, which would be stale/re-fetchable by this
+        # point (see that capture's own comment).
         advance_xing_scan_progress(
             db,
             uid_validity=collector.uid_validity,
