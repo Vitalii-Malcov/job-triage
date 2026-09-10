@@ -80,7 +80,7 @@ from app.services.follow_up_recipient import (
     FollowUpRecipientInvalidError,
     derive_canonical_recipient,
 )
-from app.services.response_draft import TRUSTED_JOB_SOURCES
+from app.services.response_draft import bound_subject, is_trusted_job_source
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +92,6 @@ logger = logging.getLogger(__name__)
 # app.db.repositories.list_jobs_by_status_after_id/`after_job_id`, never
 # offset (see `list_due_follow_ups`).
 FOLLOW_UP_JOB_SCAN_LIMIT = 200
-
-# Must stay <= FollowUpProposalRecord.subject's column length (String(500)).
-_SUBJECT_MAX_LENGTH = 500
-_SUBJECT_TRUNCATION_SUFFIX = "..."
 
 # S7E-009: bump whenever a change to this module (or anything it reads
 # that isn't already covered by its own version field — e.g. the
@@ -231,19 +227,6 @@ def compute_follow_up_input_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _bound_subject(subject: str) -> str:
-    if len(subject) <= _SUBJECT_MAX_LENGTH:
-        return subject
-    return (
-        subject[: _SUBJECT_MAX_LENGTH - len(_SUBJECT_TRUNCATION_SUFFIX)]
-        + _SUBJECT_TRUNCATION_SUFFIX
-    )
-
-
-def _is_trusted_job_source(source: str) -> bool:
-    return source in TRUSTED_JOB_SOURCES
-
-
 def _derive_candidate_name(record: CandidateProfileRecord | None) -> str | None:
     """A full "First Last" name, ONLY if both `first_name` and `last_name`
     independently pass `is_top_level_fact_usable_for_generation` — `None`
@@ -309,7 +292,7 @@ def _build_proposal(
 
     job_title: str | None = None
     job_company: str | None = None
-    if _is_trusted_job_source(job.source):
+    if is_trusted_job_source(job.source):
         job_title = job.title
         job_company = job.company
 
@@ -344,7 +327,7 @@ def _build_proposal(
         anchor_gmail_message_id=anchor_gmail_message_id,
         eligibility_reason=eligibility_reason,
         due_at=due_at,
-        subject=_bound_subject(content.subject),
+        subject=bound_subject(content.subject),
         body=content.body,
         language=content.language,
         missing_fields=content.missing_fields,

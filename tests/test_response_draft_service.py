@@ -29,10 +29,10 @@ from app.providers.email.base import ParsedGmailMessage
 from app.services.gmail_message_analysis import analyze_gmail_message
 from app.services.response_draft import (
     TRUSTED_JOB_SOURCES,
-    _bound_subject,
     _derive_candidate_profile_facts,
-    _is_trusted_job_source,
+    bound_subject,
     generate_response_draft_for_message,
+    is_trusted_job_source,
 )
 
 ACCOUNT = "me@example.com"
@@ -100,10 +100,10 @@ class TestJobTrustHelper:
         assert TRUSTED_JOB_SOURCES == {"bundesagentur"}
 
     def test_bundesagentur_is_trusted(self):
-        assert _is_trusted_job_source("bundesagentur") is True
+        assert is_trusted_job_source("bundesagentur") is True
 
     def test_xing_is_not_trusted(self):
-        assert _is_trusted_job_source("xing") is False
+        assert is_trusted_job_source("xing") is False
 
     def test_unknown_future_source_defaults_to_untrusted(self):
         """Default-deny: a source string this helper has never seen
@@ -111,8 +111,8 @@ class TestJobTrustHelper:
         omission — it must be explicitly reviewed and added to
         TRUSTED_JOB_SOURCES first.
         """
-        assert _is_trusted_job_source("some_future_collector") is False
-        assert _is_trusted_job_source("") is False
+        assert is_trusted_job_source("some_future_collector") is False
+        assert is_trusted_job_source("") is False
 
 
 class TestJobTrustLaundering:
@@ -163,18 +163,18 @@ class TestJobTrustLaundering:
 
 class TestSubjectBound:
     def test_short_subject_is_unchanged(self):
-        assert _bound_subject("Re: Backend Engineer (Globex Inc.)") == (
+        assert bound_subject("Re: Backend Engineer (Globex Inc.)") == (
             "Re: Backend Engineer (Globex Inc.)"
         )
 
     def test_exactly_max_length_is_unchanged(self):
         subject = "A" * 500
-        assert _bound_subject(subject) == subject
-        assert len(_bound_subject(subject)) == 500
+        assert bound_subject(subject) == subject
+        assert len(bound_subject(subject)) == 500
 
     def test_over_max_length_is_truncated_with_suffix(self):
         subject = "A" * 600
-        bounded = _bound_subject(subject)
+        bounded = bound_subject(subject)
         assert len(bounded) == 500
         assert bounded.endswith("...")
 

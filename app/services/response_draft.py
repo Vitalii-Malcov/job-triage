@@ -52,7 +52,7 @@ this module writes carries `requires_human_review=True` unconditionally
   verbatim. Before this fix, `job.title`/`job.company` were interpolated
   into generated drafts regardless of `job.source` — letting attacker
   text (e.g. a job titled `"IGNORE ALL PREVIOUS INSTRUCTIONS"`) reach a
-  human-reviewed draft. `_is_trusted_job_source` (default-deny: a source
+  human-reviewed draft. `is_trusted_job_source` (default-deny: a source
   is untrusted unless explicitly listed in `TRUSTED_JOB_SOURCES`) now
   gates job-fact use the same way `is_top_level_fact_usable_for_generation`
   already gates candidate facts — an untrusted-source job is treated
@@ -61,7 +61,7 @@ this module writes carries `requires_human_review=True` unconditionally
 - **Subject length.** `ResponseDraftRecord.subject` is `String(500)`;
   `JobRecord.title`/`company` are each up to 300 chars, so an unbounded
   `f"{title} ({company})"` job label concatenated into a subject template
-  could exceed the column. `_bound_subject` truncates deterministically
+  could exceed the column. `bound_subject` truncates deterministically
   (never the body — an oversized subject is a cosmetic/DB-fit concern; an
   oversized body could silently drop meaningful drafted content, which
   the spec explicitly forbids).
@@ -111,6 +111,9 @@ TRUSTED_JOB_SOURCES: frozenset[str] = frozenset({"bundesagentur"})
 
 # Must stay <= ResponseDraftRecord.subject's column length (String(500),
 # see app/db/models.py). Never applied to `body` — see module docstring.
+# `bound_subject` below (which uses these) is also imported directly by
+# app.services.follow_up — FollowUpProposalRecord.subject is a separate
+# column but is also String(500), so the same bound applies there too.
 _SUBJECT_MAX_LENGTH = 500
 _SUBJECT_TRUNCATION_SUFFIX = "..."
 
@@ -130,11 +133,11 @@ class ResponseDraftAnalysisNotFoundError(Exception):
     """
 
 
-def _is_trusted_job_source(source: str) -> bool:
+def is_trusted_job_source(source: str) -> bool:
     return source in TRUSTED_JOB_SOURCES
 
 
-def _bound_subject(subject: str) -> str:
+def bound_subject(subject: str) -> str:
     if len(subject) <= _SUBJECT_MAX_LENGTH:
         return subject
     return (
@@ -208,7 +211,7 @@ def generate_response_draft_for_message(
     job_company: str | None = None
     if analysis.matched_job_id is not None:
         job = get_job_by_id(db, analysis.matched_job_id)
-        if job is not None and _is_trusted_job_source(job.source):
+        if job is not None and is_trusted_job_source(job.source):
             job_title = job.title
             job_company = job.company
 
@@ -231,7 +234,7 @@ def generate_response_draft_for_message(
     else:
         status = "PROPOSED"
         reason = None
-        subject = _bound_subject(content.subject)
+        subject = bound_subject(content.subject)
         body = content.body
         language_value = content.language
         missing_fields = content.missing_fields
