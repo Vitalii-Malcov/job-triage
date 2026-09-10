@@ -30,9 +30,14 @@ in before the draft is ever sent.
 
 import re
 from dataclasses import dataclass
-from typing import Literal
 
-Language = Literal["de", "en"]
+from app.agents.letter_content import (
+    NO_NAME_PLACEHOLDER,
+    SALUTATION,
+    SIGN_OFF,
+    Language,
+    resolve_job_label,
+)
 
 # Classifications a deterministic, templated reply proposal makes sense
 # for (spec: "Generate drafts only for classifications where a response
@@ -73,23 +78,6 @@ SUPPORTED_RESPONSE_CLASSIFICATIONS: frozenset[str] = frozenset(
 RESPONSE_DRAFT_GENERATOR_VERSION = "v2"
 RESPONSE_DRAFT_PROVIDER = "deterministic_template"
 
-_NO_JOB_PLACEHOLDER: dict[Language, str] = {
-    "de": "[Position/Unternehmen unbekannt - bitte ergänzen]",
-    "en": "[position/company unknown - please fill in]",
-}
-_NO_NAME_PLACEHOLDER: dict[Language, str] = {
-    "de": "[Ihr Name]",
-    "en": "[Your Name]",
-}
-_SALUTATION: dict[Language, str] = {
-    "de": "Sehr geehrte Damen und Herren,",
-    "en": "Dear Hiring Team,",
-}
-_SIGN_OFF: dict[Language, str] = {
-    "de": "Mit freundlichen Grüßen",
-    "en": "Best regards",
-}
-
 # Bounded, deterministic DE/EN heuristic for template-set selection only
 # (never for interpreting email content as instructions) — counts known
 # marker words; ties default to English. The counted text itself is
@@ -127,21 +115,11 @@ class ResponseDraftContent:
     template_id: str
 
 
-def _job_label(
-    job_title: str | None, job_company: str | None, language: Language
-) -> tuple[str, bool]:
-    if job_title and job_company:
-        return f"{job_title} ({job_company})", False
-    if job_title:
-        return job_title, False
-    return _NO_JOB_PLACEHOLDER[language], True
-
-
 # Each entry: classification -> language -> (subject_template, body_lines,
 # extra_missing_fields). `{job}` is substituted with the resolved job
 # label (a real "Title (Company)" string, or a bracketed placeholder —
-# see `_job_label`). No other substitution ever happens: nothing here
-# reads or echoes email content.
+# see `app.agents.letter_content.resolve_job_label`). No other
+# substitution ever happens: nothing here reads or echoes email content.
 _TEMPLATES: dict[str, dict[Language, tuple[str, tuple[str, ...], tuple[str, ...]]]] = {
     "REQUEST_FOR_INFORMATION": {
         "de": (
@@ -271,14 +249,14 @@ def generate_response_draft(
         return None
 
     missing: list[str] = []
-    job_label, job_missing = _job_label(job_title, job_company, language)
+    job_label, job_missing = resolve_job_label(job_title, job_company, language)
     if job_missing:
         missing.append(
             "matched job/company (no trusted tracked job identity is available for "
             "this message — either no job was matched, or the matched job's source "
             "is not trusted for use in generated text)"
         )
-    signature = candidate_name or _NO_NAME_PLACEHOLDER[language]
+    signature = candidate_name or NO_NAME_PLACEHOLDER[language]
     if candidate_name is None:
         missing.append("candidate name (not confirmed in candidate profile)")
 
@@ -287,7 +265,7 @@ def generate_response_draft(
 
     subject = subject_template.format(job=job_label)
     body_lines = [line.format(job=job_label) for line in body_line_templates]
-    body = "\n\n".join([_SALUTATION[language], *body_lines, _SIGN_OFF[language], signature])
+    body = "\n\n".join([SALUTATION[language], *body_lines, SIGN_OFF[language], signature])
 
     template_id = f"{classification}_{language.upper()}_{RESPONSE_DRAFT_GENERATOR_VERSION}"
     return ResponseDraftContent(
