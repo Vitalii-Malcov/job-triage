@@ -69,11 +69,19 @@ class FakeCollector:
         self._message_id = message_id
         self.skipped_invalid_count = 0
         self.deadline_exceeded = False
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): run_xing
+        # always reads these after awaiting fetch_message_batches() to
+        # persist the scan watermark -- see
+        # app.db.xing_scan_progress_repository. None is a legitimate
+        # value here (this fake never determines a real UIDVALIDITY) and
+        # simply makes run_xing skip the watermark-advance step.
+        self.uid_validity: int | None = None
+        self.confirmed_uids: list[int] = []
 
     async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
         if self._error is not None:
             raise self._error
-        return [XingEmailBatch(message_id=self._message_id, jobs=tuple(self._jobs))]
+        return [XingEmailBatch(message_id=self._message_id, jobs=tuple(self._jobs), uid=1)]
 
 
 @pytest.fixture()

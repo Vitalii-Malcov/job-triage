@@ -58,6 +58,10 @@ from app.db.repositories import (
     profile_skills,
     upsert_job,
 )
+from app.db.xing_scan_progress_repository import (
+    advance_xing_scan_progress,
+    get_xing_scan_progress,
+)
 from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
@@ -372,38 +376,40 @@ async def run_bundesagentur(
             db, settings, job_record, result, auto_research_budget, is_lease_lost=is_lease_lost
         )
 
-        if (
-            result.recommendation == "APPLY"
-            and result.score >= settings.min_job_score_to_notify
-            and (is_lease_lost is None or not is_lease_lost())
-        ):
+        if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
             # Notification delivery is best-effort orchestration on top of
             # already-committed persistence: a failed/slow send must not
             # affect created/updated/failed counts or abort the run.
-            # Codex gate follow-up (Astra R4A lease-loss MEDIUM): a
-            # confirmed-lost lease must stop NEW Telegram sends too --
-            # see `_maybe_auto_research`'s own docstring for the full
-            # rationale (`is_lease_lost` is None for every standalone
-            # caller, so this is a no-op there).
             if notified_count > 0:
                 await asyncio.sleep(1)
-            try:
-                sent = await notifier.send_job(job, result)
-            except Exception as exc:
-                logger.warning(
-                    "bundesagentur_notification_error title=%s company=%s error_type=%s",
-                    job.title,
-                    job.company,
-                    type(exc).__name__,
-                )
-            else:
-                if not sent:
+            # Codex gate follow-up (Astra R4A lease-loss MEDIUM, take 2):
+            # rechecked HERE, immediately before send_job() -- covers both
+            # "lease lost during the pacing sleep above" (the bug: the
+            # previous version checked is_lease_lost() only BEFORE that
+            # `await asyncio.sleep(1)`, so a lease lost during the sleep
+            # still let send_job() run) and, when no sleep happened at
+            # all, the ordinary immediate case. See
+            # `_maybe_auto_research`'s own docstring for the full
+            # rationale (`is_lease_lost` is None for every standalone
+            # caller, so this is always a no-op there).
+            if is_lease_lost is None or not is_lease_lost():
+                try:
+                    sent = await notifier.send_job(job, result)
+                except Exception as exc:
                     logger.warning(
-                        "bundesagentur_notification_failed title=%s company=%s",
+                        "bundesagentur_notification_error title=%s company=%s error_type=%s",
                         job.title,
                         job.company,
+                        type(exc).__name__,
                     )
-            notified_count += 1
+                else:
+                    if not sent:
+                        logger.warning(
+                            "bundesagentur_notification_failed title=%s company=%s",
+                            job.title,
+                            job.company,
+                        )
+                notified_count += 1
 
     logger.info(
         "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
@@ -446,6 +452,14 @@ async def run_xing(
             "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
         )
 
+    # Codex gate follow-up (Astra R4A MEDIUM, starvation): the persisted
+    # scan watermark from the LAST run -- see
+    # app.db.models.XingScanProgressRecord's docstring. `scan_progress`
+    # may be None (brand-new installation) or have both fields unset
+    # (never successfully advanced yet); either way `XingEmailCollector`
+    # treats that identically to "scan everything in the search window",
+    # same as before this fix existed.
+    scan_progress = get_xing_scan_progress(db)
     collector = XingEmailCollector(
         imap_host=settings.xing_mailbox_imap_host,
         imap_port=settings.xing_mailbox_imap_port,
@@ -456,6 +470,8 @@ async def run_xing(
         # passed as a constructor `db` param, so the collector itself stays
         # decoupled from SQLAlchemy — see XingEmailCollector's docstring.
         is_message_processed=lambda message_id: is_message_processed(db, "xing", message_id),
+        scan_from_uid=scan_progress.confirmed_upto_uid if scan_progress is not None else None,
+        expected_uid_validity=scan_progress.uid_validity if scan_progress is not None else None,
     )
 
     message_batches = await collector.fetch_message_batches()
@@ -475,6 +491,13 @@ async def run_xing(
     failed_count = 0
     notified_count = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
+    # Codex gate follow-up (Astra R4A MEDIUM, starvation): per-batch
+    # persistence outcome, keyed by the batch's own IMAP UID -- combined
+    # with `collector.confirmed_uids` below to compute the new
+    # contiguous confirmed-handled prefix once every batch has been
+    # attempted. Only a batch whose `mark_message_processed` actually ran
+    # (i.e. every job in it persisted) counts as "handled" here.
+    batch_uid_outcomes: dict[int, bool] = {}
     for batch in message_batches:
         batch_failed = False
         for job in batch.jobs:
@@ -525,35 +548,66 @@ async def run_xing(
             if (
                 result.recommendation == "APPLY"
                 and result.score >= settings.min_job_score_to_notify
-                and (is_lease_lost is None or not is_lease_lost())
             ):
                 # Same best-effort contract as run_bundesagentur: notification
                 # failures are orchestration on top of already-committed
                 # persistence and must not affect counts or abort the run.
-                # Codex gate follow-up (Astra R4A lease-loss MEDIUM): see
-                # run_bundesagentur's identical guard.
                 if notified_count > 0:
                     await asyncio.sleep(1)
-                try:
-                    sent = await notifier.send_job(job, result)
-                except Exception as exc:
-                    logger.warning(
-                        "xing_notification_error title=%s company=%s error_type=%s",
-                        job.title,
-                        job.company,
-                        type(exc).__name__,
-                    )
-                else:
-                    if not sent:
+                # Codex gate follow-up (Astra R4A lease-loss MEDIUM, take
+                # 2): see run_bundesagentur's identical, rechecked-right-
+                # before-send_job() guard -- fixes the same "lost during
+                # the pacing sleep" gap here too.
+                if is_lease_lost is None or not is_lease_lost():
+                    try:
+                        sent = await notifier.send_job(job, result)
+                    except Exception as exc:
                         logger.warning(
-                            "xing_notification_failed title=%s company=%s",
+                            "xing_notification_error title=%s company=%s error_type=%s",
                             job.title,
                             job.company,
+                            type(exc).__name__,
                         )
-                notified_count += 1
+                    else:
+                        if not sent:
+                            logger.warning(
+                                "xing_notification_failed title=%s company=%s",
+                                job.title,
+                                job.company,
+                            )
+                    notified_count += 1
 
         if not batch_failed:
             mark_message_processed(db, "xing", batch.message_id)
+        batch_uid_outcomes[batch.uid] = not batch_failed
+
+    # Codex gate follow-up (Astra R4A MEDIUM, starvation): compute and
+    # persist how far the scan can safely resume from next run.
+    # `handled_uids` combines every UID this run either (a) confirmed
+    # safe to skip without ever yielding a batch (`collector.confirmed_uids`)
+    # or (b) yielded a batch that just finished persisting above
+    # (`batch_uid_outcomes`, True only if `mark_message_processed` ran).
+    # Walking them in ascending order and stopping at the FIRST one that
+    # is not True (a failed batch, or -- impossible by construction, but
+    # defensive -- a gap) guarantees the persisted watermark never skips
+    # over a UID that still needs to be retried.
+    if collector.uid_validity is not None:
+        handled_uids: dict[int, bool] = {uid: True for uid in collector.confirmed_uids}
+        handled_uids.update(batch_uid_outcomes)
+        baseline_uid = (
+            scan_progress.confirmed_upto_uid
+            if scan_progress is not None and scan_progress.uid_validity == collector.uid_validity
+            else None
+        )
+        new_watermark = baseline_uid
+        for uid in sorted(handled_uids):
+            if handled_uids[uid]:
+                new_watermark = uid
+            else:
+                break
+        advance_xing_scan_progress(
+            db, uid_validity=collector.uid_validity, confirmed_upto_uid=new_watermark
+        )
 
     logger.info(
         "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s "

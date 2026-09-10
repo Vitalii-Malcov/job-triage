@@ -95,7 +95,11 @@ class FakeImapClient:
     """
 
     def __init__(
-        self, messages: list[bytes], *, raise_oserror_on_message_set: set[bytes] | None = None
+        self,
+        messages: list[bytes],
+        *,
+        raise_oserror_on_message_set: set[bytes] | None = None,
+        uid_validity: int = 1,
     ) -> None:
         self._messages = messages
         # Codex gate follow-up (Astra R4A HIGH): a fetch for any
@@ -104,9 +108,18 @@ class FakeImapClient:
         # (including "the deadline watchdog force-closed the socket
         # mid-FETCH") without any real socket/timing involved.
         self._raise_oserror_on_message_set = raise_oserror_on_message_set or set()
+        # Codex gate follow-up (Astra R4A MEDIUM, starvation): this fake
+        # uses UID == 1-based list index throughout (both `.uid("search",
+        # ...)` and `.uid("fetch", ...)` delegate straight to the
+        # existing `search`/`fetch` below) -- realistic enough to
+        # exercise the real collector's UID-based scan-position logic
+        # while keeping every existing byte-string assertion in this
+        # file (e.g. `fetch_calls == [b"1", b"1"]`) meaningful unchanged.
+        self.uid_validity = uid_validity
         self.select_calls: list[tuple[str, bool]] = []
         self.search_calls: list[tuple[str, ...]] = []
         self.fetch_calls: list = []
+        self.status_calls: list[tuple[str, str]] = []
         self.closed = False
         self.logged_out = False
 
@@ -116,6 +129,11 @@ class FakeImapClient:
     def select(self, mailbox: str, readonly: bool) -> tuple[str, list[bytes]]:
         self.select_calls.append((mailbox, readonly))
         return ("OK", [str(len(self._messages)).encode()])
+
+    def status(self, mailbox: str, names: str) -> tuple[str, list[bytes]]:
+        self.status_calls.append((mailbox, names))
+        line = f"INBOX (UIDVALIDITY {self.uid_validity})".encode()
+        return ("OK", [line])
 
     def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
         self.search_calls.append(criteria)
@@ -129,6 +147,19 @@ class FakeImapClient:
         index = int(message_set) - 1
         raw = self._messages[index]
         return ("OK", [(b"1 (RFC822 {%d}" % len(raw), raw)])
+
+    def uid(self, command: str, *args) -> tuple[str, list]:
+        if command == "search":
+            # args = (charset, criteria...) -- same shape `search` takes.
+            return self.search(*args)
+        if command == "fetch":
+            # Deliberately NOT decoding `message_set` -- it stays exactly
+            # the bytes the production collector passed (e.g. b"1"), so
+            # `fetch_calls`/`raise_oserror_on_message_set` behave
+            # identically to before this fake gained UID support.
+            message_set, message_parts = args
+            return self.fetch(message_set, message_parts)
+        raise NotImplementedError(f"FakeImapClient.uid: unsupported command {command!r}")
 
     def close(self) -> tuple[str, list[bytes]]:
         self.closed = True

@@ -243,6 +243,38 @@ class TestBundesagenturLeaseGuard:
         assert CountingResearchService.calls == ["Solo Company"]
         assert CountingNotifier.calls == ["Solo Company"]
 
+    @pytest.mark.asyncio
+    async def test_lease_lost_during_pacing_sleep_blocks_telegram_send(self, db, monkeypatch):
+        """Codex gate follow-up (Astra R4A lease-loss MEDIUM, take 2):
+        the lease is HEALTHY when job 1 is sent (no sleep happens before
+        the first send, so nothing could have changed underneath it) --
+        it is only lost WHILE job 2's pacing `await asyncio.sleep(1)` is
+        in flight. The earlier version of this guard checked
+        `is_lease_lost()` only BEFORE that sleep, so a loss occurring
+        during the sleep itself still let `send_job()` run for job 2.
+        `asyncio.sleep` is faked (mirrors
+        tests/test_collector_endpoint.py's own `fake_sleep` convention)
+        both to keep this test instant and to deterministically flip the
+        lease state exactly inside the awaited gap this fix closes.
+        """
+        jobs = [
+            _ba_job(company="First Company", url="https://example.com/jobs/first"),
+            _ba_job(company="Second Company", url="https://example.com/jobs/second"),
+        ]
+        state = {"lost": False}
+
+        async def fake_sleep(seconds: float) -> None:
+            state["lost"] = True
+
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
+
+        result = await self._run(db, monkeypatch, jobs, is_lease_lost=lambda: state["lost"])
+
+        assert result["created"] == 2
+        # Job 1 sent while the lease was still healthy; job 2's send was
+        # blocked by the recheck immediately after the (faked) sleep.
+        assert CountingNotifier.calls == ["First Company"]
+
 
 class TestXingLeaseGuard:
     async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None):
@@ -253,11 +285,22 @@ class TestXingLeaseGuard:
             def __init__(self, **kwargs) -> None:
                 self.skipped_invalid_count = 0
                 self.deadline_exceeded = False
+                # Codex gate follow-up (Astra R4A MEDIUM, starvation):
+                # run_xing always reads these after awaiting
+                # fetch_message_batches() to persist the scan watermark
+                # -- see app.db.xing_scan_progress_repository. None here
+                # is a legitimate value (mirrors a fake/injected client
+                # that never determined a real UIDVALIDITY) and simply
+                # makes run_xing skip the watermark-advance step.
+                self.uid_validity: int | None = None
+                self.confirmed_uids: list[int] = []
 
             async def fetch_message_batches(self, since=None):
                 from app.collectors.xing_email import XingEmailBatch
 
-                return [XingEmailBatch(message_id="<digest@mail.xing.com>", jobs=tuple(jobs))]
+                return [
+                    XingEmailBatch(message_id="<digest@mail.xing.com>", jobs=tuple(jobs), uid=1)
+                ]
 
         monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
         monkeypatch.setattr(
@@ -321,3 +364,38 @@ class TestXingLeaseGuard:
         assert result["created"] == 1
         assert CountingResearchService.calls == ["Solo Company"]
         assert CountingNotifier.calls == ["Solo Company"]
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_during_pacing_sleep_blocks_telegram_send(self, db, monkeypatch):
+        """Same regression as
+        TestBundesagenturLeaseGuard's identically named test, for
+        `run_xing`'s own pacing/notification block."""
+        jobs = [
+            Job(
+                source="xing",
+                title="Backend Engineer",
+                company="First Company",
+                url="https://www.xing.com/m/DDDDDDDDDDDDDDDDDDDD4",
+                description="",
+                skills=[],
+            ),
+            Job(
+                source="xing",
+                title="Frontend Engineer",
+                company="Second Company",
+                url="https://www.xing.com/m/EEEEEEEEEEEEEEEEEEEE5",
+                description="",
+                skills=[],
+            ),
+        ]
+        state = {"lost": False}
+
+        async def fake_sleep(seconds: float) -> None:
+            state["lost"] = True
+
+        monkeypatch.setattr("app.services.collector_runner.asyncio.sleep", fake_sleep)
+
+        result = await self._run(db, monkeypatch, jobs, is_lease_lost=lambda: state["lost"])
+
+        assert result["created"] == 2
+        assert CountingNotifier.calls == ["First Company"]
