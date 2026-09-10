@@ -975,6 +975,159 @@ class TestResolveAddrinfoBounded:
         assert not (after - before), "a DNS resolution worker leaked across repeated timeouts"
 
 
+# ---------------------------------------------------------------------------
+# FINAL-003 (Astra R5A, re-corrected after Codex's TARGETED re-review): the
+# first correction still let `_terminate_and_confirm_dead` return normally
+# after a second BOUNDED join even if the process was somehow still alive
+# (only logging a warning) -- i.e. "resolver process guaranteed dead before
+# return" was not actually true. These tests exercise that method directly,
+# via lightweight test doubles that implement the same terminate/kill/join/
+# is_alive surface `multiprocessing.Process` does, so the terminate-then-
+# escalate-to-kill state machine can be driven deterministically -- a REAL
+# process can't be made to survive `.kill()`/`TerminateProcess` on demand
+# (that's the whole point of using it), so a fake is the only way to prove
+# the escalation branch and the "cannot return while alive" invariant
+# without relying on OS/platform-specific signal-handling quirks.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcessDiesOnTerminate:
+    """Dies as soon as `.terminate()` is called -- the common case, where
+    escalating to `.kill()` is never needed. State transitions happen
+    synchronously in `terminate()`/`kill()` themselves (not on a background
+    OS scheduler), so `join()` is a plain no-op recorder here.
+    """
+
+    def __init__(self) -> None:
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.join_calls: list[float | None] = []
+        self._alive = True
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._alive = False
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+
+
+class _FakeProcessSurvivesTerminateNeedsKill:
+    """Ignores/outlives `.terminate()` (models a POSIX child that caught or
+    delayed SIGTERM) and only actually dies once `.kill()` has been called
+    AND it is reaped via a `join()` call with NO timeout -- a bounded join
+    after `.kill()` does NOT observe death in this fake, so it fails any
+    implementation that reintroduces a timeout on that final join (exactly
+    the Codex-flagged regression this proves is fixed).
+    """
+
+    def __init__(self) -> None:
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.join_calls: list[float | None] = []
+        self._alive = True
+        self._killed = False
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._killed = True
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+        if self._killed and timeout is None:
+            self._alive = False
+
+
+class _FakeProcessNeverDies:
+    """Reports itself alive no matter what is called on it -- models a
+    hypothetical OS-level failure to ever reap the process. Used to prove
+    `_terminate_and_confirm_dead` cannot silently return a false "confirmed
+    dead" guarantee: it must trip its own postcondition check instead.
+    """
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+class TestTerminateAndConfirmDead:
+    def test_normal_terminate_path_ends_with_process_confirmed_dead(self):
+        deadline = ImapSessionDeadline(5.0)
+        process = _FakeProcessDiesOnTerminate()
+        deadline._terminate_and_confirm_dead(process)
+        assert not process.is_alive()
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 0
+
+    def test_kill_escalation_path_ends_with_process_confirmed_dead(self):
+        deadline = ImapSessionDeadline(5.0)
+        process = _FakeProcessSurvivesTerminateNeedsKill()
+        deadline._terminate_and_confirm_dead(process)
+        assert not process.is_alive()
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+        # The join immediately after .kill() must be UNTIMED -- a bounded
+        # join here would let this method return while the process could
+        # still be alive, which is the exact bug this fixes.
+        assert process.join_calls[-1] is None
+
+    def test_terminate_and_confirm_dead_cannot_return_while_process_is_alive(self):
+        deadline = ImapSessionDeadline(5.0)
+        with pytest.raises(AssertionError):
+            deadline._terminate_and_confirm_dead(_FakeProcessNeverDies())
+
+    def test_real_process_termination_is_reasonably_bounded(self):
+        """Not a fake -- spawns a REAL child process blocked forever and
+        confirms `_terminate_and_confirm_dead` actually reaps it within a
+        tight, fixed bound on this platform, not just according to a test
+        double's simulated semantics. This is the "real supported
+        termination path" (`.terminate()`/`TerminateProcess` succeeding,
+        with no escalation needed) -- the only path expected to run in
+        production, since neither POSIX SIGKILL nor Windows
+        TerminateProcess can be intercepted or declined.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_hang_forever_dns_worker, args=(None, 0, child_conn), daemon=True
+        )
+        process.start()
+        child_conn.close()
+        try:
+            deadline = ImapSessionDeadline(5.0)
+            start = time.monotonic()
+            deadline._terminate_and_confirm_dead(process)
+            elapsed = time.monotonic() - start
+            assert not process.is_alive()
+            assert elapsed < 2.0, (
+                f"real process termination took {elapsed:.2f}s -- too slow "
+                "for cleanup on top of a short IMAP deadline"
+            )
+        finally:
+            parent_conn.close()
+
+
 def test_deadline_imap4ssl_construction_is_bounded_when_dns_resolution_hangs(monkeypatch):
     """FINAL-003 (Astra R5A, corrected) integration-level proof:
     constructing `DeadlineIMAP4SSL` itself -- not just

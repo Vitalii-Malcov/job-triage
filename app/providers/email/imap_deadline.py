@@ -197,18 +197,21 @@ class HasClose(Protocol):
 # at all".
 IMAP_SESSION_DEADLINE_SECONDS = 300.0
 
-# FINAL-003 (Astra R5A, corrected): ceiling for how long
-# ImapSessionDeadline._terminate_and_confirm_dead waits, per escalation
-# step, for the DNS resolution worker PROCESS to actually die -- see
-# that method's own docstring for why this is a safety-margin ceiling
-# (OS-level process termination is normally observable within low
-# milliseconds), not an expected-case duration, and for the exact
-# worst-case total additive latency this bounds
-# (2 * this constant, across the terminate()-then-kill() escalation).
-# Deliberately small: a short-lived resolver worker being reaped is not
-# something that should ever legitimately need seconds, and this must
-# never let a short configured session deadline return many seconds
-# late just because cleanup used an overly generous timeout.
+# FINAL-003 (Astra R5A, re-corrected after Codex targeted re-review):
+# ceiling for how long ImapSessionDeadline._terminate_and_confirm_dead
+# waits for `.terminate()` (SIGTERM / TerminateProcess) ALONE to have
+# taken effect before escalating to `.kill()` -- see that method's own
+# docstring for why this is the ONLY bounded step left: SIGTERM's
+# default action is termination but is interceptable/delayable by a
+# handler on POSIX (and, in principle, by OS scheduling delay on
+# either platform), so giving it a short, fixed grace period before
+# escalating is legitimate. The join AFTER `.kill()` is deliberately
+# NOT governed by this constant -- see `_terminate_and_confirm_dead`.
+# Deliberately small: a short-lived resolver worker responding to
+# SIGTERM is not something that should ever legitimately need seconds,
+# and this must never let a short configured session deadline return
+# many seconds late just because cleanup used an overly generous
+# timeout for this first, best-effort step.
 _WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS = 0.5
 
 
@@ -303,13 +306,19 @@ class ImapSessionDeadline:
            the deadline's remaining time.
         2. If the deadline's remaining time elapses before resolution
            completes, the worker PROCESS is `.terminate()`d (escalating
-           to `.kill()` if it hasn't died within a few seconds) and its
-           death is confirmed via `.join()` BEFORE this method raises --
-           never left running. This is the actual fix for the Codex
-           finding that the first version of this method (a background
-           THREAD merely abandoned after a timeout) left the resolver
-           WORKER's lifetime unbounded even though the caller's own wait
-           was bounded.
+           to `.kill()`, and an untimed `join()`, if it hasn't died
+           within `_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS`) and its
+           death is CONFIRMED -- not merely asked-for -- before this
+           method raises; see `_terminate_and_confirm_dead`'s own
+           docstring for the exact postcondition and why the escalated
+           path is no longer timeout-bounded. This is the actual fix
+           for the Codex finding that the first version of this method
+           (a background THREAD merely abandoned after a timeout) left
+           the resolver WORKER's lifetime unbounded even though the
+           caller's own wait was bounded -- and for the follow-up
+           Codex finding that an even earlier version of THIS
+           correction still returned normally after a second bounded
+           join even if the process was somehow still alive.
         3. Only plain, picklable data (a list of `getaddrinfo()`
            5-tuples, or an `OSError`) ever crosses the process boundary
            -- never a live socket, which would require platform-fragile
@@ -379,38 +388,62 @@ class ImapSessionDeadline:
         return payload
 
     def _terminate_and_confirm_dead(self, process: multiprocessing.Process) -> None:
-        """Terminates `process` and BLOCKS until its death is confirmed
-        -- the actual FINAL-003 correction: a worker must never merely
-        be asked to stop and then forgotten about. `.terminate()` (a
-        real OS-level SIGTERM/TerminateProcess) is escalated to
-        `.kill()` (SIGKILL, not interceptable) if the process hasn't
-        died within `_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS`.
+        """Terminates `process` and BLOCKS until its death is confirmed.
 
-        Bounded total added latency, not just "usually fast": OS-level
-        process termination for a process blocked in a syscall (no
-        installed signal handler intercepts SIGTERM by default, and
-        `TerminateProcess` on Windows is not interceptable at all) is
-        normally observable within low milliseconds -- these join()
-        timeouts are safety-margin CEILINGS, not expected-case
-        durations. Worst case (both `.terminate()` AND the `.kill()`
-        escalation each need their full budget, itself already an
-        unusual/pathological outcome) this method adds at most
-        `2 * _WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS` of wall-clock
-        time on top of whatever the session deadline itself already
-        allowed -- a small, fixed, provably bounded constant, never
-        several seconds, regardless of how short the configured total
-        session deadline is.
+        Postcondition (the actual FINAL-003 fix, re-corrected after
+        Codex's targeted re-review of the first attempt): if this
+        method returns normally, `process.is_alive()` is False --
+        CONFIRMED, not merely asked-for-and-hoped. There is no code
+        path that returns while the process could still be alive; the
+        previous version's "log and return anyway" branch after a
+        second bounded `join()` is exactly what made that a false
+        guarantee, and it has been removed, not merely reworded.
+
+        Two steps, only the FIRST of which is timeout-bounded:
+
+        1. `.terminate()` (SIGTERM / TerminateProcess) is given
+           `_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS` to take effect.
+           This step is genuinely best-effort and bounded: SIGTERM's
+           default action is termination, but on POSIX it is a
+           regular, interceptable/delayable signal (a handler could in
+           principle catch or postpone it), so it earns a short, fixed
+           grace period rather than being trusted blindly.
+        2. If still alive, `.kill()` -- on POSIX, SIGKILL, which
+           cannot be intercepted, blocked, or ignored by user-level
+           code in the child; on Windows, the SAME `TerminateProcess`
+           call as step 1 (this platform has no separate "harder"
+           kill primitive -- `multiprocessing.popen_spawn_win32.Popen
+           .kill` is a plain alias for `.terminate`), which is already
+           unconditional. The `join()` immediately after `.kill()` is
+           therefore called with NO timeout: since the OS guarantees a
+           killed process cannot decline to die, this wait is what
+           actually turns "asked to die" into "confirmed dead" --
+           reintroducing a timeout here would just resurrect the exact
+           bug this fixes (returning while the process might still be
+           alive). In practice this is observable within low
+           milliseconds; the only thing that could make it block
+           longer is a catastrophic OS-level failure (e.g. a process
+           wedged in an uninterruptible kernel wait), a scenario no
+           timeout-bounded wait could give a truthful liveness
+           guarantee for either -- it would only let this method lie
+           about it, which is the thing being fixed here.
+
+        The trailing `assert` is a self-check of that reasoning, not
+        the source of the guarantee -- the guarantee comes from
+        `join()`'s own blocking semantics (confirmed on both the POSIX
+        `os.waitpid`-based and Windows `WaitForSingleObject`-based
+        implementations: an untimed `join()` does not return until the
+        process has actually been reaped).
         """
         process.terminate()
         process.join(timeout=_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS)
         if process.is_alive():
             process.kill()
-            process.join(timeout=_WORKER_TERMINATION_JOIN_TIMEOUT_SECONDS)
-        if process.is_alive():
-            # Should be unreachable (SIGKILL/TerminateProcess cannot be
-            # blocked by user-level code) -- logged, never silently
-            # swallowed, if the OS itself somehow failed to reap it.
-            logger.warning("imap_dns_resolution_worker_still_alive_after_kill")
+            process.join()
+        assert not process.is_alive(), (
+            "unreachable: SIGKILL/TerminateProcess cannot be intercepted or "
+            "declined by user-level code, and the join() above has no timeout"
+        )
 
     def _force_close(self, sock: socket.socket, extra_closable: HasClose | None) -> None:
         # Codex final review: closing `extra_closable` (a
