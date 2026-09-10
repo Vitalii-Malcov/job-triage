@@ -495,12 +495,17 @@ def test_deadline_imap4ssl_normal_handshake_and_greeting_still_succeeds(tmp_path
 # prove it never does, not just reverse the two calls.
 #
 # This project's own runtime (see `sys.version_info` below) is what's
-# actually running these tests; CPython 3.11/3.12/3.13 layouts are
-# exercised synthetically (get_imap_makefile_reader against fake objects,
-# and DeadlineIMAP4SSL subclassed to rename self._file -> self.file after
-# construction) since only one interpreter is installed in this
-# environment -- see this fix's PR report for exactly which version(s)
-# were actually executed.
+# actually running these tests; get_imap_makefile_reader's own branch
+# selection is exercised synthetically against fake objects
+# (TestGetImapMakefileReader below) for interpreter layouts other than
+# whichever one is actually installed here. The end-to-end
+# _LegacyAttributeDeadlineIMAP4SSL tests below are portable across BOTH
+# known real imaplib layouts (see that class's own docstring): CI runs
+# CPython 3.13.15, where imaplib.IMAP4.open() already assigns self.file
+# directly (the native <=3.13 branch is exercised for real there); local
+# dev runs CPython 3.14+, where self._file is assigned and renamed onto
+# self.file to simulate the same <=3.13 layout. Either interpreter
+# proves the same self.file-only code path end to end.
 # ---------------------------------------------------------------------------
 
 
@@ -546,23 +551,34 @@ class TestGetImapMakefileReader:
 
 
 class _LegacyAttributeDeadlineIMAP4SSL(DeadlineIMAP4SSL):
-    """Simulates CPython <=3.13's imaplib attribute layout (`self.file`,
-    never `self._file`) on top of this project's actual dev/CI runtime,
-    so the compatibility path is exercised end-to-end (real socket, real
-    TLS, real imaplib greeting parsing, real watchdog firing) without
-    requiring a real 3.13 interpreter to be installed here. Confirms
-    get_imap_makefile_reader's fallback branch is what's actually used,
-    not just that it CAN find a `.file` attribute in isolation.
+    """Exercises the makefile()-backed reader path end-to-end (real
+    socket, real TLS, real imaplib greeting parsing, real watchdog
+    firing) using whichever attribute layout the ACTUAL running
+    interpreter's `imaplib.IMAP4.open()` produces -- portable across both
+    known layouts, not a simulation of one specific version:
 
-    CPython 3.14 keeps `IMAP4.file` as a READ-ONLY property (an
-    undocumented back-compat shim that proxies to `self._file`, emitting
-    a RuntimeWarning -- confirmed by reading `imaplib.IMAP4.file.fget`'s
-    source on this runtime). `file = None` here shadows that inherited
-    property with a plain class attribute so `self.file = ...` below is
-    a normal instance assignment instead of hitting a "no setter" error
-    -- <=3.13 has no such property at all, so `self.file` is already a
-    plain instance attribute there and needs no shadowing in reality;
-    this is purely a hoop this SIMULATION has to jump through on 3.14.
+    - CPython <=3.13 (e.g. this project's CI, which runs 3.13.15):
+      `imaplib.IMAP4.open()` assigns `self.file` directly as a plain
+      instance attribute. There is no `self._file` at all -- this is the
+      REAL <=3.13 layout, exercised natively, no renaming needed.
+    - CPython 3.14+ (this project's local dev runtime): `imaplib.IMAP4
+      .open()` assigns `self._file` and exposes `IMAP4.file` only as a
+      READ-ONLY property (an undocumented back-compat shim that proxies
+      to `self._file`, emitting a RuntimeWarning -- confirmed by reading
+      `imaplib.IMAP4.file.fget`'s source on this runtime). `open()`
+      below detects `self._file`, moves it onto `self.file`, and deletes
+      `self._file` -- simulating, on 3.14, the exact <=3.13 layout this
+      class is named for.
+
+    Either way, `get_imap_makefile_reader`'s `self.file` fallback branch
+    is what's actually exercised afterward, never the `self._file`
+    branch -- proving the fallback works, not just that it CAN find a
+    `.file` attribute in isolation. `file = None` here shadows the
+    inherited 3.14 read-only property with a plain class attribute so
+    `self.file = ...` below is a normal instance assignment instead of
+    hitting a "no setter" error; on <=3.13 there is no such property, so
+    this class attribute is simply overwritten by imaplib's own instance
+    assignment and does nothing.
     """
 
     file = None
@@ -571,11 +587,21 @@ class _LegacyAttributeDeadlineIMAP4SSL(DeadlineIMAP4SSL):
         self, host: str = "", port: int = imaplib.IMAP4_SSL_PORT, timeout: float | None = None
     ) -> None:
         imaplib.IMAP4.open(self, host, port, timeout)
-        # Rename to mimic <=3.13's layout exactly -- self.file exists,
-        # self._file does not.
-        assert hasattr(self, "_file"), "this runtime's imaplib.IMAP4.open() layout changed"
-        self.file = self._file
-        del self._file
+        if hasattr(self, "_file"):
+            # CPython 3.14-style layout: rename to mimic <=3.13's real
+            # layout exactly -- self.file becomes a plain instance
+            # attribute, self._file no longer exists.
+            self.file = self._file
+            del self._file
+        else:
+            # CPython <=3.13-style layout: imaplib.IMAP4.open() already
+            # assigned self.file directly -- this IS the real <=3.13
+            # layout, nothing to rename.
+            assert hasattr(self, "file") and self.file is not None, (
+                "this runtime's imaplib.IMAP4.open() layout changed -- neither "
+                "self._file (3.14-style) nor a populated self.file (<=3.13-style) "
+                "was produced"
+            )
         self._imap_deadline.bind_socket(self.sock, extra_closable=get_imap_makefile_reader(self))
 
 

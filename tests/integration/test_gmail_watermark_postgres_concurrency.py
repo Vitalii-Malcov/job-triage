@@ -19,11 +19,16 @@ processed on the very next scan -- never permanently skipped just
 because a higher-id message was already scanned first.
 
 **Local execution:** skipped automatically unless `TEST_POSTGRES_URL` is
-set -- this project's default dev/test setup is SQLite-only.
+set -- this project's default dev/test setup is SQLite-only. If you do
+set it locally, run `alembic upgrade head` (with `DATABASE_URL` pointed
+at that same database) first -- NEW-007 removed this module's own
+`Base.metadata.create_all` fallback (see `pg_session_factory` below), so
+the schema must already exist via the real migration chain.
 
 **CI:** `.github/workflows/ci.yml`'s `scheduler-postgres` job (renamed
-in comment only -- same real `postgres:16` service container) also runs
-this module on every push/PR.
+in comment only -- same real `postgres:16` service container) runs
+`alembic upgrade head` against it and also runs this module on every
+push/PR.
 
 This module never duplicates the fetch/selection SQL itself -- it calls
 the REAL `app.services.automation_gmail.prepare_gmail_response_drafts`,
@@ -44,7 +49,6 @@ from sqlalchemy import create_engine, delete
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
-from app.db.base import Base
 from app.db.models import (
     GmailMessageAnalysisRecord,
     GmailMessageRecord,
@@ -101,8 +105,13 @@ def _build_message(*, thread_id: int, uid: int, subject: str) -> GmailMessageRec
 
 @pytest.fixture()
 def pg_session_factory():
+    # NEW-007: no Base.metadata.create_all here -- the schema must come
+    # from the real Alembic migration chain (CI's scheduler-postgres job
+    # runs `alembic upgrade head` before this module executes; see the
+    # module docstring for the local-execution equivalent). A missing
+    # table here means the migration chain is broken and must fail
+    # loudly, not be silently papered over by ORM metadata creation.
     engine = create_engine(TEST_POSTGRES_URL, future=True)
-    Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     yield factory
     with engine.begin() as conn:

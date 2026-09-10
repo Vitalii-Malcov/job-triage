@@ -57,6 +57,25 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev,postgres]"
+      # NEW-007: prove a fresh, real PostgreSQL database can be created
+      # through the actual Alembic migration chain -- not through
+      # Base.metadata.create_all, which would happily create tables even
+      # if the real migration chain is broken. The postgres:16 service
+      # container above starts empty on every job run, so this always
+      # migrates from a genuinely empty database. Runs BEFORE the
+      # integration tests below, which (see
+      # tests/integration/test_scheduler_postgres_concurrency.py and
+      # tests/integration/test_gmail_watermark_postgres_concurrency.py)
+      # no longer call create_all themselves and rely entirely on this
+      # step for schema creation, so a broken migration fails loudly
+      # here instead of being silently papered over.
+      - name: Alembic upgrade head against CI PostgreSQL
+        run: |
+          python -m alembic upgrade head
+          python -m alembic current | tee /tmp/alembic_current.txt
+          grep -q "b4f6a1c9e7d2 (head)" /tmp/alembic_current.txt
+        env:
+          DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
           tests/integration/test_gmail_watermark_postgres_concurrency.py
         env:
