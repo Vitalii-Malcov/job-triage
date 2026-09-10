@@ -28,6 +28,7 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.models import JobRecord
 from app.db.xing_scan_progress_repository import (
+    _advance_existing,
     advance_xing_scan_progress,
     compute_mailbox_scope,
     get_xing_scan_progress,
@@ -432,3 +433,85 @@ async def test_mailbox_scope_isolates_watermark_between_mailboxes(db, monkeypatc
     progress_a = get_xing_scan_progress(db, mailbox_scope=scope_a)
     assert progress_a is not None
     assert progress_a.confirmed_upto_uid == 6
+
+
+def test_mailbox_scope_serialization_does_not_collide_across_field_boundaries():
+    """Codex gate follow-up (Astra R4A MEDIUM take 2, scope serialization)
+    regression: a naive `":"`-joined fingerprint is ambiguous whenever a
+    field can itself contain `":"`.  `username="ab:cd", mailbox="ef"` and
+    `username="ab", mailbox="cd:ef"` both concatenate to the identical
+    `"...:ab:cd:ef"` tail under plain string interpolation -- two
+    genuinely different mailbox configurations must never hash to the
+    same scope.
+    """
+    scope_1 = compute_mailbox_scope("imap.example.com", 993, "ab:cd", mailbox="ef")
+    scope_2 = compute_mailbox_scope("imap.example.com", 993, "ab", mailbox="cd:ef")
+
+    assert scope_1 != scope_2
+
+
+def test_mailbox_scope_username_case_is_not_folded():
+    """Codex gate follow-up (Astra R4A MEDIUM take 2, scope serialization)
+    regression: unlike `imap_host`, `username` must NOT be lowercased --
+    an IMAP username's local-part is not guaranteed case-insensitive by
+    every server, so folding case here could silently collapse two
+    distinct configured mailboxes into one scope.
+    """
+    scope_upper = compute_mailbox_scope("imap.example.com", 993, "User@Example.com")
+    scope_lower = compute_mailbox_scope("imap.example.com", 993, "user@example.com")
+
+    assert scope_upper != scope_lower
+
+
+@pytest.mark.asyncio
+async def test_advance_xing_scan_progress_never_regresses_under_concurrent_stale_write(db):
+    """Codex gate follow-up (Astra R4A MEDIUM, concurrency) regression:
+    a writer holding a STALE snapshot of the progress row (as would occur
+    under real concurrent access -- two workers both read the row before
+    either commits) must never be able to regress `confirmed_upto_uid`,
+    even though the naive prior implementation branched on exactly that
+    stale snapshot rather than the database's live state.
+
+    Exercises `_advance_existing` directly (not
+    `advance_xing_scan_progress`, which always re-reads a fresh row and
+    would trivially avoid this regression regardless of the underlying
+    bug) with a deliberately stale `existing` object, proving the
+    monotonic guard lives in the SQL `WHERE` clause itself.
+    """
+    scope = "concurrency-scope"
+    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope)
+
+    # Simulates "worker B" observing the row while it still read
+    # confirmed_upto_uid=5 -- a stale snapshot from before "worker A"
+    # (below) advances it further.
+    stale_existing = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert stale_existing.confirmed_upto_uid == 5
+
+    # Worker A advances first and commits a higher watermark.
+    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=10, mailbox_scope=scope)
+
+    # Worker B now persists its own (smaller, computed from the stale
+    # read) value using the snapshot it captured before A's commit.
+    _advance_existing(db, stale_existing, uid_validity=1, new=8)
+
+    progress = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert progress.confirmed_upto_uid == 10  # must NOT regress to 8
+
+
+@pytest.mark.asyncio
+async def test_advance_xing_scan_progress_stale_writer_can_still_advance_further(db):
+    """Companion to the regression above: a stale-snapshot writer whose
+    computed value is still GENUINELY ahead of the current stored value
+    must still be able to advance it -- the SQL guard must compare
+    against live state, not simply reject every write from a stale
+    snapshot.
+    """
+    scope = "concurrency-scope-advance"
+    advance_xing_scan_progress(db, uid_validity=1, confirmed_upto_uid=5, mailbox_scope=scope)
+
+    stale_existing = get_xing_scan_progress(db, mailbox_scope=scope)
+
+    _advance_existing(db, stale_existing, uid_validity=1, new=12)
+
+    progress = get_xing_scan_progress(db, mailbox_scope=scope)
+    assert progress.confirmed_upto_uid == 12
