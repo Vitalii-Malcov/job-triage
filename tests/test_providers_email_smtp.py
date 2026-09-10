@@ -538,14 +538,24 @@ class TestTotalSendDeadline:
         monkeypatch.setattr(
             smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: _NeverReturningSendClient()
         )
-        provider = _provider(client=None, total_deadline_seconds=0.2)
+        # A more generous deadline than the "before send" test above:
+        # `_connect()` still calls the REAL `ssl.create_default_context()`
+        # even though `smtplib.SMTP_SSL` itself is faked -- on some
+        # platforms/environments that alone can take several hundred ms
+        # (enumerating the OS certificate store), which a 0.2s deadline
+        # could exhaust BEFORE send_message() is ever reached, silently
+        # testing the wrong branch (pre-transmission, not this test's
+        # actual target: mid-send_message). 3.0s comfortably clears that
+        # while still firing well before send_message()'s own 5s sleep
+        # returns.
+        provider = _provider(client=None, total_deadline_seconds=3.0)
 
         start = time.monotonic()
         with pytest.raises(EmailSendOutcomeUnknownError):
             provider.send(_message())
         elapsed = time.monotonic() - start
 
-        assert elapsed < 2.0
+        assert elapsed < 5.0
 
     def test_normal_send_within_deadline_is_unaffected(self):
         """The common case — a fast, healthy send — must behave exactly
@@ -556,3 +566,166 @@ class TestTotalSendDeadline:
         provider.send(_message())
 
         assert len(client.sent_messages) == 1
+
+    def test_blocked_login_that_later_releases_never_reaches_send_message(self, monkeypatch):
+        """Codex gate follow-up (Astra R4B, NEW-006 take 2) REQUIRED
+        regression: connect/login blocks PAST the deadline; the caller
+        gets back a DEFINITE pre-transmission failure; the blocked
+        login() call THEN releases on its own (simulating a block that
+        cannot be forcibly interrupted -- this fake has no real `.sock`
+        for `_force_close` to act on, exactly like the injected-client
+        path always has). `send_message()` must NEVER be called
+        afterward.
+
+        Proves the guarantee comes from `send()`'s own atomic
+        `gate_lock` cancellation checkpoint, not from hoping the
+        abandoned daemon thread never gets there -- if it were only
+        "abandon and hope", this test would flake or fail once `login()`
+        finally returns and the worker resumes.
+        """
+        release_login = threading.Event()
+
+        class _BlockingThenReleasingLoginClient:
+            def __init__(self) -> None:
+                self.send_message_called = False
+
+            def login(self, user, password):
+                # Blocks until the test explicitly releases it -- models
+                # "the blocked operation later releases" deterministically,
+                # without depending on real elapsed-time timing.
+                release_login.wait()
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                self.send_message_called = True
+                return {}
+
+            def quit(self):
+                return (221, b"Bye")
+
+        fake_client = _BlockingThenReleasingLoginClient()
+        monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: fake_client)
+        # Comfortably above ssl.create_default_context()'s own real (and,
+        # on some platforms, several-hundred-ms) cost -- see the "after
+        # send" test above's identical rationale -- while still small
+        # enough to keep this test fast.
+        provider = _provider(client=None, total_deadline_seconds=1.5)
+
+        with pytest.raises(EmailSendConnectionError):
+            provider.send(_message())
+
+        assert fake_client.send_message_called is False
+
+        # NOW let the blocked login() call release -- the worker thread
+        # resumes and reaches its post-connect checkpoint.
+        release_login.set()
+        # Give the abandoned worker a moment to actually run past that
+        # checkpoint (it no longer affects this call's own return value
+        # or timing -- send() already returned above).
+        time.sleep(0.5)
+
+        assert fake_client.send_message_called is False
+
+    def test_active_interruption_closes_a_real_blocked_socket(self, monkeypatch):
+        """Codex gate follow-up (Astra R4B, NEW-006 take 2): when the
+        deadline wins the pre-transmission race AND a real transport
+        handle exists (registered via `_connect`'s `on_connected`
+        callback right after the socket-level connect succeeds, BEFORE
+        `login()` -- see that callback's own docstring), `send()`
+        actively closes its socket -- not merely abandons the thread.
+
+        A REAL socket, not a mock: `smtplib.SMTP_SSL` is faked to return
+        a client wrapping a REAL raw socket already connected to a
+        listener that never writes anything back, so `login()`'s
+        blocking `recv()` genuinely hangs. Proves the socket is
+        ACTIVELY closed (not merely that some eventual timeout fired) by
+        having the SERVER side observe the connection drop well within
+        `SMTP_OPERATION_TIMEOUT_SECONDS`, which `login()` here is
+        configured to use directly as its own read timeout -- deliberately
+        far larger than this test's total deadline, so a pass can only be
+        explained by active closure racing ahead of that timeout, not by
+        it coincidentally firing on its own.
+        """
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        connection_closed = threading.Event()
+
+        def _accept_then_detect_close():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(SMTP_OPERATION_TIMEOUT_SECONDS)
+                # Never writes anything back -- blocks until the peer
+                # closes (recv returns b"") or this generous per-op
+                # timeout fires; the test asserts the FORMER happens
+                # first, well before the latter ever could.
+                data = conn.recv(1)
+                if data == b"":
+                    connection_closed.set()
+            except OSError:
+                connection_closed.set()
+            finally:
+                conn.close()
+
+        server_thread = threading.Thread(target=_accept_then_detect_close, daemon=True)
+        server_thread.start()
+        try:
+            raw_client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_client_sock.connect((host, port))
+
+            class _RawSocketClient:
+                """`smtplib.SMTP_SSL`-shaped double wrapping a REAL,
+                already-connected raw socket -- `login()` genuinely
+                blocks on it (the fake server never replies)."""
+
+                sock = raw_client_sock
+
+                def __init__(self) -> None:
+                    self.send_message_called = False
+
+                def login(self, user, password):
+                    raw_client_sock.settimeout(SMTP_OPERATION_TIMEOUT_SECONDS)
+                    raw_client_sock.recv(1)  # blocks until closed or timed out
+                    return (235, b"OK")
+
+                def send_message(self, msg):
+                    self.send_message_called = True
+                    return {}
+
+                def quit(self):
+                    return (221, b"Bye")
+
+            fake_client = _RawSocketClient()
+            monkeypatch.setattr(smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: fake_client)
+            # Comfortably above ssl.create_default_context()'s own real
+            # cost (see the other tests' identical rationale) while still
+            # far below SMTP_OPERATION_TIMEOUT_SECONDS, so a pass proves
+            # ACTIVE closure, not that timeout coincidentally firing too.
+            provider = GmailSmtpProvider(
+                smtp_host=host,
+                smtp_port=port,
+                username=ACCOUNT,
+                app_password="app-password",
+                total_deadline_seconds=1.5,
+            )
+
+            start = time.monotonic()
+            with pytest.raises(EmailSendConnectionError):
+                provider.send(_message())
+            elapsed = time.monotonic() - start
+
+            # The forced close must have happened well within this
+            # call's own bounded return -- not merely "eventually".
+            assert elapsed < 4.0
+            assert fake_client.send_message_called is False
+            assert connection_closed.wait(timeout=4.0), (
+                "server never observed the client socket close -- "
+                "_force_close did not actively interrupt the real blocked read"
+            )
+        finally:
+            server.close()
+            server_thread.join(timeout=3)

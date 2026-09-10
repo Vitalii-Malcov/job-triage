@@ -47,6 +47,7 @@ import logging
 import smtplib
 import ssl
 import threading
+from collections.abc import Callable
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -106,11 +107,29 @@ SMTP_OPERATION_TIMEOUT_SECONDS = 8.0
 # 7E's HTTP handlers run in FastAPI's worker thread pool), so `send()`
 # instead runs the actual blocking smtplib work on a dedicated daemon
 # thread and imposes this deadline from the CALLING thread via
-# `threading.Event.wait(timeout=...)` — see `send()`'s own docstring for
-# the full mechanism, including why the worker thread is deliberately
-# `daemon=True` (so an abandoned pathological call can never block
-# process shutdown) and how transmission-attempted state is tracked to
-# preserve the UNCERTAIN-vs-DEFINITE-failure classification.
+# `threading.Event.wait(timeout=...)`.
+#
+# **Active interruption, not passive abandonment (Codex gate follow-up,
+# Astra R4B, NEW-006 take 2).** When the deadline fires BEFORE
+# `send_message()` was reached, `send()` does two things, not one:
+# (1) it actively closes the worker's live socket, if by then it has
+# one, so a genuinely blocked real recv/send call unblocks promptly
+# instead of running to its own natural `SMTP_OPERATION_TIMEOUT_SECONDS`;
+# (2) — the actual CORRECTNESS guarantee, independent of whether (1)
+# succeeds (e.g. an injected test double, or a block that isn't
+# socket-shaped at all) — it atomically marks the send as cancelled
+# under a shared lock the worker itself checks, under the SAME lock,
+# immediately before calling `send_message()`. Whichever side reaches
+# the lock first wins: if the deadline-side wins, the worker is
+# GUARANTEED to observe "cancelled" and return without ever calling
+# `send_message()`, even if whatever blocked it (real or fake) later
+# resolves on its own. If the worker already committed to sending
+# before the deadline-side could grab the lock, the deadline-side
+# correctly reports the outcome as UNCERTAIN instead of DEFINITE
+# instead. See `send()`'s own docstring for the full mechanism. The
+# worker thread stays `daemon=True` purely so it can never block process
+# shutdown if it does not exit promptly — that property is not the
+# cancellation mechanism itself.
 #
 # Margin below `THREAD_LOCK_TTL_SECONDS` (30s, imported only by
 # tests/test_providers_email_smtp.py — this module stays DB-free, see
@@ -195,46 +214,65 @@ class GmailSmtpProvider:
             logger.warning("outbound_email_build_failed error_type=%s", type(exc).__name__)
             raise EmailSendConnectionError("Building the outbound email failed") from exc
 
-        # Codex gate follow-up (Astra R4B, NEW-006: SMTP total deadline).
-        # The actual blocking smtplib work (connect + login + send_message
-        # + quit) runs on a dedicated `daemon=True` thread; THIS (calling)
-        # thread imposes the hard wall-clock deadline via
+        # Codex gate follow-up (Astra R4B, NEW-006 take 2: SMTP total
+        # deadline, active interruption). The actual blocking smtplib
+        # work (connect + login + send_message + quit) runs on a
+        # dedicated `daemon=True` thread; THIS (calling) thread imposes
+        # the hard wall-clock deadline via
         # `done.wait(timeout=self.total_deadline_seconds)` instead of
         # trusting any per-socket-operation timeout to bound the whole
         # call — see `SMTP_TOTAL_DEADLINE_SECONDS`'s own docstring for why
-        # that is NOT equivalent (a peer trickling bytes just under each
-        # per-operation timeout can otherwise hold a single smtplib call
-        # open indefinitely, since socket timeouts only bound inactivity,
-        # not a call's total duration).
+        # that is NOT equivalent.
         #
-        # `daemon=True` is deliberate: if the deadline fires, this thread
-        # is ABANDONED (Python cannot forcibly cancel a blocking call) —
-        # it keeps running until its own eventual per-operation socket
-        # timeout or connection closure unblocks it, entirely off this
-        # caller's critical path. A daemon thread can never block process
-        # shutdown the way a non-daemon one (or an unshut-down
-        # ThreadPoolExecutor, whose atexit hook joins every thread it ever
-        # spawned) would.
-        #
-        # `transmission_attempted` is set INSIDE the worker thread
-        # immediately before `send_message()` is invoked — read here
-        # (after the wait) to preserve the exact same UNCERTAIN-vs-
-        # DEFINITE-failure classification as every exception path below:
-        # unset means the deadline fired during connect/login (still
-        # provably pre-transmission), set means transmission may already
-        # be in flight.
-        transmission_attempted = threading.Event()
+        # **The correctness guarantee is NOT "the thread is abandoned and
+        # we hope it never sends."** `gate_lock` + `state["phase"]` form a
+        # single atomic checkpoint shared by both threads: the worker
+        # must hold `gate_lock` to transition from "before_send" to
+        # "sending" immediately before calling `send_message()`; the
+        # deadline-side, on timeout, must hold the SAME lock to transition
+        # to "cancelled". Whichever side reaches the lock first wins --
+        # there is no window where both "the deadline already returned a
+        # DEFINITE failure to the caller" and "the worker still goes on to
+        # call send_message()" can both be true. `state["client"]` is
+        # populated as early as possible (via `_connect`'s `on_connected`
+        # callback, right after the socket-level connect succeeds, before
+        # `login()`) so the deadline-side can ALSO actively close the live
+        # transport when it wins the race -- a genuinely blocked real
+        # recv/send call (e.g. a hung `login()`) then raises promptly
+        # instead of running to its own natural per-operation timeout.
+        # This is real interruption, not merely a hope that the daemon
+        # thread eventually gives up.
+        gate_lock = threading.Lock()
+        state: dict[str, object] = {"phase": "before_send", "client": None}
         done = threading.Event()
         outcome: dict[str, BaseException | OutboundSendResult] = {}
+
+        def _register_client(connected_client: SmtpClient) -> None:
+            with gate_lock:
+                state["client"] = connected_client
 
         def _do_send() -> None:
             try:
                 client = self._injected_client
                 owns_connection = client is None
                 if client is None:
-                    client = self._connect()
+                    client = self._connect(on_connected=_register_client)
+                else:
+                    _register_client(client)
                 try:
-                    transmission_attempted.set()
+                    with gate_lock:
+                        if state["phase"] == "cancelled":
+                            # The deadline already won this race and
+                            # reported a DEFINITE pre-transmission failure
+                            # to the caller -- send_message() must never
+                            # be reached after that, regardless of what
+                            # unblocked this worker (a real socket error
+                            # from the forced close below, or -- for an
+                            # injected/fake transport with nothing to
+                            # actually close -- the blocked call simply
+                            # returning on its own).
+                            return
+                        state["phase"] = "sending"
                     client.send_message(msg)
                 except (smtplib.SMTPException, OSError) as exc:
                     # Transmission was ATTEMPTED — the server may or may
@@ -277,20 +315,35 @@ class GmailSmtpProvider:
         worker.start()
         finished = done.wait(timeout=self.total_deadline_seconds)
 
-        if not finished:
-            if transmission_attempted.is_set():
-                logger.warning("outbound_smtp_total_deadline_exceeded_after_send_attempted")
-                raise EmailSendOutcomeUnknownError(
-                    "Sending the outbound email exceeded the total send deadline "
-                    "after transmission may have begun"
-                )
-            logger.warning("outbound_smtp_total_deadline_exceeded_before_send")
-            raise EmailSendConnectionError("Total send deadline exceeded before transmission began")
+        if finished:
+            error = outcome.get("error")
+            if error is not None:
+                raise error
+            return outcome["result"]
 
-        error = outcome.get("error")
-        if error is not None:
-            raise error
-        return outcome["result"]
+        # Deadline fired: resolve the race atomically against the
+        # worker's own pre-send_message() checkpoint above.
+        with gate_lock:
+            already_sending = state["phase"] != "before_send"
+            if not already_sending:
+                state["phase"] = "cancelled"
+            client = state["client"]
+
+        if already_sending:
+            logger.warning("outbound_smtp_total_deadline_exceeded_after_send_attempted")
+            raise EmailSendOutcomeUnknownError(
+                "Sending the outbound email exceeded the total send deadline "
+                "after transmission may have begun"
+            )
+
+        # Won the race pre-transmission: actively interrupt the live
+        # transport (if one exists yet) rather than merely abandoning the
+        # thread -- see this method's own comment above and
+        # `_force_close`'s docstring.
+        if client is not None:
+            self._force_close(client)
+        logger.warning("outbound_smtp_total_deadline_exceeded_before_send")
+        raise EmailSendConnectionError("Total send deadline exceeded before transmission began")
 
     def _build_message(self, message: OutboundMessage) -> EmailMessage:
         msg = EmailMessage()
@@ -304,7 +357,16 @@ class GmailSmtpProvider:
         msg.set_content(message.body)
         return msg
 
-    def _connect(self) -> smtplib.SMTP_SSL:
+    def _connect(
+        self, *, on_connected: Callable[[SmtpClient], None] | None = None
+    ) -> smtplib.SMTP_SSL:
+        """`on_connected` (NEW-006 take 2): invoked with the client
+        object right after the socket-level connect succeeds, BEFORE
+        `login()` is attempted -- lets `send()` register the live
+        transport as early as possible, maximizing the window during
+        which its total-deadline watchdog can actively close it if
+        `login()` itself hangs.
+        """
         try:
             # S7E-014: `timeout` bounds connect + the TLS handshake + the
             # initial greeting read — and, since it is set on the
@@ -340,6 +402,9 @@ class GmailSmtpProvider:
                 "Could not connect to the configured outbound SMTP host"
             ) from exc
 
+        if on_connected is not None:
+            on_connected(client)
+
         try:
             client.login(self.username, self.app_password)
         except smtplib.SMTPException as exc:
@@ -364,3 +429,30 @@ class GmailSmtpProvider:
             client.quit()
         except Exception as exc:
             logger.warning("outbound_smtp_quit_failed error_type=%s", type(exc).__name__)
+
+    def _force_close(self, client: SmtpClient) -> None:
+        """Codex gate follow-up (Astra R4B, NEW-006 take 2): actively
+        interrupts a live transport `send()`'s total-deadline watchdog
+        has decided to abandon PRE-transmission -- closes the underlying
+        socket directly (not `client.quit()`/`client.close()`, which do
+        their own request/reply exchange or mutate `client`'s own
+        `sock`/`file` attributes, either of which is unsafe to run
+        concurrently with whatever the WORKER thread is doing to the same
+        object) so a genuinely blocked real recv/send call (e.g. a hung
+        `login()`) raises almost immediately instead of running to its
+        own natural `SMTP_OPERATION_TIMEOUT_SECONDS`.
+
+        Best-effort only: an injected test double (or any `SmtpClient`
+        with no real `.sock`) is silently tolerated -- this is a
+        defense-in-depth speed-up, not the actual correctness guarantee.
+        The guarantee that `send_message()` is never reached after
+        cancellation comes from `send()`'s own `gate_lock`, independent
+        of whether this succeeds.
+        """
+        sock = getattr(client, "sock", None)
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
