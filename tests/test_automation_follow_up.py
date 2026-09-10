@@ -53,7 +53,7 @@ def session_factory(tmp_path):
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-async def _noop_collector(db, settings, *, touched_jobs=None):
+async def _noop_collector(db, settings, *, touched_jobs=None, is_lease_lost=None):
     return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
 

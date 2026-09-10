@@ -85,12 +85,12 @@ def session_factory(tmp_path):
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-async def _noop_collector(db, settings, *, touched_jobs=None):
+async def _noop_collector(db, settings, *, touched_jobs=None, is_lease_lost=None):
     return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
 
 def _failing_collector(exc: Exception):
-    async def _fail(db, settings, *, touched_jobs=None):
+    async def _fail(db, settings, *, touched_jobs=None, is_lease_lost=None):
         raise exc
 
     return _fail
@@ -256,7 +256,9 @@ class TestOverallStatusAggregation:
             failing_job = _seed_job(db, tier=TIER_60, score=99)
             healthy_job = _seed_job(db, tier=TIER_60, score=1)
 
-            async def _touching_bundesagentur(db, settings, *, touched_jobs=None):
+            async def _touching_bundesagentur(
+                db, settings, *, touched_jobs=None, is_lease_lost=None
+            ):
                 if touched_jobs is not None:
                     touched_jobs.append(_touch(failing_job))
                     touched_jobs.append(_touch(healthy_job))
@@ -660,7 +662,7 @@ class TestBewerbungReuse:
             job = _seed_job(db, tier=TIER_60)
             job_id = job.id
 
-            async def _touch_job_collector(db, settings, *, touched_jobs=None):
+            async def _touch_job_collector(db, settings, *, touched_jobs=None, is_lease_lost=None):
                 record = db.get(JobRecord, job_id)
                 if touched_jobs is not None:
                     touched_jobs.append(_touch(record))

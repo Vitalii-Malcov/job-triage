@@ -38,6 +38,7 @@ public contract, not an implementation detail of routes.py.
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -138,6 +139,8 @@ async def _maybe_auto_research(
     record: JobRecord,
     result: JobScore,
     budget: dict[str, int],
+    *,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> None:
     """Best-effort, opt-in company research for a just-persisted high-score job.
 
@@ -155,7 +158,24 @@ async def _maybe_auto_research(
     APPLY jobs it produces, so a large batch can't silently fan out into an
     unbounded number of research runs. Manual triggers (POST
     /jobs/{id}/research, Telegram /research) are unaffected by this budget.
+
+    Codex gate follow-up (Astra R4A, lease-loss MEDIUM): `is_lease_lost`
+    is an OPTIONAL callback (`None` for every standalone caller -- the
+    manual endpoint, Telegram bot command; only
+    `app.services.automation.run_automation_cycle` ever passes one, bound
+    to `heartbeat.lease_lost.is_set`). `run_automation_cycle`'s own
+    between-STEP checks (`_raise_if_lease_lost`) cannot see a lease lost
+    mid-way through a SINGLE step's own per-job loop -- a collector run
+    can process up to `MAX_MESSAGES_PER_SYNC`/many jobs, each potentially
+    making a real external research call, so ownership can be confirmed
+    lost partway through one step's own execution. Checked here (never
+    inside the job-scoring/persistence path itself, which stays durable
+    and idempotent either way) so a lease-lost worker stops launching NEW
+    external research calls immediately, without needing to wait for the
+    whole step to return.
     """
+    if is_lease_lost is not None and is_lease_lost():
+        return
     if not settings.company_research_auto_enabled or result.recommendation != "APPLY":
         return
     if budget["remaining"] <= 0:
@@ -198,7 +218,11 @@ async def _maybe_auto_research(
 
 
 async def run_bundesagentur(
-    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+    db: Session,
+    settings,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> dict[str, int]:
     """Fetch + score + persist one Bundesagentur collector run.
 
@@ -220,6 +244,18 @@ async def run_bundesagentur(
     `except Exception` branch's `continue` above the touch point).
     Existing callers (the API endpoint, the Telegram bot command) omit
     this parameter entirely and see no behavior change whatsoever.
+
+    `is_lease_lost` (Codex gate follow-up, Astra R4A lease-loss MEDIUM):
+    optional kw-only callback, `None` for every standalone caller (the
+    API endpoint, the Telegram bot command) -- only
+    `app.services.automation.run_automation_cycle` passes one. Checked
+    before each job's auto-research/Telegram-notification calls (never
+    before its own scoring/persistence, which stays durable and
+    idempotent regardless of lease ownership) so a worker that has
+    already confirmed it lost the automation lease stops launching NEW
+    external side-effect calls immediately, without waiting for this
+    whole run to return. See `_maybe_auto_research`'s own docstring for
+    the full rationale.
     """
     if not is_api_key_configured(settings.bundesagentur_api_key):
         raise CollectorNotConfiguredError(
@@ -332,12 +368,23 @@ async def run_bundesagentur(
                 )
             )
 
-        await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+        await _maybe_auto_research(
+            db, settings, job_record, result, auto_research_budget, is_lease_lost=is_lease_lost
+        )
 
-        if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
+        if (
+            result.recommendation == "APPLY"
+            and result.score >= settings.min_job_score_to_notify
+            and (is_lease_lost is None or not is_lease_lost())
+        ):
             # Notification delivery is best-effort orchestration on top of
             # already-committed persistence: a failed/slow send must not
             # affect created/updated/failed counts or abort the run.
+            # Codex gate follow-up (Astra R4A lease-loss MEDIUM): a
+            # confirmed-lost lease must stop NEW Telegram sends too --
+            # see `_maybe_auto_research`'s own docstring for the full
+            # rationale (`is_lease_lost` is None for every standalone
+            # caller, so this is a no-op there).
             if notified_count > 0:
                 await asyncio.sleep(1)
             try:
@@ -377,14 +424,19 @@ async def run_bundesagentur(
 
 
 async def run_xing(
-    db: Session, settings, *, touched_jobs: list[TouchedJob] | None = None
+    db: Session,
+    settings,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
 ) -> dict[str, int]:
     """Fetch + score + persist one XING mailbox collector run.
 
     Shared by POST /collectors/xing/run, the Telegram control center's
     `/run xing` command, and Stage 8A's automation orchestrator — see
     `run_bundesagentur` above for the same rationale, including
-    `touched_jobs`'s exact semantics (S8C-POOL-001).
+    `touched_jobs`'s exact semantics (S8C-POOL-001) and `is_lease_lost`'s
+    (Codex gate follow-up, Astra R4A lease-loss MEDIUM).
     """
     if not is_configured(settings.xing_mailbox_username) or not is_configured(
         settings.xing_mailbox_app_password
@@ -461,15 +513,25 @@ async def run_xing(
                     )
                 )
 
-            await _maybe_auto_research(db, settings, job_record, result, auto_research_budget)
+            await _maybe_auto_research(
+                db,
+                settings,
+                job_record,
+                result,
+                auto_research_budget,
+                is_lease_lost=is_lease_lost,
+            )
 
             if (
                 result.recommendation == "APPLY"
                 and result.score >= settings.min_job_score_to_notify
+                and (is_lease_lost is None or not is_lease_lost())
             ):
                 # Same best-effort contract as run_bundesagentur: notification
                 # failures are orchestration on top of already-committed
                 # persistence and must not affect counts or abort the run.
+                # Codex gate follow-up (Astra R4A lease-loss MEDIUM): see
+                # run_bundesagentur's identical guard.
                 if notified_count > 0:
                     await asyncio.sleep(1)
                 try:

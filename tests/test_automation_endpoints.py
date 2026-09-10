@@ -593,7 +593,7 @@ class TestSanitizedStepFailureLogging:
     ):
         test_client, _session_factory = client
 
-        def _boom(db, settings, *, touched_jobs=None):
+        def _boom(db, settings, *, touched_jobs=None, is_lease_lost=None):
             raise RuntimeError("secret-upstream-detail-should-never-leak")
 
         # A raw callable, not a CollectorError subclass -- exercises the

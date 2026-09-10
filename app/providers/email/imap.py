@@ -503,7 +503,26 @@ class GmailImapProvider:
             # instead of letting each remaining UID fail one at a time.
             if deadline is not None and deadline.exceeded:
                 break
-            parsed = self._fetch_one(client, uid_bytes, uid_validity)
+            try:
+                parsed = self._fetch_one(client, uid_bytes, uid_validity)
+            except OSError:
+                # Codex gate follow-up (Astra R4A MEDIUM): a transport
+                # -level failure mid-FETCH (the between-iterations
+                # `.exceeded` check above cannot catch this -- the
+                # watchdog can force-close the socket WHILE a FETCH is
+                # already blocked in flight, raising OSError from inside
+                # _fetch_one rather than being observed cleanly at the
+                # top of the next iteration). If the deadline is what
+                # caused this, stop cleanly and let the SAME post-loop
+                # logic below return the messages already completed,
+                # flagged via `deadline_exceeded` -- never silently
+                # discarded. If the deadline did NOT cause it (a
+                # genuine, unexpected connection failure), re-raise so
+                # `_fetch_sync`'s existing outer handler logs and raises
+                # `GmailConnectionError`, unchanged.
+                if deadline is not None and deadline.exceeded:
+                    break
+                raise
             if parsed is None:
                 skipped_count += 1
             else:
@@ -678,6 +697,22 @@ class GmailImapProvider:
             # project's Gmail correspondence chronology now trusts — see
             # `_parse_internal_date` and ParsedGmailMessage.provider_arrival_at.
             typ, msg_data = client.uid("fetch", uid_bytes, "(INTERNALDATE BODY.PEEK[])")
+        except OSError:
+            # Codex gate follow-up (Astra R4A MEDIUM): a genuine
+            # transport/protocol failure mid-FETCH (including the total
+            # session deadline's watchdog force-closing the socket
+            # WHILE this call is blocked in flight) must NEVER be
+            # reinterpreted as an ordinary skipped message — that would
+            # both quietly discard the distinction between "this one
+            # message was unreadable" and "the whole connection just
+            # died", and (for the deadline case specifically) risk the
+            # caller's `for uid_bytes in uids` loop just moving on to
+            # the NEXT uid on an already-dead socket instead of stopping
+            # cleanly. Propagate to `_fetch_sync_body`'s loop, which
+            # decides: deadline-caused -> stop and preserve what already
+            # completed; genuine failure -> re-raise up to `_fetch_sync`'s
+            # existing OSError handler, unchanged.
+            raise
         except Exception as exc:
             logger.warning("gmail_message_fetch_error error_type=%s", type(exc).__name__)
             return None

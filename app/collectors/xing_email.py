@@ -95,6 +95,11 @@ _SUBJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^Entdecke\s+ähnliche\s+Jobs\s+wie\b", re.IGNORECASE),
 )
 
+# Codex gate follow-up (Astra R4A HIGH): extracts a bare "Message-ID:"
+# header value from a HEADER.FIELDS-scoped FETCH response -- see
+# `_read_message_id_header`'s own docstring.
+_MESSAGE_ID_HEADER_RE = re.compile(rb"Message-ID:\s*(.+)", re.IGNORECASE)
+
 # One or more consecutive separator lines act as a single block boundary —
 # real digests observed with both one and two stacked dash lines between
 # postings. 10+ dashes distinguishes a separator line from any incidental
@@ -436,7 +441,27 @@ class XingEmailCollector(JobCollector):
             # time.
             if deadline is not None and deadline.exceeded:
                 break
-            batch = self._fetch_and_process_message(client, message_number)
+            try:
+                batch = self._fetch_and_process_message(client, message_number)
+            except OSError:
+                # Codex gate follow-up (Astra R4A HIGH): a transport
+                # -level failure mid-FETCH (the exact case the earlier
+                # NEW-001 fix's between-iterations `break` above did NOT
+                # cover -- the deadline watchdog can force-close the
+                # socket WHILE a FETCH is already blocked in flight,
+                # raising OSError from inside
+                # _fetch_and_process_message rather than being observed
+                # cleanly at the top of the next iteration). If the
+                # deadline is what caused this, stop cleanly here and let
+                # the SAME post-loop logic below return the batches
+                # already completed, flagged via `deadline_exceeded` --
+                # never silently discarded. If the deadline did NOT
+                # cause it (a genuine, unexpected connection failure),
+                # re-raise so `_fetch_sync`'s existing outer handler logs
+                # and raises `XingConnectionError`, unchanged.
+                if deadline is not None and deadline.exceeded:
+                    break
+                raise
             if batch is not None:
                 batches.append(batch)
 
@@ -537,9 +562,60 @@ class XingEmailCollector(JobCollector):
         except Exception:
             logger.warning("xing_email_imap_logout_failed", exc_info=True)
 
+    def _read_message_id_header(self, client: ImapClient, message_number: bytes) -> str | None:
+        """Codex gate follow-up (Astra R4A HIGH): a lightweight pre-check
+        -- mirrors `app.providers.email.imap.GmailImapProvider
+        ._read_message_size`'s "cheap probe before the expensive
+        transfer" pattern -- that fetches ONLY the Message-ID header via
+        `BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]` instead of the full
+        RFC822 body. This is what lets `_fetch_and_process_message` skip
+        an already-acknowledged message WITHOUT paying for a full-body
+        transfer at all (the starvation this closes: a backlog where
+        most messages are already-processed used to spend the ENTIRE
+        per-run fetch budget re-transferring their full bodies before
+        ever reaching a genuinely new message).
+
+        Returns None if the header could not be determined (some
+        servers/fakes may omit or malform it, or a real transport error
+        occurred) -- the caller then falls back to the full fetch rather
+        than failing closed, an honest documented gap exactly like
+        `_read_message_size`'s own. `OSError` is NOT swallowed here: a
+        transport-level failure (including the deadline watchdog forcing
+        the socket closed mid-read) must propagate to
+        `_fetch_and_process_message`'s own caller, never be silently
+        reinterpreted as "header absent, fall back to full fetch".
+        """
+        try:
+            typ, data = client.fetch(message_number, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        except OSError:
+            raise
+        except Exception:
+            return None
+        if typ != "OK" or not data:
+            return None
+        for item in data:
+            candidate = item[1] if isinstance(item, tuple) else item
+            if not isinstance(candidate, bytes | bytearray):
+                continue
+            match = _MESSAGE_ID_HEADER_RE.search(bytes(candidate))
+            if match:
+                return match.group(1).decode("ascii", errors="replace").strip()
+        return None
+
     def _fetch_and_process_message(
         self, client: ImapClient, message_number: bytes
     ) -> XingEmailBatch | None:
+        # Codex gate follow-up (Astra R4A HIGH): skip already-acknowledged
+        # messages BEFORE transferring their full RFC822 body -- see
+        # `_read_message_id_header`'s own docstring for the starvation
+        # this prevents. A pre-check that couldn't determine the header
+        # (None) falls through to the normal full fetch below, where
+        # `_process_message`'s own (pre-existing, unchanged)
+        # `is_message_processed` check still applies as a safety net.
+        precheck_message_id = self._read_message_id_header(client, message_number)
+        if precheck_message_id and self._is_message_processed(precheck_message_id):
+            return None
+
         typ, msg_data = client.fetch(message_number, "(RFC822)")
         if typ != "OK" or not msg_data or msg_data[0] is None:
             logger.warning("xing_email_message_fetch_failed message_number=%s", message_number)

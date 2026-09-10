@@ -158,11 +158,13 @@ class TestHeartbeatKeepsSlowRunAlive:
                     acquire_attempts.append((created, _run.id, _run.status))
                     time.sleep(0.05)
 
-            async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+            async def _slow_run_bundesagentur(
+                db, settings, *, touched_jobs=None, is_lease_lost=None
+            ):
                 await asyncio.sleep(2.0)
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-            async def _slow_run_xing(db, settings, *, touched_jobs=None):
+            async def _slow_run_xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
             monkeypatch.setattr(
@@ -252,11 +254,13 @@ class TestHeartbeatStoppingLetsLeaseExpire:
                 recovery_result["created"] = created
                 recovery_result["run_id"] = run.id
 
-            async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+            async def _slow_run_bundesagentur(
+                db, settings, *, touched_jobs=None, is_lease_lost=None
+            ):
                 await asyncio.sleep(0.3)
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-            async def _slow_run_xing(db, settings, *, touched_jobs=None):
+            async def _slow_run_xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
                 return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
             monkeypatch.setattr(
@@ -325,7 +329,9 @@ class TestFinishRunRejectsAnExpiredLeaseEvenIfUncontested:
     def test_run_does_not_complete_when_steps_finish_after_ttl_but_before_first_heartbeat(
         self, session_factory, monkeypatch
     ):
-        async def _bundesagentur_outlives_the_ttl(db, settings, *, touched_jobs=None):
+        async def _bundesagentur_outlives_the_ttl(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
             # Tiny TTL (0.05s) expires well before this step returns,
             # and the heartbeat interval (1.0s) is deliberately longer
             # than both the TTL and this step -- so no renewal attempt
@@ -335,7 +341,7 @@ class TestFinishRunRejectsAnExpiredLeaseEvenIfUncontested:
             await asyncio.sleep(0.15)
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_noop(db, settings, *, touched_jobs=None):
+        async def _xing_noop(db, settings, *, touched_jobs=None, is_lease_lost=None):
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
         monkeypatch.setattr(
@@ -385,14 +391,14 @@ class TestHeartbeatRenewalExceptionFailsClosed:
 
         monkeypatch.setattr("app.services.automation.renew_run_lease", _boom)
 
-        async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None):
+        async def _slow_run_bundesagentur(db, settings, *, touched_jobs=None, is_lease_lost=None):
             # Long enough for the heartbeat's first tick (interval below)
             # to fire and hit the patched, always-raising renew_run_lease
             # before this step returns.
             await asyncio.sleep(0.3)
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_noop(db, settings, *, touched_jobs=None):
+        async def _xing_noop(db, settings, *, touched_jobs=None, is_lease_lost=None):
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
         monkeypatch.setattr("app.services.automation.run_bundesagentur", _slow_run_bundesagentur)
@@ -472,11 +478,13 @@ class TestLeaseLossStopsFurtherWorkImmediately:
         bundesagentur_calls = {"count": 0}
         xing_calls = {"count": 0}
 
-        async def _bundesagentur_should_never_run(db, settings, *, touched_jobs=None):
+        async def _bundesagentur_should_never_run(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
             bundesagentur_calls["count"] += 1
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_should_never_run(db, settings, *, touched_jobs=None):
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
             xing_calls["count"] += 1
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
@@ -503,14 +511,16 @@ class TestLeaseLossStopsFurtherWorkImmediately:
 
         xing_calls = {"count": 0}
 
-        async def _bundesagentur_then_lease_is_lost(db, settings, *, touched_jobs=None):
+        async def _bundesagentur_then_lease_is_lost(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
             # Simulates the heartbeat discovering lease loss WHILE this
             # step was running -- by the time it returns, ownership is
             # already gone.
             captured["heartbeat"].lease_lost.set()
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_should_never_run(db, settings, *, touched_jobs=None):
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
             xing_calls["count"] += 1
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
@@ -544,7 +554,7 @@ class TestLeaseLossStopsFurtherWorkImmediately:
         xing_calls = {"count": 0}
 
         async def _bundesagentur_persists_a_job_then_lease_is_lost(
-            db, settings, *, touched_jobs=None
+            db, settings, *, touched_jobs=None, is_lease_lost=None
         ):
             now = datetime.now(UTC)
             db.add(
@@ -567,7 +577,7 @@ class TestLeaseLossStopsFurtherWorkImmediately:
             captured["heartbeat"].lease_lost.set()
             return {"fetched": 1, "created": 1, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
-        async def _xing_should_never_run(db, settings, *, touched_jobs=None):
+        async def _xing_should_never_run(db, settings, *, touched_jobs=None, is_lease_lost=None):
             xing_calls["count"] += 1
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
@@ -619,7 +629,7 @@ class TestReplacementWorkerAfterLeaseLoss:
             _make_stub_heartbeat_class(captured, start_sets_lease_lost=True),
         )
 
-        async def _noop_step(db, settings, *, touched_jobs=None):
+        async def _noop_step(db, settings, *, touched_jobs=None, is_lease_lost=None):
             return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
 
         monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_step)

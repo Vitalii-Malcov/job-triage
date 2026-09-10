@@ -155,7 +155,13 @@ class AutomationRunLeaseLostError(Exception):
 
 
 async def _run_step(
-    db: Session, step_name: str, step_callable, settings, touched_jobs: list[TouchedJob]
+    db: Session,
+    step_name: str,
+    step_callable,
+    settings,
+    touched_jobs: list[TouchedJob],
+    *,
+    is_lease_lost,
 ) -> dict:
     """Run exactly one coordinated step, translating its outcome into an
     `AutomationRunStepResult`-shaped dict — never lets an exception
@@ -169,9 +175,25 @@ async def _run_step(
     every collector step so `run_automation_cycle` can hand Stage 8C the
     exact set of jobs THIS run's own collectors persisted — see
     `app.services.collector_runner.TouchedJob`.
+
+    `is_lease_lost` (Codex gate follow-up, Astra R4A lease-loss MEDIUM):
+    forwarded unchanged to `step_callable`
+    (`app.services.collector_runner.run_bundesagentur`/`run_xing`, the
+    only two callables `_run_step` is ever used for) as its own
+    `is_lease_lost` kwarg. The between-STEP check this module already
+    does (`_raise_if_lease_lost`, before `_run_step` is even called)
+    cannot see a lease lost mid-way through ONE step's own per-job loop
+    -- a single collector run can process many jobs, each potentially
+    making a real external research/Telegram call, so ownership can be
+    confirmed lost partway through one step's own execution. Passing the
+    SAME live callback all the way down lets that step stop launching
+    NEW external side-effect calls immediately once loss is confirmed,
+    without waiting for the whole step to return.
     """
     try:
-        counters = await step_callable(db, settings, touched_jobs=touched_jobs)
+        counters = await step_callable(
+            db, settings, touched_jobs=touched_jobs, is_lease_lost=is_lease_lost
+        )
     except CollectorNotConfiguredError as exc:
         db.rollback()
         logger.info("automation_run_step_not_configured step=%s", step_name)
@@ -546,7 +568,12 @@ async def run_automation_cycle(
             # very end — see _raise_if_lease_lost's own docstring.
             _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results[step_name] = await _run_step(
-                db, step_name, step_callables[step_name], settings, touched_jobs
+                db,
+                step_name,
+                step_callables[step_name],
+                settings,
+                touched_jobs,
+                is_lease_lost=heartbeat.lease_lost.is_set,
             )
 
         # Stage 8C: opt-in only (Settings.automation_auto_prepare_enabled
