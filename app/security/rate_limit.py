@@ -1,3 +1,23 @@
+"""Per-client-IP, in-process sliding-window rate limiting for the HTTP API.
+
+Architecture:
+- Each endpoint (or group sharing a cost profile) gets its own independent
+  `_RateLimiter` instance: own bucket dict (keyed by `request.client.host`),
+  own lock, own fixed 429 detail message. Never shared across limiters --
+  see each bucket's own comment below for why it's separate.
+- Same-limiter read/expire/count/append is atomic: `check()` does the
+  whole sequence inside one `with self._lock:` block.
+- `max_requests`/`window_seconds` are passed into `check()` at call time,
+  not bound at construction, so each `enforce_*_rate_limit` function's own
+  bare-name reference to its module-level constant (or, for
+  `enforce_rate_limit`, a fresh `get_settings()` call) stays monkeypatchable
+  exactly as before this refactor.
+- Each bucket dict is also exposed under its original module-level name
+  (e.g. `_xing_requests = _xing_limiter.buckets`, the same object, not a
+  copy) solely so the existing test suite's
+  `rate_limit_module._xing_requests.clear()` fixtures keep working.
+"""
+
 import threading
 import time
 from collections import defaultdict, deque
@@ -6,17 +26,69 @@ from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
 
-_lock = threading.Lock()
-_requests: dict[str, deque[float]] = defaultdict(deque)
+
+class _RateLimiter:
+    """One independent sliding-window rate-limit bucket set, keyed by
+    `request.client.host`, plus the lock that guards it. A class is used
+    here -- rather than a bare function + module dict -- because this
+    object owns mutable, concurrently-accessed state; rate/window
+    configuration itself stays plain module-level constants (see module
+    docstring), not attributes of this class.
+    """
+
+    def __init__(self, *, detail: str) -> None:
+        self.buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+        self._detail = detail
+
+    def check(self, request: Request, *, max_requests: int, window_seconds: float) -> None:
+        key = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        cutoff = now - window_seconds
+
+        with self._lock:
+            bucket = self.buckets[key]
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= max_requests:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=self._detail,
+                )
+            bucket.append(now)
+
+
+_generic_limiter = _RateLimiter(detail="Rate limit exceeded")
+_requests = _generic_limiter.buckets
+
+
+def enforce_rate_limit(request: Request) -> None:
+    settings = get_settings()
+    _generic_limiter.check(
+        request,
+        max_requests=settings.rate_limit_requests,
+        window_seconds=settings.rate_limit_window_seconds,
+    )
+
 
 # Separate, stricter bucket for expensive collector runs: each call makes
 # many outbound requests to a third-party API (itself rate-limited) and
 # writes to the DB in a loop, unlike a single /jobs/score call. Fixed rather
 # than Settings-driven since this endpoint is meant to be triggered manually
 # and infrequently, not tuned per deployment.
-_collector_requests: dict[str, deque[float]] = defaultdict(deque)
+_collector_limiter = _RateLimiter(detail="Collector rate limit exceeded")
+_collector_requests = _collector_limiter.buckets
 COLLECTOR_RATE_LIMIT_REQUESTS = 5
 COLLECTOR_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_collector_rate_limit(request: Request) -> None:
+    _collector_limiter.check(
+        request,
+        max_requests=COLLECTOR_RATE_LIMIT_REQUESTS,
+        window_seconds=COLLECTOR_RATE_LIMIT_WINDOW_SECONDS,
+    )
+
 
 # Separate, stricter bucket than the generic collector limit above, specific
 # to the IMAP-based XING collector. Rationale: repeated failed/rapid IMAP
@@ -27,9 +99,18 @@ COLLECTOR_RATE_LIMIT_WINDOW_SECONDS = 300
 # is worse than a slow collector run. Kept in its own bucket rather than
 # sharing `_collector_requests` so calling the Bundesagentur collector
 # doesn't eat into the IMAP collector's (tighter) budget or vice versa.
-_xing_requests: dict[str, deque[float]] = defaultdict(deque)
+_xing_limiter = _RateLimiter(detail="XING collector rate limit exceeded")
+_xing_requests = _xing_limiter.buckets
 XING_RATE_LIMIT_REQUESTS = 3
 XING_RATE_LIMIT_WINDOW_SECONDS = 600
+
+
+def enforce_xing_rate_limit(request: Request) -> None:
+    _xing_limiter.check(
+        request,
+        max_requests=XING_RATE_LIMIT_REQUESTS,
+        window_seconds=XING_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate, stricter bucket for company-research runs: each call can make
@@ -37,61 +118,18 @@ XING_RATE_LIMIT_WINDOW_SECONDS = 600
 # plus a DB write, similar cost profile to the collector endpoints above.
 # Fixed rather than Settings-driven for the same reason as the collector
 # bucket: triggered manually/infrequently, not tuned per deployment.
-_company_research_requests: dict[str, deque[float]] = defaultdict(deque)
+_company_research_limiter = _RateLimiter(detail="Company research rate limit exceeded")
+_company_research_requests = _company_research_limiter.buckets
 COMPANY_RESEARCH_RATE_LIMIT_REQUESTS = 10
 COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
-def enforce_rate_limit(request: Request) -> None:
-    settings = get_settings()
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - settings.rate_limit_window_seconds
-
-    with _lock:
-        bucket = _requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= settings.rate_limit_requests:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded",
-            )
-        bucket.append(now)
-
-
-def enforce_collector_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - COLLECTOR_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _collector_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= COLLECTOR_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Collector rate limit exceeded",
-            )
-        bucket.append(now)
-
-
-def enforce_xing_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - XING_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _xing_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= XING_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="XING collector rate limit exceeded",
-            )
-        bucket.append(now)
+def enforce_company_research_rate_limit(request: Request) -> None:
+    _company_research_limiter.check(
+        request,
+        max_requests=COMPANY_RESEARCH_RATE_LIMIT_REQUESTS,
+        window_seconds=COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate bucket for candidate-job-match runs: unlike the collector/XING/
@@ -101,52 +139,36 @@ def enforce_xing_rate_limit(request: Request) -> None:
 # the cache misses, so it gets its own bucket rather than sharing the
 # generic per-key budget, sized more generously than the network-bound
 # buckets above to reflect that lower cost.
-_match_requests: dict[str, deque[float]] = defaultdict(deque)
+_match_limiter = _RateLimiter(detail="Candidate job match rate limit exceeded")
+_match_requests = _match_limiter.buckets
 MATCH_RATE_LIMIT_REQUESTS = 30
 MATCH_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_match_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - MATCH_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _match_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= MATCH_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Candidate job match rate limit exceeded",
-            )
-        bucket.append(now)
+    _match_limiter.check(
+        request,
+        max_requests=MATCH_RATE_LIMIT_REQUESTS,
+        window_seconds=MATCH_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate bucket for CV draft generation: like matching (section above),
 # this is pure local computation with zero network calls, but a POST still
 # writes a new candidate_cv_drafts row when the cache misses — same
 # rationale and same generous sizing as MATCH_RATE_LIMIT above.
-_cv_draft_requests: dict[str, deque[float]] = defaultdict(deque)
+_cv_draft_limiter = _RateLimiter(detail="CV draft rate limit exceeded")
+_cv_draft_requests = _cv_draft_limiter.buckets
 CV_DRAFT_RATE_LIMIT_REQUESTS = 30
 CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_cv_draft_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _cv_draft_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= CV_DRAFT_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="CV draft rate limit exceeded",
-            )
-        bucket.append(now)
+    _cv_draft_limiter.check(
+        request,
+        max_requests=CV_DRAFT_RATE_LIMIT_REQUESTS,
+        window_seconds=CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate, stricter bucket for Bewerbung generation: unlike match/cv-draft
@@ -154,43 +176,18 @@ def enforce_cv_draft_rate_limit(request: Request) -> None:
 # (spec: "generation is an external/expensive operation" even though v1's
 # only shipped provider is local/deterministic — sized for a future
 # real-LLM provider's cost profile now rather than widening later).
-_bewerbung_requests: dict[str, deque[float]] = defaultdict(deque)
+_bewerbung_limiter = _RateLimiter(detail="Bewerbung draft rate limit exceeded")
+_bewerbung_requests = _bewerbung_limiter.buckets
 BEWERBUNG_RATE_LIMIT_REQUESTS = 5
 BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_bewerbung_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _bewerbung_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= BEWERBUNG_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Bewerbung draft rate limit exceeded",
-            )
-        bucket.append(now)
-
-
-def enforce_company_research_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _company_research_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= COMPANY_RESEARCH_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Company research rate limit exceeded",
-            )
-        bucket.append(now)
+    _bewerbung_limiter.check(
+        request,
+        max_requests=BEWERBUNG_RATE_LIMIT_REQUESTS,
+        window_seconds=BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate bucket for review-package writes (create/patch/approve/reject):
@@ -199,9 +196,18 @@ def enforce_company_research_rate_limit(request: Request) -> None:
 # reuse an expensive LLM rate bucket unnecessarily") — sized identically to
 # MATCH_RATE_LIMIT/CV_DRAFT_RATE_LIMIT rather than the stricter Bewerbung
 # generation bucket.
-_review_write_requests: dict[str, deque[float]] = defaultdict(deque)
+_review_write_limiter = _RateLimiter(detail="Review package rate limit exceeded")
+_review_write_requests = _review_write_limiter.buckets
 REVIEW_WRITE_RATE_LIMIT_REQUESTS = 30
 REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_review_write_rate_limit(request: Request) -> None:
+    _review_write_limiter.check(
+        request,
+        max_requests=REVIEW_WRITE_RATE_LIMIT_REQUESTS,
+        window_seconds=REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate, stricter bucket for the Gmail inbox IMAP sync endpoint — same
@@ -210,26 +216,18 @@ REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
 # temporarily locking the account). Kept in its own bucket rather than
 # sharing XING's so the two independent mailboxes/credentials never
 # compete for the same budget.
-_gmail_requests: dict[str, deque[float]] = defaultdict(deque)
+_gmail_limiter = _RateLimiter(detail="Gmail inbox sync rate limit exceeded")
+_gmail_requests = _gmail_limiter.buckets
 GMAIL_RATE_LIMIT_REQUESTS = 3
 GMAIL_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
 def enforce_gmail_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - GMAIL_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _gmail_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= GMAIL_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Gmail inbox sync rate limit exceeded",
-            )
-        bucket.append(now)
+    _gmail_limiter.check(
+        request,
+        max_requests=GMAIL_RATE_LIMIT_REQUESTS,
+        window_seconds=GMAIL_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate bucket for Stage 7B analysis runs: like match/cv-draft/
@@ -237,26 +235,18 @@ def enforce_gmail_rate_limit(request: Request) -> None:
 # regex-based matching/classification, zero network calls) with a DB
 # write on cache miss — sized identically to those buckets rather than
 # the stricter network-bound ones (XING/Gmail sync/Bewerbung).
-_gmail_analysis_requests: dict[str, deque[float]] = defaultdict(deque)
+_gmail_analysis_limiter = _RateLimiter(detail="Gmail message analysis rate limit exceeded")
+_gmail_analysis_requests = _gmail_analysis_limiter.buckets
 GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS = 30
 GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_gmail_analysis_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _gmail_analysis_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Gmail message analysis rate limit exceeded",
-            )
-        bucket.append(now)
+    _gmail_analysis_limiter.check(
+        request,
+        max_requests=GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS,
+        window_seconds=GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate bucket for Stage 7C response-draft generation: like the Stage
@@ -264,68 +254,37 @@ def enforce_gmail_analysis_rate_limit(request: Request) -> None:
 # template lookup, zero network calls) with a DB write on cache miss —
 # sized identically to GMAIL_ANALYSIS_RATE_LIMIT rather than the
 # stricter network-bound buckets (XING/Gmail sync/Bewerbung).
-_response_draft_requests: dict[str, deque[float]] = defaultdict(deque)
+_response_draft_limiter = _RateLimiter(detail="Response draft rate limit exceeded")
+_response_draft_requests = _response_draft_limiter.buckets
 RESPONSE_DRAFT_RATE_LIMIT_REQUESTS = 30
 RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_response_draft_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _response_draft_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= RESPONSE_DRAFT_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Response draft rate limit exceeded",
-            )
-        bucket.append(now)
-
-
-def enforce_review_write_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _review_write_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= REVIEW_WRITE_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Review package rate limit exceeded",
-            )
-        bucket.append(now)
+    _response_draft_limiter.check(
+        request,
+        max_requests=RESPONSE_DRAFT_RATE_LIMIT_REQUESTS,
+        window_seconds=RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Bucket for Stage 7D approve/reject decisions: pure local DB read+write,
 # zero network cost — sized like MATCH_RATE_LIMIT/REVIEW_WRITE_RATE_LIMIT
 # rather than the stricter network-bound buckets below.
-_response_draft_decision_requests: dict[str, deque[float]] = defaultdict(deque)
+_response_draft_decision_limiter = _RateLimiter(
+    detail="Response draft decision rate limit exceeded"
+)
+_response_draft_decision_requests = _response_draft_decision_limiter.buckets
 RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS = 30
 RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_response_draft_decision_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _response_draft_decision_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Response draft decision rate limit exceeded",
-            )
-        bucket.append(now)
+    _response_draft_decision_limiter.check(
+        request,
+        max_requests=RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS,
+        window_seconds=RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate, stricter bucket for Stage 7D SEND — same rationale as
@@ -334,102 +293,70 @@ def enforce_response_draft_decision_rate_limit(request: Request) -> None:
 # SMTP logins risk tripping Gmail's own abuse detection on the same
 # account the read-only IMAP sync uses. Kept in its own bucket, sized
 # tightly, rather than sharing any other bucket.
-_response_draft_send_requests: dict[str, deque[float]] = defaultdict(deque)
+_response_draft_send_limiter = _RateLimiter(detail="Response draft send rate limit exceeded")
+_response_draft_send_requests = _response_draft_send_limiter.buckets
 RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS = 5
 RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_response_draft_send_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _response_draft_send_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Response draft send rate limit exceeded",
-            )
-        bucket.append(now)
+    _response_draft_send_limiter.check(
+        request,
+        max_requests=RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS,
+        window_seconds=RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Bucket for Stage 7E follow-up evaluation: unlike a single-message Stage
 # 7B analysis, one call scans up to FOLLOW_UP_JOB_SCAN_LIMIT tracked jobs
 # (pure local computation + a DB write per newly-eligible one) — sized
 # tighter than GMAIL_ANALYSIS_RATE_LIMIT to reflect that bulk-scan cost.
-_follow_up_evaluate_requests: dict[str, deque[float]] = defaultdict(deque)
+_follow_up_evaluate_limiter = _RateLimiter(detail="Follow-up evaluation rate limit exceeded")
+_follow_up_evaluate_requests = _follow_up_evaluate_limiter.buckets
 FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS = 10
 FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_follow_up_evaluate_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _follow_up_evaluate_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Follow-up evaluation rate limit exceeded",
-            )
-        bucket.append(now)
+    _follow_up_evaluate_limiter.check(
+        request,
+        max_requests=FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS,
+        window_seconds=FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Bucket for Stage 7E follow-up approve/reject decisions: pure local DB
 # read+write, zero network cost — sized like
 # RESPONSE_DRAFT_DECISION_RATE_LIMIT.
-_follow_up_decision_requests: dict[str, deque[float]] = defaultdict(deque)
+_follow_up_decision_limiter = _RateLimiter(detail="Follow-up decision rate limit exceeded")
+_follow_up_decision_requests = _follow_up_decision_limiter.buckets
 FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS = 30
 FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_follow_up_decision_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _follow_up_decision_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Follow-up decision rate limit exceeded",
-            )
-        bucket.append(now)
+    _follow_up_decision_limiter.check(
+        request,
+        max_requests=FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS,
+        window_seconds=FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Separate, stricter bucket for Stage 7E follow-up SEND — same rationale
 # as RESPONSE_DRAFT_SEND_RATE_LIMIT: this transmits a real outbound email
 # over the same account's SMTP credentials.
-_follow_up_send_requests: dict[str, deque[float]] = defaultdict(deque)
+_follow_up_send_limiter = _RateLimiter(detail="Follow-up send rate limit exceeded")
+_follow_up_send_requests = _follow_up_send_limiter.buckets
 FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS = 5
 FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 def enforce_follow_up_send_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _follow_up_send_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Follow-up send rate limit exceeded",
-            )
-        bucket.append(now)
+    _follow_up_send_limiter.check(
+        request,
+        max_requests=FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS,
+        window_seconds=FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
 
 # Stage 8A: POST /automation/runs coordinates BOTH the Bundesagentur and
@@ -440,23 +367,15 @@ def enforce_follow_up_send_rate_limit(request: Request) -> None:
 # bucket rather than sharing either collector's so a manual single-
 # collector run and an orchestrated run never compete for the same
 # budget.
-_automation_run_requests: dict[str, deque[float]] = defaultdict(deque)
+_automation_run_limiter = _RateLimiter(detail="Automation run rate limit exceeded")
+_automation_run_requests = _automation_run_limiter.buckets
 AUTOMATION_RUN_RATE_LIMIT_REQUESTS = 3
 AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
 def enforce_automation_run_rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    cutoff = now - AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS
-
-    with _lock:
-        bucket = _automation_run_requests[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= AUTOMATION_RUN_RATE_LIMIT_REQUESTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Automation run rate limit exceeded",
-            )
-        bucket.append(now)
+    _automation_run_limiter.check(
+        request,
+        max_requests=AUTOMATION_RUN_RATE_LIMIT_REQUESTS,
+        window_seconds=AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS,
+    )
