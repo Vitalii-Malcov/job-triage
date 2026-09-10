@@ -27,7 +27,11 @@ from app.collectors.xing_email import XingEmailBatch
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.models import JobRecord
-from app.db.xing_scan_progress_repository import get_xing_scan_progress
+from app.db.xing_scan_progress_repository import (
+    advance_xing_scan_progress,
+    compute_mailbox_scope,
+    get_xing_scan_progress,
+)
 from app.models.job import Job, JobScore
 from app.services.collector_runner import run_xing
 
@@ -80,6 +84,11 @@ class _FakeXingCollector:
         self._expected_uid_validity = kwargs.get("expected_uid_validity")
         self.uid_validity: int | None = None
         self.confirmed_uids: list[int] = []
+        # Codex gate follow-up (Astra R4A HIGH, watermark gap): mirrors
+        # the real XingEmailCollector.candidate_uids contract -- see its
+        # own docstring. `run_xing` walks this list (not merely the keys
+        # of its own handled-UID map) to compute the new watermark.
+        self.candidate_uids: list[int] = []
 
     async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
         self.uid_validity = FAKE_UID_VALIDITY
@@ -89,6 +98,7 @@ class _FakeXingCollector:
         )
         all_uids = [*OLD_UIDS, NEW_UID]
         candidates = [u for u in all_uids if effective_from is None or u > effective_from]
+        self.candidate_uids = candidates
         examined = candidates[:PER_RUN_SCAN_BUDGET]
         self.deadline_exceeded = len(examined) < len(candidates)
 
@@ -131,6 +141,14 @@ def _settings() -> Settings:
     )
 
 
+def _mailbox_scope(settings: Settings) -> str:
+    return compute_mailbox_scope(
+        settings.xing_mailbox_imap_host,
+        settings.xing_mailbox_imap_port,
+        settings.xing_mailbox_username,
+    )
+
+
 def _seed_already_processed(db, uids: list[int]) -> None:
     """Pre-seeds ProcessedEmailMessage rows for `uids` -- simulates a
     mailbox with a real prior history of successfully processed digests,
@@ -169,7 +187,7 @@ async def test_bounded_scan_progress_eventually_reaches_message_after_large_pref
     # this cycle actually confirmed.
     result_1 = await run_xing(db, settings)
     assert result_1["created"] == 0
-    progress_1 = get_xing_scan_progress(db)
+    progress_1 = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
     assert progress_1 is not None
     assert progress_1.uid_validity == FAKE_UID_VALIDITY
     assert progress_1.confirmed_upto_uid == 2
@@ -178,14 +196,14 @@ async def test_bounded_scan_progress_eventually_reaches_message_after_large_pref
     # start from uid 3, not uid 1 again -- reaching uid 3-4.
     result_2 = await run_xing(db, settings)
     assert result_2["created"] == 0
-    progress_2 = get_xing_scan_progress(db)
+    progress_2 = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
     assert progress_2.confirmed_upto_uid == 4
 
     # Cycle 3: watermark now skips straight to uid 5-6 -- the new
     # message (uid 6) is finally reached and persisted.
     result_3 = await run_xing(db, settings)
     assert result_3["created"] == 1
-    progress_3 = get_xing_scan_progress(db)
+    progress_3 = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
     assert progress_3.confirmed_upto_uid == 6
 
     db.expire_all()
@@ -224,9 +242,10 @@ async def test_uid_validity_mismatch_resets_watermark_instead_of_skipping_blindl
     row with a different uid_validity and prove uid 1 is examined again
     rather than silently skipped.
     """
-    from app.db.xing_scan_progress_repository import advance_xing_scan_progress
-
-    advance_xing_scan_progress(db, uid_validity=999, confirmed_upto_uid=6)
+    settings = _settings()
+    advance_xing_scan_progress(
+        db, uid_validity=999, confirmed_upto_uid=6, mailbox_scope=_mailbox_scope(settings)
+    )
     _seed_already_processed(db, OLD_UIDS[:1])  # only uid 1 actually processed already
     monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
     monkeypatch.setattr(
@@ -238,7 +257,7 @@ async def test_uid_validity_mismatch_resets_watermark_instead_of_skipping_blindl
         "app.services.collector_runner.CompanyResearchService", _NoOpResearchService
     )
 
-    result = await run_xing(db, _settings())
+    result = await run_xing(db, settings)
 
     # uid_validity mismatch (999 stored vs FAKE_UID_VALIDITY observed) --
     # scan starts fresh from uid 1, not skipping straight past it: uid 1
@@ -246,7 +265,170 @@ async def test_uid_validity_mismatch_resets_watermark_instead_of_skipping_blindl
     # the stale watermark would have silently skipped as "<= 6, already
     # handled" -- is examined and correctly found to be a genuinely new
     # message.
-    progress = get_xing_scan_progress(db)
+    progress = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
     assert progress.uid_validity == FAKE_UID_VALIDITY
     assert progress.confirmed_upto_uid == 2
     assert result["created"] == 1
+
+
+class _FakeXingCollectorUnresolvedUid:
+    """Codex gate follow-up (Astra R4A HIGH, watermark gap) regression
+    fixture: UID 2 is neither confirmed-skippable nor does it yield a
+    batch -- mirrors the real `_fetch_and_process_message`'s `(None,
+    False)` return for a non-OK FETCH response (or, equivalently, a UID
+    the session deadline never reached). UIDs 1 and 3 resolve normally
+    (new, unprocessed messages).
+    """
+
+    def __init__(self, **kwargs) -> None:
+        self.skipped_invalid_count = 0
+        self.deadline_exceeded = False
+        self._is_message_processed = kwargs["is_message_processed"]
+        self._scan_from_uid = kwargs.get("scan_from_uid")
+        self._expected_uid_validity = kwargs.get("expected_uid_validity")
+        self.uid_validity: int | None = None
+        self.confirmed_uids: list[int] = []
+        self.candidate_uids: list[int] = []
+
+    async def fetch_message_batches(self, since=None) -> list[XingEmailBatch]:
+        self.uid_validity = FAKE_UID_VALIDITY
+        self.confirmed_uids = []
+        effective_from = (
+            self._scan_from_uid if self._expected_uid_validity == self.uid_validity else None
+        )
+        all_uids = [1, 2, 3]
+        candidates = [u for u in all_uids if effective_from is None or u > effective_from]
+        self.candidate_uids = candidates
+
+        batches: list[XingEmailBatch] = []
+        for uid in candidates:
+            if uid == 2:
+                # Simulates a non-OK FETCH: neither added to
+                # confirmed_uids nor turned into a batch.
+                continue
+            message_id = f"<uid-{uid}@mail.xing.com>"
+            if self._is_message_processed(message_id):
+                self.confirmed_uids.append(uid)
+                continue
+            job = Job(
+                source="xing",
+                title=f"Job {uid}",
+                company=f"Company {uid}",
+                url=f"https://example.com/jobs/{uid}",
+                description="",
+                skills=[],
+            )
+            batches.append(XingEmailBatch(message_id=message_id, jobs=(job,), uid=uid))
+        return batches
+
+
+@pytest.mark.asyncio
+async def test_watermark_never_advances_past_unresolved_uid(db, monkeypatch):
+    """Codex gate follow-up (Astra R4A HIGH) regression: UID 1 handled,
+    UID 2's FETCH fails/unresolved, UID 3 handled. The persisted
+    watermark must NOT advance past UID 2 -- a prior version walked
+    `sorted(handled_uids)`, and since an unresolved UID is simply ABSENT
+    from that dict (not merely False), sorting silently deleted the gap
+    and let UID 3's success advance the watermark straight past UID 2,
+    permanently losing it (never retried again, since the watermark
+    already skips past it).
+    """
+    monkeypatch.setattr(
+        "app.services.collector_runner.XingEmailCollector", _FakeXingCollectorUnresolvedUid
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _NoOpResearchService
+    )
+    settings = _settings()
+
+    result_1 = await run_xing(db, settings)
+    assert result_1["created"] == 2  # UID 1 and UID 3's jobs both persisted
+
+    progress_1 = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
+    assert progress_1 is not None
+    assert progress_1.confirmed_upto_uid == 1  # must NOT advance past UID 2
+
+    # Next cycle must retry UID 2: scan_from_uid=1 means candidates=[2, 3].
+    # UID 2 is still unresolved, so the watermark must still not advance.
+    result_2 = await run_xing(db, settings)
+    assert result_2["created"] == 0  # UID 3's job already persisted (updated, not created)
+
+    progress_2 = get_xing_scan_progress(db, mailbox_scope=_mailbox_scope(settings))
+    assert progress_2.confirmed_upto_uid == 1
+
+
+@pytest.mark.asyncio
+async def test_mailbox_scope_isolates_watermark_between_mailboxes(db, monkeypatch):
+    """Codex gate follow-up (Astra R4A MEDIUM, mailbox scope) regression:
+    mailbox A's watermark must never leak into mailbox B, even when B's
+    mailbox happens to report the SAME UIDVALIDITY as A (a real-world
+    coincidence the mailbox_scope key exists to guard against -- see
+    `compute_mailbox_scope`'s own docstring). B must start a fresh scan.
+    """
+    monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
+    monkeypatch.setattr(
+        "app.services.collector_runner.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _NoOpResearchService
+    )
+
+    settings_a = Settings(
+        xing_mailbox_imap_host="imap.mailbox-a.example.com",
+        xing_mailbox_username="user-a@example.com",
+        xing_mailbox_app_password="app-password",
+        company_research_auto_enabled=False,
+        min_job_score_to_notify=50,
+    )
+    settings_b = Settings(
+        xing_mailbox_imap_host="imap.mailbox-b.example.com",
+        xing_mailbox_username="user-b@example.com",
+        xing_mailbox_app_password="app-password",
+        company_research_auto_enabled=False,
+        min_job_score_to_notify=50,
+    )
+    scope_a = _mailbox_scope(settings_a)
+    scope_b = _mailbox_scope(settings_b)
+    assert scope_a != scope_b
+
+    # Seed mailbox A's watermark directly -- simulates a prior successful
+    # run that scanned all the way through uid 6, at the SAME
+    # FAKE_UID_VALIDITY mailbox B's fake collector will also report.
+    advance_xing_scan_progress(
+        db, uid_validity=FAKE_UID_VALIDITY, confirmed_upto_uid=6, mailbox_scope=scope_a
+    )
+
+    captured: dict[str, object] = {}
+
+    class _CapturingFakeCollector(_FakeXingCollector):
+        def __init__(self, **kwargs):
+            captured["scan_from_uid"] = kwargs.get("scan_from_uid")
+            captured["expected_uid_validity"] = kwargs.get("expected_uid_validity")
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _CapturingFakeCollector)
+
+    result_b = await run_xing(db, settings_b)
+
+    # run_xing must have passed scan_from_uid=None for mailbox B -- it
+    # never saw mailbox A's confirmed_upto_uid=6, despite the matching
+    # UIDVALIDITY.
+    assert captured["scan_from_uid"] is None
+    assert captured["expected_uid_validity"] is None
+
+    progress_b = get_xing_scan_progress(db, mailbox_scope=scope_b)
+    assert progress_b is not None
+    assert progress_b.confirmed_upto_uid == 2  # fresh scan: budget reaches only uid 1-2
+    assert result_b["created"] == 2  # uid 1 and 2 both new, since B never saw A's history
+
+    # Mailbox A's own row must be untouched by mailbox B's run.
+    progress_a = get_xing_scan_progress(db, mailbox_scope=scope_a)
+    assert progress_a is not None
+    assert progress_a.confirmed_upto_uid == 6

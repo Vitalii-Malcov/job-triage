@@ -314,9 +314,19 @@ class XingScanProgressRecord(Base):
     """
 
     __tablename__ = "xing_scan_progress"
+    __table_args__ = (
+        UniqueConstraint("source", "mailbox_scope", name="uq_xing_scan_progress_source_mailbox"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    source: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    # Codex gate follow-up (Astra R4A MEDIUM, mailbox scope): deterministic
+    # non-secret hash of (imap_host, imap_port, username, mailbox) -- see
+    # `app.db.xing_scan_progress_repository.compute_mailbox_scope`'s own
+    # docstring. Part of the row's real identity together with `source`:
+    # two mailboxes that happen to share a `UIDVALIDITY` must never share
+    # a watermark row.
+    mailbox_scope: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     uid_validity: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     confirmed_upto_uid: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(

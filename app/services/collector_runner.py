@@ -60,6 +60,7 @@ from app.db.repositories import (
 )
 from app.db.xing_scan_progress_repository import (
     advance_xing_scan_progress,
+    compute_mailbox_scope,
     get_xing_scan_progress,
 )
 from app.models.company_research import CompanyResearchRunResponse
@@ -459,7 +460,17 @@ async def run_xing(
     # (never successfully advanced yet); either way `XingEmailCollector`
     # treats that identically to "scan everything in the search window",
     # same as before this fix existed.
-    scan_progress = get_xing_scan_progress(db)
+    # Codex gate follow-up (Astra R4A MEDIUM, mailbox scope): scopes the
+    # watermark row to THIS configured mailbox -- see
+    # `compute_mailbox_scope`'s own docstring for why `source="xing"`
+    # alone is not a safe key (two different mailboxes can coincidentally
+    # share a `UIDVALIDITY`).
+    mailbox_scope = compute_mailbox_scope(
+        settings.xing_mailbox_imap_host,
+        settings.xing_mailbox_imap_port,
+        settings.xing_mailbox_username,
+    )
+    scan_progress = get_xing_scan_progress(db, mailbox_scope=mailbox_scope)
     collector = XingEmailCollector(
         imap_host=settings.xing_mailbox_imap_host,
         imap_port=settings.xing_mailbox_imap_port,
@@ -581,16 +592,29 @@ async def run_xing(
             mark_message_processed(db, "xing", batch.message_id)
         batch_uid_outcomes[batch.uid] = not batch_failed
 
-    # Codex gate follow-up (Astra R4A MEDIUM, starvation): compute and
+    # Codex gate follow-up (Astra R4A HIGH, watermark gap): compute and
     # persist how far the scan can safely resume from next run.
     # `handled_uids` combines every UID this run either (a) confirmed
     # safe to skip without ever yielding a batch (`collector.confirmed_uids`)
     # or (b) yielded a batch that just finished persisting above
     # (`batch_uid_outcomes`, True only if `mark_message_processed` ran).
-    # Walking them in ascending order and stopping at the FIRST one that
-    # is not True (a failed batch, or -- impossible by construction, but
-    # defensive -- a gap) guarantees the persisted watermark never skips
-    # over a UID that still needs to be retried.
+    #
+    # The walk MUST iterate `collector.candidate_uids` -- the full ordered
+    # list of UIDs this run considered, INCLUDING ones neither confirmed
+    # nor batched (a non-OK FETCH per `_fetch_and_process_message`'s
+    # `(None, False)` return, or a UID the session deadline never reached)
+    # -- and not merely `sorted(handled_uids)`. A prior version walked
+    # `sorted(handled_uids)`: since an unresolved UID is absent from that
+    # dict entirely (neither key nor False value), sorting its keys
+    # silently DELETED the gap instead of stopping at it, letting a later
+    # successfully-handled UID advance the watermark straight past an
+    # earlier UID whose FETCH failed -- permanently losing that message
+    # (it would never be retried, since the watermark already skips past
+    # it). Walking the full ordered candidate list and treating "absent
+    # from handled_uids" the same as "present but False" (`.get(uid)` is
+    # falsy either way) guarantees the watermark stops at the FIRST
+    # unresolved/failed/unreached UID, exactly like a present-and-False
+    # entry already did.
     if collector.uid_validity is not None:
         handled_uids: dict[int, bool] = {uid: True for uid in collector.confirmed_uids}
         handled_uids.update(batch_uid_outcomes)
@@ -600,13 +624,16 @@ async def run_xing(
             else None
         )
         new_watermark = baseline_uid
-        for uid in sorted(handled_uids):
-            if handled_uids[uid]:
+        for uid in collector.candidate_uids:
+            if handled_uids.get(uid):
                 new_watermark = uid
             else:
                 break
         advance_xing_scan_progress(
-            db, uid_validity=collector.uid_validity, confirmed_upto_uid=new_watermark
+            db,
+            uid_validity=collector.uid_validity,
+            confirmed_upto_uid=new_watermark,
+            mailbox_scope=mailbox_scope,
         )
 
     logger.info(

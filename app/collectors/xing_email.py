@@ -413,6 +413,18 @@ class XingEmailCollector(JobCollector):
         # into).
         self.uid_validity: int | None = None
         self.confirmed_uids: list[int] = []
+        # Codex gate follow-up (Astra R4A HIGH, watermark gap): the FULL
+        # ordered (ascending) list of UIDs this run considered candidates
+        # -- set once in `_fetch_sync_body` before the per-UID loop, and
+        # never mutated afterward, so it also includes UIDs the loop never
+        # reached (session deadline) or that failed FETCH outright (not in
+        # `confirmed_uids`, no batch produced). `run_xing` walks this list
+        # in order -- not `confirmed_uids`/its own persisted-batch map
+        # keys alone -- so a UID that is neither confirmed-skippable nor a
+        # successfully persisted batch stops the watermark computation
+        # immediately, instead of simply being absent and silently
+        # stepped over by a later UID that DID resolve.
+        self.candidate_uids: list[int] = []
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
         batches = await self.fetch_message_batches(since)
@@ -434,6 +446,7 @@ class XingEmailCollector(JobCollector):
         self.deadline_exceeded = False
         self.uid_validity = None
         self.confirmed_uids = []
+        self.candidate_uids = []
         since_date = since or (datetime.now(UTC) - timedelta(days=self.lookback_days))
 
         # IMAP (imaplib) is synchronous/blocking; run it off the event loop
@@ -525,6 +538,13 @@ class XingEmailCollector(JobCollector):
             # fix), which still paid for one header FETCH per already
             # -processed message every run.
             candidate_uids = [uid for uid in all_uids if uid > scan_from_uid]
+
+        # Codex gate follow-up (Astra R4A HIGH, watermark gap): captured
+        # BEFORE the loop runs, and never mutated afterward -- see
+        # `self.candidate_uids`'s own docstring in `__init__` for why
+        # `run_xing` needs the full ordered candidate list, not just the
+        # subset that ended up in `confirmed_uids`/produced a batch.
+        self.candidate_uids = candidate_uids
 
         batches: list[XingEmailBatch] = []
         for uid in candidate_uids:

@@ -17,6 +17,7 @@ an unexpected overlap -- it can only ever move `confirmed_upto_uid`
 forward or reset it on a genuine `UIDVALIDITY` change, never backward.
 """
 
+import hashlib
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
@@ -28,15 +29,67 @@ from app.db.models import XingScanProgressRecord
 XING_SCAN_PROGRESS_SOURCE = "xing"
 
 
+def compute_mailbox_scope(
+    imap_host: str, imap_port: int, username: str, mailbox: str = "INBOX"
+) -> str:
+    """Deterministic, non-secret key identifying the actual configured
+    mailbox a scan-progress row belongs to (Codex gate follow-up, Astra
+    R4A MEDIUM: mailbox scope).
+
+    **The problem this closes.** `XingScanProgressRecord` was previously
+    keyed by `source` alone, and XING has exactly one row for that source
+    ("xing") no matter which mailbox is actually configured. `UIDVALIDITY`
+    is only guaranteed unique WITHIN one mailbox across its own history --
+    two different mailboxes (different host, account, or folder) can
+    coincidentally report the same `UIDVALIDITY` value. If an operator
+    repoints `XING_MAILBOX_*` at a different mailbox that happens to share
+    a `UIDVALIDITY` with the old one, the stored watermark would pass the
+    existing `uid_validity == expected_uid_validity` check and skip a UID
+    prefix in the NEW mailbox that was never actually scanned there --
+    silently losing messages, exactly the class of bug `uid_validity`
+    itself exists to prevent for a single mailbox recreated in place.
+
+    Scoping every progress row by `(source, mailbox_scope)` instead closes
+    that gap: changing host/account/mailbox always changes this key, so a
+    new mailbox always starts fresh regardless of any UIDVALIDITY
+    coincidence.
+
+    Hashed (never the raw host/account string) so no mailbox identity
+    (which, for `username`, is normally an email address) is stored in
+    the clear in this table -- deliberately NOT a secret (unlike the App
+    Password, which this module never touches), but there is no reason to
+    persist it in plaintext either when a deterministic hash serves the
+    same scoping purpose. sha256 (not a keyed/secret hash) is appropriate
+    here: this key only needs to be deterministic and collision-resistant
+    across distinct mailboxes, not resistant to a deliberate attacker
+    trying to forge a collision.
+    """
+    fingerprint = (
+        f"{imap_host.strip().lower()}:{imap_port}:"
+        f"{username.strip().lower()}:{mailbox.strip().lower()}"
+    )
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+
+
 def get_xing_scan_progress(
-    db: Session, source: str = XING_SCAN_PROGRESS_SOURCE
+    db: Session, *, mailbox_scope: str, source: str = XING_SCAN_PROGRESS_SOURCE
 ) -> XingScanProgressRecord | None:
     """The mailbox's progress row, if one has ever been created. Returns
     `None` for a brand-new installation -- callers treat that exactly
     like `uid_validity`/`confirmed_upto_uid` both being unset (scan the
     full search window, same as before this fix existed).
+
+    `mailbox_scope` (Codex gate follow-up, Astra R4A MEDIUM) restricts the
+    lookup to the row for THIS configured mailbox -- see
+    `compute_mailbox_scope`'s own docstring for why `source` alone is not
+    a safe key.
     """
-    return db.scalar(select(XingScanProgressRecord).where(XingScanProgressRecord.source == source))
+    return db.scalar(
+        select(XingScanProgressRecord).where(
+            XingScanProgressRecord.source == source,
+            XingScanProgressRecord.mailbox_scope == mailbox_scope,
+        )
+    )
 
 
 def advance_xing_scan_progress(
@@ -44,6 +97,7 @@ def advance_xing_scan_progress(
     *,
     uid_validity: int | None,
     confirmed_upto_uid: int | None,
+    mailbox_scope: str,
     source: str = XING_SCAN_PROGRESS_SOURCE,
 ) -> None:
     """Persist how far this run confirmed the scan can safely resume from.
@@ -62,10 +116,11 @@ def advance_xing_scan_progress(
       confirmed prefix than a previous run already persisted must never
       regress the watermark and force wasted rescanning.
     """
-    existing = get_xing_scan_progress(db, source)
+    existing = get_xing_scan_progress(db, mailbox_scope=mailbox_scope, source=source)
     if existing is None:
         record = XingScanProgressRecord(
             source=source,
+            mailbox_scope=mailbox_scope,
             uid_validity=uid_validity,
             confirmed_upto_uid=confirmed_upto_uid,
         )
@@ -74,7 +129,7 @@ def advance_xing_scan_progress(
             db.commit()
         except IntegrityError:
             db.rollback()
-            existing = get_xing_scan_progress(db, source)
+            existing = get_xing_scan_progress(db, mailbox_scope=mailbox_scope, source=source)
             if existing is not None:
                 _advance_existing(db, existing, uid_validity=uid_validity, new=confirmed_upto_uid)
         return
