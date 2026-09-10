@@ -704,6 +704,78 @@ class TestConnectSecurityHardening:
 
         assert sensitive_exc_text not in str(exc_info.value)
 
+    def test_disconnect_close_failure_does_not_leak_via_exc_info(self, caplog):
+        """Codex gate follow-up (Astra R4B, NEW-003: XING log leakage)
+        regression: `_disconnect`'s close-failure log previously passed
+        `exc_info=True`, which logs the FULL traceback INCLUDING the
+        exception's own str() -- exactly the raw provider detail this
+        module's other exception paths (see
+        test_connect_raises_sanitized_connection_error_without_host_port_or_raw_text
+        above) deliberately keep out of logs via `type(exc).__name__`
+        alone. A `close()` failure on a real connection can be a raw
+        `imaplib.IMAP4.error`/`OSError` carrying server-controlled or
+        connection-internal text.
+        """
+        sensitive_exc_text = "SECRET_CLOSE_FAILURE_TEXT_MUST_NOT_LEAK"
+
+        class _FailingCloseClient:
+            def close(self):
+                raise imaplib.IMAP4.error(sensitive_exc_text)
+
+            def logout(self):
+                return ("BYE", [b"logging out"])
+
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with caplog.at_level("DEBUG"):
+            collector._disconnect(_FailingCloseClient())
+
+        assert sensitive_exc_text not in caplog.text
+        assert "xing_email_imap_close_failed" in caplog.text
+        assert "error_type=IMAP4.error" in caplog.text or "error_type=error" in caplog.text
+        # The actual mechanism, not just the text: no record on this
+        # logger carries exc_info (a full traceback dump), for EITHER
+        # phase of _disconnect -- exc_info=True is exactly what let the
+        # raw exception text above leak before this fix.
+        xing_records = [r for r in caplog.records if r.name == xing_email_module.__name__]
+        assert xing_records
+        assert all(r.exc_info is None for r in xing_records)
+
+    def test_disconnect_logout_failure_does_not_leak_via_exc_info(self, caplog):
+        """Same regression as above, for the logout phase -- a separate
+        try/except block in `_disconnect`, so must be proven
+        independently."""
+        sensitive_exc_text = "SECRET_LOGOUT_FAILURE_TEXT_MUST_NOT_LEAK"
+
+        class _FailingLogoutClient:
+            def close(self):
+                return ("OK", [b"closed"])
+
+            def logout(self):
+                raise OSError(sensitive_exc_text)
+
+        collector = XingEmailCollector(
+            imap_host="imap.example.com",
+            imap_port=993,
+            username="user@example.com",
+            app_password="app-password",
+        )
+
+        with caplog.at_level("DEBUG"):
+            collector._disconnect(_FailingLogoutClient())
+
+        assert sensitive_exc_text not in caplog.text
+        assert "xing_email_imap_logout_failed" in caplog.text
+        assert "error_type=OSError" in caplog.text
+        xing_records = [r for r in caplog.records if r.name == xing_email_module.__name__]
+        assert xing_records
+        assert all(r.exc_info is None for r in xing_records)
+
 
 # ---------------------------------------------------------------------------
 # AUD-005 (total wall-clock session deadline, not just per-read inactivity).

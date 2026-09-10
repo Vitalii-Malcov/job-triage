@@ -46,6 +46,7 @@ never received" among post-`send_message()` exceptions.
 import logging
 import smtplib
 import ssl
+import threading
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -80,21 +81,45 @@ logger = logging.getLogger(__name__)
 # tests/test_providers_email_smtp.py::test_operation_timeout_is_safely_below_thread_lock_ttl,
 # which is the actual proof that this margin holds, not just prose).
 #
-# **Honest limitation (documented, not overclaimed — mirrors this
-# project's other honestly-scoped fallbacks, e.g. GMAIL-005's
-# RFC822.SIZE gap).** This bounds each INDIVIDUAL blocking socket
-# operation, not the CUMULATIVE wall-clock time of the whole `send()`
-# call: Python's socket timeout has no "total deadline for this
-# connection" primitive, and a hard preemptive per-call deadline (e.g.
-# `signal.alarm`) is main-thread-only and unusable here — Stage 7E's
-# HTTP handlers run in FastAPI's worker thread pool. A pathological peer
-# that responds just under this timeout on EVERY one of the several SMTP
-# round trips (EHLO/AUTH/MAIL FROM/RCPT TO/DATA) could in principle still
-# exceed THREAD_LOCK_TTL_SECONDS in total. THREAD_LOCK_TTL_SECONDS (30s)
-# leaves a 22-second margin above this timeout specifically to absorb
-# that worst-realistic case; a peer malicious/degraded enough to hit the
-# cap on every single round trip is far outside normal SMTP behavior.
+# This bounds each INDIVIDUAL blocking socket operation's INACTIVITY —
+# a peer that keeps trickling SOME bytes before every read times out
+# (never idle long enough to trip this) can still hold a single
+# operation open far longer than this value; see
+# `SMTP_TOTAL_DEADLINE_SECONDS` below for the actual wall-clock cap on
+# the whole `send()` call, which is what interrupts that case.
 SMTP_OPERATION_TIMEOUT_SECONDS = 8.0
+
+# Codex gate follow-up (Astra R4B, NEW-006: SMTP total deadline). A
+# genuine wall-clock deadline for the ENTIRE `send()` call (connect +
+# login + send_message + quit combined), not merely
+# `SMTP_OPERATION_TIMEOUT_SECONDS`'s per-operation INACTIVITY bound.
+#
+# **Why the per-operation timeout alone is not enough.** Python's socket
+# timeout resets on any activity — it bounds how long a single recv/send
+# call may sit IDLE, not how long a whole logical operation (which can
+# involve many internal recv/send round trips, e.g. `login()`'s own
+# EHLO/AUTH exchange) may run in total. A peer that keeps writing SOME
+# bytes before every read's timeout expires — never actually idle long
+# enough to trip `SMTP_OPERATION_TIMEOUT_SECONDS` — can hold the
+# connection open indefinitely under that bound alone. A hard preemptive
+# deadline (`signal.alarm`) is main-thread-only and unusable here (Stage
+# 7E's HTTP handlers run in FastAPI's worker thread pool), so `send()`
+# instead runs the actual blocking smtplib work on a dedicated daemon
+# thread and imposes this deadline from the CALLING thread via
+# `threading.Event.wait(timeout=...)` — see `send()`'s own docstring for
+# the full mechanism, including why the worker thread is deliberately
+# `daemon=True` (so an abandoned pathological call can never block
+# process shutdown) and how transmission-attempted state is tracked to
+# preserve the UNCERTAIN-vs-DEFINITE-failure classification.
+#
+# Margin below `THREAD_LOCK_TTL_SECONDS` (30s, imported only by
+# tests/test_providers_email_smtp.py — this module stays DB-free, see
+# `SMTP_OPERATION_TIMEOUT_SECONDS`'s own note) covers this thread-based
+# deadline's own small scheduling overhead plus the caller's work after
+# `send()` returns, before it releases the per-thread lock — proven by
+# tests/test_providers_email_smtp.py::test_total_deadline_is_safely_below_thread_lock_ttl,
+# not just this comment.
+SMTP_TOTAL_DEADLINE_SECONDS = 20.0
 
 
 class SmtpClient(Protocol):
@@ -131,6 +156,7 @@ class GmailSmtpProvider:
         from_address: str | None = None,
         smtp_client: SmtpClient | None = None,
         timeout_seconds: float = SMTP_OPERATION_TIMEOUT_SECONDS,
+        total_deadline_seconds: float = SMTP_TOTAL_DEADLINE_SECONDS,
     ) -> None:
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
@@ -147,6 +173,10 @@ class GmailSmtpProvider:
         # bound to keep a real-socket timeout proof fast — production
         # callers (app/api/routes.py) always use the safe module default.
         self.timeout_seconds = timeout_seconds
+        # NEW-006 (Astra R4B): same override contract as timeout_seconds
+        # above, for the whole-call wall-clock deadline -- see
+        # SMTP_TOTAL_DEADLINE_SECONDS's own docstring.
+        self.total_deadline_seconds = total_deadline_seconds
 
     def send(self, message: OutboundMessage) -> OutboundSendResult:
         if not is_configured(self.username) or not is_configured(self.app_password):
@@ -165,30 +195,102 @@ class GmailSmtpProvider:
             logger.warning("outbound_email_build_failed error_type=%s", type(exc).__name__)
             raise EmailSendConnectionError("Building the outbound email failed") from exc
 
-        client = self._injected_client
-        owns_connection = client is None
-        if client is None:
-            client = self._connect()
+        # Codex gate follow-up (Astra R4B, NEW-006: SMTP total deadline).
+        # The actual blocking smtplib work (connect + login + send_message
+        # + quit) runs on a dedicated `daemon=True` thread; THIS (calling)
+        # thread imposes the hard wall-clock deadline via
+        # `done.wait(timeout=self.total_deadline_seconds)` instead of
+        # trusting any per-socket-operation timeout to bound the whole
+        # call — see `SMTP_TOTAL_DEADLINE_SECONDS`'s own docstring for why
+        # that is NOT equivalent (a peer trickling bytes just under each
+        # per-operation timeout can otherwise hold a single smtplib call
+        # open indefinitely, since socket timeouts only bound inactivity,
+        # not a call's total duration).
+        #
+        # `daemon=True` is deliberate: if the deadline fires, this thread
+        # is ABANDONED (Python cannot forcibly cancel a blocking call) —
+        # it keeps running until its own eventual per-operation socket
+        # timeout or connection closure unblocks it, entirely off this
+        # caller's critical path. A daemon thread can never block process
+        # shutdown the way a non-daemon one (or an unshut-down
+        # ThreadPoolExecutor, whose atexit hook joins every thread it ever
+        # spawned) would.
+        #
+        # `transmission_attempted` is set INSIDE the worker thread
+        # immediately before `send_message()` is invoked — read here
+        # (after the wait) to preserve the exact same UNCERTAIN-vs-
+        # DEFINITE-failure classification as every exception path below:
+        # unset means the deadline fired during connect/login (still
+        # provably pre-transmission), set means transmission may already
+        # be in flight.
+        transmission_attempted = threading.Event()
+        done = threading.Event()
+        outcome: dict[str, BaseException | OutboundSendResult] = {}
 
-        try:
-            client.send_message(msg)
-        except (smtplib.SMTPException, OSError) as exc:
-            # Transmission was ATTEMPTED — the server may or may not have
-            # accepted the message before this exception occurred (a
-            # dropped connection, a timeout waiting for the final reply,
-            # etc.). This package has no positive proof of non-delivery
-            # for ANY exception raised past this point (safest-acceptable
-            # rule — see EmailSendOutcomeUnknownError's docstring), so
-            # this is NEVER reported as a definite failure.
-            logger.warning("outbound_email_send_outcome_unknown error_type=%s", type(exc).__name__)
-            raise EmailSendOutcomeUnknownError(
-                "Sending the outbound email had an uncertain outcome"
-            ) from exc
-        finally:
-            if owns_connection:
-                self._disconnect(client)
+        def _do_send() -> None:
+            try:
+                client = self._injected_client
+                owns_connection = client is None
+                if client is None:
+                    client = self._connect()
+                try:
+                    transmission_attempted.set()
+                    client.send_message(msg)
+                except (smtplib.SMTPException, OSError) as exc:
+                    # Transmission was ATTEMPTED — the server may or may
+                    # not have accepted the message before this exception
+                    # occurred (a dropped connection, a timeout waiting
+                    # for the final reply, etc.). This package has no
+                    # positive proof of non-delivery for ANY exception
+                    # raised past this point (safest-acceptable rule —
+                    # see EmailSendOutcomeUnknownError's docstring), so
+                    # this is NEVER reported as a definite failure.
+                    logger.warning(
+                        "outbound_email_send_outcome_unknown error_type=%s", type(exc).__name__
+                    )
+                    # Deliberately NOT `from exc` (unlike this same
+                    # classification pre-thread-refactor): this object is
+                    # stored and re-raised in the CALLING thread below,
+                    # not raised immediately inside this `except` block,
+                    # so Python would not auto-chain it anyway — and per
+                    # NEW-003's identical rationale (see
+                    # app.collectors.xing_email), never attach a raw
+                    # OSError/SMTPException as `__cause__` on purpose:
+                    # a future `logger.exception()`/traceback dump of
+                    # this exception must not resurrect the underlying
+                    # provider detail this classification exists to keep
+                    # out of logs.
+                    outcome["error"] = EmailSendOutcomeUnknownError(
+                        "Sending the outbound email had an uncertain outcome"
+                    )
+                    return
+                finally:
+                    if owns_connection:
+                        self._disconnect(client)
+                outcome["result"] = OutboundSendResult(provider_message_id=msg.get("Message-Id"))
+            except BaseException as exc:  # noqa: BLE001 -- re-raised in the caller's thread below
+                outcome["error"] = exc
+            finally:
+                done.set()
 
-        return OutboundSendResult(provider_message_id=msg.get("Message-Id"))
+        worker = threading.Thread(target=_do_send, daemon=True, name="smtp-send-total-deadline")
+        worker.start()
+        finished = done.wait(timeout=self.total_deadline_seconds)
+
+        if not finished:
+            if transmission_attempted.is_set():
+                logger.warning("outbound_smtp_total_deadline_exceeded_after_send_attempted")
+                raise EmailSendOutcomeUnknownError(
+                    "Sending the outbound email exceeded the total send deadline "
+                    "after transmission may have begun"
+                )
+            logger.warning("outbound_smtp_total_deadline_exceeded_before_send")
+            raise EmailSendConnectionError("Total send deadline exceeded before transmission began")
+
+        error = outcome.get("error")
+        if error is not None:
+            raise error
+        return outcome["result"]
 
     def _build_message(self, message: OutboundMessage) -> EmailMessage:
         msg = EmailMessage()

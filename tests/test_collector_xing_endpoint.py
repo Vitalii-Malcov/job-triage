@@ -255,6 +255,45 @@ class TestRunXingCollector:
 
         assert response.status_code == 502
 
+    def test_upstream_failure_log_does_not_leak_via_exc_info(self, client, monkeypatch, caplog):
+        """Codex gate follow-up (Astra R4B, NEW-003: XING log leakage)
+        regression: `run_xing_collector`'s `except CollectorError` branch
+        previously called `logger.exception(...)`, which logs the FULL
+        traceback INCLUDING any chained `__cause__`'s own str() -- even
+        though the raised `CollectorError`'s OWN message is always
+        deliberately sanitized (see app.collectors.xing_email's AUD-005
+        comments), a chained raw OSError/imaplib error underneath it can
+        still carry host/port/server-controlled text. Simulates that
+        chain explicitly (`XingConnectionError(...).__cause__` set to a
+        real raised OSError, exactly like `raise ... from exc` produces)
+        to prove the log line never resurrects it.
+        """
+        sensitive_cause_text = "SECRET_UPSTREAM_CAUSE_TEXT_MUST_NOT_LEAK"
+        try:
+            raise OSError(sensitive_cause_text)
+        except OSError as cause:
+            chained_error = XingConnectionError(
+                "Could not connect to the configured XING mailbox IMAP host"
+            )
+            chained_error.__cause__ = cause
+
+        monkeypatch.setattr(
+            "app.services.collector_runner.XingEmailCollector",
+            lambda **kwargs: FakeCollector(error=chained_error),
+        )
+
+        with caplog.at_level("DEBUG"):
+            response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
+
+        assert response.status_code == 502
+        assert sensitive_cause_text not in caplog.text
+        assert sensitive_cause_text not in response.text
+        assert "xing_collector_run_failed" in caplog.text
+        assert "error_type=XingConnectionError" in caplog.text
+        routes_records = [r for r in caplog.records if r.name == "app.api.routes"]
+        assert routes_records
+        assert all(r.exc_info is None for r in routes_records)
+
     def test_xing_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):
         monkeypatch.setattr(
             "app.services.collector_runner.XingEmailCollector",

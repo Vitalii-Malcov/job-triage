@@ -418,8 +418,16 @@ class TestLeaseLostDoesNotRetryImmediately:
             # Sanitized logging: the fixed, hardcoded event message only
             # -- this branch never touches str(exc) in the first place,
             # so there is nothing exception-specific to leak.
+            #
+            # AUD-010 LOW (Codex gate follow-up, Astra R4B): account_key
+            # is a normalized email address and must never appear in
+            # runtime scheduler logs -- schedule_id (a non-identity
+            # surrogate key) is the correlator instead, mirroring
+            # run_due_digest_if_claimed's existing delivery_id
+            # convention (S8E-PRIVACY-001).
             assert "automation_scheduler_run_lease_lost" in caplog.text
-            assert f"account_key={ACCOUNT}" in caplog.text
+            assert "schedule_id=" in caplog.text
+            assert ACCOUNT not in caplog.text
 
             # The slot remains advanced -- no immediate retry.
             schedule = get_schedule(db, ACCOUNT)
@@ -433,6 +441,112 @@ class TestLeaseLostDoesNotRetryImmediately:
 
             # Session remains usable.
             assert get_schedule(db, ACCOUNT) is not None
+        finally:
+            db.close()
+
+
+def _scheduler_log_text(caplog) -> str:
+    """Only `app.services.scheduler`'s OWN log records -- this ticket
+    (AUD-010) scopes to the scheduler module specifically.
+    `app.services.automation.run_automation_cycle` (called BY the
+    scheduler, but also directly by POST /automation/runs) logs its own
+    `account_key=...` separately and is out of scope here -- fixing that
+    would touch a shared module used by a different, unrelated caller.
+    """
+    return "\n".join(
+        record.getMessage() for record in caplog.records if record.name == "app.services.scheduler"
+    )
+
+
+class TestSchedulerLogsNeverIncludeAccountIdentity:
+    """AUD-010 LOW (Codex gate follow-up, Astra R4B) regression:
+    `account_key` is a normalized email address
+    (`AutomationScheduleRecord`'s own docstring) -- `run_due_cycle_if_
+    claimed` must never write it into a log line, on ANY branch, exactly
+    like `run_due_digest_if_claimed` already never logs it (S8E-
+    PRIVACY-001). Covers the remaining branches
+    TestLeaseLostDoesNotRetryImmediately's own regression above does not:
+    already-in-progress, the success/run_triggered path, and the
+    best-effort record_last_run failure path.
+    """
+
+    def test_already_in_progress_log_omits_account_key(self, session_factory, monkeypatch, caplog):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        db = session_factory()
+        other_session = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+            create_running_run(other_session, account_key=ACCOUNT, holder="other-holder")
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            scheduler_log_text = _scheduler_log_text(caplog)
+            assert "automation_scheduler_run_already_in_progress" in scheduler_log_text
+            assert "schedule_id=" in scheduler_log_text
+            assert ACCOUNT not in scheduler_log_text
+        finally:
+            db.close()
+            other_session.close()
+
+    def test_successful_run_triggered_log_omits_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        db = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            scheduler_log_text = _scheduler_log_text(caplog)
+            assert "automation_scheduler_run_triggered" in scheduler_log_text
+            assert "schedule_id=" in scheduler_log_text
+            assert "run_id=" in scheduler_log_text
+            assert ACCOUNT not in scheduler_log_text
+        finally:
+            db.close()
+
+    def test_record_last_run_failure_log_omits_account_key(
+        self, session_factory, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("app.services.automation.run_bundesagentur", _noop_collector)
+        monkeypatch.setattr("app.services.automation.run_xing", _noop_collector)
+
+        def _boom(db, account_key, *, run_id, now=None):
+            raise RuntimeError("secret-detail-must-not-leak")
+
+        monkeypatch.setattr("app.services.scheduler.record_last_run", _boom)
+
+        db = session_factory()
+        try:
+            past = datetime.now(UTC) - timedelta(hours=1)
+            get_or_create_schedule(db, ACCOUNT, now=past)
+
+            with caplog.at_level("DEBUG"):
+                triggered = asyncio.run(
+                    run_due_cycle_if_claimed(db, account_key=ACCOUNT, settings=Settings())
+                )
+
+            assert triggered is True
+            scheduler_log_text = _scheduler_log_text(caplog)
+            assert "automation_scheduler_record_last_run_failed" in scheduler_log_text
+            assert "schedule_id=" in scheduler_log_text
+            assert "secret-detail-must-not-leak" not in caplog.text
+            assert ACCOUNT not in scheduler_log_text
         finally:
             db.close()
 

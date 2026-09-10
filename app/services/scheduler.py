@@ -142,6 +142,18 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
     if claimed is None:
         return False
 
+    # Codex gate follow-up (Astra R4B, AUD-010 LOW): none of this
+    # function's own logging below includes `account_key` -- it is a
+    # normalized email address (see `AutomationScheduleRecord`'s own
+    # docstring: "the same normalized identity `AutomationRunRecord.
+    # account_key` already uses", itself mirroring GMAIL-002's
+    # convention). `claimed.id` (the schedule row's own surrogate key)
+    # and `run.id` are non-identity correlators that locate the same
+    # rows without it -- exactly the substitution
+    # `run_due_digest_if_claimed` below already makes for
+    # `delivery_id`/`digest_date` (see its own S8E-PRIVACY-001 comment).
+    schedule_id = claimed.id
+
     try:
         run = await run_automation_cycle(db, account_key=account_key, settings=settings)
     except AutomationRunAlreadyInProgressError:
@@ -151,14 +163,14 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
         # or queue -- the schedule slot has already been advanced by
         # claim_due_schedule above; the account is simply re-evaluated
         # on the next normal interval.
-        logger.info("automation_scheduler_run_already_in_progress account_key=%s", account_key)
+        logger.info("automation_scheduler_run_already_in_progress schedule_id=%s", schedule_id)
         return True
     except AutomationRunLeaseLostError:
         # Fail closed -- run_automation_cycle itself could not safely
         # finalize this run's outcome (another process may now own its
         # lease). No immediate retry storm; wait for the next normal
         # interval.
-        logger.warning("automation_scheduler_run_lease_lost account_key=%s", account_key)
+        logger.warning("automation_scheduler_run_lease_lost schedule_id=%s", schedule_id)
         return True
     except Exception as exc:
         # Any truly unexpected failure -- never let it kill the poll
@@ -168,8 +180,8 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
         # convention (S8A-004).
         db.rollback()
         logger.warning(
-            "automation_scheduler_unexpected_error account_key=%s error_type=%s",
-            account_key,
+            "automation_scheduler_unexpected_error schedule_id=%s error_type=%s",
+            schedule_id,
             type(exc).__name__,
         )
         return True
@@ -186,15 +198,15 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
     except Exception as exc:
         db.rollback()
         logger.warning(
-            "automation_scheduler_record_last_run_failed account_key=%s run_id=%s error_type=%s",
-            account_key,
+            "automation_scheduler_record_last_run_failed schedule_id=%s run_id=%s error_type=%s",
+            schedule_id,
             run.id,
             type(exc).__name__,
         )
 
     logger.info(
-        "automation_scheduler_run_triggered account_key=%s run_id=%s status=%s",
-        account_key,
+        "automation_scheduler_run_triggered schedule_id=%s run_id=%s status=%s",
+        schedule_id,
         run.id,
         run.status,
     )

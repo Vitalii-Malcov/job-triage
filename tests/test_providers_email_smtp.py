@@ -27,7 +27,11 @@ from app.providers.email.outbound_base import (
     EmailSendOutcomeUnknownError,
     OutboundMessage,
 )
-from app.providers.email.smtp import SMTP_OPERATION_TIMEOUT_SECONDS, GmailSmtpProvider
+from app.providers.email.smtp import (
+    SMTP_OPERATION_TIMEOUT_SECONDS,
+    SMTP_TOTAL_DEADLINE_SECONDS,
+    GmailSmtpProvider,
+)
 
 ACCOUNT = "me@example.com"
 
@@ -397,3 +401,158 @@ class TestHardConnectionTimeout:
 
         with pytest.raises(EmailSendConnectionError):
             provider.send(_message())
+
+
+class TestTotalSendDeadline:
+    """Codex gate follow-up (Astra R4B, NEW-006: SMTP total deadline):
+    `SMTP_OPERATION_TIMEOUT_SECONDS` alone bounds each blocking
+    operation's INACTIVITY, not the whole `send()` call's cumulative
+    wall-clock time — a peer that keeps trickling SOME bytes before every
+    per-operation timeout expires (never idle long enough to trip it) can
+    hold a single operation open indefinitely under that bound alone.
+    These tests prove `send()` now imposes a genuine total deadline that
+    interrupts exactly that pathological case, and preserves the
+    UNCERTAIN-vs-DEFINITE-failure classification depending on whether
+    transmission may already have begun when the deadline fires.
+    """
+
+    def test_total_deadline_is_safely_below_thread_lock_ttl(self):
+        """The actual proof of the safety margin this module's own
+        docstring claims for SMTP_TOTAL_DEADLINE_SECONDS — not just
+        prose."""
+        assert SMTP_OPERATION_TIMEOUT_SECONDS < SMTP_TOTAL_DEADLINE_SECONDS
+        assert SMTP_TOTAL_DEADLINE_SECONDS < THREAD_LOCK_TTL_SECONDS
+        margin = THREAD_LOCK_TTL_SECONDS - SMTP_TOTAL_DEADLINE_SECONDS
+        assert margin >= THREAD_LOCK_TTL_SECONDS / 4
+
+    def test_pathological_continuously_trickling_peer_is_bounded_by_total_deadline(self):
+        """A REAL socket, not a mock: a listener that accepts the
+        connection and then writes one junk byte every 0.05s forever —
+        far too fast to ever trip a per-operation inactivity timeout
+        (even a generous one), but never completing a valid TLS
+        handshake either. Under the OLD (pre-fix) behavior this would
+        hang for the full per-operation timeout on every internal retry,
+        potentially indefinitely. Proves the NEW total deadline cuts this
+        off well within its own configured bound, not
+        SMTP_OPERATION_TIMEOUT_SECONDS's (much larger, here deliberately
+        generous) one.
+        """
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        host, port = server.getsockname()
+        stop = threading.Event()
+        accepted = threading.Event()
+
+        def _accept_and_trickle():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            accepted.set()
+            try:
+                while not stop.is_set():
+                    try:
+                        conn.sendall(b"\x00")
+                    except OSError:
+                        return
+                    time.sleep(0.05)
+            finally:
+                conn.close()
+
+        server_thread = threading.Thread(target=_accept_and_trickle, daemon=True)
+        server_thread.start()
+        try:
+            provider = GmailSmtpProvider(
+                smtp_host=host,
+                smtp_port=port,
+                username=ACCOUNT,
+                app_password="app-password",
+                # Deliberately generous per-operation timeout -- proves
+                # the TOTAL deadline is what bounds this, not this value.
+                timeout_seconds=30.0,
+                total_deadline_seconds=0.5,
+            )
+
+            start = time.monotonic()
+            with pytest.raises(EmailSendConnectionError):
+                provider.send(_message())
+            elapsed = time.monotonic() - start
+
+            assert accepted.wait(timeout=2), "test server never accepted the connection"
+            assert elapsed < 5.0, (
+                f"the total deadline did not bound the pathological trickle (took {elapsed:.2f}s)"
+            )
+        finally:
+            stop.set()
+            server.close()
+            server_thread.join(timeout=3)
+
+    def test_deadline_before_send_message_is_classified_as_connection_error(self, monkeypatch):
+        """The deadline firing during connect/login (transmission never
+        attempted) must stay a DEFINITE pre-transmission failure, exactly
+        like every other pre-send_message() exception path in this
+        module — never misclassified as ambiguous."""
+
+        class _NeverReturningLoginClient:
+            def login(self, user, password):
+                time.sleep(5)
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                raise AssertionError("must never be reached")
+
+            def quit(self):
+                return (221, b"Bye")
+
+        monkeypatch.setattr(
+            smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: _NeverReturningLoginClient()
+        )
+        provider = _provider(client=None, total_deadline_seconds=0.2)
+
+        start = time.monotonic()
+        with pytest.raises(EmailSendConnectionError):
+            provider.send(_message())
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0
+
+    def test_deadline_after_send_message_invoked_is_classified_as_outcome_unknown(
+        self, monkeypatch
+    ):
+        """Once send_message() has actually been invoked, a deadline
+        firing before it returns must be UNCERTAIN, never a definite
+        failure — the peer may have already accepted the message."""
+
+        class _NeverReturningSendClient:
+            def login(self, user, password):
+                return (235, b"OK")
+
+            def send_message(self, msg):
+                time.sleep(5)
+                return {}
+
+            def quit(self):
+                return (221, b"Bye")
+
+        monkeypatch.setattr(
+            smtp_module.smtplib, "SMTP_SSL", lambda *a, **kw: _NeverReturningSendClient()
+        )
+        provider = _provider(client=None, total_deadline_seconds=0.2)
+
+        start = time.monotonic()
+        with pytest.raises(EmailSendOutcomeUnknownError):
+            provider.send(_message())
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0
+
+    def test_normal_send_within_deadline_is_unaffected(self):
+        """The common case — a fast, healthy send — must behave exactly
+        as before this change, well within a generous total deadline."""
+        client = FakeSmtpClient()
+        provider = _provider(client, total_deadline_seconds=SMTP_TOTAL_DEADLINE_SECONDS)
+
+        provider.send(_message())
+
+        assert len(client.sent_messages) == 1
