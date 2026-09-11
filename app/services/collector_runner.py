@@ -45,7 +45,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import JobScorer
 from app.agents.skill_extractor import extract_skills
-from app.collectors.base import CollectorError, CollectorNotConfiguredError, is_configured
+from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.db.models import JobRecord, UserProfile
@@ -67,6 +67,7 @@ from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.telegram import TelegramNotifier
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 

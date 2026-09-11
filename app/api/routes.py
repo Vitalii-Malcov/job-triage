@@ -36,7 +36,6 @@ from app.agents.review_package_builder import (
     ReviewSourceMismatchError,
     ReviewVersionConflictError,
 )
-from app.collectors.base import is_configured
 from app.core.config import get_settings
 from app.db.automation_repository import (
     AUTOMATION_RUN_LIST_DEFAULT_LIMIT,
@@ -250,6 +249,7 @@ from app.services.response_draft_send import (
 )
 from app.services.review_package import ReviewPackageService, get_approved_package
 from app.services.telegram import TelegramNotifier
+from app.utils.config_flags import is_configured
 
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
@@ -1053,7 +1053,17 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     except CollectorError as exc:
-        logger.exception("bundesagentur_collector_run_failed")
+        # HARD-002 (adversarial hardening r1): this branch used to call
+        # `logger.exception(...)`, which logs the FULL traceback
+        # (including any chained upstream exception's own str()) --
+        # exactly the leakage class already identified and fixed for the
+        # XING branch below (Codex gate follow-up, Astra R4B, NEW-003).
+        # A raw httpx/requests connection error's `__cause__` can carry
+        # host/response-body text; `exc`'s own message is already
+        # sanitized by the collector before it reaches here, so only
+        # `type(exc).__name__` is logged, matching the XING sibling and
+        # every other CollectorError log site in this project.
+        logger.warning("bundesagentur_collector_run_failed error_type=%s", type(exc).__name__)
         raise HTTPException(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
             detail=f"Bundesagentur Jobsuche API request failed: {exc}",

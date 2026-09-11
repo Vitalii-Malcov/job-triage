@@ -52,7 +52,6 @@ from collections.abc import Callable
 from email.message import EmailMessage
 from typing import Protocol
 
-from app.collectors.base import is_configured
 from app.providers.email.outbound_base import (
     EmailSendAuthError,
     EmailSendConnectionError,
@@ -60,6 +59,7 @@ from app.providers.email.outbound_base import (
     OutboundMessage,
     OutboundSendResult,
 )
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 

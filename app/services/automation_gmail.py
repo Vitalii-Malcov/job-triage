@@ -88,7 +88,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.collectors.base import CollectorNotConfiguredError, is_configured
+from app.collectors.base import CollectorNotConfiguredError
 from app.db.gmail_repository import (
     GmailMessageAutomationCASLostError,
     list_unprocessed_messages_for_automation,
@@ -100,6 +100,7 @@ from app.providers.email.base import normalize_account_key
 from app.services.gmail_message_analysis import analyze_gmail_message
 from app.services.gmail_sync import sync_mailbox
 from app.services.response_draft import generate_response_draft_for_message
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 

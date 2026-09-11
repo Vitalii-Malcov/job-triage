@@ -24,18 +24,6 @@ class CollectorNotConfiguredError(CollectorError):
     """
 
 
-def is_configured(value: str) -> bool:
-    """True if `value` is a real, usable config value rather than empty/whitespace-only.
-
-    Shared across collectors (e.g. Bundesagentur's API key, XING's mailbox
-    username/app password) so "is this thing configured" is defined once
-    instead of duplicated as slightly different `if not value:` checks per
-    source, which could drift out of sync (see the whitespace-only-key bug
-    this pattern was introduced to fix).
-    """
-    return bool(value and value.strip())
-
-
 class JobCollector(ABC):
     """Interface every job source collector implements.
 

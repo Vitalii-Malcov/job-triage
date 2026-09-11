@@ -8,8 +8,9 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from app.collectors.base import CollectorError, JobCollector, is_configured
+from app.collectors.base import CollectorError, JobCollector
 from app.models.job import Job
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def is_api_key_configured(api_key: str) -> bool:
     POST /collectors/bundesagentur/run route so "is this thing configured"
     is defined in exactly one place rather than duplicated as two separate
     `if not ...:` checks that could drift out of sync. Thin wrapper over the
-    cross-collector app.collectors.base.is_configured — kept as a named
+    cross-collector app.utils.config_flags.is_configured — kept as a named
     function here since existing call sites/tests import it from this module.
     """
     return is_configured(api_key)

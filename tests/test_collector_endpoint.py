@@ -212,6 +212,42 @@ class TestRunBundesagenturCollector:
 
         assert response.status_code == 502
 
+    def test_upstream_failure_log_does_not_leak_via_exc_info(self, client, monkeypatch, caplog):
+        """HARD-002 (adversarial hardening r1) regression:
+        `run_bundesagentur_collector`'s `except CollectorError` branch
+        previously called `logger.exception(...)`, which logs the FULL
+        traceback INCLUDING any chained `__cause__`'s own str() -- the
+        exact leakage class already identified and fixed for the sibling
+        XING endpoint (see
+        tests/test_collector_xing_endpoint.py::test_upstream_failure_log_does_not_leak_via_exc_info,
+        Codex gate follow-up, Astra R4B, NEW-003) but never applied to
+        this branch three lines above it in app/api/routes.py. Simulates
+        a chained raw OSError exactly like `raise ... from exc` produces.
+        """
+        sensitive_cause_text = "SECRET_BUNDESAGENTUR_CAUSE_TEXT_MUST_NOT_LEAK"
+        try:
+            raise OSError(sensitive_cause_text)
+        except OSError as cause:
+            chained_error = BundesagenturAPIError("Bundesagentur Jobsuche API request failed")
+            chained_error.__cause__ = cause
+
+        monkeypatch.setattr(
+            "app.services.collector_runner.BundesagenturCollector",
+            lambda **kwargs: FakeCollector(error=chained_error),
+        )
+
+        with caplog.at_level("DEBUG"):
+            response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
+
+        assert response.status_code == 502
+        assert sensitive_cause_text not in caplog.text
+        assert sensitive_cause_text not in response.text
+        assert "bundesagentur_collector_run_failed" in caplog.text
+        assert "error_type=BundesagenturAPIError" in caplog.text
+        routes_records = [r for r in caplog.records if r.name == "app.api.routes"]
+        assert routes_records
+        assert all(r.exc_info is None for r in routes_records)
+
     def test_collector_rate_limit_is_stricter_than_general_limit(self, client, monkeypatch):
         monkeypatch.setattr(
             "app.services.collector_runner.BundesagenturCollector",

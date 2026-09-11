@@ -51,7 +51,6 @@ from email.header import decode_header
 from email.message import Message
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
-from app.collectors.base import is_configured
 from app.providers.email.base import (
     MAX_ADDRESS_LENGTH,
     MAX_ADDRESSES_PER_HEADER,
@@ -80,6 +79,7 @@ from app.providers.email.imap_deadline import (
     ImapSessionDeadline,
 )
 from app.providers.email.mime_utils import decode_mime_part
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 

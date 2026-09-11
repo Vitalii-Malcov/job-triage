@@ -67,7 +67,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from app.collectors.base import CollectorError, JobCollector, is_configured
+from app.collectors.base import CollectorError, JobCollector
 from app.models.job import Job
 from app.providers.email.imap_deadline import (
     IMAP_SESSION_DEADLINE_SECONDS,
@@ -75,6 +75,7 @@ from app.providers.email.imap_deadline import (
     ImapSessionDeadline,
 )
 from app.providers.email.mime_utils import decode_mime_part
+from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
 

@@ -45,12 +45,13 @@ NOT have (a failure in either mailbox there still propagates as a single
 
 from sqlalchemy.orm import Session
 
-from app.collectors.base import CollectorNotConfiguredError, is_configured
+from app.collectors.base import CollectorNotConfiguredError
 from app.db.gmail_repository import get_known_uids
 from app.models.gmail import GmailSyncResult
 from app.providers.email.base import normalize_account_key
 from app.providers.email.imap import GmailImapProvider
 from app.services.gmail_inbox import GmailInboxService
+from app.utils.config_flags import is_configured
 
 __all__ = [
     "make_gmail_provider",
