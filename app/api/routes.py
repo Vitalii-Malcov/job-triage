@@ -260,6 +260,21 @@ GMAIL_MAX_LIST_LIMIT = 200
 GMAIL_ANALYSES_DEFAULT_LIST_LIMIT = 50
 GMAIL_ANALYSES_MAX_LIST_LIMIT = 200
 
+# BOUND-001 (api-boundaries hardening r1): every `offset: int = Query(...)`
+# below previously had `ge=0` but no upper bound at all. offset=2**63
+# (still a legal, non-negative Python int) crashes the SQLite driver with
+# an unhandled `OverflowError` ("Python int too large to convert to
+# SQLite INTEGER") -- confirmed live via TestClient
+# (tests/test_api_boundary_hardening.py::TestPaginationAbuse::test_offset_at_2_63_does_not_crash),
+# propagating uncaught to a raw 500 instead of a clean 422. No legitimate
+# caller of this single-user API ever needs an offset anywhere near this
+# project's realistic row-count scale (see
+# docs/DATA_RETENTION_CAPACITY.md) -- 2**31-1 is a conventional,
+# comfortably-generous bound, verified to sit far below both SQLite's
+# signed-64-bit affinity limit (2**63-1) and PostgreSQL's `bigint` range,
+# so the same bound is safe for both supported dialects.
+MAX_OFFSET = 2**31 - 1
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -368,7 +383,7 @@ def _to_detail(record: JobRecord) -> JobDetail:
 def get_jobs(
     status: ApplicationStatus | None = Query(default=None),
     limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[JobListItem]:
     records = list_jobs(db, status=status, limit=limit, offset=offset)
@@ -1063,6 +1078,16 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
         # sanitized by the collector before it reaches here, so only
         # `type(exc).__name__` is logged, matching the XING sibling and
         # every other CollectorError log site in this project.
+        #
+        # BOUND-XXX (api-boundaries hardening r1, privacy second-pass):
+        # the "exc's own message is already sanitized" assumption below
+        # (for the `detail=f"...: {exc}"` line) was actually FALSE for
+        # one path until this same pass: a non-JSON upstream response
+        # (WAF/proxy error page) embedded up to 100 raw chars of that
+        # page's body directly into `BundesagenturAPIError`'s message --
+        # see app/collectors/bundesagentur.py's JSONDecodeError handler,
+        # now fixed to log that snippet server-side only and keep the
+        # client-visible exception message snippet-free.
         logger.warning("bundesagentur_collector_run_failed error_type=%s", type(exc).__name__)
         raise HTTPException(
             status_code=http_status.HTTP_502_BAD_GATEWAY,
@@ -1161,7 +1186,7 @@ def list_automation_runs(
     limit: int = Query(
         default=AUTOMATION_RUN_LIST_DEFAULT_LIMIT, ge=1, le=AUTOMATION_RUN_LIST_MAX_LIMIT
     ),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[AutomationRun]:
     account_key = _current_gmail_account_key(get_settings())
@@ -1220,7 +1245,7 @@ def _current_gmail_account_key(settings) -> str:
 )
 def get_gmail_messages(
     limit: int = Query(default=GMAIL_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_MAX_LIST_LIMIT),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[GmailMessageSummary]:
     """Pure read of already-synced messages, in compact summary form
@@ -1256,7 +1281,7 @@ def get_gmail_message(message_id: int, db: Session = Depends(get_db)) -> GmailMe
 )
 def get_gmail_threads(
     limit: int = Query(default=GMAIL_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_MAX_LIST_LIMIT),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[GmailThread]:
     account_key = _current_gmail_account_key(get_settings())
@@ -1372,7 +1397,7 @@ def get_gmail_analyses(
     limit: int = Query(
         default=GMAIL_ANALYSES_DEFAULT_LIST_LIMIT, ge=1, le=GMAIL_ANALYSES_MAX_LIST_LIMIT
     ),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[GmailMessageAnalysis]:
     """Bounded, most-recent-first list of persisted analysis revisions
@@ -1465,7 +1490,7 @@ def get_gmail_message_response_draft_history(
     limit: int = Query(
         default=RESPONSE_DRAFT_HISTORY_DEFAULT_LIMIT, ge=1, le=RESPONSE_DRAFT_HISTORY_MAX_LIMIT
     ),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[ResponseDraft]:
     """The FULL, bounded, most-recent-first history of response-draft
@@ -1705,7 +1730,7 @@ def evaluate_follow_up_for_single_job(
 )
 def get_follow_ups(
     limit: int = Query(default=FOLLOW_UP_LIST_DEFAULT_LIMIT, ge=1, le=FOLLOW_UP_LIST_MAX_LIMIT),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[FollowUpProposal]:
     """Pure read of already-persisted follow-up proposals — never
