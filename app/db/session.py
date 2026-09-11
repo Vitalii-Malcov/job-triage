@@ -6,8 +6,40 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 
+
+def _connect_args_for(database_url: str) -> dict:
+    """Pure so it's directly unit-testable for both dialects (see
+    tests/test_db_session_connect_args.py) without needing to reimport
+    this module with a different DATABASE_URL.
+    """
+    if database_url.startswith("sqlite"):
+        return {"check_same_thread": False}
+    # HARD-011 (adversarial hardening r1): without an explicit
+    # connect_timeout, a connection attempt to a host that isn't
+    # actively refusing (DB process stopped but the port/network path
+    # still accepts a TCP handshake attempt at the OS/container level,
+    # or a firewall silently drops packets) blocks on the OS's own TCP
+    # connect timeout -- measured live during this hardening pass to
+    # exceed 60+ seconds with nothing bounding it. That turned a DB
+    # outage into an indefinitely hung request thread instead of a
+    # fast, clear error. A 10s-per-address bound converts that into a
+    # clean, finite OperationalError. Note: libpq/psycopg apply this
+    # PER resolved address, not once overall -- a hostname resolving to
+    # both an IPv6 and an IPv4 address (e.g. "localhost") can still take
+    # up to ~2x this value before failing, confirmed live during this
+    # hardening pass (~20s observed, not 10s) -- still a bounded,
+    # diagnosable failure instead of an indefinite hang, which is the
+    # actual fix; it is not a promise of an exact wall-clock number.
+    # `pool_pre_ping` (below) bounds STALE pooled connections; this
+    # bounds the separate "can't connect at all" case pre_ping alone
+    # doesn't cover, since pre_ping's own health-check query opens a
+    # connection the same unbounded way if none exists yet. See
+    # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-011.
+    return {"connect_timeout": 10}
+
+
 settings = get_settings()
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+connect_args = _connect_args_for(settings.database_url)
 # AUD-007: pool_pre_ping issues a lightweight "is this connection still
 # alive" check before handing a pooled connection to a request, so a
 # connection that went stale while idle (DB restart, firewall/load-

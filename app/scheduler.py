@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 _CONFIGURATION_ERROR_MESSAGE = "Automation scheduler configuration error. Check scheduler settings."
 
 
-class _ShutdownRequested(Exception):
+class _ShutdownRequested(BaseException):
     """Raised by `_handle_sigterm` below so a container's `docker stop`
     (which sends SIGTERM, not SIGINT) shuts this worker down through the
     exact same clean-exit path Ctrl+C (SIGINT -> KeyboardInterrupt)
@@ -69,6 +69,19 @@ class _ShutdownRequested(Exception):
     (see this module's own docstring); this only turns the common,
     intentional `docker stop` case into a clean logged stop instead of a
     silent hard kill.
+
+    HARD-005 (adversarial hardening r1): subclasses `BaseException`, not
+    `Exception` -- deliberately mirroring `KeyboardInterrupt`/`SystemExit`,
+    for the exact same reason those two are BaseException subclasses. A
+    signal can interrupt at any bytecode boundary, including inside
+    `_poll_loop`'s own per-iteration `except Exception:` blocks (around
+    `run_due_cycle_if_claimed`/`run_due_digest_if_claimed`). If this class
+    subclassed `Exception`, a SIGTERM landing in that narrow window would
+    be silently swallowed there (logged as
+    `automation_scheduler_poll_iteration_error` and the poll loop would
+    continue) instead of propagating up to `main()`'s dedicated
+    `except _ShutdownRequested:` handler -- meaning a single `docker stop`
+    could occasionally be absorbed and ignored rather than honored.
     """
 
 

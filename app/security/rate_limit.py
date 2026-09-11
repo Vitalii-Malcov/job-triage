@@ -36,6 +36,17 @@ class _RateLimiter:
     docstring), not attributes of this class.
     """
 
+    # HARD-001: a distinct-host key is never removed from `self.buckets`
+    # just by its own deque emptying out (trimming only ever runs when
+    # THAT host makes another request) -- a host that is never seen again
+    # would otherwise leave its dict entry allocated for the life of the
+    # process. Bounded, amortized-cost fix: once a limiter has
+    # accumulated more distinct host keys than this threshold, one
+    # request pays the cost of sweeping out every key whose bucket is now
+    # fully expired. Below the threshold, check() is unchanged (no sweep
+    # cost at all) -- see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-001.
+    _SWEEP_THRESHOLD = 512
+
     def __init__(self, *, detail: str) -> None:
         self.buckets: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
@@ -56,6 +67,17 @@ class _RateLimiter:
                     detail=self._detail,
                 )
             bucket.append(now)
+            if len(self.buckets) > self._SWEEP_THRESHOLD:
+                self._evict_expired_buckets(cutoff)
+
+    def _evict_expired_buckets(self, cutoff: float) -> None:
+        # Called with self._lock already held. A bucket is fully expired
+        # (safe to forget) if its newest entry is still older than the
+        # current cutoff -- `key`'s own bucket (just appended to above)
+        # can never match this, so it's never evicted by its own request.
+        stale_keys = [k for k, bucket in self.buckets.items() if not bucket or bucket[-1] < cutoff]
+        for stale_key in stale_keys:
+            del self.buckets[stale_key]
 
 
 _generic_limiter = _RateLimiter(detail="Rate limit exceeded")

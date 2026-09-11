@@ -259,6 +259,54 @@ class TestTickLevelExceptionContainment:
         assert "boom-2" not in caplog.text
 
 
+class TestShutdownRequestedPropagatesThroughTickLevelExceptionHandling:
+    """HARD-005 (adversarial hardening r1): `_ShutdownRequested` (raised
+    by the SIGTERM handler, AUD-008) must propagate all the way out of
+    `_poll_loop` even if the signal lands while control is inside the
+    per-tick `try: ... except Exception:` block wrapping
+    `run_due_cycle_if_claimed`. Before this fix, `_ShutdownRequested`
+    subclassed `Exception`, so a SIGTERM landing in that exact window
+    would have been silently caught there (logged as a generic tick
+    error) and the poll loop would have continued instead of shutting
+    down -- meaning a `docker stop` could occasionally be absorbed and
+    ignored. Simulating the signal by raising `_ShutdownRequested`
+    directly from the faked `run_due_cycle_if_claimed` is the most
+    direct, deterministic way to prove this without depending on actual
+    OS signal delivery timing.
+    """
+
+    def test_shutdown_requested_from_inside_a_tick_is_not_swallowed(self, monkeypatch, caplog):
+        from app.scheduler import _ShutdownRequested
+
+        fake_session_local = _FakeSessionLocal()
+        monkeypatch.setattr("app.db.session.SessionLocal", fake_session_local)
+
+        async def _fake_run_due_cycle_if_claimed(db, *, account_key, settings):
+            raise _ShutdownRequested()
+
+        monkeypatch.setattr(
+            "app.scheduler.run_due_cycle_if_claimed", _fake_run_due_cycle_if_claimed
+        )
+
+        with caplog.at_level("DEBUG"), pytest.raises(_ShutdownRequested):
+            asyncio.run(_poll_loop(_fake_settings()))
+
+        # The per-tick "poll_iteration_error" containment log must NEVER
+        # fire for this -- that would mean it was misreported as a
+        # generic tick failure instead of a clean shutdown signal.
+        assert "automation_scheduler_poll_iteration_error" not in caplog.text
+        # The session opened for the interrupted tick must still be
+        # closed -- _poll_loop's own `finally: db.close()` runs
+        # regardless of what kind of exception unwinds through it.
+        assert fake_session_local.created[0].closed is True
+
+    def test_shutdown_requested_is_not_an_ordinary_exception_subclass(self):
+        from app.scheduler import _ShutdownRequested
+
+        assert not issubclass(_ShutdownRequested, Exception)
+        assert issubclass(_ShutdownRequested, BaseException)
+
+
 class TestStartupLoggingPrivacy:
     """AUD-010: `_poll_loop`'s one-time startup log line must never
     include `account_key` -- an operator's real account identity
