@@ -14,6 +14,21 @@ def _connect_args_for(database_url: str) -> dict:
     """
     if database_url.startswith("sqlite"):
         return {"check_same_thread": False}
+    # HARD-011 verification pass: `connect_timeout` is a psycopg/libpq
+    # connection parameter, not a generic SQLAlchemy one -- this `else`
+    # branch is only ever reached by PostgreSQL URLs in practice.
+    # Confirmed, not assumed: `pyproject.toml` declares exactly one
+    # non-SQLite DB driver extra (`postgres = ["psycopg[binary]>=3.1"]`,
+    # no MySQL/MariaDB/other driver anywhere in the dependency list);
+    # `.env.example` documents exactly two DATABASE_URL schemes
+    # (`sqlite:///...` and `postgresql+psycopg://...`); `compose.yaml`'s
+    # production target is explicitly PostgreSQL-only
+    # (docs/DEPLOYMENT.md: "do not use SQLite in production compose").
+    # No other dialect is supported, tested, or documented anywhere in
+    # this project -- so passing a psycopg-specific kwarg unconditionally
+    # here is safe under the project's actual, confirmed two-dialect
+    # contract. If a third dialect is ever added, this branch would need
+    # to become dialect-aware instead of a blanket `else`.
     # HARD-011 (adversarial hardening r1): without an explicit
     # connect_timeout, a connection attempt to a host that isn't
     # actively refusing (DB process stopped but the port/network path
