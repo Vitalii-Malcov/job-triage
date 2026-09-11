@@ -27,8 +27,17 @@ class Settings(BaseSettings):
     # No default on purpose: an empty/unset key means require_api_key()
     # rejects every request instead of accepting a predictable value.
     api_key: str = ""
-    rate_limit_requests: int = 60
-    rate_limit_window_seconds: int = 60
+    # HARD-006: ge=1 on both -- an unvalidated 0/negative
+    # rate_limit_requests made _RateLimiter.check's `len(bucket) >=
+    # max_requests` always true (every request 429s, total self-lockout);
+    # an unvalidated negative rate_limit_window_seconds made `cutoff = now
+    # - window_seconds` a FUTURE timestamp, so every bucket entry always
+    # looked expired and the limiter silently never limited anything --
+    # both previously passed Settings() construction with no error and
+    # only misbehaved later, at request time. See
+    # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-006.
+    rate_limit_requests: int = Field(default=60, ge=1)
+    rate_limit_window_seconds: int = Field(default=60, ge=1)
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -53,7 +62,11 @@ class Settings(BaseSettings):
     xing_mailbox_imap_port: int = 993
     xing_mailbox_username: str = ""
     xing_mailbox_app_password: str = ""
-    xing_lookback_days: int = 7
+    # HARD-006: bounded the same way gmail_lookback_days already is --
+    # an unvalidated 0/negative value pushed the IMAP `since_date` into
+    # the present/future, silently returning zero messages with no
+    # error, inconsistent with the sibling Gmail setting below.
+    xing_lookback_days: int = Field(default=7, ge=1, le=1095)
 
     # Company Research Agent (POST/GET /jobs/{id}/research, Telegram
     # /research <id>). v1 makes zero outbound network requests — its only

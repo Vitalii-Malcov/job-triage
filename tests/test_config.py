@@ -236,3 +236,66 @@ def test_automation_scheduler_account_key_overlong_value_never_echoed_in_error()
     with pytest.raises(ValidationError) as exc_info:
         Settings(automation_scheduler_account_key=overlong)
     assert overlong not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# HARD-006 (adversarial hardening r1): rate_limit_requests/window_seconds
+# and xing_lookback_days previously accepted 0/negative values that passed
+# Settings() construction with no error and only misbehaved later, at
+# request time (see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-006).
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_requests_zero_rejected():
+    """A caller-visible symptom of the pre-fix bug: rate_limit_requests=0
+    made _RateLimiter.check's `len(bucket) >= max_requests` always true,
+    so every request -- including the first ever made -- was 429'd."""
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_requests=0)
+
+
+def test_rate_limit_requests_negative_rejected():
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_requests=-1)
+
+
+def test_rate_limit_window_seconds_zero_rejected():
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_window_seconds=0)
+
+
+def test_rate_limit_window_seconds_negative_rejected():
+    """A caller-visible symptom of the pre-fix bug: a negative window made
+    `cutoff = now - window_seconds` a FUTURE timestamp, so every bucket
+    entry always looked expired and the limiter silently never limited
+    anything -- a security-relevant silent fail-open, not just a crash."""
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_window_seconds=-1)
+
+
+def test_rate_limit_requests_and_window_positive_values_still_accepted():
+    settings = Settings(rate_limit_requests=1, rate_limit_window_seconds=1)
+    assert settings.rate_limit_requests == 1
+    assert settings.rate_limit_window_seconds == 1
+
+
+def test_xing_lookback_days_zero_rejected():
+    with pytest.raises(ValidationError):
+        Settings(xing_lookback_days=0)
+
+
+def test_xing_lookback_days_negative_rejected():
+    """A caller-visible symptom of the pre-fix bug: a negative value
+    pushed the IMAP `since_date` filter into the future, so the collector
+    silently returned zero messages every run with no error anywhere."""
+    with pytest.raises(ValidationError):
+        Settings(xing_lookback_days=-1)
+
+
+def test_xing_lookback_days_matches_gmail_lookback_days_bounds():
+    """Consistency check: the two sibling per-mailbox lookback-window
+    settings must accept/reject the same range now that both are bounded."""
+    settings = Settings(xing_lookback_days=1095)
+    assert settings.xing_lookback_days == 1095
+    with pytest.raises(ValidationError):
+        Settings(xing_lookback_days=1096)

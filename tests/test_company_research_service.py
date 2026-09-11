@@ -181,6 +181,28 @@ async def test_provider_failure_with_existing_record_serves_stale():
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_error_field_never_echoes_raw_exception_text():
+    """HARD-003 (adversarial hardening r1): `result.error` (persisted to
+    CompanyResearchRecord.last_error AND returned verbatim via the public
+    API) must be a sanitized, derived string (type(exc).__name__),
+    matching this project's established last_error convention elsewhere
+    (scheduler.py/follow_up_send.py/response_draft_send.py) -- never the
+    raw exception message, which could embed sensitive detail for a
+    future network-based provider."""
+    db = _db()
+    job = _seed_job(db)
+    sensitive_text = "SECRET_PROVIDER_DETAIL_MUST_NOT_LEAK://user:token@internal-host"
+    provider = _FakeProvider(error=RuntimeError(sensitive_text))
+    service = CompanyResearchService(provider=provider)
+    settings = _settings()
+
+    result = await service.get_or_run(db, job, settings)
+
+    assert result.error == "RuntimeError"
+    assert sensitive_text not in result.error
+
+
+@pytest.mark.asyncio
 async def test_provider_failure_with_no_prior_record_is_not_a_success():
     db = _db()
     job = _seed_job(db)

@@ -248,7 +248,24 @@ class CompanyResearchService:
                 job.company,
                 exc_info=True,
             )
-            error_message = str(exc) or exc.__class__.__name__
+            # HARD-003 (adversarial hardening r1): this used to be
+            # `str(exc) or exc.__class__.__name__` -- the ONLY
+            # `last_error`-writing site in the codebase that persisted a
+            # raw exception message instead of a sanitized, derived
+            # string (every sibling site -- app/services/scheduler.py,
+            # app/services/follow_up_send.py,
+            # app/services/response_draft_send.py -- uses
+            # `type(exc).__name__`). This value is both persisted to
+            # `CompanyResearchRecord.last_error` AND returned verbatim to
+            # API clients via `CompanyResearchRunResponse.error` (below),
+            # so a future network-based provider's exception (a URL with
+            # an embedded API key, a response body) could otherwise reach
+            # an HTTP client through this field. v1's only provider makes
+            # zero outbound network requests today, so this was low-risk
+            # in practice, but the code path is written generically for a
+            # future provider -- fixed to match the established
+            # project-wide convention now rather than waiting for that.
+            error_message = type(exc).__name__
             record = record_failed_attempt(
                 db,
                 normalized_domain=effective_domain,
