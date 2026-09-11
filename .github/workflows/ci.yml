@@ -81,9 +81,15 @@ jobs:
       # response-draft email from being sent twice under concurrent
       # dispatch -- was previously proven only against SQLite. Added to
       # this same real-PostgreSQL job rather than a new one.
+      #
+      # HARD-007 verification pass: real-PostgreSQL evidence for
+      # upsert_job's concurrent-new-fingerprint race (documented, not
+      # fixed -- reserved for Codex review; see
+      # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007).
       - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
           tests/integration/test_gmail_watermark_postgres_concurrency.py
           tests/integration/test_response_draft_send_postgres_concurrency.py
+          tests/integration/test_upsert_job_postgres_concurrency.py
         env:
           TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
 

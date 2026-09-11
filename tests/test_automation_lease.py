@@ -677,3 +677,115 @@ class TestReplacementWorkerAfterLeaseLoss:
             assert reloaded_original.status == "FAILED"
         finally:
             db2.close()
+
+
+class TestShutdownRequestedDuringActiveCycleCleansUpSafely:
+    """HARD-005 verification pass (adversarial hardening r1): proves the
+    key safety invariant behind the conclusion that raising
+    `_ShutdownRequested` (app/scheduler.py's SIGTERM handler exception)
+    from ARBITRARY code inside an active `run_automation_cycle` -- not
+    just the idle poll-loop sleep already covered by
+    tests/test_scheduler_poll_loop.py -- leaves the system in a state no
+    worse than a hard SIGKILL at the same point, which the lease/CAS
+    design already has to tolerate:
+
+    1. the heartbeat's background thread is cleanly stopped (its
+       bounded `join()` inside `stop()` actually completes), never
+       orphaned;
+    2. the Session `run_automation_cycle` was using remains usable
+       afterward (no corrupted transaction state);
+    3. the abandoned `AutomationRunRecord` is left exactly `RUNNING`
+       with a live-then-expiring lease -- the SAME shape
+       `TestStaleRunIsReconciledAndRecovered`/
+       `TestReplacementWorkerAfterLeaseLoss` already prove the existing
+       reconciliation recovers correctly, now re-confirmed for THIS
+       specific interruption cause rather than assumed by analogy.
+
+    This does NOT prove signal delivery is safe at every conceivable
+    CPython bytecode boundary (that would require CPython-internals-
+    level formal reasoning this test cannot provide) -- it proves the
+    concrete, testable invariant this codebase's crash-recovery design
+    actually depends on: that an async-raised BaseException unwinding
+    through `run_automation_cycle` is handled at least as gracefully as
+    the process-level crash the lease design was built for.
+    """
+
+    def test_shutdown_requested_mid_cycle_stops_heartbeat_and_leaves_session_usable(
+        self, session_factory, monkeypatch
+    ):
+        from app.scheduler import _ShutdownRequested
+
+        async def _run_bundesagentur_raises_shutdown(
+            db, settings, *, touched_jobs=None, is_lease_lost=None
+        ):
+            # Simulates a SIGTERM landing while control is inside an
+            # active collector step -- the exact "mid-cycle" scenario
+            # tests/test_scheduler_poll_loop.py's own
+            # TestShutdownRequestedPropagatesThroughTickLevelExceptionHandling
+            # simulates one layer up (at the poll-loop level, with a
+            # faked run_due_cycle_if_claimed); this test goes one layer
+            # deeper, into the REAL run_automation_cycle with a REAL
+            # heartbeat thread.
+            raise _ShutdownRequested()
+
+        async def _xing_noop(db, settings, *, touched_jobs=None, is_lease_lost=None):
+            return {"fetched": 0, "created": 0, "updated": 0, "skipped_invalid": 0, "failed": 0}
+
+        monkeypatch.setattr(
+            "app.services.automation.run_bundesagentur", _run_bundesagentur_raises_shutdown
+        )
+        monkeypatch.setattr("app.services.automation.run_xing", _xing_noop)
+
+        db = session_factory()
+        try:
+            with pytest.raises(_ShutdownRequested):
+                asyncio.run(
+                    run_automation_cycle(
+                        db,
+                        account_key=ACCOUNT,
+                        settings=Settings(),
+                        lease_ttl_seconds=0.05,
+                        heartbeat_interval_seconds=0.02,
+                    )
+                )
+
+            # Invariant 2: the session must still be usable -- a trivial
+            # query must not itself raise.
+            db.rollback()
+            from sqlalchemy import func, select
+
+            db.execute(select(func.count()).select_from(AutomationRunRecord))
+
+            # Invariant 3: abandoned, not corrupted.
+            run = get_running_run_for_account(db, ACCOUNT)
+            assert run is not None
+            assert run.status == "RUNNING"
+        finally:
+            db.close()
+
+        # Invariant 1: no leaked background thread -- every
+        # automation-run-lease-heartbeat thread must have actually
+        # finished (heartbeat.stop()'s bounded join completed), not be
+        # silently still running after the exception unwound past it.
+        leaked = [
+            t
+            for t in threading.enumerate()
+            if t.name == "automation-run-lease-heartbeat" and t.is_alive()
+        ]
+        assert leaked == []
+
+        time.sleep(0.15)  # let the abandoned lease genuinely expire
+        monkeypatch.undo()  # restore the REAL collector steps
+
+        db2 = session_factory()
+        try:
+            replacement = asyncio.run(
+                run_automation_cycle(db2, account_key=ACCOUNT, settings=Settings())
+            )
+            assert replacement.status in ("COMPLETED", "PARTIAL", "FAILED")
+
+            db2.expire_all()
+            reloaded_original = db2.get(AutomationRunRecord, run.id)
+            assert reloaded_original.status == "FAILED"
+        finally:
+            db2.close()
