@@ -303,7 +303,7 @@ async def test_raises_api_error_on_non_json_response_body():
 
 @pytest.mark.asyncio
 async def test_non_json_response_body_text_never_reaches_exception_message(caplog):
-    """BOUND-XXX (api-boundaries hardening r1, privacy second-pass): the
+    """BOUND-011b (api-boundaries hardening r1, privacy second-pass): the
     raw response body used to be embedded directly into
     `BundesagenturAPIError`'s own message -- which
     app/api/routes.py's collector-run endpoint interpolates verbatim

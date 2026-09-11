@@ -405,7 +405,7 @@ class BundesagenturCollector(JobCollector):
                 # retryable, and must not be silently swallowed as "0
                 # results".
                 #
-                # BOUND-XXX (api-boundaries hardening r1, privacy
+                # BOUND-011b (api-boundaries hardening r1, privacy
                 # second-pass): the raw response snippet used to be
                 # embedded directly into THIS exception's own message --
                 # which app/api/routes.py's collector-run endpoint

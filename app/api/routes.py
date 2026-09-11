@@ -1079,7 +1079,7 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
         # `type(exc).__name__` is logged, matching the XING sibling and
         # every other CollectorError log site in this project.
         #
-        # BOUND-XXX (api-boundaries hardening r1, privacy second-pass):
+        # BOUND-011b (api-boundaries hardening r1, privacy second-pass):
         # the "exc's own message is already sanitized" assumption below
         # (for the `detail=f"...: {exc}"` line) was actually FALSE for
         # one path until this same pass: a non-JSON upstream response

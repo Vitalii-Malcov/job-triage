@@ -640,7 +640,7 @@ class _ThreadLockHeartbeat:
                         ttl_seconds=self._ttl_seconds,
                     )
                 except Exception as exc:
-                    # BOUND-XXX (api-boundaries hardening r1, privacy
+                    # BOUND-011 (api-boundaries hardening r1, privacy
                     # second-pass): this used to be
                     # `logger.warning(..., exc_info=True)` -- the exact
                     # leakage class already fixed for this class's own

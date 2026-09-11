@@ -1119,7 +1119,7 @@ class TestLeaseRenewalHeartbeat:
     def test_heartbeat_renewal_error_log_never_echoes_raw_exception_text(
         self, db, monkeypatch, caplog
     ):
-        """BOUND-XXX (api-boundaries hardening r1, privacy second-pass):
+        """BOUND-011 (api-boundaries hardening r1, privacy second-pass):
         the renewal-error log line used to call
         `logger.warning(..., exc_info=True)`, logging the full traceback
         including the exception's own message -- for a DB-layer failure,
