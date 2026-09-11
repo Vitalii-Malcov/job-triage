@@ -242,6 +242,137 @@ class TestTimezoneRollover:
             db.close()
 
 
+class TestDSTTransitions:
+    """hardening/api-boundaries-r1, Section 8: the prior adversarial pass
+    (docs/ADVERSARIAL_HARDENING_REPORT.md, Phase 11 verification-pass
+    note) correctly downgraded its DST claim because it was mostly
+    static reasoning plus a same-timezone-year-round comparison
+    (TestTimezoneRollover above never actually crosses a DST boundary --
+    September in Europe/Berlin is CEST/UTC+2 on both ends). These tests
+    inject real UTC instants straddling the actual 2026 Europe/Berlin
+    transitions (computed directly via zoneinfo, not guessed/hardcoded
+    from memory -- spring-forward: local clocks jump 02:00->03:00 CEST
+    on 2026-03-29, the 02:00-03:00 hour never occurs; fall-back: local
+    02:00-03:00 occurs TWICE on 2026-10-25, first as CEST/UTC+2 then
+    again as CET/UTC+1). No real time.sleep -- every instant is passed
+    explicitly via `now=`.
+    """
+
+    # UTC 2026-03-29T01:00:00 is the first instant of Berlin's new
+    # UTC+2 offset -- local time is 03:00 (hour jumped straight from
+    # 01:59:59 to 03:00:00, skipping the 02:00 hour entirely).
+    SPRING_FORWARD_JUST_BEFORE_UTC = datetime(2026, 3, 29, 0, 30, tzinfo=UTC)  # local 01:30, hour=1
+    SPRING_FORWARD_JUST_AFTER_UTC = datetime(2026, 3, 29, 1, 30, tzinfo=UTC)  # local 03:30, hour=3
+
+    # UTC 2026-10-25T00:30 -> local 02:30 CEST (UTC+2, first occurrence).
+    # UTC 2026-10-25T01:30 -> local 02:30 CET (UTC+1, second occurrence,
+    # SAME calendar date, SAME local wall-clock time as the first).
+    FALL_BACK_FIRST_0230_UTC = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+    FALL_BACK_SECOND_0230_UTC = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_spring_forward_gate_still_fires_once_the_skipped_hour_has_passed(
+        self, session_factory, monkeypatch
+    ):
+        """digest_hour=2 -- a hour that literally does not exist as a
+        local wall-clock value on 2026-03-29 in Europe/Berlin. The
+        "not-before" inequality (`local_now.hour < digest_hour`) must
+        still correctly gate: not due at local hour 1 (before the
+        skip), due at local hour 3 (after the skip landed past the
+        nonexistent hour 2) -- confirms the prior audit's static claim
+        ("survives a spring-forward hour-skip") against a REAL
+        transition, not just the general principle.
+        """
+        db = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT])
+        try:
+            settings = _settings(telegram_daily_digest_hour=2)
+
+            before = await run_due_digest_if_claimed(
+                db,
+                account_key=ACCOUNT,
+                settings=settings,
+                now=self.SPRING_FORWARD_JUST_BEFORE_UTC,
+            )
+            assert before is False
+            assert calls["count"] == 0
+
+            after = await run_due_digest_if_claimed(
+                db, account_key=ACCOUNT, settings=settings, now=self.SPRING_FORWARD_JUST_AFTER_UTC
+            )
+            assert after is True
+            assert calls["count"] == 1
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_fall_back_repeated_local_hour_never_sends_twice(
+        self, session_factory, monkeypatch
+    ):
+        """digest_hour=2 -- local wall-clock 02:30 occurs TWICE on
+        2026-10-25 (once as CEST, once as CET, one hour apart in real
+        UTC time but identical local time). Both ticks map to the SAME
+        calendar date (2026-10-25), so the once-per-`(account_key,
+        digest_date)` CAS must permit exactly ONE send, not two --
+        confirms the prior audit's static claim ("survives a fall-back
+        repeated hour without double-sending") against the actual
+        repeated-hour instants, not just the general once-per-date
+        principle already covered elsewhere in this file for
+        non-DST-adjacent dates.
+        """
+        db = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT])
+        try:
+            settings = _settings(telegram_daily_digest_hour=2)
+
+            first_tick = await run_due_digest_if_claimed(
+                db, account_key=ACCOUNT, settings=settings, now=self.FALL_BACK_FIRST_0230_UTC
+            )
+            second_tick = await run_due_digest_if_claimed(
+                db, account_key=ACCOUNT, settings=settings, now=self.FALL_BACK_SECOND_0230_UTC
+            )
+
+            assert first_tick is True
+            assert second_tick is False  # same digest_date, already SENT -- claim lost
+            assert calls["count"] == 1
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_fall_back_day_after_still_advances_to_a_new_claimable_date(
+        self, session_factory, monkeypatch
+    ):
+        """The calendar day AFTER the fall-back transition (2026-10-26,
+        by which point Berlin is settled into CET/UTC+1) must still be
+        an independently claimable digest_date -- the repeated-hour
+        transition day must not leave the CAS keying in a state that
+        confuses the following, DST-transition-free day.
+        """
+        db = session_factory()
+        calls = _fake_send(monkeypatch, [TelegramSendOutcome.SENT, TelegramSendOutcome.SENT])
+        try:
+            settings = _settings(telegram_daily_digest_hour=8)
+
+            transition_day = await run_due_digest_if_claimed(
+                db,
+                account_key=ACCOUNT,
+                settings=settings,
+                now=datetime(2026, 10, 25, 7, 0, tzinfo=UTC),  # 08:00 CET local (past hour=8 gate)
+            )
+            next_day = await run_due_digest_if_claimed(
+                db,
+                account_key=ACCOUNT,
+                settings=settings,
+                now=datetime(2026, 10, 26, 7, 0, tzinfo=UTC),  # 08:00 CET local, next calendar day
+            )
+
+            assert transition_day is True
+            assert next_day is True
+            assert calls["count"] == 2
+        finally:
+            db.close()
+
+
 def _berlin():
     from zoneinfo import ZoneInfo
 
