@@ -515,6 +515,72 @@ def test_approve_clean_no_edits(client):
     assert body["approved_revision_id"] == created["current_revision_id"]
 
 
+def test_approve_expected_version_zero_rejected_at_schema_boundary(client):
+    """BOUND-006 (api-boundaries hardening r1): `expected_review_version`
+    now matches CandidateProfilePatchRequest.expected_profile_version's
+    already-established `Field(ge=1)` bound -- 0/negative is rejected
+    with a 422 at the schema boundary, before any DB round-trip, instead
+    of only being caught later by the version-mismatch 409.
+    """
+    test_client, session_factory = client
+    job_id = _seed_job(session_factory)
+    cv_draft_id, bewerbung_draft_id = _ready_pair(test_client, session_factory, job_id)
+    created = _create_review(test_client, job_id, cv_draft_id, bewerbung_draft_id).json()
+
+    response = test_client.post(
+        f"/api/v1/review-packages/{created['id']}/approve",
+        headers=_auth_headers(),
+        json={"expected_review_version": 0},
+    )
+    assert response.status_code == 422
+
+
+def test_patch_expected_version_zero_rejected_at_schema_boundary(client):
+    test_client, session_factory = client
+    job_id = _seed_job(session_factory)
+    cv_draft_id, bewerbung_draft_id = _ready_pair(test_client, session_factory, job_id)
+    created = _create_review(test_client, job_id, cv_draft_id, bewerbung_draft_id).json()
+
+    response = test_client.patch(
+        f"/api/v1/review-packages/{created['id']}",
+        headers=_auth_headers(),
+        json={"expected_review_version": -1, "edit_note": "test"},
+    )
+    assert response.status_code == 422
+
+
+def test_decision_note_over_2000_chars_rejected(client):
+    """BOUND-006: `decision_note` now matches
+    ResponseDraftApprovalRequest.note / FollowUpApprovalRequest.note's
+    already-established `max_length=2000` bound.
+    """
+    test_client, session_factory = client
+    job_id = _seed_job(session_factory)
+    cv_draft_id, bewerbung_draft_id = _ready_pair(test_client, session_factory, job_id)
+    created = _create_review(test_client, job_id, cv_draft_id, bewerbung_draft_id).json()
+
+    response = test_client.post(
+        f"/api/v1/review-packages/{created['id']}/approve",
+        headers=_auth_headers(),
+        json={"expected_review_version": 1, "decision_note": "x" * 2001},
+    )
+    assert response.status_code == 422
+
+
+def test_decision_note_at_2000_chars_accepted(client):
+    test_client, session_factory = client
+    job_id = _seed_job(session_factory)
+    cv_draft_id, bewerbung_draft_id = _ready_pair(test_client, session_factory, job_id)
+    created = _create_review(test_client, job_id, cv_draft_id, bewerbung_draft_id).json()
+
+    response = test_client.post(
+        f"/api/v1/review-packages/{created['id']}/approve",
+        headers=_auth_headers(),
+        json={"expected_review_version": 1, "decision_note": "x" * 2000},
+    )
+    assert response.status_code == 200, response.text
+
+
 def test_approve_manual_without_ack_returns_422(client):
     """spec test 63."""
     test_client, session_factory = client

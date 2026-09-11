@@ -15,9 +15,13 @@ from sqlalchemy.orm import Session
 from app.db.models import ResponseDraftRecord
 from app.models.response_draft import ResponseDraft
 
-# Bounded, most-recent-first history page size defaults — mirrors
-# GMAIL_ANALYSES_DEFAULT_LIST_LIMIT / GMAIL_ANALYSES_MAX_LIST_LIMIT in
-# app/api/routes.py.
+# Bounded, most-recent-first history page size defaults. Deliberately its
+# own tier, not a mirror of GMAIL_ANALYSES_DEFAULT_LIST_LIMIT (50) /
+# GMAIL_ANALYSES_MAX_LIST_LIMIT (200) in app/api/routes.py — this comment
+# previously (incorrectly) claimed to mirror those; the two limit tiers
+# have always been numerically different (20/100 vs 50/200). BOUND-007
+# (api-boundaries hardening r1): comment-only correction, no behavior
+# change.
 RESPONSE_DRAFT_HISTORY_DEFAULT_LIMIT = 20
 RESPONSE_DRAFT_HISTORY_MAX_LIMIT = 100
 

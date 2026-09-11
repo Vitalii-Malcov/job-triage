@@ -218,10 +218,23 @@ class ReviewPackagePatchRequest(BaseModel):
     is created.
     """
 
-    expected_review_version: int
+    # BOUND-006 (api-boundaries hardening r1): `ge=1` matches the
+    # already-established sibling precedent
+    # (CandidateProfilePatchRequest.expected_profile_version) -- this
+    # optimistic-concurrency token starts at 1 and only ever increments,
+    # so a 0/negative value can never be valid. Previously unbounded
+    # here (an inconsistency between two structurally identical fields,
+    # not a live bug -- the version-mismatch check downstream already
+    # rejects 0/negative via a 409, this just rejects it earlier/cheaper
+    # at the schema boundary with a 422, matching the sibling).
+    expected_review_version: int = Field(ge=1)
     cv_changes: CVContentPatch | None = None
     bewerbung_changes: BewerbungContentPatch | None = None
-    edit_note: str | None = None
+    # BOUND-006: max_length=2000 matches the already-established sibling
+    # precedent (ResponseDraftApprovalRequest.note /
+    # FollowUpApprovalRequest.note) for the same "optional human-authored
+    # note attached to a decision" role.
+    edit_note: str | None = Field(default=None, max_length=2000)
 
 
 class ReviewPackageApproveRequest(BaseModel):
@@ -232,13 +245,13 @@ class ReviewPackageApproveRequest(BaseModel):
     approval of unverified human-authored content.
     """
 
-    expected_review_version: int
+    expected_review_version: int = Field(ge=1)
     acknowledge_manual_overrides: bool = False
-    decision_note: str | None = None
+    decision_note: str | None = Field(default=None, max_length=2000)
 
 
 class ReviewPackageRejectRequest(BaseModel):
     """POST /api/v1/review-packages/{review_id}/reject body."""
 
-    expected_review_version: int
-    decision_note: str | None = None
+    expected_review_version: int = Field(ge=1)
+    decision_note: str | None = Field(default=None, max_length=2000)
