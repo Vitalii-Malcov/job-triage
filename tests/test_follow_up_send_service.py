@@ -1116,6 +1116,50 @@ class TestLeaseRenewalHeartbeat:
         finally:
             heartbeat.stop()
 
+    def test_heartbeat_renewal_error_log_never_echoes_raw_exception_text(
+        self, db, monkeypatch, caplog
+    ):
+        """BOUND-XXX (api-boundaries hardening r1, privacy second-pass):
+        the renewal-error log line used to call
+        `logger.warning(..., exc_info=True)`, logging the full traceback
+        including the exception's own message -- for a DB-layer failure,
+        that message can embed a bound SQL parameter value. The sibling
+        test above (`test_heartbeat_marks_lock_lost_when_renewal_raises`)
+        only checked `lock_lost` behavior, never what reached the logs --
+        this test closes that gap independently, mirroring the
+        HARD-002/003 sensitive-marker pattern.
+        """
+        import app.services.follow_up_send as send_module
+
+        proposal, outbound, _approval = _seed_and_approve(db)
+        thread_id = outbound.thread_id
+        holder = "raises-holder"
+        assert acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=5.0) is True
+
+        sensitive_text = "SECRET_THREAD_LOCK_RENEWAL_DETAIL_MUST_NOT_LEAK"
+
+        def _raising_renew(*args, **kwargs):
+            raise RuntimeError(f"simulated DB error: {sensitive_text}")
+
+        monkeypatch.setattr(send_module, "renew_thread_lock", _raising_renew)
+
+        heartbeat = send_module._ThreadLockHeartbeat(
+            db, thread_id, holder=holder, ttl_seconds=5.0, interval_seconds=0.05
+        )
+        with caplog.at_level("DEBUG"):
+            heartbeat.start()
+            try:
+                assert heartbeat.lock_lost.wait(timeout=2.0)
+            finally:
+                heartbeat.stop()
+
+        assert sensitive_text not in caplog.text
+        assert "follow_up_send_lock_heartbeat_renewal_error" in caplog.text
+        assert "RuntimeError" in caplog.text
+        heartbeat_records = [r for r in caplog.records if r.name == "app.services.follow_up_send"]
+        assert heartbeat_records
+        assert all(r.exc_info is None for r in heartbeat_records)
+
     def test_send_fails_closed_when_lease_already_lost_before_dispatch(self, db, monkeypatch):
         """AUD-003 (Astra R2): if the heartbeat has already lost the lease
         BEFORE the outbound provider is ever called, the provider must

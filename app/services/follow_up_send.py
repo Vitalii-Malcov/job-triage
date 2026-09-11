@@ -639,11 +639,24 @@ class _ThreadLockHeartbeat:
                         holder=self._holder,
                         ttl_seconds=self._ttl_seconds,
                     )
-                except Exception:
+                except Exception as exc:
+                    # BOUND-XXX (api-boundaries hardening r1, privacy
+                    # second-pass): this used to be
+                    # `logger.warning(..., exc_info=True)` -- the exact
+                    # leakage class already fixed for this class's own
+                    # sibling, `app.services.automation._RunLeaseHeartbeat`
+                    # (see that class's S8A-004 comment: `exc_info=True`
+                    # logs the full traceback INCLUDING the exception's
+                    # own str(exc), which for a DB-layer failure can embed
+                    # a bound SQL parameter value, e.g. an account_key).
+                    # Only the event name, thread id, and sanitized type
+                    # name are logged now, matching that established
+                    # convention.
                     logger.warning(
-                        "follow_up_send_lock_heartbeat_renewal_error gmail_thread_id=%s",
+                        "follow_up_send_lock_heartbeat_renewal_error gmail_thread_id=%s "
+                        "error_type=%s",
                         self._thread_id,
-                        exc_info=True,
+                        type(exc).__name__,
                     )
                     self.lock_lost.set()
                     return

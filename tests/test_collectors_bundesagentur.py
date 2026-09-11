@@ -302,6 +302,35 @@ async def test_raises_api_error_on_non_json_response_body():
 
 
 @pytest.mark.asyncio
+async def test_non_json_response_body_text_never_reaches_exception_message(caplog):
+    """BOUND-XXX (api-boundaries hardening r1, privacy second-pass): the
+    raw response body used to be embedded directly into
+    `BundesagenturAPIError`'s own message -- which
+    app/api/routes.py's collector-run endpoint interpolates verbatim
+    into a client-visible 502 detail. An upstream WAF/proxy error page's
+    body is untrusted, third-party-controlled content and must never
+    reach the client this way. Confirms the exception message is now
+    snippet-free (only status code), while the snippet IS still
+    available server-side via the log line for diagnostics.
+    """
+    sensitive_text = "SECRET_UPSTREAM_WAF_PAGE_DETAIL_MUST_NOT_LEAK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=f"<html>{sensitive_text}</html>".encode())
+
+    collector = _make_collector(handler, max_retries=3)
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(BundesagenturAPIError) as exc_info:
+            await collector.fetch()
+
+    assert sensitive_text not in str(exc_info.value)
+    # The snippet IS still logged server-side (diagnostics), just never
+    # placed in the exception message a client can see.
+    assert sensitive_text in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_raises_api_error_on_empty_response_body():
     """A 200 response with an empty body (truncated response) must also
     raise a clear CollectorError instead of a bare json.JSONDecodeError,
