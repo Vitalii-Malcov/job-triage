@@ -76,8 +76,14 @@ jobs:
           grep -q "c7d3f9a1e5b8 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
+      # HARD-010 (adversarial hardening r1): claim_send_attempt's
+      # UNIQUE-constraint-backed CAS -- the mechanism preventing a
+      # response-draft email from being sent twice under concurrent
+      # dispatch -- was previously proven only against SQLite. Added to
+      # this same real-PostgreSQL job rather than a new one.
       - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
           tests/integration/test_gmail_watermark_postgres_concurrency.py
+          tests/integration/test_response_draft_send_postgres_concurrency.py
         env:
           TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
 

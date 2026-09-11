@@ -1,5 +1,6 @@
 import json
 import threading
+import unicodedata
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -140,6 +141,54 @@ def test_xing_fingerprint_still_distinguishes_different_postings():
         url="https://www.xing.com/m/AAAAAAAAAAAAAAAAAAAA1",
     )
 
+    assert _fingerprint(job_a) != _fingerprint(job_b)
+
+
+def test_fingerprint_nfc_vs_nfd_same_visible_company_name_does_not_dedup():
+    """HARD-009 (adversarial hardening r1), documented but NOT fixed --
+    see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-009. `_fingerprint`
+    only does `.strip().casefold()` on each field, with no
+    `unicodedata.normalize()` step. The same VISIBLE company name
+    "Café Zentrale" can arrive as two different Unicode byte sequences:
+    NFC (single codepoint U+00E9 for "é") vs. NFD (decomposed "e" +
+    U+0301 combining acute accent) -- both render identically and are a
+    real-world possibility across different collector runs / re-scrapes
+    that normalize text differently upstream. `casefold()` alone does
+    NOT perform canonical composition, so these two forms currently hash
+    to DIFFERENT fingerprints, meaning `upsert_job` would create a
+    duplicate `JobRecord` for what is, to a human, obviously the same
+    company/posting -- the same root-cause class as the already-fixed
+    title-normalization bug referenced in CLAUDE.md's Bundesagentur
+    collector tech debt notes (url-fallback fingerprint instability).
+    A fix (adding unicodedata.normalize("NFKC", ...) to _fingerprint,
+    matching app.models.candidate_profile.normalize_text_identity's
+    existing convention) is deliberately NOT applied here -- per project
+    convention, fingerprint changes require a live-data-driven audit
+    before being changed, not a speculative one-line addition.
+    """
+    company_nfc = "Café Zentrale"  # single codepoint "é" (U+00E9)
+    company_nfd = "Café Zentrale"  # "e" + combining acute (U+0301)
+    assert company_nfc != company_nfd  # sanity: genuinely different byte sequences
+    assert company_nfc == unicodedata.normalize("NFC", company_nfd)  # but visually identical
+
+    job_a = Job(
+        source="bundesagentur",
+        title="Barista",
+        company=company_nfc,
+        location="Berlin",
+        url="https://example.com/jobs/1",
+    )
+    job_b = Job(
+        source="bundesagentur",
+        title="Barista",
+        company=company_nfd,
+        location="Berlin",
+        url="https://example.com/jobs/1",
+    )
+
+    # THE GAP: these should arguably dedup (same visible company/title/
+    # url) but currently do not, because casefold() alone never composes
+    # NFD into NFC.
     assert _fingerprint(job_a) != _fingerprint(job_b)
 
 
@@ -399,6 +448,90 @@ def test_concurrent_updates_to_same_job_reference_never_duplicate_token_rows(tmp
         tokens = [row.token for row in rows]
         assert len(tokens) == len(set(tokens)), "duplicate (job_id, token) rows persisted"
         assert set(tokens) == {"BBB222"}
+    finally:
+        verify.close()
+
+
+def test_concurrent_insert_of_the_same_new_job_can_raise_unhandled_integrity_error(tmp_path):
+    """HARD-007 (adversarial hardening r1), documented but NOT fixed --
+    see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007 for why a fix
+    (catch IntegrityError, fall back to re-reading and treating it as an
+    update) is deliberately deferred to independent Codex review rather
+    than implemented here, since it touches upsert_job's write/retry
+    semantics.
+
+    `JobRecord.fingerprint` DOES have a DB-level UNIQUE constraint
+    (`uq_jobs_fingerprint`), so this race can never silently create two
+    rows with the same fingerprint -- the data-integrity guarantee
+    itself holds. But unlike every other insert-race site in this
+    project (e.g. get_or_create_schedule, create_approval,
+    claim_send_attempt, upsert_message), `upsert_job`'s new-record
+    branch (`_finalize_job_write` -> `db.commit()`) has NO
+    `try/except IntegrityError` around it. Two sessions racing to
+    persist the exact same brand-new fingerprint concurrently: one
+    commits successfully; the other's commit can raise `IntegrityError`
+    UNCAUGHT out of `upsert_job` -- an ugly, unhandled 500-class failure
+    instead of the graceful "someone else already inserted it, use
+    their row" resolution this project uses everywhere else it has the
+    same race shape. This test proves the current (unhandled) behavior
+    on the losing side; it is not something a fix should change what
+    WHICH thread wins, only how the loser is treated.
+    """
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent_new_job_insert.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    score = JobScore(score=80, recommendation="APPLY")
+
+    same_new_job = Job(
+        source="xing",
+        title="Backend Engineer",
+        company="RaceCo",
+        location="Remote",
+        url="https://raceco.example.com/jobs/RACE001",
+    )
+
+    barrier = threading.Barrier(2)
+    results: dict[int, object] = {}
+
+    def worker(index: int) -> None:
+        session = session_factory()
+        try:
+            barrier.wait(timeout=5)
+            results[index] = upsert_job(session, same_new_job, score)
+        except BaseException as exc:  # noqa: BLE001
+            results[index] = exc
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    outcomes = list(results.values())
+    successes = [o for o in outcomes if isinstance(o, tuple)]
+    failures = [o for o in outcomes if isinstance(o, BaseException)]
+
+    # The DB-level UNIQUE constraint is never violated: at most one
+    # thread's INSERT is ever allowed to durably succeed.
+    assert len(successes) == 1
+    # Documents the CURRENT gap: the losing thread gets an exception
+    # (IntegrityError, or SQLite's own "database is locked" under
+    # contention) instead of a graceful fallback-to-existing-row result.
+    assert len(failures) == 1
+
+    verify = session_factory()
+    try:
+        rows = verify.scalars(
+            select(JobRecord).where(JobRecord.fingerprint == _fingerprint(same_new_job))
+        ).all()
+        # No duplicate row was ever created -- the fingerprint UNIQUE
+        # constraint is the real, load-bearing guarantee here.
+        assert len(rows) == 1
     finally:
         verify.close()
 
