@@ -242,11 +242,23 @@ class CompanyResearchService:
             # never the research content itself. Logged here (not re-raised)
             # since this is a handled, expected failure mode for an external
             # data source.
+            # HARD-003 follow-up (adversarial hardening r1, verification
+            # pass): this log call used to be
+            # `logger.warning(..., exc_info=True)` -- sanitizing
+            # `error_message` below (the value persisted/returned) does
+            # NOT sanitize this separate statement. `exc_info=True` logs
+            # the full traceback, including a chained `__cause__`'s own
+            # message (e.g. a raw ConnectionError/HTTPError embedding a
+            # URL, host, or response body for a future network-based
+            # provider) -- the exact leakage class already fixed for the
+            # Bundesagentur/XING collector-run log sites (HARD-002).
+            # Only the event name + provider + sanitized type name are
+            # logged now, matching that same established convention.
             logger.warning(
-                "company_research_provider_failed provider=%s company=%s",
+                "company_research_provider_failed provider=%s company=%s error_type=%s",
                 provider.name,
                 job.company,
-                exc_info=True,
+                type(exc).__name__,
             )
             # HARD-003 (adversarial hardening r1): this used to be
             # `str(exc) or exc.__class__.__name__` -- the ONLY

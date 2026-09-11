@@ -182,13 +182,19 @@ async def test_provider_failure_with_existing_record_serves_stale():
 
 @pytest.mark.asyncio
 async def test_provider_failure_error_field_never_echoes_raw_exception_text():
-    """HARD-003 (adversarial hardening r1): `result.error` (persisted to
-    CompanyResearchRecord.last_error AND returned verbatim via the public
-    API) must be a sanitized, derived string (type(exc).__name__),
-    matching this project's established last_error convention elsewhere
-    (scheduler.py/follow_up_send.py/response_draft_send.py) -- never the
-    raw exception message, which could embed sensitive detail for a
-    future network-based provider."""
+    """HARD-003 (adversarial hardening r1) -- API/PERSISTENCE half only.
+    `result.error` (persisted to CompanyResearchRecord.last_error AND
+    returned verbatim via the public API) must be a sanitized, derived
+    string (type(exc).__name__), matching this project's established
+    last_error convention elsewhere (scheduler.py/follow_up_send.py/
+    response_draft_send.py) -- never the raw exception message, which
+    could embed sensitive detail for a future network-based provider.
+    See test_provider_failure_log_never_echoes_raw_exception_text below
+    for the SEPARATE log-leakage half of this finding -- sanitizing the
+    persisted/returned field does not, by itself, prove the log line is
+    also sanitized; the two are independent code paths in the same
+    except block and were verified/fixed separately.
+    """
     db = _db()
     job = _seed_job(db)
     sensitive_text = "SECRET_PROVIDER_DETAIL_MUST_NOT_LEAK://user:token@internal-host"
@@ -200,6 +206,67 @@ async def test_provider_failure_error_field_never_echoes_raw_exception_text():
 
     assert result.error == "RuntimeError"
     assert sensitive_text not in result.error
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_log_never_echoes_raw_exception_text(caplog):
+    """HARD-003 (adversarial hardening r1 follow-up) -- LOG half.
+    `company_research_provider_failed`'s `logger.warning(..., exc_info=True)`
+    was NOT touched by the earlier fix to `error_message` -- sanitizing
+    what gets PERSISTED/RETURNED does not sanitize what gets LOGGED; they
+    are two separate statements in the same except block. `exc_info=True`
+    logs the full traceback, including a chained `__cause__`'s own
+    message -- exactly the leakage class already fixed for the sibling
+    Bundesagentur/XING collector-run log sites (HARD-002). Constructs a
+    real chained exception (`raise ... from cause`, exactly like
+    production `raise ... from exc` sites produce) so the chain is
+    genuine, not simulated by hand-setting `__cause__`.
+    """
+    db = _db()
+    job = _seed_job(db)
+    sensitive_text = "SECRET_COMPANY_RESEARCH_PROVIDER_DETAIL_MUST_NOT_LEAK"
+
+    try:
+        raise ConnectionError(f"upstream error: {sensitive_text}")
+    except ConnectionError as cause:
+        try:
+            raise RuntimeError("provider request failed") from cause
+        except RuntimeError as chained:
+            provider_error = chained
+
+    provider = _FakeProvider(error=provider_error)
+    service = CompanyResearchService(provider=provider)
+    settings = _settings()
+
+    with caplog.at_level("DEBUG"):
+        result = await service.get_or_run(db, job, settings)
+
+    # 1. API response field.
+    assert sensitive_text not in (result.error or "")
+
+    # 2. Persisted DB field -- read back independently, not via `result`.
+    persisted = db.scalar(
+        select(CompanyResearchRecord).where(CompanyResearchRecord.id == result.research.id)
+        if result.research is not None
+        else select(CompanyResearchRecord)
+    )
+    assert persisted is not None
+    assert sensitive_text not in (persisted.last_error or "")
+
+    # 3. Log text -- the actual gap this test targets.
+    assert sensitive_text not in caplog.text
+    assert (
+        "provider request failed" not in caplog.text
+    )  # the exception's OWN message, also not safe to log raw
+    assert "company_research_provider_failed" in caplog.text
+    assert "RuntimeError" in caplog.text  # sanitized type name IS expected
+
+    # 4. No log record for this event carries a traceback/exc_info.
+    company_research_records = [
+        r for r in caplog.records if r.name == "app.services.company_research"
+    ]
+    assert company_research_records
+    assert all(r.exc_info is None for r in company_research_records)
 
 
 @pytest.mark.asyncio
