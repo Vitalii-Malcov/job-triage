@@ -35,12 +35,28 @@ services:
     env_file:
       - .env
     environment:
-      # Overrides .env's DATABASE_URL (which defaults to SQLite for local
-      # dev) so the container always targets the compose-network Postgres
-      # service by name. ALEMBIC_AUTO_UPGRADE stays false here on
-      # purpose -- migrations are an explicit `docker compose run` step,
-      # never automatic on boot (see docs/DOCKER.md).
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jobtriage}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobtriage}
+      # DEPLOY-001 (Codex master review): discrete parts, not a
+      # pre-assembled DATABASE_URL string. The previous
+      # `DATABASE_URL: postgresql+psycopg://user:${POSTGRES_PASSWORD}@...`
+      # form interpolated the raw password INTO a URI at the shell/compose
+      # layer -- any URI-reserved character in the password (`@ / : # %`)
+      # then corrupted the surrounding URL's delimiter structure, causing
+      # SQLAlchemy to parse the wrong host/user/password split with no
+      # error at all. Passing POSTGRES_HOST/PORT/USER/PASSWORD/DB as their
+      # own atomic env vars means compose never concatenates the password
+      # into a URI string -- `app.core.config.Settings` builds the actual
+      # DATABASE_URL from these parts via `sqlalchemy.engine.URL.create`,
+      # which percent-encodes each part correctly regardless of content
+      # (see that module's docstring and tests/test_config.py). `db` here
+      # is the compose-network Postgres service's own hostname.
+      # ALEMBIC_AUTO_UPGRADE stays false on purpose -- migrations are an
+      # explicit `docker compose run` step, never automatic on boot (see
+      # docs/DOCKER.md).
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-jobtriage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-jobtriage}
       ALEMBIC_AUTO_UPGRADE: "false"
     ports:
       - "${WEB_PORT:-8000}:8000"
@@ -73,7 +89,13 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jobtriage}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jobtriage}
+      # See the `web` service's own POSTGRES_* comment above (DEPLOY-001)
+      # -- same discrete-parts rationale applies here unchanged.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-jobtriage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-jobtriage}
       ALEMBIC_AUTO_UPGRADE: "false"
 
 volumes:

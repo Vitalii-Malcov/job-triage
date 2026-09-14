@@ -2,6 +2,7 @@ from functools import lru_cache
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 from app.providers.email.base import (
     MAX_ADDRESS_LENGTH,
@@ -20,6 +21,33 @@ from app.providers.email.base import (
 class Settings(BaseSettings):
     app_env: str = "development"
     database_url: str = "sqlite:///./job_search.db"
+    # DEPLOY-001 (Codex master review): an operator-supplied discrete-parts
+    # alternative to `database_url` above, built into a PostgreSQL URL by
+    # `_build_database_url_from_postgres_parts` below via
+    # `sqlalchemy.engine.URL.create` rather than raw string interpolation.
+    # This exists because `compose.yaml` previously interpolated
+    # `POSTGRES_PASSWORD` directly into a `user:${PASSWORD}@host` string —
+    # any URI-reserved character in the password (`@ / : # %`) then
+    # corrupted the surrounding URL's own delimiter structure (e.g. an `@`
+    # in the password is indistinguishable from the userinfo/host
+    # separator), so SQLAlchemy would parse the WRONG host/user/password
+    # split with no error at all, only a confusing auth or "unknown host"
+    # failure at connection time. `URL.create` percent-encodes each part
+    # independently before assembling the string, so this is safe for any
+    # password (see tests/test_config.py's reserved-character round-trip
+    # tests). All-or-nothing: `postgres_host` set without
+    # `postgres_user`/`postgres_password`/`postgres_db` also set fails
+    # Settings() construction immediately (see the model_validator below)
+    # rather than silently falling back to `database_url`'s SQLite default
+    # or building an obviously-broken URL. Leaving `postgres_host` unset
+    # (the default) leaves `database_url` exactly as configured above —
+    # this is purely additive, existing SQLite-dev and manually-supplied
+    # `DATABASE_URL` deployments are unaffected.
+    postgres_host: str = ""
+    postgres_port: int = Field(default=5432, ge=1, le=65535)
+    postgres_user: str = ""
+    postgres_password: str = ""
+    postgres_db: str = ""
     # Opt-in only: when true, run `alembic upgrade head` programmatically on
     # startup. Intended for local dev/tests. Production must run migrations
     # explicitly (manually or in CI/CD) before starting the app.
@@ -356,6 +384,52 @@ class Settings(BaseSettings):
                 "automation_candidate_match_max_per_run must be >= "
                 "automation_shortlist_max_per_run (unless automation_shortlist_max_per_run == 0)"
             )
+        return self
+
+    # DEPLOY-001 (Codex master review): builds `database_url` from the
+    # discrete `postgres_*` parts above via `sqlalchemy.engine.URL.create`
+    # — see that field's docstring for why this replaces raw
+    # string-interpolation of the password into a URL. Runs after every
+    # field validator above (mode="after"), and after
+    # `_validate_scheduler_requires_account_key_when_enabled` etc. in
+    # declaration order, but none of those touch `database_url`/
+    # `postgres_*`, so ordering among the `model_validator`s here doesn't
+    # matter. Fails closed (raises, refusing to construct `Settings` at
+    # all) rather than building a URL that is missing a user/password/
+    # database and would only fail confusingly later, at connection time.
+    @model_validator(mode="after")
+    def _build_database_url_from_postgres_parts(self) -> "Settings":
+        if not self.postgres_host:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("postgres_user", self.postgres_user),
+                ("postgres_password", self.postgres_password),
+                ("postgres_db", self.postgres_db),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "postgres_user, postgres_password, and postgres_db must all be set "
+                f"when postgres_host is configured; missing: {', '.join(missing)}"
+            )
+        url = URL.create(
+            drivername="postgresql+psycopg",
+            username=self.postgres_user,
+            password=self.postgres_password,
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_db,
+        )
+        # render_as_string(hide_password=False): the REAL password is
+        # needed in the value actually used to connect — `str(url)`/the
+        # default `render_as_string()` deliberately mask it with `***`
+        # for safe incidental logging/repr elsewhere, but that masked form
+        # is not a valid connection string. Never log `self.database_url`
+        # itself after this point.
+        self.database_url = url.render_as_string(hide_password=False)
         return self
 
 

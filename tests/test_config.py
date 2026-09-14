@@ -299,3 +299,109 @@ def test_xing_lookback_days_matches_gmail_lookback_days_bounds():
     assert settings.xing_lookback_days == 1095
     with pytest.raises(ValidationError):
         Settings(xing_lookback_days=1096)
+
+
+# ---------------------------------------------------------------------------
+# DEPLOY-001 (Codex master review): `compose.yaml` previously interpolated
+# POSTGRES_PASSWORD directly into a `user:${PASSWORD}@host` DATABASE_URL
+# string -- any URI-reserved character in the password (`@ / : # %`) then
+# corrupted the surrounding URL's own delimiter structure. Settings now
+# builds the URL from discrete postgres_* parts via
+# `sqlalchemy.engine.URL.create`, which percent-encodes each part
+# correctly regardless of content.
+# ---------------------------------------------------------------------------
+
+
+def test_database_url_default_is_unaffected_when_postgres_host_unset():
+    settings = Settings()
+    assert settings.database_url == "sqlite:///./job_search.db"
+    assert settings.postgres_host == ""
+
+
+def test_explicit_database_url_is_unaffected_when_postgres_host_unset():
+    """An operator supplying DATABASE_URL directly (no postgres_* parts)
+    must see it passed through completely unmodified -- this is purely
+    additive, not a replacement for that existing configuration path."""
+    settings = Settings(database_url="postgresql+psycopg://user:pass@localhost:5432/db")
+    assert settings.database_url == "postgresql+psycopg://user:pass@localhost:5432/db"
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "p@ss:word/with#hash%percent",
+        "@@@",
+        "a/b/c",
+        "col:on",
+        "hash#tag",
+        "percent%20literal",
+        "back\\slash",
+        "space in password",
+        "quote'and\"quote",
+    ],
+)
+def test_postgres_password_with_reserved_characters_round_trips(password):
+    """The exact adversarial case DEPLOY-001 covers: every URI-reserved
+    character SQLAlchemy's URL parser treats specially must still produce
+    a DATABASE_URL that parses back to the EXACT original password/host/
+    user/db -- never a silently-wrong split.
+    """
+    settings = Settings(
+        postgres_host="db",
+        postgres_port=5432,
+        postgres_user="jobtriage",
+        postgres_password=password,
+        postgres_db="jobtriage",
+    )
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(settings.database_url)
+    assert parsed.password == password
+    assert parsed.username == "jobtriage"
+    assert parsed.host == "db"
+    assert parsed.port == 5432
+    assert parsed.database == "jobtriage"
+    assert parsed.drivername == "postgresql+psycopg"
+
+
+def test_postgres_host_set_without_password_fails_closed():
+    """Required, testable configuration contract: partially-configured
+    postgres_* parts must fail Settings() construction with a clear error
+    rather than building a broken URL or silently falling back to SQLite.
+    """
+    with pytest.raises(ValidationError):
+        Settings(postgres_host="db", postgres_user="jobtriage", postgres_db="jobtriage")
+
+
+def test_postgres_host_set_without_user_fails_closed():
+    with pytest.raises(ValidationError):
+        Settings(postgres_host="db", postgres_password="secret", postgres_db="jobtriage")
+
+
+def test_postgres_host_set_without_db_fails_closed():
+    with pytest.raises(ValidationError):
+        Settings(postgres_host="db", postgres_user="jobtriage", postgres_password="secret")
+
+
+def test_postgres_password_never_appears_in_default_string_repr():
+    """`str(URL)`/the settings object's own repr must never leak the raw
+    password even if something incidentally logs/prints it -- only the
+    dedicated `database_url` attribute (never logged, see
+    app/core/config.py's docstring) carries the real value."""
+    settings = Settings(
+        postgres_host="db",
+        postgres_user="jobtriage",
+        postgres_password="p@ssw0rd/secret",
+        postgres_db="jobtriage",
+    )
+    from sqlalchemy.engine import make_url
+
+    assert "p@ssw0rd/secret" not in str(make_url(settings.database_url))
+
+
+def test_postgres_port_default_and_bounds():
+    assert Settings().postgres_port == 5432
+    with pytest.raises(ValidationError):
+        Settings(postgres_port=0)
+    with pytest.raises(ValidationError):
+        Settings(postgres_port=70_000)
