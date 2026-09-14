@@ -20,6 +20,8 @@ Docker was available locally (Docker Desktop, `docker compose v5.4.0`). A full s
 | Scheduler container smoke test | `docker compose --profile scheduler up -d scheduler` | Started, logged `automation_scheduler_disabled` and exited `0` (both scheduler/digest flags are `false` by default) — **this surfaced a real finding**: with `restart: unless-stopped`, a disabled scheduler exits `0` and restart-loops forever. Fixed in this branch by changing `scheduler`'s restart policy to `on-failure` (see `compose.yaml` and `docs/DEPLOYMENT.md`) — only a genuine crash triggers a restart; a clean, intentional "nothing to do" exit does not. |
 | Teardown | `docker compose --profile scheduler down`, `docker volume rm ai_agent_pgdata` | Clean removal; no leftover containers/networks; the temporary `.env` was deleted immediately after. |
 
+**Update (DEPLOY-002, Codex master review):** the `on-failure` fix above only solved the restart-loop half of the problem — it also meant a deliberately-enabled scheduler would never be resumed by the Docker daemon after a host/daemon restart (`on-failure` is not restarted on daemon startup at all, unlike `unless-stopped`). The scheduler now idles in a no-op loop instead of exiting `0` when disabled, and `compose.yaml` uses `restart: unless-stopped` again — see `docs/DEPLOYMENT.md`'s "Restart behavior" section for the full before/after.
+
 No real external services (IMAP, SMTP, Bundesagentur, Telegram) were contacted — all credential-requiring features stayed in their default-disabled state for this smoke test, consistent with the "do not run real collectors against external accounts" constraint.
 
 Real command output (exit codes, container logs, migration log) was inspected directly during this session, not fabricated.

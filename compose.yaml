@@ -76,12 +76,23 @@ services:
   scheduler:
     build: .
     command: ["python", "-m", "app.scheduler"]
-    # on-failure, not unless-stopped: `python -m app.scheduler` exits 0
-    # (not an error) when both AUTOMATION_SCHEDULER_ENABLED and
-    # TELEGRAM_DAILY_DIGEST_ENABLED are false -- confirmed by local
-    # smoke test (docs/DOCKER.md). unless-stopped would restart-loop
-    # that clean exit forever; on-failure only restarts a real crash.
-    restart: on-failure
+    # DEPLOY-002 (Codex master review): unless-stopped, not on-failure.
+    # `on-failure` restarts a crashed process but is NEVER re-started by
+    # the Docker daemon on its own startup/host reboot, regardless of
+    # exit code -- so a deliberately-enabled scheduler could silently
+    # stay stopped after a host restart while web/db (both
+    # unless-stopped) resumed normally. `python -m app.scheduler` used to
+    # exit 0 immediately whenever both AUTOMATION_SCHEDULER_ENABLED and
+    # TELEGRAM_DAILY_DIGEST_ENABLED are false, which is why on-failure was
+    # chosen originally (unless-stopped restart-loops a container that
+    # keeps exiting 0 on its own) -- see docs/DEPLOYMENT.md's "Restart
+    # behavior" section and docs/TECHNICAL_DEBT.md TD-032 for that
+    # history. The actual fix is in app/scheduler.py, not here: a
+    # disabled scheduler now idles forever instead of exiting, so it
+    # never exits 0 on its own again and unless-stopped can no longer
+    # restart-loop it -- only a real crash or an explicit stop/SIGTERM
+    # ever ends the process now.
+    restart: unless-stopped
     profiles: ["scheduler"]
     depends_on:
       db:

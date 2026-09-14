@@ -89,6 +89,54 @@ def _handle_sigterm(signum, frame) -> None:
     raise _ShutdownRequested()
 
 
+def _run_until_shutdown(coro) -> int:
+    """Shared `asyncio.run` + clean-shutdown wrapper for both the real
+    poll loop and `_idle_forever` (DEPLOY-002) — both must stop the exact
+    same way on Ctrl+C (SIGINT) or `docker stop` (SIGTERM), and always
+    return `0` for either (see `main()`'s two call sites).
+    """
+    try:
+        asyncio.run(coro)
+    except KeyboardInterrupt:
+        logger.info("automation_scheduler_stopped_keyboard_interrupt")
+        print("Automation scheduler stopped.")
+    except _ShutdownRequested:
+        logger.info("automation_scheduler_stopped_sigterm")
+        print("Automation scheduler stopped.")
+    return 0
+
+
+async def _idle_forever() -> None:
+    """DEPLOY-002 (Codex master review): entered instead of returning
+    immediately when both `automation_scheduler_enabled` and
+    `telegram_daily_digest_enabled` are false. Blocks until SIGINT/SIGTERM
+    without doing any work.
+
+    **Why this exists.** `compose.yaml`'s `scheduler` service is opt-in
+    (`profiles: ["scheduler"]`) and must survive a Docker daemon/host
+    restart once an operator has deliberately enabled it — that requires
+    `restart: unless-stopped` (Docker only re-starts previously-running
+    containers on daemon startup for `unless-stopped`/`always`, never for
+    `on-failure`, regardless of the exit code they last stopped with). But
+    `unless-stopped` restart-loops any container that exits `0` on its
+    own while the daemon keeps running — which `main()` used to do
+    immediately whenever both feature flags were false, since there was
+    nothing to poll. The fix is not a restart-policy trick (no single
+    Compose restart policy gets both "survives a daemon restart" AND
+    "never restart-loops on a clean disabled exit" for a process that
+    still exits `0` sometimes) — it's making the disabled state a
+    legitimate long-running idle state instead of an exit. A disabled
+    scheduler container now simply never exits `0` on its own; the only
+    exits are a real crash (`unless-stopped` restarts it, same as
+    `on-failure` already did) or an explicit stop
+    (`docker stop`/`compose down`/daemon shutdown sending SIGTERM, which
+    `unless-stopped` correctly does not fight — see AUD-008's existing
+    `_ShutdownRequested` handling, reused here unchanged).
+    """
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def _poll_loop(settings) -> None:
     """Poll persisted schedule state every `automation_scheduler_poll_seconds`,
     opening and closing a fresh `Session` for each tick (never one
@@ -196,13 +244,20 @@ def main() -> int:
     # so a worker started for "digest only" never triggers an
     # automation cycle, and vice versa.
     if not settings.automation_scheduler_enabled and not settings.telegram_daily_digest_enabled:
+        # DEPLOY-002 (Codex master review): idle instead of exiting 0 --
+        # see `_idle_forever`'s docstring for why a clean exit here is
+        # exactly what makes `restart: unless-stopped` restart-loop this
+        # container. Still logs the same informative message; an operator
+        # inspecting `docker compose logs scheduler` sees the same signal
+        # as before, the container just stays "Up" instead of "Exited (0)".
         logger.info("automation_scheduler_disabled")
         print(
             "Automation scheduler and Telegram daily digest are both disabled "
             "(AUTOMATION_SCHEDULER_ENABLED=false, TELEGRAM_DAILY_DIGEST_ENABLED=false) "
-            "-- exiting without starting a poll loop."
+            "-- idling until stopped. Enable one of these settings and restart the "
+            "container to begin polling."
         )
-        return 0
+        return _run_until_shutdown(_idle_forever())
 
     try:
         validate_scheduler_settings(settings)
@@ -216,15 +271,7 @@ def main() -> int:
         print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
 
-    try:
-        asyncio.run(_poll_loop(settings))
-    except KeyboardInterrupt:
-        logger.info("automation_scheduler_stopped_keyboard_interrupt")
-        print("Automation scheduler stopped.")
-    except _ShutdownRequested:
-        logger.info("automation_scheduler_stopped_sigterm")
-        print("Automation scheduler stopped.")
-    return 0
+    return _run_until_shutdown(_poll_loop(settings))
 
 
 if __name__ == "__main__":
