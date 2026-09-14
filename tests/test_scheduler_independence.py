@@ -196,6 +196,19 @@ class TestPollLoopGating:
 
 class TestMainEntrypointGating:
     def test_both_disabled_exits_cleanly_without_starting_loop(self, monkeypatch, capsys):
+        """DEPLOY-002 (Codex master review): `main()` no longer returns
+        immediately when both flags are disabled -- it now enters
+        `_idle_forever`, a genuine block-forever loop in production (see
+        `app/scheduler.py`'s own docstring for why: `restart:
+        unless-stopped` needs the container to never exit 0 on its own).
+        `_idle_forever` is mocked here as a fast no-op -- exactly the
+        same pattern `tests/test_scheduler_idle.py` uses -- so this test
+        can still assert its actual job (the poll loop is never started,
+        the "disabled" message is logged) without blocking for real.
+        `_idle_forever`'s own "never returns on its own" contract is
+        covered by `test_scheduler_idle.py::TestIdleForeverNeverReturnsOnItsOwn`,
+        not re-proven here.
+        """
         settings = Settings(automation_scheduler_enabled=False, telegram_daily_digest_enabled=False)
         monkeypatch.setattr("app.scheduler.get_settings", lambda: settings)
 
@@ -205,11 +218,19 @@ class TestMainEntrypointGating:
             nonlocal loop_started
             loop_started = True
 
+        idle_forever_called = False
+
+        async def _fake_idle_forever():
+            nonlocal idle_forever_called
+            idle_forever_called = True
+
         monkeypatch.setattr("app.scheduler._poll_loop", _fake_poll_loop)
+        monkeypatch.setattr("app.scheduler._idle_forever", _fake_idle_forever)
 
         exit_code = main()
 
         assert exit_code == 0
+        assert idle_forever_called is True
         assert loop_started is False
         assert "disabled" in capsys.readouterr().out.lower()
 
