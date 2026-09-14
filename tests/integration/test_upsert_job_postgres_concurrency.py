@@ -1,9 +1,9 @@
-"""HARD-007 verification pass (adversarial hardening r1): upgrades the
-SQLite-only reproduction of `app.db.repositories.upsert_job`'s
-concurrent-new-fingerprint race
-(tests/test_repository.py::test_concurrent_insert_of_the_same_new_job_can_raise_unhandled_integrity_error)
-to real PostgreSQL-dialect evidence, per the explicit instruction that a
-SQLite-only concurrency claim is not sufficient production evidence.
+"""HARD-007 (Codex master review): proves `app.db.repositories.upsert_job`'s
+fix for the concurrent-new-fingerprint race against REAL PostgreSQL, not
+just the SQLite reproduction
+(tests/test_repository.py::test_concurrent_insert_of_the_same_new_job_converges_on_one_row),
+per the explicit instruction that a SQLite-only concurrency claim is not
+sufficient production evidence.
 
 **The scenario.** Two independent Sessions/connections race to
 `upsert_job()` the exact same brand-new (never-before-seen) fingerprint.
@@ -20,28 +20,22 @@ module-level name `upsert_job` itself calls, not by touching
 observed `existing is None` before either is allowed to proceed to its
 INSERT -- deterministically reproducing the true race every run.
 
-**What this proves (evidence for HARD-007, NOT a fix):**
+**What this proves (HARD-007 fix, real PostgreSQL):**
 - `JobRecord.fingerprint`'s DB-level UNIQUE constraint
   (`uq_jobs_fingerprint`) really does hold under genuine PostgreSQL
   concurrency -- exactly one row is ever created, never two.
-- The exact exception class the LOSING thread receives on real
-  PostgreSQL (psycopg wraps this as `sqlalchemy.exc.IntegrityError`,
-  confirmed below -- not a generic `OperationalError` or a driver-level
-  surprise).
-- Whether the losing Session remains usable after catching that
-  exception WITHOUT an explicit `rollback()` first (PostgreSQL, unlike
-  SQLite, poisons the entire transaction after any error until an
-  explicit ROLLBACK -- this is a real, dialect-specific behavior
-  difference worth confirming directly rather than assuming).
+- The losing call no longer raises `IntegrityError` out of `upsert_job`
+  at all -- it converges on the winner's row (`created=False`) with the
+  normal existing-row update semantics applied, exactly like a
+  sequential second call would.
+- The Session `upsert_job` was called with remains fully usable
+  immediately afterward with NO extra caller-side `rollback()` required
+  -- PostgreSQL, unlike SQLite, poisons the entire transaction after any
+  error until an explicit ROLLBACK, and `upsert_job` now performs that
+  rollback itself as part of the race-recovery path (see that
+  function's own docstring).
 - That a subsequent, unrelated, legitimate `upsert_job()` call on the
-  SAME losing Session succeeds normally once the poisoned transaction is
-  rolled back -- i.e. the caller (once it learns to `rollback()`, which
-  `upsert_job` itself currently does NOT do for this specific race) is
-  not left permanently stuck.
-
-Per this session's explicit instruction, `upsert_job` is NOT fixed here
--- this only upgrades HARD-007's evidence from SQLite to real
-PostgreSQL and is reserved for Codex review.
+  SAME (former loser) Session succeeds normally right after.
 
 **Local execution:** skipped automatically unless `TEST_POSTGRES_URL` is
 set. Run `alembic upgrade head` against that same database first --
@@ -57,7 +51,6 @@ import threading
 
 import pytest
 from sqlalchemy import create_engine, delete, func, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import JobRecord
@@ -119,16 +112,31 @@ def _synchronized_get_job_by_fingerprint(read_barrier: threading.Barrier):
     """
     from app.db.repositories import get_job_by_fingerprint as real_get_job_by_fingerprint
 
+    thread_local = threading.local()
+
     def _wrapped(db, job):
         result = real_get_job_by_fingerprint(db, job)
-        read_barrier.wait(timeout=5)
+        # HARD-007 fix note: upsert_job's own race-recovery path now
+        # calls get_job_by_fingerprint a SECOND time (the post-rollback
+        # re-read to find the winner) -- only on the LOSING thread, and
+        # only after the INSERT has already failed. That second call
+        # must never touch this 2-party barrier again (only one thread
+        # would ever reach it a second time, so a second .wait() call
+        # would time out waiting for a partner that will never arrive).
+        # Only each thread's FIRST call -- the actual pre-INSERT
+        # existence check this barrier exists to synchronize -- waits.
+        if not getattr(thread_local, "used_barrier", False):
+            thread_local.used_barrier = True
+            read_barrier.wait(timeout=5)
         return result
 
     return _wrapped
 
 
 class TestRealConcurrentNewJobInsert:
-    def test_only_one_row_created_loser_gets_integrity_error(self, pg_session_factory, monkeypatch):
+    def test_only_one_row_created_loser_converges_without_raising(
+        self, pg_session_factory, monkeypatch
+    ):
         same_new_job = _make_job(1)
         score = JobScore(score=80, recommendation="APPLY")
         fingerprint = _fingerprint(same_new_job)
@@ -160,18 +168,14 @@ class TestRealConcurrentNewJobInsert:
         successes = [o for o in outcomes if isinstance(o, tuple)]
         failures = [o for o in outcomes if isinstance(o, BaseException)]
 
-        # Exactly one thread's INSERT durably wins.
-        assert len(successes) == 1
-        assert len(failures) == 1
-
-        # The exact exception class real PostgreSQL/psycopg produces via
-        # SQLAlchemy for this race -- confirms it's a clean, recognizable
-        # IntegrityError, not an opaque driver-level surprise.
-        loser_exc = failures[0]
-        assert isinstance(loser_exc, IntegrityError)
-        assert (
-            "uq_jobs_fingerprint" in str(loser_exc.orig) or "unique" in str(loser_exc.orig).lower()
-        )
+        # HARD-007 fix: no unhandled IntegrityError escapes either thread
+        # -- both logical calls succeed and converge on the SAME row.
+        assert not failures, f"upsert_job raised for the losing call: {failures}"
+        assert len(successes) == 2
+        created_flags = sorted(created for _record, created in successes)
+        assert created_flags == [False, True]
+        record_ids = {record.id for record, _created in successes}
+        assert len(record_ids) == 1
 
         verify = pg_session_factory()
         try:
@@ -182,19 +186,19 @@ class TestRealConcurrentNewJobInsert:
         finally:
             verify.close()
 
-    def test_losing_session_is_poisoned_until_explicit_rollback_then_usable_again(
+    def test_losing_session_remains_usable_immediately_with_no_caller_side_rollback(
         self, pg_session_factory, monkeypatch
     ):
-        """PostgreSQL-specific behavior (does NOT reproduce on SQLite):
-        after ANY statement fails inside a transaction, PostgreSQL
-        refuses every further statement in that same transaction
-        ("current transaction is aborted, commands ignored until end of
-        transaction block") until an explicit ROLLBACK. Confirms
-        `upsert_job`'s caller -- not `upsert_job` itself, which does not
-        currently catch this race's IntegrityError at all -- MUST
-        rollback before reusing the Session, and confirms that doing so
-        is sufficient to make the Session fully usable again (no need to
-        discard/recreate it).
+        """PostgreSQL-specific behavior this guards against (does NOT
+        reproduce on SQLite): after ANY statement fails inside a
+        transaction, PostgreSQL refuses every further statement in that
+        same transaction ("current transaction is aborted, commands
+        ignored until end of transaction block") until an explicit
+        ROLLBACK. `upsert_job` now performs that rollback itself, as part
+        of its own race-recovery path (see its docstring) -- this proves
+        the CALLER needs to do nothing extra: the Session is immediately
+        usable the instant `upsert_job` returns normally, for both a
+        trivial read and a genuinely new, unrelated `upsert_job` call.
         """
         same_new_job = _make_job(2)
         score = JobScore(score=80, recommendation="APPLY")
@@ -216,9 +220,9 @@ class TestRealConcurrentNewJobInsert:
             except BaseException as exc:  # noqa: BLE001
                 results[index] = exc
             # Deliberately NOT closing the session here -- the main
-            # thread needs to inspect the loser's session state (poisoned
-            # vs. usable) below, from outside this thread, only after
-            # this thread has already finished touching it.
+            # thread needs to inspect the loser's session state below,
+            # from outside this thread, only after this thread has
+            # already finished touching it.
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
         for t in threads:
@@ -226,12 +230,12 @@ class TestRealConcurrentNewJobInsert:
         for t in threads:
             t.join(timeout=20)
 
-        winner_index = next(i for i, r in results.items() if isinstance(r, tuple))
-        loser_index = next(i for i, r in results.items() if isinstance(r, BaseException))
-        loser_exc = results[loser_index]
+        assert all(isinstance(r, tuple) for r in results.values()), (
+            f"upsert_job raised instead of converging: {results}"
+        )
+        winner_index = next(i for i, r in results.items() if r[1] is True)
+        loser_index = next(i for i, r in results.items() if r[1] is False)
         loser_session = sessions[loser_index]
-
-        assert isinstance(loser_exc, IntegrityError)
 
         # Restore the REAL (unwrapped) get_job_by_fingerprint before the
         # follow-up "subsequent normal work succeeds" check below -- the
@@ -244,16 +248,9 @@ class TestRealConcurrentNewJobInsert:
         monkeypatch.undo()
 
         try:
-            # Before rollback: PostgreSQL has poisoned this transaction --
-            # even a trivial, unrelated read must fail.
-            with pytest.raises(Exception):  # noqa: B017, PT011 -- exact type is driver-level (InFailedSqlTransaction)
-                loser_session.execute(select(func.count()).select_from(JobRecord))
-
-            # After an explicit rollback, the Session is fully usable
-            # again -- both for a trivial read AND for a genuinely new,
-            # unrelated upsert_job call (proves the caller isn't
-            # permanently stuck, just needs to know to rollback first).
-            loser_session.rollback()
+            # No caller-side rollback anywhere in this test -- upsert_job
+            # already performed it internally. A trivial, unrelated read
+            # must succeed immediately.
             loser_session.execute(select(func.count()).select_from(JobRecord))
 
             unrelated_job = _make_job(3)

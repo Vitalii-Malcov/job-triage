@@ -143,21 +143,60 @@ def _finalize_job_write(db: Session, record: JobRecord) -> JobRecord:
     return record
 
 
+def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: datetime) -> None:
+    """The normal "already exists" update semantics — factored out so
+    HARD-007's race-recovery path (below) can apply the EXACT same update
+    a sequential second call would have made, rather than a bespoke
+    partial update. `description` is only ever overwritten with a
+    non-blank value — an empty scrape must never blank out a previously
+    good description.
+    """
+    record.last_seen_at = now
+    record.score = score.score
+    record.recommendation = score.recommendation
+    record.skills_json = json.dumps(job.skills)
+    record.data_confidence = score.data_confidence
+    record.skill_source = job.skill_source
+    record.must_have_skills_json = json.dumps(job.must_have_skills)
+    record.nice_to_have_skills_json = json.dumps(job.nice_to_have_skills)
+    if job.description.strip():
+        record.description = job.description
+
+
 def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
+    """HARD-007 (Codex master review): two concurrent calls racing to
+    insert the SAME brand-new fingerprint can both observe `existing is
+    None` above (the classic check-then-act TOCTOU window between this
+    function's own SELECT and its INSERT) — `JobRecord.fingerprint`'s
+    UNIQUE constraint (`uq_jobs_fingerprint`) still guarantees only one
+    row is ever durably created, but the LOSING call used to receive an
+    unhandled `IntegrityError` with its Session left in PostgreSQL's
+    poisoned-transaction state (every further statement refused until an
+    explicit ROLLBACK) — see
+    tests/integration/test_upsert_job_postgres_concurrency.py for the
+    real-PostgreSQL evidence this fixes.
+
+    The recovery path below deliberately does NOT blindly retry the
+    INSERT (the fingerprint is durably taken by construction — a second
+    INSERT attempt would just fail the same way again). Instead it
+    rolls back immediately (clears the poisoned transaction so the
+    Session stays usable), re-reads by fingerprint, and — if a winner
+    row is now found — converges on it via the EXACT same update
+    semantics `_apply_job_update_fields` already applies for a
+    sequential "already exists" call (`created=False`), including the
+    `job_reference_tokens` sync (`_finalize_job_write`). This makes a
+    race indistinguishable in outcome from the two calls having simply
+    run sequentially in whichever order actually committed first. If no
+    winner is found after rollback, the `IntegrityError` was NOT this
+    race (some other constraint violation, or the winner's row was
+    deleted between the failed INSERT and this re-read) and is
+    re-raised unchanged rather than silently swallowed.
+    """
     fingerprint = _fingerprint(job)
     existing = get_job_by_fingerprint(db, job)
     now = datetime.now(UTC)
     if existing:
-        existing.last_seen_at = now
-        existing.score = score.score
-        existing.recommendation = score.recommendation
-        existing.skills_json = json.dumps(job.skills)
-        existing.data_confidence = score.data_confidence
-        existing.skill_source = job.skill_source
-        existing.must_have_skills_json = json.dumps(job.must_have_skills)
-        existing.nice_to_have_skills_json = json.dumps(job.nice_to_have_skills)
-        if job.description.strip():
-            existing.description = job.description
+        _apply_job_update_fields(existing, job, score, now)
         _finalize_job_write(db, existing)
         return existing, False
 
@@ -181,7 +220,16 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         last_seen_at=now,
     )
     db.add(record)
-    _finalize_job_write(db, record)
+    try:
+        _finalize_job_write(db, record)
+    except IntegrityError:
+        db.rollback()
+        winner = get_job_by_fingerprint(db, job)
+        if winner is None:
+            raise
+        _apply_job_update_fields(winner, job, score, now)
+        _finalize_job_write(db, winner)
+        return winner, False
     return record, True
 
 

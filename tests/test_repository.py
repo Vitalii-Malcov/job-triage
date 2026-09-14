@@ -452,30 +452,21 @@ def test_concurrent_updates_to_same_job_reference_never_duplicate_token_rows(tmp
         verify.close()
 
 
-def test_concurrent_insert_of_the_same_new_job_can_raise_unhandled_integrity_error(tmp_path):
-    """HARD-007 (adversarial hardening r1), documented but NOT fixed --
-    see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007 for why a fix
-    (catch IntegrityError, fall back to re-reading and treating it as an
-    update) is deliberately deferred to independent Codex review rather
-    than implemented here, since it touches upsert_job's write/retry
-    semantics.
-
-    `JobRecord.fingerprint` DOES have a DB-level UNIQUE constraint
-    (`uq_jobs_fingerprint`), so this race can never silently create two
-    rows with the same fingerprint -- the data-integrity guarantee
-    itself holds. But unlike every other insert-race site in this
-    project (e.g. get_or_create_schedule, create_approval,
-    claim_send_attempt, upsert_message), `upsert_job`'s new-record
-    branch (`_finalize_job_write` -> `db.commit()`) has NO
-    `try/except IntegrityError` around it. Two sessions racing to
-    persist the exact same brand-new fingerprint concurrently: one
-    commits successfully; the other's commit can raise `IntegrityError`
-    UNCAUGHT out of `upsert_job` -- an ugly, unhandled 500-class failure
-    instead of the graceful "someone else already inserted it, use
-    their row" resolution this project uses everywhere else it has the
-    same race shape. This test proves the current (unhandled) behavior
-    on the losing side; it is not something a fix should change what
-    WHICH thread wins, only how the loser is treated.
+def test_concurrent_insert_of_the_same_new_job_converges_on_one_row(tmp_path):
+    """HARD-007 (Codex master review): two Sessions racing to
+    `upsert_job()` the exact same brand-new fingerprint used to leave the
+    LOSING call's `IntegrityError` unhandled -- an ugly, unhandled
+    500-class failure instead of the graceful "someone else already
+    inserted it, use their row" resolution this project uses everywhere
+    else it has the same race shape (get_or_create_schedule,
+    create_approval, claim_send_attempt, upsert_message). `upsert_job`
+    now catches that `IntegrityError`, rolls back, re-reads by
+    fingerprint, and converges on the winner's row via the exact same
+    update semantics a sequential second call would apply -- see
+    `app.db.repositories.upsert_job`'s own docstring. This is the SQLite
+    reproduction; tests/integration/test_upsert_job_postgres_concurrency.py
+    proves the same fix against real PostgreSQL (where, unlike SQLite,
+    the losing transaction is also poisoned until an explicit ROLLBACK).
     """
     engine = create_engine(
         f"sqlite:///{tmp_path / 'concurrent_new_job_insert.db'}",
@@ -516,13 +507,16 @@ def test_concurrent_insert_of_the_same_new_job_can_raise_unhandled_integrity_err
     successes = [o for o in outcomes if isinstance(o, tuple)]
     failures = [o for o in outcomes if isinstance(o, BaseException)]
 
-    # The DB-level UNIQUE constraint is never violated: at most one
-    # thread's INSERT is ever allowed to durably succeed.
-    assert len(successes) == 1
-    # Documents the CURRENT gap: the losing thread gets an exception
-    # (IntegrityError, or SQLite's own "database is locked" under
-    # contention) instead of a graceful fallback-to-existing-row result.
-    assert len(failures) == 1
+    # Both logical calls now succeed -- no unhandled IntegrityError
+    # escapes either thread -- and converge on the SAME row: exactly one
+    # `created=True` (the durable winner) and one `created=False` (the
+    # loser, having converged via the race-recovery path).
+    assert not failures, f"upsert_job raised for the losing call: {failures}"
+    assert len(successes) == 2
+    created_flags = sorted(created for _record, created in successes)
+    assert created_flags == [False, True]
+    record_ids = {record.id for record, _created in successes}
+    assert len(record_ids) == 1
 
     verify = session_factory()
     try:
@@ -532,6 +526,13 @@ def test_concurrent_insert_of_the_same_new_job_can_raise_unhandled_integrity_err
         # No duplicate row was ever created -- the fingerprint UNIQUE
         # constraint is the real, load-bearing guarantee here.
         assert len(rows) == 1
+        # The loser's update semantics were actually applied to the
+        # winner's row (HARD-007 requirement 4: preserve the normal
+        # existing-row update semantics) -- score/recommendation from the
+        # SAME `score` both threads passed, confirming the converge path
+        # ran a real update rather than a no-op.
+        assert rows[0].score == score.score
+        assert rows[0].recommendation == score.recommendation
     finally:
         verify.close()
 
