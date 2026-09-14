@@ -1158,7 +1158,25 @@ class ResponseDraftSendRecord(Base):
       (checking whether the recruiter actually received the reply, and
       deciding what to do next) is intentionally out of scope for Stage
       7D — this table's job is only to make the ambiguity visible and
-      prevent an automated duplicate-send risk, not to resolve it.
+      prevent an automated duplicate-send risk, not to resolve it. Also
+      reached (HARD-008, Codex master review) when a row is found
+      PENDING with `send_attempted=True` on a later attempt — see
+      `send_attempted` below — since a successful send whose SENT-commit
+      itself then failed is indistinguishable, from a later reader's
+      perspective, from a crash mid-send or a still-live concurrent
+      attempt; all three fail closed to UNCERTAIN rather than ever being
+      silently retried.
+
+    **`send_attempted`** (HARD-008, Codex master review) durably
+    distinguishes "transmission was never attempted for this claim"
+    (safe to hand to a later request) from "transmission may already be
+    underway or already happened" (never blindly retried) — see that
+    column's own docstring below and
+    `app.db.response_draft_approval_repository.begin_transmission`. This
+    closes the gap where a `PENDING` row could previously be stranded
+    forever with no recovery path if the outbound provider's `send()`
+    call succeeded but the local commit recording `SENT` afterward
+    failed (a DB connection drop or process kill at that exact instant).
 
     Deliberately NOT linked to `GmailMessageAnalysisRecord`/`JobRecord`
     via a ForeignKey, same rationale as `ResponseDraftApprovalRecord`.
@@ -1195,6 +1213,29 @@ class ResponseDraftSendRecord(Base):
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # HARD-008 (Codex master review, crash/CAS recovery): False for the
+    # entire window between winning the PENDING claim and the instant
+    # right before `OutboundEmailProvider.send` is actually invoked;
+    # flipped to True by a dedicated CAS
+    # (`app.db.response_draft_approval_repository.begin_transmission`)
+    # immediately before that call, in the same request that will make
+    # it. A row found PENDING with `send_attempted=False` is PROVABLY
+    # pre-transmission — the process that claimed it crashed (or never
+    # got that far) before any network call was made, so it is always
+    # safe to let a later request take over (see
+    # `app.services.response_draft_send._resolve_existing_send_record`).
+    # A row found PENDING with `send_attempted=True` means transmission
+    # may already be underway (either a live concurrent request, a crash
+    # mid-send, or a successful send whose SENT-recording commit itself
+    # then failed) — indistinguishable from here, so it is NEVER retried;
+    # instead it is moved to the fail-closed terminal `UNCERTAIN` state.
+    # `begin_transmission`'s own CAS (`WHERE send_attempted=False`) is
+    # what makes "who gets to actually call the provider" mutually
+    # exclusive between concurrent requests — this column is the single
+    # source of truth for that exclusivity, not `status` alone. Exact
+    # mirror of `FollowUpSendRecord.send_attempted` (see that column's
+    # own docstring, S7E-010).
+    send_attempted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # RFC 5322 Message-ID the provider reported for the sent message, if
     # any — traceability only, never an identity/dedup key (mirrors
     # GmailMessageRecord.message_id_header's own convention). Set only on

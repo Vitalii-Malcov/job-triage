@@ -16,6 +16,7 @@ from app.db.candidate_profile_repository import apply_candidate_profile_patch
 from app.db.gmail_repository import upsert_message
 from app.db.models import CandidateProfileRecord, JobRecord
 from app.db.response_draft_approval_repository import (
+    begin_transmission,
     claim_send_attempt,
     get_approval_for_draft,
     get_send_for_draft,
@@ -38,7 +39,6 @@ from app.services.response_draft_send import (
     ResponseDraftNotApprovedError,
     ResponseDraftNotFoundError,
     ResponseDraftSendFailedError,
-    ResponseDraftSendInProgressError,
     ResponseDraftSendOutcomeUncertainError,
     approve_or_reject_response_draft,
     get_response_draft_state,
@@ -316,16 +316,25 @@ class TestDoubleSendRetryConcurrency:
             send_response_draft(db, ACCOUNT, draft.id, provider)
         assert provider.call_count == 1  # never called a second time
 
-    def test_concurrent_pending_claim_blocks_a_second_request(self, db):
-        """Simulates a genuine race: another request's claim_send_attempt
-        already committed a PENDING row before this request reaches the
-        gate — this request must refuse to call the provider at all.
+    def test_pending_claim_with_no_transmission_attempted_yet_is_safely_reclaimed(self, db):
+        """HARD-008 (Codex master review) invariant 1: a PENDING row with
+        `send_attempted=False` is PROVABLY pre-transmission -- a bare
+        `claim_send_attempt` INSERT alone, before any request has reached
+        `begin_transmission`, does NOT mean a send is genuinely in
+        flight (e.g. a process crashed between claiming and attempting).
+        A later request must be able to safely take over and actually
+        send -- this is a deliberate behavior CHANGE from the pre-HARD-008
+        world, where a bare claim alone blocked every subsequent request
+        forever with no recovery path (see
+        TestStrandedPendingAfterSuccessfulSendCommitFailure below for the
+        related, now-fixed scenario).
         """
         _seed_job(db)
         msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
         draft, approval = _generate_and_approve_draft(db, msg_id=msg_id)
 
-        # A concurrent request "wins" the claim first.
+        # Simulates a crashed prior request: it claimed PENDING but never
+        # reached begin_transmission (send_attempted stays False).
         claim_send_attempt(
             db,
             account_key=ACCOUNT,
@@ -335,9 +344,39 @@ class TestDoubleSendRetryConcurrency:
         )
 
         provider = FakeOutboundProvider()
-        with pytest.raises(ResponseDraftSendInProgressError):
+        record = send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        assert record.status == "SENT"
+        assert provider.call_count == 1
+
+    def test_pending_with_transmission_already_attempted_blocks_a_second_request(self, db):
+        """Once `send_attempted=True` (this request actually reached
+        `begin_transmission`), a concurrent second request must refuse to
+        call the provider at all -- and, per HARD-008 invariant 4, the
+        stranded row is reconciled to the terminal UNCERTAIN state rather
+        than left blocking forever.
+        """
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, approval = _generate_and_approve_draft(db, msg_id=msg_id)
+
+        record, _claimed = claim_send_attempt(
+            db,
+            account_key=ACCOUNT,
+            response_draft_id=draft.id,
+            gmail_message_id=draft.gmail_message_id,
+            approval_id=approval.id,
+        )
+        won = begin_transmission(db, record)
+        assert won is True
+
+        provider = FakeOutboundProvider()
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
             send_response_draft(db, ACCOUNT, draft.id, provider)
         assert provider.call_count == 0
+
+        send_record = get_send_for_draft(db, ACCOUNT, draft.id)
+        assert send_record.status == "UNCERTAIN"
 
     def test_provider_failure_marks_failed_and_does_not_consume_approval(self, db):
         _seed_job(db)
@@ -655,32 +694,32 @@ class TestStateEndpointHelper:
 
 
 class TestStrandedPendingAfterSuccessfulSendCommitFailure:
-    """HARD-008 (adversarial hardening r1), documented but NOT fixed --
-    see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-008 for why a fix is
-    deliberately deferred to independent Codex review: it's exactly the
-    "any semantic change here must be marked REQUIRES CODEX" case for
-    outbound-send ambiguity.
+    """HARD-008 (Codex master review): the fix for the P1 finding from
+    the earlier adversarial hardening pass. Failure-injection Scenario
+    F/G from the Phase 6 SMTP ambiguity audit: the provider's `send()`
+    call succeeds (message genuinely transmitted and accepted), but the
+    LOCAL commit that would record `SENT` afterward fails (simulating a
+    DB connection drop / process kill at that exact instant, by
+    monkeypatching `mark_send_sent` to raise AFTER the fake provider has
+    already recorded the message as sent).
 
-    Failure-injection Scenario F/G from the Phase 6 SMTP ambiguity audit:
-    the provider's `send()` call succeeds (message genuinely transmitted
-    and accepted), but the LOCAL commit that would record `SENT`
-    afterward fails (simulating a DB connection drop / process kill at
-    that exact instant, by monkeypatching `mark_send_sent` to raise
-    AFTER the fake provider has already recorded the message as sent).
-
-    `follow_up_send.py`'s sibling module has a `send_attempted` CAS flag
-    that lets a later request recognize "a send may already be in
-    flight/done" and fail closed to a terminal UNCERTAIN state.
-    `response_draft_send.py` has no equivalent -- this test proves the
-    resulting `PENDING` row stays `PENDING` FOREVER: a later retry
-    attempt does not resolve it, does not recover it, and does not
-    let a human ever see it as needing review. This is the single
-    highest-priority finding in this hardening pass (HARD-008, P1).
+    Before this fix, the resulting `PENDING` row stayed `PENDING`
+    FOREVER -- no later attempt ever resolved, recovered, or surfaced it
+    for human review. `send_attempted` (mirroring
+    `app.services.follow_up_send`'s proven model) now lets a LATER
+    attempt recognize "transmission was attempted for this claim" and
+    reconcile it to the terminal `UNCERTAIN` state instead.
     """
 
-    def test_send_record_is_stranded_pending_forever_after_post_success_commit_failure(
-        self, db, monkeypatch
-    ):
+    def test_original_request_propagates_the_raw_commit_failure(self, db, monkeypatch):
+        """The ORIGINAL request that hit the commit failure gets the raw
+        exception back (nothing to gracefully degrade to here -- the
+        caller genuinely doesn't know if the write happened), leaving the
+        row PENDING with send_attempted=True. Recovery is a LATER
+        request's job (see the next test) -- exactly matching
+        `app.services.follow_up_send`'s own bare `mark_send_sent` call,
+        which has the same property.
+        """
         _seed_job(db)
         msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
         draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
@@ -702,27 +741,83 @@ class TestStrandedPendingAfterSuccessfulSendCommitFailure:
         assert provider.call_count == 1
         assert len(provider.sent_messages) == 1
 
-        # But the local record never reached SENT -- it is stuck at
-        # PENDING, because claim_send_attempt already committed that
-        # state before provider.send() was ever called.
-        state = get_response_draft_state(db, ACCOUNT, draft.id)
-        assert state.send is not None
-        assert state.send.status == "PENDING"
+        # The local record is left PENDING, but now with send_attempted
+        # durably recorded True -- the crash-recovery marker HARD-008
+        # adds. begin_transmission's own CAS commit (which happens
+        # BEFORE provider.send() is ever called) is what makes this
+        # durable regardless of the later mark_send_sent failure.
+        send_record = get_send_for_draft(db, ACCOUNT, draft.id)
+        assert send_record.status == "PENDING"
+        assert send_record.send_attempted is True
 
-        # THE GAP: unlike follow_up_send.py's send_attempted-gated
-        # recovery, a subsequent attempt to send the SAME draft again
-        # does not resolve, retry, or surface this for human review --
-        # it just fails with "already in progress", forever. There is
-        # no code path anywhere in this module that ever moves a
-        # stranded PENDING row to a terminal state.
+    def test_a_later_attempt_reconciles_the_stranded_row_to_uncertain(self, db, monkeypatch):
+        """THE FIX: unlike before, a subsequent attempt to send the SAME
+        draft no longer blocks forever with no recovery path -- it
+        reconciles the stranded PENDING+send_attempted=True row to the
+        terminal UNCERTAIN state, never silently retries, and never
+        calls the provider a second time (no duplicate email).
+        """
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider()
+
+        def _mark_send_sent_raises(*args, **kwargs):
+            raise RuntimeError("simulated DB connection drop during the SENT commit")
+
+        monkeypatch.setattr(
+            "app.services.response_draft_send.mark_send_sent", _mark_send_sent_raises
+        )
+        with pytest.raises(RuntimeError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+        monkeypatch.undo()
+
         provider_second_attempt = FakeOutboundProvider()
-        with pytest.raises(ResponseDraftSendInProgressError):
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
             send_response_draft(db, ACCOUNT, draft.id, provider_second_attempt)
-        # The second attempt must not have transmitted a duplicate email
-        # -- confirming this is a "stuck," not a "silently double-sent,"
-        # gap -- but "stuck forever with no recovery path" is still a
-        # real, documented finding (HARD-008).
+        # No duplicate email -- the provider is never called a second
+        # time for a row whose transmission may already be underway/done.
         assert provider_second_attempt.call_count == 0
 
         state_after_retry = get_response_draft_state(db, ACCOUNT, draft.id)
-        assert state_after_retry.send.status == "PENDING"
+        assert state_after_retry.send.status == "UNCERTAIN"
+
+        # Terminal: a THIRD attempt is refused the same way, still no
+        # provider call, and the row stays UNCERTAIN, never oscillating.
+        provider_third_attempt = FakeOutboundProvider()
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider_third_attempt)
+        assert provider_third_attempt.call_count == 0
+        assert get_send_for_draft(db, ACCOUNT, draft.id).status == "UNCERTAIN"
+
+
+class TestMarkSendSentCasResultIsChecked:
+    """HARD-008 invariant 7: `mark_send_sent`'s own CAS result must be
+    checked, not merely called and ignored -- defense-in-depth for the
+    (should-be-unreachable, given begin_transmission's exclusivity) case
+    where it returns False rather than raising.
+    """
+
+    def test_mark_send_sent_returning_false_is_treated_as_uncertain_not_silent_success(
+        self, db, monkeypatch
+    ):
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        provider = FakeOutboundProvider()
+
+        def _mark_send_sent_loses_cas(*args, **kwargs):
+            return False
+
+        monkeypatch.setattr(
+            "app.services.response_draft_send.mark_send_sent", _mark_send_sent_loses_cas
+        )
+
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            send_response_draft(db, ACCOUNT, draft.id, provider)
+
+        # The provider WAS called (transmission genuinely happened) --
+        # this proves the CAS-result check runs AFTER a real send
+        # attempt, not instead of one.
+        assert provider.call_count == 1
+        assert get_send_for_draft(db, ACCOUNT, draft.id).status == "UNCERTAIN"

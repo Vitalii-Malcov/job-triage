@@ -10,11 +10,18 @@ in this project:**
 - `create_approval` — INSERT + `IntegrityError` catch against
   `UNIQUE(response_draft_id)`, exactly like
   `app.db.gmail_repository`'s `GmailMessageIdClaimRecord` claim pattern.
-- `claim_send_attempt` / `retry_send_attempt` / `mark_send_sent` /
-  `mark_send_failed` / `mark_send_uncertain` — CAS (compare-and-swap)
-  UPDATEs conditioned on `id` + expected `status`, checking
+- `claim_send_attempt` / `retry_send_attempt` / `begin_transmission` /
+  `mark_send_sent` / `mark_send_failed` / `mark_send_uncertain` — CAS
+  (compare-and-swap) UPDATEs conditioned on `id` + expected `status`
+  (`begin_transmission` also on `send_attempted`), checking
   `rowcount == 1`, exactly like `app.db.review_package_repository`'s
   `ApplicationPackageReviewRecord` status transitions.
+- `begin_transmission` (HARD-008, Codex master review) — a second CAS,
+  `send_attempted: False -> True`, exactly mirroring
+  `app.db.follow_up_approval_repository.begin_transmission`. This is the
+  actual exclusivity gate for calling the outbound provider — see
+  `ResponseDraftSendRecord.send_attempted`'s docstring for why `status`
+  alone is not enough to make crash recovery safe.
 
 `mark_send_uncertain`'s `PENDING -> UNCERTAIN` transition is terminal:
 no function in this module ever transitions a row OUT of `UNCERTAIN` —
@@ -183,6 +190,12 @@ def retry_send_attempt(db: Session, record: ResponseDraftSendRecord) -> bool:
     WHERE clause (not a separate re-read first) — exactly one concurrent
     retry attempt can ever win this transition; every other concurrent
     retry's UPDATE affects 0 rows. Returns whether THIS call won.
+
+    `send_attempted` is reset to False (HARD-008, mirrors
+    `app.db.follow_up_approval_repository.retry_send_attempt`'s own
+    rationale): a FAILED row is, by construction, always a DEFINITE
+    pre-transmission failure (see `mark_send_failed`'s docstring), so a
+    fresh retry legitimately starts the pre-transmission window over.
     """
     result = db.execute(
         update(ResponseDraftSendRecord)
@@ -192,9 +205,41 @@ def retry_send_attempt(db: Session, record: ResponseDraftSendRecord) -> bool:
         )
         .values(
             status="PENDING",
+            send_attempted=False,
             attempt_count=ResponseDraftSendRecord.attempt_count + 1,
             updated_at=datetime.now(UTC),
         )
+    )
+    db.commit()
+    won = result.rowcount == 1
+    if won:
+        db.refresh(record)
+    return won
+
+
+def begin_transmission(db: Session, record: ResponseDraftSendRecord) -> bool:
+    """HARD-008 (Codex master review): the SOLE exclusivity gate for "who
+    gets to actually call `OutboundEmailProvider.send`" — a CAS
+    `send_attempted: False -> True`, guarded by `WHERE status='PENDING'
+    AND send_attempted=False`. Exactly one concurrent request can ever
+    win this for a given `ResponseDraftSendRecord` row (a second
+    concurrent request's identical UPDATE affects 0 rows, since the
+    first commit already flipped `send_attempted` to True). Must be
+    called — and won — AFTER claiming/retrying the send record and
+    IMMEDIATELY BEFORE the actual provider call, so that only the single
+    winner ever reaches it for this draft. Exact mirror of
+    `app.db.follow_up_approval_repository.begin_transmission` — see that
+    function's docstring and `ResponseDraftSendRecord.send_attempted`'s
+    own docstring for the full crash-recovery semantics this enables.
+    """
+    result = db.execute(
+        update(ResponseDraftSendRecord)
+        .where(
+            ResponseDraftSendRecord.id == record.id,
+            ResponseDraftSendRecord.status == "PENDING",
+            ResponseDraftSendRecord.send_attempted.is_(False),
+        )
+        .values(send_attempted=True, updated_at=datetime.now(UTC))
     )
     db.commit()
     won = result.rowcount == 1

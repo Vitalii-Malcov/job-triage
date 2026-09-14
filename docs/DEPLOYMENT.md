@@ -73,7 +73,7 @@ Single default `compose` bridge network. `web` and `scheduler` both reach `db` b
 
 - `ALEMBIC_AUTO_UPGRADE` **must stay `false`** in this deployment (the app already defaults to this and documents it as a hard production rule — `app/db/session.py`).
 - Migrations run as an **explicit, separate step**, before the `web`/`scheduler` containers start serving traffic: `docker compose run --rm web alembic upgrade head` (or an init container / CI/CD pipeline step). This makes migration failure loud and blocking rather than silently skipped or racily run once-per-worker.
-- The Alembic head this project expects is `c7d3f9a1e5b8` — the same value the CI `scheduler-postgres` job asserts via `alembic current`.
+- The Alembic head this project expects is `a1b2c3d4e5f6` — the same value the CI `scheduler-postgres` job asserts via `alembic current`.
 
 ## Secrets
 

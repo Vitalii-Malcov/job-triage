@@ -69,6 +69,36 @@ ambiguous, and a later send request for the same draft is refused before
 the provider is ever called again. Resolving a genuinely `UNCERTAIN`
 outcome (confirming with the recruiter, deciding whether to manually
 follow up) is a human task this module deliberately does not attempt.
+
+**Transmission boundary / crash recovery (HARD-008, Codex master
+review).** A PENDING claim alone is not enough to make crash recovery
+safe: before this fix, `send_response_draft` persisted PENDING, then
+called the outbound provider — if the provider's `send()` call
+succeeded (the email genuinely transmitted) but the subsequent
+`mark_send_sent` commit then failed (a DB connection drop, a process
+kill at that exact instant), the row stayed PENDING FOREVER, with no
+code path anywhere that ever moved it to a terminal state, even though
+the real, irreversible external side effect had already happened. This
+module now mirrors `app.services.follow_up_send`'s proven
+`send_attempted` CAS model exactly (see that module's own "Crash/CAS
+recovery" docstring section): `begin_transmission`
+(`app.db.response_draft_approval_repository.begin_transmission`) CASes
+`send_attempted: False -> True` immediately before — and only
+immediately before — the outbound provider is ever called, and
+`_resolve_existing_send_record` below is the ONLY place a later request
+can observe a PENDING row again. A row found PENDING with
+`send_attempted=False` is PROVABLY pre-transmission (the process that
+claimed it crashed, or never got that far, before any network call) and
+is safe to reclaim; a row found PENDING with `send_attempted=True` means
+transmission may already be underway OR may have already succeeded with
+only its own SENT-recording commit failing — indistinguishable from
+here, so it is NEVER retried, and is instead reconciled to the terminal
+`UNCERTAIN` state on that later attempt. `mark_send_sent`'s own CAS
+result is also checked directly (not merely called and ignored) — see
+`send_response_draft` below — so a lost race on that specific UPDATE
+(defense-in-depth; `begin_transmission`'s exclusivity should already
+make this unreachable in practice) is treated the same fail-closed way
+rather than silently assumed to have succeeded.
 """
 
 import json
@@ -79,6 +109,7 @@ from sqlalchemy.orm import Session
 from app.db.gmail_repository import get_message_by_id
 from app.db.models import ResponseDraftApprovalRecord, ResponseDraftSendRecord
 from app.db.response_draft_approval_repository import (
+    begin_transmission,
     claim_send_attempt,
     create_approval,
     get_approval_for_draft,
@@ -249,15 +280,72 @@ def _build_outbound_message(message, approval: ResponseDraftApprovalRecord) -> O
     )
 
 
+def _resolve_existing_send_record(
+    db: Session, *, account_key: str, draft, record: ResponseDraftSendRecord
+) -> ResponseDraftSendRecord:
+    """HARD-008 (Codex master review, crash/CAS recovery): dispatch on an
+    ALREADY-EXISTING `ResponseDraftSendRecord` found by `claim_send_attempt`'s
+    losing INSERT. Exact mirror of
+    `app.services.follow_up_send._resolve_existing_send_record` — see
+    module docstring's "Transmission boundary / crash recovery" section.
+    """
+    if record.status == "SENT":
+        raise ResponseDraftAlreadySentError(f"response_draft_id={draft.id!r} has already been sent")
+    if record.status == "UNCERTAIN":
+        raise ResponseDraftSendOutcomeUncertainError(
+            f"response_draft_id={draft.id!r} has an uncertain prior send outcome; "
+            "manual reconciliation is required, not an automatic retry"
+        )
+    if record.status == "PENDING":
+        if not record.send_attempted:
+            # PROVABLY pre-transmission (see
+            # ResponseDraftSendRecord.send_attempted's docstring) —
+            # always safe for this request to take over. The actual
+            # mutual-exclusion gate is begin_transmission, called by the
+            # caller right after this returns.
+            return record
+        # Transmission may already be underway (a live concurrent
+        # request, a crash mid-send, or a successful send whose own
+        # SENT-recording commit then failed) — indistinguishable from
+        # here, so this is NEVER retried. Fail closed to the terminal
+        # UNCERTAIN state and check what the CAS actually did (it may
+        # lose to whichever request genuinely owns this attempt
+        # finishing first).
+        mark_send_uncertain(db, record, last_error="StrandedPendingTransmissionAttempted")
+        current = get_send_for_draft(db, account_key, draft.id)
+        if current is not None and current.status == "SENT":
+            raise ResponseDraftAlreadySentError(
+                f"response_draft_id={draft.id!r} has already been sent"
+            )
+        if current is not None and current.status == "UNCERTAIN":
+            raise ResponseDraftSendOutcomeUncertainError(
+                f"response_draft_id={draft.id!r} has an uncertain prior send outcome; "
+                "manual reconciliation is required, not an automatic retry"
+            )
+        raise ResponseDraftSendInProgressError(
+            f"A send attempt for response_draft_id={draft.id!r} is already in progress"
+        )
+    # status == "FAILED": a legitimate retry — try to win the CAS back to
+    # PENDING (send_attempted reset to False by retry_send_attempt). If
+    # we lose (a concurrent retry got there first), the winner owns this
+    # attempt; we must not also proceed.
+    won_retry = retry_send_attempt(db, record)
+    if not won_retry:
+        raise ResponseDraftSendInProgressError(
+            f"A concurrent retry for response_draft_id={draft.id!r} is already in progress"
+        )
+    return record
+
+
 def _claim_or_retry_send(
     db: Session, *, account_key: str, draft, approval: ResponseDraftApprovalRecord
 ) -> ResponseDraftSendRecord:
-    """Wins (or refuses) the right to actually call the outbound
-    provider for this draft — see module docstring's concurrency
-    section. Raises `ResponseDraftAlreadySentError` /
-    `ResponseDraftSendInProgressError` /
-    `ResponseDraftSendOutcomeUncertainError` when this call must NOT
-    proceed.
+    """Wins (or refuses) the right to CONTEND for actually calling the
+    outbound provider for this draft — returns a `ResponseDraftSendRecord`
+    guaranteed `status='PENDING', send_attempted=False` at read time, or
+    raises. The caller MUST still win `begin_transmission` (HARD-008's
+    real exclusivity gate) before calling the provider — see module
+    docstring's "Transmission boundary / crash recovery" section.
     """
     record, claimed = claim_send_attempt(
         db,
@@ -268,33 +356,7 @@ def _claim_or_retry_send(
     )
     if claimed:
         return record
-
-    if record.status == "SENT":
-        raise ResponseDraftAlreadySentError(f"response_draft_id={draft.id!r} has already been sent")
-    if record.status == "PENDING":
-        raise ResponseDraftSendInProgressError(
-            f"A send attempt for response_draft_id={draft.id!r} is already in progress"
-        )
-    if record.status == "UNCERTAIN":
-        # Fail-closed and terminal — see ResponseDraftSendRecord's
-        # docstring. Refused BEFORE the provider is ever called again;
-        # never routed through retry_send_attempt (whose CAS only ever
-        # matches status='FAILED' and therefore could never touch this
-        # row anyway, but the explicit check here makes the refusal
-        # reason accurate rather than an incidental side effect).
-        raise ResponseDraftSendOutcomeUncertainError(
-            f"response_draft_id={draft.id!r} has an uncertain prior send outcome; "
-            "manual reconciliation is required, not an automatic retry"
-        )
-    # status == "FAILED": a legitimate retry — try to win the CAS back to
-    # PENDING. If we lose (a concurrent retry got there first), the
-    # winner owns this attempt; we must not also proceed.
-    won_retry = retry_send_attempt(db, record)
-    if not won_retry:
-        raise ResponseDraftSendInProgressError(
-            f"A concurrent retry for response_draft_id={draft.id!r} is already in progress"
-        )
-    return record
+    return _resolve_existing_send_record(db, account_key=account_key, draft=draft, record=record)
 
 
 def send_response_draft(
@@ -338,6 +400,15 @@ def send_response_draft(
 
     send_record = _claim_or_retry_send(db, account_key=account_key, draft=draft, approval=approval)
 
+    # HARD-008: the exclusive gate — only the request that wins this CAS
+    # may call the outbound provider. See module docstring's
+    # "Transmission boundary / crash recovery" section.
+    won_attempt = begin_transmission(db, send_record)
+    if not won_attempt:
+        raise ResponseDraftSendInProgressError(
+            f"A concurrent send attempt for response_draft_id={draft.id!r} is already in progress"
+        )
+
     try:
         result = provider.send(outbound_message)
     except EmailSendOutcomeUnknownError as exc:
@@ -372,7 +443,31 @@ def send_response_draft(
             f"Sending response_draft_id={draft_id!r} failed"
         ) from exc
 
-    mark_send_sent(db, send_record, provider_message_id=result.provider_message_id)
+    # HARD-008 invariant: the outbound provider has ALREADY confirmed
+    # success at this point — this CAS's own result must be checked
+    # (never called and ignored), since begin_transmission's exclusivity
+    # should already make a lost race here unreachable in practice, but
+    # "should" is not "proven": if it somehow returns False anyway (the
+    # row is no longer PENDING for some other reason), this request must
+    # not silently claim SENT succeeded when it cannot prove that. If
+    # `mark_send_sent` itself raises (e.g. the DB connection drops during
+    # this exact commit — the literal HARD-008 scenario), the exception
+    # propagates unchanged: the row is left PENDING with
+    # `send_attempted=True`, and `_resolve_existing_send_record` above
+    # reconciles it to UNCERTAIN the next time anyone attempts this
+    # draft's send, never silently retried.
+    sent = mark_send_sent(db, send_record, provider_message_id=result.provider_message_id)
+    if not sent:
+        mark_send_uncertain(db, send_record, last_error="SentCasLost")
+        logger.warning(
+            "response_draft_send_sent_cas_lost response_draft_id=%s",
+            draft.id,
+        )
+        raise ResponseDraftSendOutcomeUncertainError(
+            f"response_draft_id={draft_id!r}: outbound provider confirmed success, but "
+            "recording SENT lost its CAS; the message may have been sent but the local "
+            "state could not be durably confirmed"
+        )
     logger.info("response_draft_sent response_draft_id=%s", draft.id)
     return send_record
 

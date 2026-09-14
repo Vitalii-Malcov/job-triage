@@ -2186,6 +2186,7 @@ def test_response_draft_sends_table_shape(tmp_path: Path) -> None:
         "gmail_message_id",
         "status",
         "attempt_count",
+        "send_attempted",
         "provider_message_id",
         "last_error",
         "sent_at",
@@ -2959,8 +2960,94 @@ def test_gmail_permanent_skips_downgrade_removes_table_then_upgrade_restores_it(
     assert "gmail_permanent_skips" in inspector.get_table_names()
 
 
+# ---------------------------------------------------------------------------
+# a1b2c3d4e5f6 (HARD-008, Codex master review: response_draft_sends.send_attempted)
+# ---------------------------------------------------------------------------
+
+
+def test_response_draft_sends_send_attempted_downgrade_then_upgrade_cycle(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migrations_response_draft_send_attempted_cycle.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    columns = {col["name"] for col in inspect(engine).get_columns("response_draft_sends")}
+    assert "send_attempted" in columns
+
+    downgrade(cfg, "c7d3f9a1e5b8")
+
+    assert _alembic_current_revision(engine) == "c7d3f9a1e5b8"
+    inspector = inspect(engine)
+    assert not any(table.startswith("_alembic_tmp") for table in inspector.get_table_names())
+    columns_after_downgrade = {col["name"] for col in inspector.get_columns("response_draft_sends")}
+    assert "send_attempted" not in columns_after_downgrade
+    # Every other column survives the downgrade untouched.
+    assert columns_after_downgrade == {
+        "id",
+        "account_key",
+        "response_draft_id",
+        "approval_id",
+        "gmail_message_id",
+        "status",
+        "attempt_count",
+        "provider_message_id",
+        "last_error",
+        "sent_at",
+        "created_at",
+        "updated_at",
+    }
+
+    upgrade(cfg, "head")
+    assert _alembic_current_revision(engine) == _alembic_head_revision(cfg)
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    columns_after_reupgrade = {col["name"] for col in inspector.get_columns("response_draft_sends")}
+    assert "send_attempted" in columns_after_reupgrade
+
+
+def test_response_draft_sends_send_attempted_defaults_false_for_existing_rows(
+    tmp_path: Path,
+) -> None:
+    """A row inserted BEFORE this migration ran (server_default=false)
+    must come out with `send_attempted=False`, not NULL -- existing
+    PENDING rows from before HARD-008 must be treated as PROVABLY
+    pre-transmission, never accidentally treated as ambiguous.
+    """
+    db_path = tmp_path / "migrations_response_draft_send_attempted_default.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "c7d3f9a1e5b8")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO response_draft_sends (
+                    account_key, response_draft_id, approval_id, gmail_message_id,
+                    status, attempt_count, created_at, updated_at
+                ) VALUES (
+                    'a@example.com', 1, 1, 1, 'PENDING', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        value = connection.execute(
+            text(
+                "SELECT send_attempted FROM response_draft_sends "
+                "WHERE account_key = 'a@example.com'"
+            )
+        ).scalar()
+    assert value in (False, 0)
+
+
 def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    assert heads[0] == "c7d3f9a1e5b8"
+    assert heads[0] == "a1b2c3d4e5f6"

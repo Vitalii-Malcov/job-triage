@@ -73,7 +73,7 @@ jobs:
         run: |
           python -m alembic upgrade head
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "c7d3f9a1e5b8 (head)" /tmp/alembic_current.txt
+          grep -q "a1b2c3d4e5f6 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       # HARD-010 (adversarial hardening r1): claim_send_attempt's
