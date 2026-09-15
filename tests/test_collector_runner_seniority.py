@@ -61,10 +61,12 @@ def _job(**overrides) -> Job:
     return Job(**data)
 
 
+# S11A-002: candidate target seniority is only JUNIOR if EVERY target role
+# explicitly says "junior" -- both roles below do, so this list is a valid
+# JUNIOR-only target.
 JUNIOR_TARGET_ROLES = [
     "Junior Python Developer",
     "Junior Backend Developer",
-    "Python Backend Developer",
 ]
 
 FULL_SKILL_SET = ["python", "fastapi", "sqlalchemy", "postgresql", "git", "pytest", "docker"]
@@ -250,3 +252,73 @@ def test_senior_job_that_would_have_skipped_anyway_is_unaffected():
     _record, result, _created = score_and_persist(db, profile, job)
 
     assert result.recommendation not in ("MAYBE", "APPLY")
+
+
+# --- S11A-002: a mixed junior + unlabeled target list is now ambiguous -----
+
+
+def test_mixed_junior_and_unlabeled_target_roles_no_longer_excludes_senior_jobs():
+    # S11A-002: a target_roles list that mixes an explicit junior role
+    # with an unlabeled one ("Python Backend Developer" says nothing
+    # about seniority) is no longer treated as a JUNIOR-only target -- the
+    # ambiguity must fail OPEN (gate never fires), not fail toward
+    # excluding jobs.
+    db = _db()
+    profile = _profile(db, FULL_SKILL_SET)
+    _set_target_roles(
+        db,
+        ["Junior Python Developer", "Junior Backend Developer", "Python Backend Developer"],
+    )
+    job = _job(title="Senior Entwickler Python (m/w/d)")
+
+    _record, result, _created = score_and_persist(db, profile, job)
+
+    assert result.recommendation == "APPLY"
+    assert result.score > 0
+
+
+# --- S11A-003: seniority lookup must never create a CandidateProfile ------
+
+
+def test_seniority_lookup_does_not_create_candidate_profile_when_none_exists():
+    from app.db.candidate_profile_repository import count_candidate_profiles
+
+    db = _db()
+    profile = _profile(db, FULL_SKILL_SET)
+    assert count_candidate_profiles(db) == 0
+
+    # No target_roles/CandidateProfile ever set -- a normal job should
+    # still score APPLY/MAYBE on skill match alone (candidate target
+    # seniority resolves to UNKNOWN, so the gate never fires), and doing
+    # so must NOT have created the singleton CandidateProfile row as a
+    # side effect of the seniority lookup.
+    job = _job(title="Python Backend Developer")
+    _record, result, _created = score_and_persist(db, profile, job)
+
+    assert result.recommendation == "APPLY"
+    assert count_candidate_profiles(db) == 0
+
+
+def test_seniority_lookup_uses_pure_get_not_get_or_create(monkeypatch):
+    # S11A-003: directly proves the seniority path calls the PURE
+    # get_candidate_profile lookup, never get_or_create_candidate_profile
+    # -- stronger than an outcome-only assertion, since it fails loudly if
+    # a future change reintroduces the create-on-read side effect.
+    import app.services.collector_runner as collector_runner_module
+
+    def _must_not_be_called(*_args, **_kwargs):
+        raise AssertionError(
+            "get_or_create_candidate_profile must not be called by the seniority lookup"
+        )
+
+    monkeypatch.setattr(
+        collector_runner_module, "get_or_create_candidate_profile", _must_not_be_called
+    )
+
+    db = _db()
+    profile = _profile(db, FULL_SKILL_SET)
+    job = _job(title="Python Backend Developer")
+
+    _record, result, _created = score_and_persist(db, profile, job)
+
+    assert result.recommendation == "APPLY"

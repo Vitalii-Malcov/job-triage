@@ -5,11 +5,11 @@ rules, no hardcoding for any one candidate. Two independent, conservative
 questions, both answered from the SAME canonical signal vocabulary below:
 
 1. `derive_candidate_target_seniority` -- does the candidate's own
-   `CandidateProfile.target_roles` (Stage 6A) explicitly target JUNIOR
-   roles, with no senior/lead-level target also present? Returns UNKNOWN
-   whenever this can't be determined conservatively (no target_roles at
-   all, or a mixed/ambiguous set) -- see that function's docstring for
-   why "cannot determine" must never be treated as a rejection signal.
+   `CandidateProfile.target_roles` (Stage 6A) UNANIMOUSLY target JUNIOR
+   roles? Returns UNKNOWN whenever this can't be determined conservatively
+   (no target_roles at all, or ANY role that doesn't itself explicitly say
+   "junior") -- see that function's docstring for why "cannot determine"
+   must never be treated as a rejection signal.
 
 2. `classify_title_seniority` -- does a job's own TITLE contain an
    explicit senior/lead-level marker?
@@ -31,6 +31,21 @@ bare substring check -- "Seniorenberater" (elder-care advisor),
 "Leadership", and similar words that merely CONTAIN one of these markers
 must not match; regex word boundaries (`\\b`) guarantee this rather than
 `marker in title.casefold()`.
+
+**S11A-001 (Codex review): explicit positive allowlist, not a generic
+suffix scan.** An earlier version matched ANY `\\w*leiter(?:in)?` and then
+tried to deny-list known non-leadership homonyms as they were discovered
+(Halbleiter, Wellenleiter, Flugbegleiter, ...) -- an open-ended, reactive
+blacklist that new false positives (Stromleiter, Schutzleiter,
+Neutralleiter, Außenleiter, Innenleiter, Phasenleiter, Kupferleiter, ...:
+German electrical-engineering terms for "conductor", an entire word
+family the denylist never anticipated) kept slipping through. **False
+SENIOR is more dangerous than missed SENIOR** -- inverted here to a
+closed, explicit positive allowlist of known organizational leadership
+compounds, plus the standalone noun. An organizational compound not on
+this list stays UNKNOWN rather than being guessed at; extend the list
+deliberately, not by trying to out-enumerate every non-leadership
+"-leiter" word instead.
 """
 
 import re
@@ -42,65 +57,31 @@ TitleSeniorityLevel = Literal["SENIOR", "UNKNOWN"]
 
 _JUNIOR_PATTERN = re.compile(r"\bjunior\b", re.IGNORECASE)
 
-# German "-leiter"/"-leiterin" is a genuinely productive compounding
-# suffix for leadership titles ("Abteilungsleiter" = department head,
-# "Projektleiter" = project lead, "Entwicklungsleiter" = head of
-# development, "Bereichsleiter" = division head, "Bauleiter" = site
-# manager, ...) -- an open-ended set no fixed prefix whitelist could
-# enumerate generically. But "Leiter" is ALSO a genuine German homonym
-# for "conductor" (physics: "elektrischer Leiter"), and "-leiter" is
-# separately the tail-end of the UNRELATED word "Begleiter" (companion/
-# escort/attendant, from "begleiten" = to accompany -- nothing to do
-# with "leiten" = to lead). Both are false-positive classes this matcher
-# must stay high-precision against ("Unknown is safer than falsely
-# excluding a legitimate non-senior vacancy" -- Stage 11A hardening):
-#
-# 1. Conductor/physics homonyms -- a SMALL, CLOSED, enumerable set of
-#    real German engineering/physics compound nouns ("Halbleiter" =
-#    semiconductor, "Supraleiter" = superconductor, "Wellenleiter" =
-#    waveguide, "Lichtleiter" = light guide/optical fiber, "Ableiter"/
-#    "Blitzableiter" = arrester/lightning rod, "Nichtleiter" =
-#    insulator). Excluded by exact whole-word denylist -- this is a
-#    general German-language vocabulary fact, not vacancy-specific, but
-#    each new physics compound needs its own denylist entry since there
-#    is no shared *structural* marker distinguishing "Team+leiter"
-#    (organizational) from "Licht+leiter" (physics) beyond the meaning
-#    of the specific prefix noun.
-#
-# 2. The "-begleiter"/"-begleiterin" WORD FAMILY -- "Flugbegleiter"
-#    (flight attendant), "Alltagsbegleiter" (everyday-life companion/
-#    caregiver), "Schulbegleiter" (school aide), "Integrationsbegleiter"
-#    (integration companion), and any OTHER "[X]begleiter(in)" compound
-#    not enumerated here (e.g. a future "Reisebegleiter" = travel
-#    companion) all share the literal suffix "begleiter"/"begleiterin"
-#    -- unlike the physics homonyms above, this is excluded as a whole
-#    SUFFIX FAMILY (any word ending in "begleiter(in)?"), not as
-#    individually enumerated words, so it generalizes to compounds never
-#    explicitly listed.
-_LEITER_NON_ROLE_EXACT_WORDS = (
-    "halbleiter",
-    "supraleiter",
-    "wellenleiter",
-    "lichtleiter",
-    "ableiter",
-    "blitzableiter",
-    "nichtleiter",
+# S11A-001: standalone "Leiter"/"Leiterin" plus an explicit, closed
+# allowlist of organizational leadership compounds. Extend this list
+# deliberately (a real title needing it, reviewed) -- never widen back to
+# a generic "\w*leiter" suffix scan.
+_LEITER_ALLOWLIST_WORDS = (
+    "leiter",
+    "leiterin",
+    "teamleiter",
+    "teamleiterin",
+    "abteilungsleiter",
+    "abteilungsleiterin",
+    "bereichsleiter",
+    "bereichsleiterin",
+    "projektleiter",
+    "projektleiterin",
+    "entwicklungsleiter",
+    "entwicklungsleiterin",
+    "bauleiter",
+    "bauleiterin",
 )
-_LEITER_COMPOUND_PATTERN = (
-    r"\b"
-    r"(?!(?:" + "|".join(_LEITER_NON_ROLE_EXACT_WORDS) + r")\b)"  # (1) exact physics homonyms
-    r"(?!\w*begleiter(?:in)?\b)"  # (2) the whole "-begleiter(in)" family
-    r"\w*leiter(?:in)?\b"
-)
+_LEITER_PATTERN = r"\b(?:" + "|".join(_LEITER_ALLOWLIST_WORDS) + r")\b"
 
 # The single canonical senior/lead-level signal vocabulary, shared by
 # both directions above (candidate target derivation AND job title
 # classification) so the two checks can never silently drift apart.
-# "teamleiter" is kept as its own explicit entry (ahead of the generic
-# compound pattern below) purely so a Teamleiter title is attributed to
-# that specific, more informative signal name in logs/tests -- the
-# generic "leiter" pattern would also match it, but list order means the
-# first match wins.
 _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE))
     for name, pattern in (
@@ -109,39 +90,34 @@ _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("principal", r"\bprincipal\b"),
         ("staff", r"\bstaff\b"),
         ("head", r"\bhead\b"),
-        ("teamleiter", r"\bteamleiter\b"),
         ("leitung", r"\bleitung\b"),
-        # Standalone "Leiter"/"Leiterin" AND any leadership compound
-        # ending in "-leiter"/"-leiterin" (Abteilungsleiter,
-        # Abteilungsleiterin, Projektleiter, Entwicklungsleiter,
-        # Bereichsleiter, ...) -- except the closed set of non-role
-        # physics/engineering homonyms above.
-        ("leiter", _LEITER_COMPOUND_PATTERN),
+        ("leiter", _LEITER_PATTERN),
     )
 )
 
 
-def _has_senior_level_signal(text: str) -> bool:
-    return any(pattern.search(text or "") for _, pattern in _SENIOR_LEVEL_PATTERNS)
-
-
 def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSeniorityTarget:
-    """Conservative by design: JUNIOR only if at least one target role
-    explicitly says "junior" AND no target role also carries a
-    senior/lead-level signal.
+    """S11A-002 (Codex review): JUNIOR only if EVERY target role
+    explicitly says "junior" -- fails open (UNKNOWN) on any ambiguity,
+    including a role that states no seniority level at all.
 
-    A candidate whose `target_roles` mixes "Junior Python Developer" with
-    e.g. "Lead Python Developer" has not unambiguously stated a
-    junior-only target -- returning UNKNOWN there (rather than guessing
-    which target was meant) is what "if candidate target seniority cannot
-    be determined: do not penalize" requires. An empty `target_roles`
-    list is the same "cannot be determined" case.
+    An earlier version returned JUNIOR as long as AT LEAST ONE role said
+    "junior" and none said senior -- too permissive: a candidate whose
+    `target_roles` includes an unlabeled role like "Data Engineer"
+    alongside "Junior Python Developer" has not unanimously stated a
+    junior-only target, and "if candidate target seniority cannot be
+    determined: do not penalize" means that ambiguity must resolve to
+    UNKNOWN, not to a best-effort guess.
+
+        ["Junior Python Developer", "Junior Backend Developer"] -> JUNIOR
+        ["Junior Python Developer", "Data Engineer"]            -> UNKNOWN
+        ["Junior Python Developer", "Senior Backend Developer"] -> UNKNOWN
+        ["Python Backend Developer"]                            -> UNKNOWN
+        []                                                      -> UNKNOWN
     """
     if not target_roles:
         return "UNKNOWN"
-    has_junior = any(_JUNIOR_PATTERN.search(role) for role in target_roles)
-    has_senior = any(_has_senior_level_signal(role) for role in target_roles)
-    if has_junior and not has_senior:
+    if all(_JUNIOR_PATTERN.search(role) for role in target_roles):
         return "JUNIOR"
     return "UNKNOWN"
 
@@ -149,8 +125,8 @@ def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSenio
 @dataclass(frozen=True)
 class TitleSeniorityClassification:
     level: TitleSeniorityLevel
-    # The specific signal name matched (e.g. "senior", "teamleiter"), or
-    # None for UNKNOWN -- carried through to the caller's log line so a
+    # The specific signal name matched (e.g. "senior", "leiter"), or None
+    # for UNKNOWN -- carried through to the caller's log line so a
     # seniority-based exclusion is auditable down to the exact matched
     # word, not just a boolean.
     matched_signal: str | None

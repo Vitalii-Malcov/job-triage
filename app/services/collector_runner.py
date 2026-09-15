@@ -54,6 +54,7 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
 from app.db.candidate_profile_repository import (
+    get_candidate_profile,
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
@@ -152,8 +153,20 @@ def _candidate_target_seniority(db: Session):
     _score_for_posting_type below) -- so a job that's already excluded or
     already SKIP on ordinary skill grounds never pays for this extra
     Candidate Profile read.
+
+    S11A-003 (Codex review): uses the PURE `get_candidate_profile` lookup,
+    not `get_or_create_candidate_profile` -- scoring is a read path and
+    must never have the side effect of creating the singleton
+    CandidateProfile row (with `db.add()` + `db.commit()`) purely because
+    a job happened to score APPLY/MAYBE. If no profile has ever been
+    created, candidate target seniority is simply UNKNOWN (the same
+    "cannot be determined, do not penalize" outcome as an empty
+    `target_roles` list) -- there is nothing to derive from a profile
+    that doesn't exist yet.
     """
-    profile_record = get_or_create_candidate_profile(db)
+    profile_record = get_candidate_profile(db)
+    if profile_record is None:
+        return "UNKNOWN"
     profile = to_candidate_profile_response(profile_record)
     return derive_candidate_target_seniority(profile.target_roles)
 
