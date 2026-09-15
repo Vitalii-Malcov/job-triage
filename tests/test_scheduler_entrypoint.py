@@ -7,6 +7,25 @@ revealing) repr of whichever field's raw input failed validation, so
 ANY Settings misconfiguration, not just ones scoped to the scheduler's
 own fields.
 
+DEPLOY-001-RR1 (Codex targeted re-review) added `hide_input_in_errors=True`
+to `Settings.model_config` -- pydantic-core itself no longer echoes a
+field's raw offending input into `ValidationError.__str__()` for ANY
+`Settings` field, closing this specific leak at the source rather than
+relying solely on `main()`'s own downstream sanitization. That makes the
+sentinel below UNAVAILABLE via a real `Settings(...)` construction
+(`automation_scheduler_poll_seconds=SENTINEL` no longer echoes SENTINEL
+anywhere -- see tests/test_config.py's DEPLOY-001-RR1 section for that
+proven directly). `_validation_error_embedding_sentinel()` therefore
+raises the sentinel-embedding `ValidationError` from a throwaway LOCAL
+pydantic model instead of the real `Settings` class -- `main()`'s own
+`except ValidationError` branch (`app/scheduler.py`) catches
+`pydantic.ValidationError` generically, regardless of which model raised
+it, so this still exercises the exact real code path these tests guard,
+now as explicit defense-in-depth for a class of leak `Settings` itself no
+longer produces (a future custom validator mistake, a reverted
+`hide_input_in_errors`, or a differently-configured pydantic model
+reaching this same `except` branch some other way).
+
 Note: `main()` calls `app.core.logging.configure_logging()`, which
 installs its own JSON `StreamHandler` on the root logger (writing to
 stderr) and clears any handlers already attached -- including pytest's
@@ -17,7 +36,7 @@ directly out of captured stderr rather than relying on `caplog`.
 import json
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
 from app.scheduler import _CONFIGURATION_ERROR_MESSAGE, main
@@ -27,14 +46,19 @@ SENTINEL = "secret-must-never-leak"
 
 
 def _validation_error_embedding_sentinel() -> ValidationError:
-    """A real ValidationError, invalid scheduler configuration, whose own
-    str()/repr() genuinely embeds SENTINEL -- proven directly against
-    real pydantic-core behavior (automation_scheduler_poll_seconds fails
-    int-coercion with the raw offending string echoed back), not a
-    hand-built double.
+    """A real ValidationError whose own str()/repr() genuinely embeds
+    SENTINEL -- proven directly against real pydantic-core behavior (a
+    throwaway local model's int field fails int-coercion with the raw
+    offending string echoed back), not a hand-built double. See module
+    docstring for why this is no longer derived from the real `Settings`
+    class (DEPLOY-001-RR1 closed that specific leak upstream).
     """
+
+    class _LeakyModelWithoutHideInputInErrors(BaseModel):
+        an_int_field: int = 0
+
     with pytest.raises(ValidationError) as exc_info:
-        Settings(automation_scheduler_poll_seconds=SENTINEL)
+        _LeakyModelWithoutHideInputInErrors(an_int_field=SENTINEL)
     assert SENTINEL in str(exc_info.value)  # sanity: the leak really exists upstream
     return exc_info.value
 

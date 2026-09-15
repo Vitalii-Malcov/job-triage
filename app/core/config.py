@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -20,7 +20,18 @@ from app.providers.email.base import (
 
 class Settings(BaseSettings):
     app_env: str = "development"
-    database_url: str = "sqlite:///./job_search.db"
+    # DEPLOY-001-RR1 (Codex targeted re-review): `repr=False` keeps this
+    # credential-bearing connection string (either the operator-supplied
+    # default/override, or the postgres_* parts assembled into it below by
+    # `_build_database_url_from_postgres_parts`) out of `repr(Settings(...))`/
+    # `str(Settings(...))` — Pydantic's default model repr otherwise prints
+    # every field's raw value, which previously included this one verbatim.
+    # Construction-time behavior is unaffected: the field is still a plain
+    # `str`, still assigned/read normally by `_build_database_url_from_postgres_parts`
+    # and `app/db/session.py`'s `create_engine(settings.database_url, ...)` —
+    # `repr=False` only changes what Pydantic's own `__repr__`/`__str__`
+    # print, never validation, assignment, or attribute access.
+    database_url: str = Field(default="sqlite:///./job_search.db", repr=False)
     # DEPLOY-001 (Codex master review): an operator-supplied discrete-parts
     # alternative to `database_url` above, built into a PostgreSQL URL by
     # `_build_database_url_from_postgres_parts` below via
@@ -46,7 +57,20 @@ class Settings(BaseSettings):
     postgres_host: str = ""
     postgres_port: int = Field(default=5432, ge=1, le=65535)
     postgres_user: str = ""
-    postgres_password: str = ""
+    # DEPLOY-001-RR1 (Codex targeted re-review): `SecretStr`, not `str` —
+    # Codex reproduced the raw password appearing in `repr(Settings(...))`
+    # AND in `ValidationError` text for a partially-invalid construction
+    # (Pydantic's error rendering echoes each field's raw input value by
+    # default). `SecretStr` masks both automatically (prints as
+    # `SecretStr('**********')`); `hide_input_in_errors=True` on
+    # `model_config` below additionally suppresses per-field input echoing
+    # in ValidationError text for every field, not just this one. The real
+    # value is only ever unwrapped via `.get_secret_value()`, and only at
+    # the one point that actually needs it: this class's own
+    # `_build_database_url_from_postgres_parts` model_validator, immediately
+    # before handing it to `URL.create` — never logged, never re-wrapped
+    # into a plain `str` field.
+    postgres_password: SecretStr = SecretStr("")
     postgres_db: str = ""
     # Opt-in only: when true, run `alembic upgrade head` programmatically on
     # startup. Intended for local dev/tests. Production must run migrations
@@ -264,7 +288,14 @@ class Settings(BaseSettings):
     # package in this project's dependencies (see pyproject.toml).
     telegram_daily_digest_timezone: str = "Europe/Berlin"
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # DEPLOY-001-RR1: hide_input_in_errors=True stops Pydantic's own
+    # ValidationError rendering from echoing each field's raw supplied
+    # value (e.g. a partially-invalid Settings() construction that still
+    # included a real postgres_password) into the error text — applies to
+    # every field, not just the SecretStr-wrapped one, which itself masks
+    # its OWN input via a dedicated pydantic-core error path independent of
+    # this flag.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # GMAIL-009: length/blank invariants, consistent with the DB columns
     # and identity normalization these values ultimately feed
@@ -405,7 +436,12 @@ class Settings(BaseSettings):
             name
             for name, value in (
                 ("postgres_user", self.postgres_user),
-                ("postgres_password", self.postgres_password),
+                # DEPLOY-001-RR1: unwrap via get_secret_value() for the
+                # blank/missing check too — `not self.postgres_password`
+                # would always be False (a SecretStr instance is truthy
+                # regardless of the string it wraps), silently defeating
+                # this fail-closed check for an unset password.
+                ("postgres_password", self.postgres_password.get_secret_value()),
                 ("postgres_db", self.postgres_db),
             )
             if not value
@@ -418,7 +454,10 @@ class Settings(BaseSettings):
         url = URL.create(
             drivername="postgresql+psycopg",
             username=self.postgres_user,
-            password=self.postgres_password,
+            # DEPLOY-001-RR1: the only place the real secret is ever
+            # unwrapped — immediately consumed by URL.create below, never
+            # assigned to a plain str attribute or logged.
+            password=self.postgres_password.get_secret_value(),
             host=self.postgres_host,
             port=self.postgres_port,
             database=self.postgres_db,

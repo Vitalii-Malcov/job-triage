@@ -405,3 +405,108 @@ def test_postgres_port_default_and_bounds():
         Settings(postgres_port=0)
     with pytest.raises(ValidationError):
         Settings(postgres_port=70_000)
+
+
+# ---------------------------------------------------------------------------
+# DEPLOY-001-RR1 (Codex targeted re-review): Codex independently reproduced
+# the raw postgres_password AND the credential-bearing database_url appearing
+# in repr(Settings(...))/str(Settings(...)), and the raw password appearing
+# in ValidationError text for a partially-invalid construction. postgres_password
+# is now a SecretStr and database_url is Field(repr=False) -- these tests
+# assert the leak is actually closed, not just that the round-trip/connection
+# behavior above still works.
+# ---------------------------------------------------------------------------
+
+_SENTINEL_PASSWORD = "sentinel-p@ss:w/rd#100%x-leak-check"
+
+
+def _settings_with_sentinel_password(**overrides) -> Settings:
+    kwargs = {
+        "postgres_host": "db",
+        "postgres_port": 5432,
+        "postgres_user": "jobtriage",
+        "postgres_password": _SENTINEL_PASSWORD,
+        "postgres_db": "jobtriage",
+    }
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+def test_postgres_password_is_a_secret_str():
+    settings = _settings_with_sentinel_password()
+    assert type(settings.postgres_password).__name__ == "SecretStr"
+    assert settings.postgres_password.get_secret_value() == _SENTINEL_PASSWORD
+
+
+def test_raw_password_absent_from_settings_repr():
+    settings = _settings_with_sentinel_password()
+    assert _SENTINEL_PASSWORD not in repr(settings)
+
+
+def test_raw_password_absent_from_settings_str():
+    settings = _settings_with_sentinel_password()
+    assert _SENTINEL_PASSWORD not in str(settings)
+
+
+def test_database_url_itself_absent_from_settings_repr_and_str():
+    """`database_url` is credential-bearing (built from the real
+    password) — it must not appear in repr/str at all, not merely with
+    the password masked inside it."""
+    settings = _settings_with_sentinel_password()
+    assert settings.database_url not in repr(settings)
+    assert settings.database_url not in str(settings)
+    assert "database_url" not in repr(settings)
+
+
+def test_raw_password_absent_from_validation_error_text():
+    """A partially-invalid Settings() construction (a real
+    postgres_password alongside an unrelated invalid field) must not
+    echo the supplied password into the ValidationError text —
+    `hide_input_in_errors=True` suppresses per-field input echoing
+    entirely."""
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            postgres_host="db",
+            postgres_user="jobtriage",
+            postgres_password=_SENTINEL_PASSWORD,
+            postgres_db="jobtriage",
+            gmail_lookback_days=-1,
+        )
+    assert _SENTINEL_PASSWORD not in str(exc_info.value)
+
+
+def test_raw_password_absent_from_validation_error_when_postgres_parts_incomplete():
+    """Same leak, different trigger: postgres_password supplied but a
+    SIBLING required part (postgres_db) missing -- the model_validator's
+    own raised ValueError must not have caused the password to be echoed
+    by Pydantic's error rendering either."""
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            postgres_host="db",
+            postgres_user="jobtriage",
+            postgres_password=_SENTINEL_PASSWORD,
+        )
+    assert _SENTINEL_PASSWORD not in str(exc_info.value)
+
+
+def test_database_url_construction_and_round_trip_unaffected_by_secret_str():
+    """Runtime connection behavior must remain unchanged: the real
+    secret value is still used at the URL-construction boundary (via
+    get_secret_value()), so the reserved-character round-trip still
+    works exactly as before this field became a SecretStr."""
+    settings = _settings_with_sentinel_password(postgres_password="p@ss:w/rd#100%x")
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(settings.database_url)
+    assert parsed.password == "p@ss:w/rd#100%x"
+    assert parsed.username == "jobtriage"
+    assert parsed.host == "db"
+    assert parsed.database == "jobtriage"
+
+
+def test_explicit_database_url_compatibility_unaffected_by_repr_false():
+    """DEPLOY-001-RR1's Field(repr=False) on database_url must not change
+    its actual value/behavior for the existing explicit-DATABASE_URL
+    compatibility path -- only what repr()/str() print."""
+    settings = Settings(database_url="postgresql+psycopg://user:pass@localhost:5432/db")
+    assert settings.database_url == "postgresql+psycopg://user:pass@localhost:5432/db"
