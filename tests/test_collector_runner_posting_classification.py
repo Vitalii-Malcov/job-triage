@@ -232,6 +232,67 @@ def test_concurrent_typed_and_untyped_upserts_converge_on_a_consistent_recommend
     assert result.recommendation == "SKIP"
 
 
+def test_posting_type_empty_string_normalizes_to_none():
+    # S10-RR-001: "" must never be treated as an explicit posting_type --
+    # it must behave identically to omitting the field entirely, so
+    # score_and_persist's preserve-on-omit rule (`if job.posting_type is
+    # not None`) never mistakes a transiently blank API value for a real
+    # instruction to erase an already-persisted classification.
+    job = Job(
+        source="bundesagentur",
+        title="Some Role",
+        company="Some GmbH",
+        url="https://example.com/job/1",
+        posting_type="",
+    )
+    assert job.posting_type is None
+
+
+def test_posting_type_whitespace_only_normalizes_to_none():
+    job = Job(
+        source="bundesagentur",
+        title="Some Role",
+        company="Some GmbH",
+        url="https://example.com/job/1",
+        posting_type="   ",
+    )
+    assert job.posting_type is None
+
+
+def test_posting_type_strips_surrounding_whitespace_on_a_real_value():
+    job = Job(
+        source="bundesagentur",
+        title="Some Role",
+        company="Some GmbH",
+        url="https://example.com/job/1",
+        posting_type="  ARBEIT  ",
+    )
+    assert job.posting_type == "ARBEIT"
+
+
+def test_blank_posting_type_cannot_erase_a_stored_selbstaendigkeit():
+    # S10-RR-001: the concrete failure mode this normalization prevents --
+    # a raw "" from an upstream API response (not Python None) must not
+    # flow through to score_and_persist's preserve-on-omit check as a
+    # non-None value, which would wrongly overwrite the stored
+    # classification.
+    db = _db()
+    profile = _profile(db, ["python", "fastapi", "sqlalchemy"])
+    original = _job(posting_type="SELBSTAENDIGKEIT")
+    record1, result1, _created1 = score_and_persist(db, profile, original)
+    assert record1.posting_type == "SELBSTAENDIGKEIT"
+    assert result1.recommendation == "SKIP"
+
+    blank_resubmit = _job(posting_type="")
+    assert blank_resubmit.posting_type is None  # normalized at construction
+
+    record2, result2, created2 = score_and_persist(db, profile, blank_resubmit)
+    assert created2 is False
+    assert record2.id == record1.id
+    assert record2.posting_type == "SELBSTAENDIGKEIT"
+    assert result2.recommendation == "SKIP"
+
+
 def test_posting_type_rejects_values_longer_than_the_db_column():
     # S10-003: Job.posting_type's max_length must match
     # JobRecord.posting_type's VARCHAR(64) so an overlong value fails

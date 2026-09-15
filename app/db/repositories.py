@@ -283,6 +283,51 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
     return record, True
 
 
+def update_job_score_if_posting_type_unchanged(
+    db: Session,
+    job_id: int,
+    *,
+    observed_posting_type: str | None,
+    score: int,
+    recommendation: str,
+    data_confidence: float,
+) -> bool:
+    """S10-RR-001 (Codex Stage 10 re-review, BLOCKING): the atomic
+    compare-and-swap `app.services.collector_runner.score_and_persist`
+    uses to reconcile a `JobRecord`'s (score, recommendation,
+    data_confidence) with its OWN currently-persisted posting_type after
+    `upsert_job` returns.
+
+    A plain "read posting_type, recompute, then UPDATE unconditionally"
+    is itself TOCTOU-prone: another writer can change posting_type again
+    in the window between the read and the write, and an unconditional
+    UPDATE would silently apply a score/recommendation computed against
+    an already-stale observation. This makes that window unexploitable by
+    encoding the observation directly into the UPDATE's WHERE clause —
+    `posting_type IS NOT DISTINCT FROM :observed_posting_type` (NULL-safe:
+    ordinary `=` never matches `NULL = NULL`, which would wrongly treat
+    every "still untyped" case as a mismatch and spin the caller's retry
+    loop forever) — so the write only takes effect if the row's
+    posting_type is STILL exactly what the caller observed and computed
+    against. Returns False (0 rows affected) if it changed underneath;
+    the caller re-reads and retries with a fresh observation.
+
+    Deliberately its own commit boundary (a single, self-contained
+    conditional state transition, not composed with any other write in
+    the same transaction) — callers must not wrap this in additional
+    uncommitted work expecting atomicity with it.
+    """
+    stmt = (
+        update(JobRecord)
+        .where(JobRecord.id == job_id)
+        .where(JobRecord.posting_type.is_not_distinct_from(observed_posting_type))
+        .values(score=score, recommendation=recommendation, data_confidence=data_confidence)
+    )
+    result = db.execute(stmt)
+    db.commit()
+    return result.rowcount == 1
+
+
 def list_jobs(
     db: Session,
     status: ApplicationStatus | None = None,

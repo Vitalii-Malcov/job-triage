@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from app.models.application_status import ApplicationStatus
 
@@ -35,6 +35,26 @@ class Job(BaseModel):
     # app.services.collector_runner.score_and_persist's own docstring.
     # S10-003: max_length matches JobRecord.posting_type's VARCHAR(64).
     posting_type: str | None = Field(default=None, max_length=64)
+
+    # S10-RR-001 (Codex Stage 10 re-review, BLOCKING): normalizes BEFORE
+    # the max_length constraint above is checked (mode="before" runs
+    # ahead of Pydantic's own built-in string validation) -- "" and
+    # whitespace-only are collapsed to None, and surrounding whitespace on
+    # a real value is stripped, so max_length is enforced against the
+    # ACTUAL content, not incidental padding. Critical for
+    # app.services.collector_runner.score_and_persist's preserve-on-omit
+    # rule (`if job.posting_type is not None: record.posting_type = ...`):
+    # an upstream API response that transiently sends "" instead of
+    # omitting the field entirely must still be treated as "no signal",
+    # never as an explicit instruction to erase an already-persisted
+    # classification (e.g. SELBSTAENDIGKEIT).
+    @field_validator("posting_type", mode="before")
+    @classmethod
+    def _normalize_posting_type(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
 
 class JobScore(BaseModel):

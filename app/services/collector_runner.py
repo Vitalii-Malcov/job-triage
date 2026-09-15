@@ -61,6 +61,7 @@ from app.db.repositories import (
     is_message_processed,
     mark_message_processed,
     profile_skills,
+    update_job_score_if_posting_type_unchanged,
     upsert_job,
 )
 from app.db.xing_scan_progress_repository import (
@@ -79,12 +80,30 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CollectorError",
     "CollectorNotConfiguredError",
+    "JobScoreReconciliationError",
     "TouchedJob",
     "run_bundesagentur",
     "run_company_research_for_job",
     "run_xing",
     "score_and_persist",
 ]
+
+# S10-RR-001: bounds the compare-and-swap retry loop in score_and_persist
+# below. Each attempt only fires when a CONCRETE concurrent write has
+# just been observed (not speculatively), so exhausting this many
+# attempts means an unusually sustained write storm on the exact same
+# fingerprint -- treated as a hard failure rather than retried forever.
+MAX_POSTING_TYPE_RECONCILE_ATTEMPTS = 5
+
+
+class JobScoreReconciliationError(Exception):
+    """Raised when score_and_persist cannot converge a JobRecord's
+    (score, recommendation) with its own currently-persisted posting_type
+    within MAX_POSTING_TYPE_RECONCILE_ATTEMPTS compare-and-swap attempts
+    (S10-RR-001) -- surfaces a genuine, unresolved consistency problem to
+    the caller rather than silently giving up and leaving a possibly
+    inconsistent (posting_type, recommendation) pairing on the row.
+    """
 
 
 @dataclass(frozen=True)
@@ -197,27 +216,58 @@ def score_and_persist(
     could end up NOT being the row `result` (below) was actually
     computed for, e.g. persisting `posting_type=SELBSTAENDIGKEIT` with a
     stale `recommendation=APPLY` computed by a losing writer back when it
-    still believed the posting was untyped. After the write, this
-    function re-checks `record.posting_type` against what `result` was
-    actually classified against and, on a mismatch, reclassifies and
-    corrects `record` in place -- so whichever call returns/commits LAST
-    for a given fingerprint always leaves (score, recommendation)
-    consistent with THAT row's own final, real posting_type, regardless
-    of write interleaving.
+    still believed the posting was untyped.
+
+    **S10-RR-001 (Codex Stage 10 RE-review, BLOCKING): the reconciliation
+    itself must not be a second TOCTOU window.** An earlier version of
+    this fix re-read `record.posting_type`, recomputed, and committed
+    unconditionally -- a THIRD writer could change posting_type again in
+    the gap between that read and that commit, and the unconditional
+    write would apply a score/recommendation computed against an
+    already-stale second observation. The loop below closes that instead
+    of just narrowing it: each attempt reclassifies against a freshly
+    OBSERVED posting_type and applies it via
+    `app.db.repositories.update_job_score_if_posting_type_unchanged` -- a
+    single atomic `UPDATE ... WHERE posting_type IS NOT DISTINCT FROM
+    :observed` (NULL-safe). If 0 rows are affected, posting_type changed
+    again underneath the observation; the loop re-reads and retries,
+    bounded by MAX_POSTING_TYPE_RECONCILE_ATTEMPTS -- if a fingerprint is
+    somehow still being rewritten on every single attempt (an extreme,
+    sustained write storm), this raises JobScoreReconciliationError
+    rather than silently giving up with a possibly inconsistent row.
+    HARD-007's own fingerprint-race recovery (inside `upsert_job`) is
+    untouched by any of this -- this loop only ever runs AFTER
+    `upsert_job` has already returned a durably-persisted row.
     """
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
     result = _score_for_posting_type(db, profile, job, effective_posting_type)
     record, created = upsert_job(db, job, result)
 
-    if record.posting_type != effective_posting_type:
-        result = _score_for_posting_type(db, profile, job, record.posting_type)
-        if record.score != result.score or record.recommendation != result.recommendation:
-            record.score = result.score
-            record.recommendation = result.recommendation
-            record.data_confidence = result.data_confidence
-            db.commit()
+    observed_posting_type = record.posting_type
+    if observed_posting_type != effective_posting_type:
+        for _attempt in range(MAX_POSTING_TYPE_RECONCILE_ATTEMPTS):
+            result = _score_for_posting_type(db, profile, job, observed_posting_type)
+            applied = update_job_score_if_posting_type_unchanged(
+                db,
+                record.id,
+                observed_posting_type=observed_posting_type,
+                score=result.score,
+                recommendation=result.recommendation,
+                data_confidence=result.data_confidence,
+            )
+            if applied:
+                record.score = result.score
+                record.recommendation = result.recommendation
+                record.data_confidence = result.data_confidence
+                break
             db.refresh(record)
+            observed_posting_type = record.posting_type
+        else:
+            raise JobScoreReconciliationError(
+                f"job_id={record.id}: could not converge (score, recommendation) with "
+                f"posting_type after {MAX_POSTING_TYPE_RECONCILE_ATTEMPTS} attempts"
+            )
 
     result.is_duplicate = not created
     return record, result, created

@@ -46,6 +46,7 @@ other PostgreSQL integration test in this directory.
 `scheduler-postgres` job.
 """
 
+import json
 import os
 import threading
 from datetime import UTC, datetime
@@ -55,9 +56,10 @@ from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import JobRecord, JobReferenceTokenRecord
+from app.db.models import CandidateProfileRecord, JobRecord, JobReferenceTokenRecord, UserProfile
 from app.db.repositories import _fingerprint, _is_fingerprint_unique_violation, upsert_job
 from app.models.job import Job, JobScore
+from app.services.collector_runner import score_and_persist
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 
@@ -366,3 +368,165 @@ class TestFingerprintViolationDetectionAgainstRealPostgresDiagnostics:
             assert _is_fingerprint_unique_violation(excinfo.value) is False
         finally:
             session.close()
+
+
+class TestPostingTypeConcurrencyReconciliation:
+    """S10-RR-001 (Codex Stage 10 re-review, BLOCKING): proves
+    `score_and_persist`'s CAS-based posting_type reconciliation
+    (`app.db.repositories.update_job_score_if_posting_type_unchanged`)
+    against REAL PostgreSQL -- two independent Sessions race
+    `score_and_persist()` for the SAME brand-new fingerprint, one
+    submitting an UNTYPED Job, the other a SELBSTAENDIGKEIT-typed one
+    with no FREELANCE preference (so it must be excluded).
+
+    Uses the same two-barrier technique as
+    `TestRealConcurrentNewJobInsert` above, but patched at
+    `app.services.collector_runner`'s own `get_job_by_fingerprint`
+    reference (`score_and_persist`'s OWN first-line read, not
+    `upsert_job`'s separate internal one) so BOTH threads are guaranteed
+    to have observed `existing is None` before either proceeds --
+    forcing the genuine INSERT collision inside `upsert_job`'s own
+    HARD-007 race-recovery path, which is exactly where S10-001's
+    original bug (a losing writer's stale precomputed recommendation
+    silently overwriting a winner's correct one) lived. `upsert_job`'s
+    OWN internal reads are left completely real/unpatched -- this proves
+    the fix WITHOUT touching or weakening HARD-007 itself.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_candidate_profile_singleton(self, pg_session_factory):
+        # A clean, default (no employment_types preference) Stage 6A
+        # Candidate Profile before each test here -- the SELBSTAENDIGKEIT
+        # scenario below depends on FREELANCE NOT being in the
+        # candidate's preferences, matching the SQLite unit tests' own
+        # default assumption
+        # (tests/test_collector_runner_posting_classification.py).
+        session = pg_session_factory()
+        try:
+            session.execute(delete(CandidateProfileRecord).where(CandidateProfileRecord.id == 1))
+            session.commit()
+        finally:
+            session.close()
+
+    def test_concurrent_typed_and_untyped_score_and_persist_never_pairs_apply_with_excluded_type(
+        self, pg_session_factory, monkeypatch
+    ):
+        marker = f"{FINGERPRINT_MARKER}-posting-type-cas"
+        job_a = Job(
+            source="bundesagentur",
+            title=f"Backend Engineer {marker}",
+            company="RaceCo",
+            location="Berlin",
+            url=f"https://example.com/jobs/{marker}",
+            must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
+            posting_type=None,
+        )
+        job_b = Job(
+            source="bundesagentur",
+            title=f"Backend Engineer {marker}",
+            company="RaceCo",
+            location="Berlin",
+            url=f"https://example.com/jobs/{marker}",
+            posting_type="SELBSTAENDIGKEIT",
+        )
+        profile = UserProfile(
+            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
+        )
+
+        read_barrier = threading.Barrier(2)
+        monkeypatch.setattr(
+            "app.services.collector_runner.get_job_by_fingerprint",
+            _synchronized_get_job_by_fingerprint(read_barrier),
+        )
+
+        results: dict[int, object] = {}
+
+        def worker(index: int, job: Job) -> None:
+            session = pg_session_factory()
+            try:
+                results[index] = score_and_persist(session, profile, job)
+            except BaseException as exc:  # noqa: BLE001
+                results[index] = exc
+            finally:
+                session.close()
+
+        threads = [
+            threading.Thread(target=worker, args=(0, job_a)),
+            threading.Thread(target=worker, args=(1, job_b)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        outcomes = list(results.values())
+        failures = [o for o in outcomes if isinstance(o, BaseException)]
+        assert not failures, f"score_and_persist raised: {failures}"
+        assert len(outcomes) == 2
+
+        verify = pg_session_factory()
+        try:
+            rows = verify.scalars(
+                select(JobRecord).where(JobRecord.fingerprint == _fingerprint(job_b))
+            ).all()
+            assert len(rows) == 1, "exactly one row must exist -- HARD-007 fingerprint uniqueness"
+            row = rows[0]
+            # The reported bug, made explicit: an excluded posting type
+            # must never be paired with recommendation=APPLY.
+            assert not (row.posting_type == "SELBSTAENDIGKEIT" and row.recommendation == "APPLY")
+            # job_b's explicit SELBSTAENDIGKEIT always wins posting_type
+            # (job_a's None never overwrites it -- preserve-on-omit in
+            # _apply_job_update_fields), so the row must always converge
+            # to excluded/SKIP regardless of which thread won the
+            # physical INSERT race.
+            assert row.posting_type == "SELBSTAENDIGKEIT"
+            assert row.recommendation == "SKIP"
+            assert row.score == 0
+        finally:
+            verify.close()
+
+    def test_blank_posting_type_cannot_erase_a_stored_selbstaendigkeit_real_postgres(
+        self, pg_session_factory
+    ):
+        marker = f"{FINGERPRINT_MARKER}-blank-erase"
+        profile = UserProfile(
+            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
+        )
+        original = Job(
+            source="bundesagentur",
+            title=f"Python Advanced {marker}",
+            company="alfatraining Bildungszentrum GmbH",
+            url=f"https://example.com/jobs/{marker}",
+            posting_type="SELBSTAENDIGKEIT",
+        )
+
+        session1 = pg_session_factory()
+        try:
+            record1, result1, created1 = score_and_persist(session1, profile, original)
+            assert created1 is True
+            assert record1.posting_type == "SELBSTAENDIGKEIT"
+            assert result1.recommendation == "SKIP"
+        finally:
+            session1.close()
+
+        # A raw "" from an upstream API response (S10-RR-001 normalizes
+        # this to None at the Job model boundary) for the SAME
+        # fingerprint, on a SEPARATE session/connection.
+        blank_resubmit = Job(
+            source="bundesagentur",
+            title=f"Python Advanced {marker}",
+            company="alfatraining Bildungszentrum GmbH",
+            url=f"https://example.com/jobs/{marker}",
+            posting_type="",
+        )
+        assert blank_resubmit.posting_type is None
+
+        session2 = pg_session_factory()
+        try:
+            record2, result2, created2 = score_and_persist(session2, profile, blank_resubmit)
+            assert created2 is False
+            assert record2.id == record1.id
+            assert record2.posting_type == "SELBSTAENDIGKEIT"
+            assert result2.recommendation == "SKIP"
+        finally:
+            session2.close()
