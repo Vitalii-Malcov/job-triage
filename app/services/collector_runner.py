@@ -43,6 +43,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from app.agents.evidence_quality_classifier import classify_evidence_quality
 from app.agents.job_scorer import JobScorer
 from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
 from app.agents.role_relevance_classifier import (
@@ -310,6 +311,77 @@ def _score_for_posting_type(
                     title_relevance.matched_signal,
                 )
                 return _excluded_job_score()
+
+    # Stage 11C: a plausibly software-development-titled job must not be
+    # left at an automatic SKIP purely because STRUCTURED skill
+    # extraction was thin -- "strong absence of evidence is not evidence
+    # of mismatch" (see app.agents.evidence_quality_classifier's own
+    # docstring for the full rationale and the concrete pilot example
+    # this distinction is built on). Only ever raises an ALREADY-SKIP
+    # result to MAYBE, never invents a higher score, never touches
+    # APPLY/MAYBE/NEEDS_ENRICHMENT results, and stacks strictly on top of
+    # every earlier gate rather than replacing any of them:
+    #
+    # - posting_type-excluded and Stage 11A/11B-excluded jobs already
+    #   returned _excluded_job_score() above and never reach this point.
+    # - Stage 11A's own seniority gate above only runs on APPLY/MAYBE
+    #   results, so it never sees an already-SKIP job -- a SKIP-scored
+    #   posting with an explicit senior title for a junior-targeting
+    #   candidate ("Senior Python Developer") is independently re-checked
+    #   here via the SAME classify_title_seniority/
+    #   _candidate_target_seniority pair (reused, not reimplemented) so
+    #   it is never rescued either.
+    # - Only a RELEVANT title (never IRRELEVANT, never UNKNOWN -- UNKNOWN
+    #   fails open to "leave it alone", not to "assume it's a dev role")
+    #   is eligible at all.
+    #
+    # Two additional guards (hardening pass, post-A/B review):
+    #
+    # 1. A CONCRETE missing must-have is never sparse evidence, no matter
+    #    how small the total signal count is. `must=["Java"]` against a
+    #    Python-only candidate is ONE genuine, identified requirement the
+    #    candidate does not meet -- that is a real mismatch signal, not
+    #    an absence of evidence, even though the total count (1) would
+    #    otherwise clear SPARSE_EVIDENCE_THRESHOLD. Only a job with ZERO
+    #    concrete missing must-haves (an empty must-have set, or one
+    #    where every extracted must-have already matched) is eligible.
+    #
+    # 2. The candidate's own target domain must be CONFIDENTLY
+    #    SOFTWARE_DEVELOPMENT (reusing _candidate_target_domain, the same
+    #    pure/no-create/no-autoflush helper Stage 11B already uses -- not
+    #    duplicated here). A missing CandidateProfile, or a mixed/
+    #    ambiguous target_roles set that only resolves to UNKNOWN, must
+    #    leave the original recommendation untouched -- rescuing a job
+    #    the candidate's OWN stated targets don't confidently support
+    #    would be exactly the "blindly boost" this floor must not do.
+    if result.recommendation == "SKIP":
+        title_relevance = classify_title_relevance(job.title)
+        title_seniority = classify_title_seniority(job.title)
+        senior_mismatch = title_seniority.level == "SENIOR" and (
+            _candidate_target_seniority(db) == "JUNIOR"
+        )
+        if (
+            title_relevance.level == "RELEVANT"
+            and not senior_mismatch
+            and _candidate_target_domain(db) == "SOFTWARE_DEVELOPMENT"
+        ):
+            must_have_total = len(result.matched_must_have) + len(result.missing_must_have)
+            nice_to_have_total = len(job.nice_to_have_skills)
+            no_concrete_missing_must = len(result.missing_must_have) == 0
+            evidence_quality = classify_evidence_quality(must_have_total, nice_to_have_total)
+            if evidence_quality == "SPARSE" and no_concrete_missing_must:
+                logger.info(
+                    "job_recommendation_floor_sparse_evidence job_title=%s source=%s "
+                    "must_have_total=%s nice_to_have_total=%s original_score=%s "
+                    "matched_signal=%s",
+                    job.title,
+                    job.source,
+                    must_have_total,
+                    nice_to_have_total,
+                    result.score,
+                    title_relevance.matched_signal,
+                )
+                result = result.model_copy(update={"recommendation": "MAYBE"})
 
     return result
 
