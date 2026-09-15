@@ -9,7 +9,7 @@ from app.agents.role_relevance_classifier import (
 def test_junior_python_developer_is_relevant():
     result = classify_title_relevance("Junior Python Developer")
     assert result.level == "RELEVANT"
-    assert result.matched_signal == "developer"
+    assert result.matched_signal == "python-developer"
 
 
 def test_python_entwickler_is_relevant():
@@ -21,7 +21,7 @@ def test_python_entwickler_is_relevant():
 def test_backend_developer_is_relevant():
     result = classify_title_relevance("Backend Developer (m/w/div.)")
     assert result.level == "RELEVANT"
-    assert result.matched_signal == "developer"
+    assert result.matched_signal == "backend-developer"
 
 
 def test_software_engineer_backend_is_relevant():
@@ -173,6 +173,143 @@ def test_wissenschaftliche_mitarbeiterin_is_irrelevant():
     assert result.matched_signal == "wissenschaftliche-mitarbeiter"
 
 
+# --- S11B-001: scientific-role signal requires the explicit "Mitarbeiter"
+# role noun, not the "wissenschaftlich..." adjective alone -------------------
+
+
+def test_wissenschaftlicher_programmierer_is_not_irrelevant():
+    result = classify_title_relevance("Wissenschaftlicher Programmierer")
+    assert result.level != "IRRELEVANT"
+
+
+def test_wissenschaftlicher_softwarearchitekt_is_not_irrelevant():
+    result = classify_title_relevance("Wissenschaftlicher Softwarearchitekt")
+    assert result.level != "IRRELEVANT"
+
+
+def test_wissenschaftlicher_data_engineer_is_not_irrelevant():
+    result = classify_title_relevance("Wissenschaftlicher Data Engineer")
+    assert result.level != "IRRELEVANT"
+
+
+def test_wissenschaftliche_hilfskraft_softwareentwicklung_is_not_irrelevant():
+    result = classify_title_relevance("Wissenschaftliche Hilfskraft Softwareentwicklung")
+    assert result.level != "IRRELEVANT"
+
+
+def test_wissenschaftlicher_mitarbeiter_standard_form_is_irrelevant():
+    result = classify_title_relevance("Wissenschaftlicher Mitarbeiter (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "wissenschaftliche-mitarbeiter"
+
+
+def test_wissenschaftliche_mitarbeiterin_standard_form_is_irrelevant():
+    result = classify_title_relevance("Wissenschaftliche Mitarbeiterin (m/w/d)")
+    assert result.level == "IRRELEVANT"
+
+
+def test_wissenschaftliche_slash_r_mitarbeiter_slash_in_form_is_irrelevant():
+    title = "Wissenschaftliche/-r Mitarbeiter/-in im Bereich Arbeitsmarkt (w/m/d)"
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "wissenschaftliche-mitarbeiter"
+
+
+def test_wissenschaftliche_asterisk_r_mitarbeiter_asterisk_in_form_is_irrelevant():
+    title = "Wissenschaftliche*r Mitarbeiter*in fuer Forschungsdatenmanagement"
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "wissenschaftliche-mitarbeiter"
+
+
+def test_real_pilot_scientific_mitarbeiter_vacancy_2_remains_irrelevant():
+    title = (
+        "Wissenschaftliche/-r Mitarbeiter/-in im Bereich Arbeitsmarkt (w/m/d) "
+        "im Referat Arbeitsmarktbeteiligung"
+    )
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+
+
+def test_real_pilot_scientific_mitarbeiter_vacancy_3_remains_irrelevant():
+    title = "Wissenschaftliche*r Mitarbeiter*in für Forschungsdatenmanagement"
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+
+
+# --- S11B-002: bare "Developer" is not a sufficient positive signal --------
+
+
+def test_business_developer_is_unknown_not_relevant():
+    result = classify_title_relevance("Business Developer")
+    assert result.level == "UNKNOWN"
+
+
+def test_senior_business_developer_is_unknown_not_relevant():
+    result = classify_title_relevance("Senior Business Developer")
+    assert result.level == "UNKNOWN"
+
+
+def test_property_developer_is_unknown_not_relevant():
+    result = classify_title_relevance("Property Developer")
+    assert result.level == "UNKNOWN"
+
+
+def test_real_estate_developer_is_unknown_not_relevant():
+    result = classify_title_relevance("Real Estate Developer")
+    assert result.level == "UNKNOWN"
+
+
+def test_python_developer_bare_phrase_is_relevant():
+    result = classify_title_relevance("Python Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "python-developer"
+
+
+def test_software_developer_is_relevant():
+    result = classify_title_relevance("Software Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "software-developer"
+
+
+def test_fullstack_developer_is_relevant():
+    result = classify_title_relevance("Fullstack Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "fullstack-developer"
+
+
+def test_full_stack_developer_with_space_is_relevant():
+    result = classify_title_relevance("Full Stack Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "fullstack-developer"
+
+
+def test_frontend_developer_is_relevant():
+    result = classify_title_relevance("Frontend Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "frontend-developer"
+
+
+def test_web_developer_is_relevant():
+    result = classify_title_relevance("Web Developer")
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "web-developer"
+
+
+def test_derive_business_developer_target_is_unknown():
+    assert derive_candidate_target_domain(["Business Developer"]) == "UNKNOWN"
+
+
+def test_derive_mixed_python_and_business_developer_target_is_unknown():
+    target_roles = ["Junior Python Developer", "Business Developer"]
+    assert derive_candidate_target_domain(target_roles) == "UNKNOWN"
+
+
+def test_derive_junior_python_and_backend_developer_target_is_software_development():
+    target_roles = ["Junior Python Developer", "Junior Backend Developer"]
+    assert derive_candidate_target_domain(target_roles) == "SOFTWARE_DEVELOPMENT"
+
+
 # --- Conflict policy: positive AND irrelevant both present -> UNKNOWN ------
 
 
@@ -185,22 +322,38 @@ def test_presales_software_engineer_is_unknown_genuinely_mixed():
     assert result.matched_signal is None
 
 
-def test_qgis_developer_is_unknown_genuinely_mixed():
+def test_qgis_developer_is_irrelevant_after_s11b_002():
+    # S11B-002 narrowed "Developer" to an explicit software-development
+    # phrase allowlist ("QGIS Developer" isn't Python/Backend/Frontend/
+    # Fullstack/Web/Software + Developer) -- bare "developer" no longer
+    # supplies a positive signal here, so this is no longer a genuinely
+    # MIXED title: only "qgis" (irrelevant) remains -> IRRELEVANT. This
+    # intentionally supersedes the pre-S11B-002 UNKNOWN outcome.
     result = classify_title_relevance("QGIS Developer")
-    assert result.level == "UNKNOWN"
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis"
 
 
-def test_wissenschaftlicher_softwareentwickler_is_unknown_genuinely_mixed():
+def test_wissenschaftlicher_softwareentwickler_is_relevant_after_s11b_001():
+    # S11B-001 restricted the scientific-role signal to require the
+    # explicit "Mitarbeiter" role noun -- "Wissenschaftlicher
+    # Softwareentwickler" ("scientific/academic software developer") has
+    # no "Mitarbeiter", so the irrelevant signal no longer fires, leaving
+    # only the positive "entwickler" (Softwareentwickler) signal ->
+    # RELEVANT. This is the intended fix, not a regression: a real
+    # software-development role must not be excluded merely because it's
+    # in a scientific/academic context.
     result = classify_title_relevance("Wissenschaftlicher Softwareentwickler")
-    assert result.level == "UNKNOWN"
+    assert result.level == "RELEVANT"
+    assert result.matched_signal == "entwickler"
 
 
 def test_conflict_outcome_is_order_independent():
-    # The SAME two signals, positive word first vs. irrelevant word first
-    # -- must classify identically either way (proves this isn't a
+    # The SAME two signals, positive phrase first vs. irrelevant word
+    # first -- must classify identically either way (proves this isn't a
     # first-match-wins ordered scan).
-    a = classify_title_relevance("Developer Personalcontroller Hybrid Role")
-    b = classify_title_relevance("Personalcontroller Developer Hybrid Role")
+    a = classify_title_relevance("Software Developer Personalcontroller Hybrid Role")
+    b = classify_title_relevance("Personalcontroller Software Developer Hybrid Role")
     assert a.level == "UNKNOWN"
     assert b.level == "UNKNOWN"
     assert a.level == b.level

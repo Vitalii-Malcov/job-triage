@@ -32,11 +32,21 @@ NOT by themselves relevant-role signals -- "Python Systemadministrator"
 and "Backend Administrator" are exactly the titles this precision fix
 (post-review hardening) exists to keep OUT of RELEVANT: a technology word
 describes WHAT the role touches, not WHETHER the role itself is a
-software-development role. Only genuine role-family words (Developer/
-Entwickler, Software Engineer, AI Engineer, ...) count as positive
-signals -- "Python Engineer"/"Backend Engineer" are legitimately UNKNOWN
-(bare "Engineer" alone is not a listed role-family signal either), not a
+software-development role. Only genuine role-family words/phrases
+(Python/Backend/Frontend/Fullstack/Web/Software Developer, Entwickler,
+Software Engineer, AI Engineer, ...) count as positive signals --
+"Python Engineer"/"Backend Engineer" are legitimately UNKNOWN (bare
+"Engineer" alone is not a listed role-family signal either), not a
 regression: UNKNOWN fails open, exactly as intended.
+
+**S11B-002: bare "Developer" is ALSO not a sufficient positive signal on
+its own.** "Business Developer", "Senior Business Developer", "Property
+Developer", and "Real Estate Developer" are real, common job titles
+where "Developer" means a business/deal originator or a real-estate
+builder, not a software role. "Developer" only counts as a positive
+signal via an explicit closed allowlist of software-development phrases
+(`_DEVELOPER_PHRASE_PATTERNS`) -- the same S11A-001 allowlist lesson
+applied one level up, not a generic "any word + Developer" scan.
 
 **Positive and irrelevant signals are evaluated INDEPENDENTLY, not as a
 first-match-wins ordered scan.** Both signal sets are checked against the
@@ -95,14 +105,30 @@ _ENTWICKLER_ALLOWLIST_WORDS = (
 )
 _ENTWICKLER_PATTERN = r"\b(?:" + "|".join(_ENTWICKLER_ALLOWLIST_WORDS) + r")\b"
 
-# ROLE-FAMILY words that confidently indicate a software-development
-# role -- deliberately NOT technology/tool words ("Python", "Backend",
-# "MongoDB", ...), which describe subject matter, not role family. See
-# module docstring for why standalone "python"/"backend" were removed.
+# ROLE-FAMILY words/phrases that confidently indicate a software-
+# development role -- deliberately NOT technology/tool words ("Python",
+# "Backend", "MongoDB", ...) and, per S11B-002, deliberately NOT bare
+# "Developer" either: "Business Developer", "Property Developer", and
+# "Real Estate Developer" are real, common non-software job titles where
+# "Developer" means something else entirely (a business/deal originator,
+# a real-estate builder). "Developer" only counts as a positive signal
+# when paired with an explicit software-development context word in the
+# SAME phrase -- an closed allowlist of complete phrases, not a generic
+# "any word + Developer" scan (which would just reintroduce the same
+# over-broad-word problem one level up).
+_DEVELOPER_PHRASE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("python-developer", r"\bpython\s+developer\b"),
+    ("backend-developer", r"\bbackend\s+developer\b"),
+    ("frontend-developer", r"\bfront[\s-]?end\s+developer\b"),
+    ("fullstack-developer", r"\bfull[\s-]?stack\s+developer\b"),
+    ("web-developer", r"\bweb\s+developer\b"),
+    ("software-developer", r"\bsoftware\s+developer\b"),
+)
+
 _RELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE))
     for name, pattern in (
-        ("developer", r"\bdeveloper\b"),
+        *_DEVELOPER_PHRASE_PATTERNS,
         ("software-engineer", r"\bsoftware\s+engineer\b"),
         ("ai-engineer", r"\bai\s+engineer\b"),
         ("entwickler", _ENTWICKLER_PATTERN),
@@ -124,10 +150,24 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("presales", r"\bpresales\b"),
         ("projektmanagement", r"\bprojektmanagement\b"),
         ("elektrotechnik", r"\belektrotechnik\b"),
-        # "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard German
-        # academic-research-assistant title family (Stage 11 pilot false
-        # positives: Uniklinikum Frankfurt, Statistisches Bundesamt).
-        ("wissenschaftliche-mitarbeiter", r"\bwissenschaftliche[rn]?\b"),
+        # S11B-001: "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard
+        # German academic-research-ASSISTANT title family (Stage 11 pilot
+        # false positives: Uniklinikum Frankfurt, Statistisches
+        # Bundesamt). Requires the explicit ROLE noun "Mitarbeiter(in)"
+        # to actually be present, not merely the adjective
+        # "wissenschaftlich..." alone -- the adjective alone also
+        # legitimately modifies real software-development titles
+        # ("Wissenschaftlicher Programmierer", "Wissenschaftlicher
+        # Softwarearchitekt", "Wissenschaftlicher Data Engineer",
+        # "Wissenschaftliche Hilfskraft Softwareentwicklung"), none of
+        # which say "Mitarbeiter". A short bounded gap (<=15 chars)
+        # between the two words tolerates the real pilot titles' messy
+        # gender-inflection punctuation ("Wissenschaftliche/r
+        # Mitarbeiterin", "Wissenschaftliche/-r Mitarbeiter/-in",
+        # "Wissenschaftliche*r Mitarbeiter*in") without becoming a
+        # generic "wissenschaftlich...anything...mitarbeiter" scan that
+        # could bridge two unrelated words in a longer title.
+        ("wissenschaftliche-mitarbeiter", r"\bwissenschaftlich[a-z]*\b.{0,15}?\bmitarbeiter"),
     )
 )
 
