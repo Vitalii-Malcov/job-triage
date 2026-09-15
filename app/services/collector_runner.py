@@ -45,6 +45,10 @@ from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import JobScorer
 from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
+from app.agents.seniority_classifier import (
+    classify_title_seniority,
+    derive_candidate_target_seniority,
+)
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
@@ -141,6 +145,41 @@ def _allowed_employment_types(db: Session, posting_type: str | None) -> frozense
     return frozenset(profile.job_preferences.employment_types)
 
 
+def _candidate_target_seniority(db: Session):
+    """The candidate's own stated CandidateProfile.target_roles (Stage
+    6A), read lazily -- only when a job has already cleared posting_type
+    classification AND scored APPLY/MAYBE (Stage 11A, see
+    _score_for_posting_type below) -- so a job that's already excluded or
+    already SKIP on ordinary skill grounds never pays for this extra
+    Candidate Profile read.
+    """
+    profile_record = get_or_create_candidate_profile(db)
+    profile = to_candidate_profile_response(profile_record)
+    return derive_candidate_target_seniority(profile.target_roles)
+
+
+def _excluded_job_score() -> JobScore:
+    """The shared zeroed-out shape for a job forced out of the normal
+    scoring pipeline -- Stage 10's posting_type exclusion and Stage 11A's
+    seniority-mismatch exclusion both return exactly this (same
+    score=0/SKIP/zero-confidence result), so neither invents a new magic
+    score threshold. The two exclusion reasons are indistinguishable from
+    the JobScore/JobRecord shape alone by design -- each call site logs
+    its own specific reason (see the two call sites below) as the
+    auditable record of WHY.
+    """
+    return JobScore(
+        score=0,
+        matched_skills=[],
+        missing_skills=[],
+        matched_must_have=[],
+        missing_must_have=[],
+        matched_nice_to_have=[],
+        recommendation="SKIP",
+        data_confidence=0.0,
+    )
+
+
 def _score_for_posting_type(
     db: Session, profile: UserProfile, job: Job, effective_posting_type: str | None
 ) -> JobScore:
@@ -161,17 +200,35 @@ def _score_for_posting_type(
             job.source,
             classification.excluded_reason,
         )
-        return JobScore(
-            score=0,
-            matched_skills=[],
-            missing_skills=[],
-            matched_must_have=[],
-            missing_must_have=[],
-            matched_nice_to_have=[],
-            recommendation="SKIP",
-            data_confidence=0.0,
-        )
-    return JobScorer(profile_skills(profile)).score(job)
+        return _excluded_job_score()
+
+    result = JobScorer(profile_skills(profile)).score(job)
+
+    # Stage 11A: an explicit senior/lead-level TITLE must not reach
+    # MAYBE/APPLY for a candidate who has explicitly (and unambiguously --
+    # see derive_candidate_target_seniority) targeted junior roles. Only
+    # checked once a job has already reached APPLY/MAYBE on ordinary
+    # skill-match grounds -- an already-SKIP job gains nothing from also
+    # being seniority-excluded. If the candidate's target seniority can't
+    # be determined (no target_roles, or an ambiguous/mixed set), this
+    # never fires -- "cannot be determined" must never be treated as a
+    # rejection signal.
+    if result.recommendation in ("APPLY", "MAYBE"):
+        candidate_target = _candidate_target_seniority(db)
+        if candidate_target == "JUNIOR":
+            title_seniority = classify_title_seniority(job.title)
+            if title_seniority.level == "SENIOR":
+                logger.info(
+                    "job_excluded_seniority_mismatch job_title=%s source=%s "
+                    "candidate_target_seniority=%s matched_signal=%s",
+                    job.title,
+                    job.source,
+                    candidate_target,
+                    title_seniority.matched_signal,
+                )
+                return _excluded_job_score()
+
+    return result
 
 
 def score_and_persist(
