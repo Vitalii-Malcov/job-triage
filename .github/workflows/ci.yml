@@ -85,11 +85,27 @@ jobs:
       # HARD-007 verification pass: real-PostgreSQL evidence for
       # upsert_job's concurrent-new-fingerprint race (documented, not
       # fixed -- reserved for Codex review; see
-      # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007).
+      # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007). HARD-007-RR1
+      # (Codex targeted re-review) added the real-diagnostics tests in
+      # the SAME module (TestFingerprintViolationDetectionAgainstReal
+      # PostgresDiagnostics) proving `_is_fingerprint_unique_violation`
+      # correctly discriminates uq_jobs_fingerprint from an unrelated
+      # real constraint violation using psycopg's own `.diag`.
+      #
+      # HARD-008-RR1 (Codex targeted re-review): runs LAST, after the
+      # other four PostgreSQL integration tests below -- it drives its
+      # own Alembic downgrade/upgrade cycle against this same database
+      # (down to c7d3f9a1e5b8 and back to head) to prove the legacy-
+      # PENDING backfill fail-closes to UNCERTAIN, and always restores
+      # head in a `finally` block (including on failure). Running it
+      # last means the four tests before it -- which all assume the
+      # schema is already at head (see the "Alembic upgrade head" step
+      # above) -- are never affected by its own temporary downgrade.
       - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
           tests/integration/test_gmail_watermark_postgres_concurrency.py
           tests/integration/test_response_draft_send_postgres_concurrency.py
           tests/integration/test_upsert_job_postgres_concurrency.py
+          tests/integration/test_hard008_legacy_pending_migration_postgres.py
         env:
           TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
 

@@ -3006,20 +3006,186 @@ def test_response_draft_sends_send_attempted_downgrade_then_upgrade_cycle(
     assert "send_attempted" in columns_after_reupgrade
 
 
-def test_response_draft_sends_send_attempted_defaults_false_for_existing_rows(
+def _insert_legacy_response_draft_send_row(
+    connection,
+    *,
+    account_key: str,
+    status: str,
+    response_draft_id: int = 1,
+    approval_id: int = 1,
+) -> None:
+    """Inserts a row shaped exactly like the pre-a1b2c3d4e5f6 schema
+    (no `send_attempted` column yet) -- used to seed each pre-existing
+    `status` value before running the migration under test, mirroring a
+    real pre-HARD-008 database.
+    """
+    connection.execute(
+        text(
+            """
+            INSERT INTO response_draft_sends (
+                account_key, response_draft_id, approval_id, gmail_message_id,
+                status, attempt_count, created_at, updated_at
+            ) VALUES (
+                :account_key, :response_draft_id, :approval_id, 1,
+                :status, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "account_key": account_key,
+            "response_draft_id": response_draft_id,
+            "approval_id": approval_id,
+            "status": status,
+        },
+    )
+
+
+def test_response_draft_sends_legacy_pending_migrates_fail_closed_to_uncertain(
     tmp_path: Path,
 ) -> None:
-    """A row inserted BEFORE this migration ran (server_default=false)
-    must come out with `send_attempted=False`, not NULL -- existing
-    PENDING rows from before HARD-008 must be treated as PROVABLY
-    pre-transmission, never accidentally treated as ambiguous.
+    """HARD-008-RR1 (Codex targeted re-review): a legacy `PENDING` row is
+    NOT provably pre-transmission -- unlike a fresh row created after
+    this migration, nothing durably recorded whether the outbound
+    provider had ever been invoked for it. This is exactly the scenario
+    the re-review flagged: an old-version row representing "the provider
+    actually transmitted the email, but the process crashed before the
+    SENT-recording commit landed" is indistinguishable, from the row
+    alone, from a row that crashed before the provider was ever called.
+
+    Replaces the old (unsafe) assertion that a legacy PENDING row must
+    come out `send_attempted=False` ("provably pre-transmission") --
+    that would let `_resolve_existing_send_record` hand the row to a
+    later request to silently re-send, reproducing the exact
+    duplicate-send failure HARD-008 exists to prevent. The correct,
+    fail-closed backfill instead moves it straight to the terminal
+    `UNCERTAIN` status with `send_attempted=True`, so it can never be
+    automatically retried by any code path -- proven end-to-end below
+    via the real `_resolve_existing_send_record` dispatch, not just by
+    inspecting the migrated column values.
     """
-    db_path = tmp_path / "migrations_response_draft_send_attempted_default.db"
+    db_path = tmp_path / "migrations_response_draft_send_attempted_legacy_pending.db"
     cfg = _alembic_config(db_path)
     upgrade(cfg, "c7d3f9a1e5b8")
 
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as connection:
+        _insert_legacy_response_draft_send_row(
+            connection, account_key="pending@example.com", status="PENDING"
+        )
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT status, send_attempted, last_error FROM response_draft_sends "
+                    "WHERE account_key = 'pending@example.com'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    # NEVER safely retryable: status must no longer be PENDING, and
+    # send_attempted must be True even though the status changed, so no
+    # future backfill/refactor could accidentally treat this row as
+    # pre-transmission again purely by looking at send_attempted.
+    assert row["status"] == "UNCERTAIN"
+    assert row["send_attempted"] in (True, 1)
+    assert row["last_error"]
+    assert "HARD-008-RR1" in row["last_error"]
+
+    # End-to-end proof: the real recovery dispatch used by
+    # send_response_draft refuses to resend this row -- it raises
+    # immediately on status=="UNCERTAIN", the same terminal branch a
+    # genuine runtime-reached UNCERTAIN row takes, never reaching (or
+    # re-checking) send_attempted at all.
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.models import ResponseDraftSendRecord
+    from app.services.response_draft_send import (
+        ResponseDraftSendOutcomeUncertainError,
+        _resolve_existing_send_record,
+    )
+
+    session_factory = sessionmaker(bind=create_engine(f"sqlite:///{db_path}"))
+    db = session_factory()
+    try:
+        record = (
+            db.query(ResponseDraftSendRecord)
+            .filter(ResponseDraftSendRecord.account_key == "pending@example.com")
+            .one()
+        )
+        with pytest.raises(ResponseDraftSendOutcomeUncertainError):
+            _resolve_existing_send_record(
+                db, account_key="pending@example.com", draft=record, record=record
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("status", ["SENT", "FAILED", "UNCERTAIN"])
+def test_response_draft_sends_legacy_non_pending_status_untouched_but_marked_attempted(
+    tmp_path: Path, status: str
+) -> None:
+    """HARD-008-RR1: legacy `SENT`/`FAILED`/`UNCERTAIN` rows keep their
+    original `status` (never converted to UNCERTAIN -- that rewrite is
+    specific to PENDING's genuine ambiguity) and are backfilled to
+    `send_attempted=True` for row-level consistency with what actually
+    happened. This has no behavioral effect: SENT/UNCERTAIN are already
+    terminal regardless of send_attempted, and FAILED's own retry path
+    (`retry_send_attempt`) unconditionally resets send_attempted back to
+    False as part of its FAILED -> PENDING CAS -- see the migration's
+    own module docstring.
+    """
+    db_path = tmp_path / f"migrations_response_draft_send_attempted_legacy_{status.lower()}.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "c7d3f9a1e5b8")
+
+    account_key = f"{status.lower()}@example.com"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_legacy_response_draft_send_row(connection, account_key=account_key, status=status)
+
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT status, send_attempted FROM response_draft_sends "
+                    "WHERE account_key = :account_key"
+                ),
+                {"account_key": account_key},
+            )
+            .mappings()
+            .one()
+        )
+
+    assert row["status"] == status
+    assert row["send_attempted"] in (True, 1)
+
+
+def test_response_draft_sends_send_attempted_defaults_false_for_rows_created_after_migration(
+    tmp_path: Path,
+) -> None:
+    """A row inserted AFTER this migration has already run (through the
+    ORM, exactly like `claim_send_attempt`'s real INSERT) must still
+    default to `send_attempted=False` -- the migration's backfill
+    `UPDATE`s only ever run once, at upgrade time, and must never affect
+    rows that did not exist yet. This is the fresh-row half of HARD-008's
+    state machine the re-review explicitly said must not be weakened.
+    """
+    db_path = tmp_path / "migrations_response_draft_send_attempted_fresh_row.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_response_draft_approval(connection, response_draft_id=1)
         connection.execute(
             text(
                 """
@@ -3027,20 +3193,18 @@ def test_response_draft_sends_send_attempted_defaults_false_for_existing_rows(
                     account_key, response_draft_id, approval_id, gmail_message_id,
                     status, attempt_count, created_at, updated_at
                 ) VALUES (
-                    'a@example.com', 1, 1, 1, 'PENDING', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    'fresh@example.com', 1, 1, 1, 'PENDING', 1,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
                 """
             )
         )
 
-    upgrade(cfg, "head")
-
-    engine = create_engine(f"sqlite:///{db_path}")
     with engine.connect() as connection:
         value = connection.execute(
             text(
                 "SELECT send_attempted FROM response_draft_sends "
-                "WHERE account_key = 'a@example.com'"
+                "WHERE account_key = 'fresh@example.com'"
             )
         ).scalar()
     assert value in (False, 0)
