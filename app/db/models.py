@@ -40,6 +40,15 @@ class JobRecord(Base):
     skill_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
     must_have_skills_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     nice_to_have_skills_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # Stage 10 finding: source-reported posting type (e.g. Bundesagentur's
+    # "stellenangebotsart") — persisted so a later re-score of the SAME
+    # fingerprint (e.g. a manual POST /jobs/score call that doesn't know
+    # to resupply this derived field) can never silently lose the
+    # classification that originally excluded a non-employment listing
+    # from APPLY. See app/db/repositories.py::_apply_job_update_fields
+    # (only overwritten by a non-None value, exactly like `description`)
+    # and app.agents.posting_classifier.
+    posting_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)

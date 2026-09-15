@@ -160,6 +160,14 @@ def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: 
     record.nice_to_have_skills_json = json.dumps(job.nice_to_have_skills)
     if job.description.strip():
         record.description = job.description
+    # Stage 10 finding: only overwritten by a non-None value, exactly like
+    # `description` above — a re-score call that omits posting_type (e.g.
+    # a manual POST /jobs/score payload that doesn't know to resupply this
+    # derived field) must never silently erase a previously-known
+    # classification and let an already-excluded non-employment listing
+    # become eligible for APPLY again.
+    if job.posting_type is not None:
+        record.posting_type = job.posting_type
 
 
 def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
@@ -252,6 +260,7 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         skill_source=job.skill_source,
         must_have_skills_json=json.dumps(job.must_have_skills),
         nice_to_have_skills_json=json.dumps(job.nice_to_have_skills),
+        posting_type=job.posting_type,
         score=score.score,
         recommendation=score.recommendation,
         status="NEW",

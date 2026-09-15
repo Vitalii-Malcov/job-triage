@@ -5,6 +5,15 @@ from app.models.job import Job, JobScore
 
 MINIMUM_DECISION_CONFIDENCE = 0.45
 
+# Stage 10 shadow-mode pilot finding: a posting whose extracted must-have
+# set has fewer than this many entries can trivially reach must_score=1.0
+# from a single coincidental match (e.g. a training-course description
+# that only literally says "Python" once) -- that is too little structured
+# requirement evidence to justify an automatic APPLY, regardless of how
+# high the resulting numeric score is. See the recommendation logic below
+# ("missing evidence must never manufacture high confidence").
+MINIMUM_MUST_HAVE_SIGNALS_FOR_APPLY = 2
+
 ALIASES = {
     "fast api": "fastapi",
     "fast-api": "fastapi",
@@ -42,7 +51,13 @@ class JobScorer:
             must_score = len(matched_must) / len(must)
         else:
             must_score = 0.5
-        nice_score = len(matched_nice) / len(nice) if nice else 1.0
+        # Stage 10 fix: an empty nice-to-have set is an ABSENCE of
+        # evidence, not proof every (nonexistent) nice-to-have was
+        # satisfied -- defaulting to 1.0 here silently added a free 20%
+        # (this term's full weight) to every sparsely-extracted posting's
+        # score. Neutral (0.5), matching must_score's own "no evidence"
+        # default immediately above, not full credit.
+        nice_score = len(matched_nice) / len(nice) if nice else 0.5
 
         text = f"{job.title} {job.description}".casefold()
         description_hits = sum(
@@ -62,6 +77,13 @@ class JobScorer:
             recommendation = "NEEDS_ENRICHMENT"
         elif missing_must and must_score < 0.6:
             recommendation = "SKIP"
+        elif score >= 80 and len(must) < MINIMUM_MUST_HAVE_SIGNALS_FOR_APPLY:
+            # Missing evidence must never manufacture high confidence: a
+            # must-have set this sparse cannot support an automatic APPLY
+            # no matter how high the numeric score is (see
+            # MINIMUM_MUST_HAVE_SIGNALS_FOR_APPLY above) -- downgrade to
+            # MAYBE, a human still reviews it.
+            recommendation = "MAYBE"
         elif score >= 80:
             recommendation = "APPLY"
         elif score >= 60:

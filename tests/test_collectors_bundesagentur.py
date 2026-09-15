@@ -84,6 +84,34 @@ async def test_maps_a_valid_posting_including_generated_detail_url():
     assert "10000-1184867112-S" in str(job.url)
     assert job.source_reference == "10000-1184867112-S"
     assert collector.skipped_invalid_count == 0
+    # No stellenangebotsart in _posting()'s default fixture.
+    assert job.posting_type is None
+
+
+@pytest.mark.asyncio
+async def test_maps_stellenangebotsart_into_job_posting_type():
+    posting = _posting(stellenangebotsart="SELBSTAENDIGKEIT")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_page([posting]))
+
+    collector = _make_collector(handler)
+    jobs = await collector.fetch()
+
+    assert jobs[0].posting_type == "SELBSTAENDIGKEIT"
+
+
+@pytest.mark.asyncio
+async def test_non_string_stellenangebotsart_is_ignored_not_crashed_on():
+    posting = _posting(stellenangebotsart=12345)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_page([posting]))
+
+    collector = _make_collector(handler)
+    jobs = await collector.fetch()
+
+    assert jobs[0].posting_type is None
 
 
 @pytest.mark.asyncio

@@ -71,7 +71,9 @@ LanguageLevel = Literal["A1", "A2", "B1", "B2", "C1", "C2", "NATIVE", "UNKNOWN"]
 
 RemotePreference = Literal["ONSITE", "HYBRID", "REMOTE", "FLEXIBLE", "UNKNOWN"]
 
-EmploymentType = Literal["FULL_TIME", "PART_TIME", "CONTRACT", "INTERNSHIP", "FREELANCE", "UNKNOWN"]
+EmploymentType = Literal[
+    "FULL_TIME", "PART_TIME", "CONTRACT", "INTERNSHIP", "FREELANCE", "APPRENTICESHIP", "UNKNOWN"
+]
 
 # Where a fact came from. Only USER_CONFIRMED / USER_PROVIDED_DOCUMENT /
 # MANUAL_ENTRY are "the candidate (or a document they supplied) directly

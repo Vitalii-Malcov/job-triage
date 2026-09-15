@@ -168,6 +168,20 @@ def _map_posting(posting: object) -> Job | None:
         or PUBLIC_JOB_URL_TEMPLATE.format(refnr=refnr)
     )
 
+    # "stellenangebotsart" (observed live on both the search-list and detail
+    # endpoints, 2026-09-15) is the API's own controlled-vocabulary posting
+    # type -- ARBEIT (real employment), SELBSTAENDIGKEIT (genuine
+    # self-employed/freelance roles, e.g. commission-based sales reps --
+    # confirmed live NOT exclusive to training providers, despite
+    # alfatraining's course listings also using it), PRAKTIKUM_TRAINEE
+    # (internship), AUSBILDUNG (apprenticeship/dual study). See
+    # app.agents.posting_classifier for how this keeps non-target-employment
+    # listings out of the normal APPLY pipeline (Stage 10 finding) --
+    # deliberately NOT filtered here at the collector level, so every
+    # posting still becomes a persisted JobRecord (dedup/ingestion history
+    # preserved) and only the scoring step decides eligibility.
+    posting_type = posting.get("stellenangebotsart")
+
     try:
         return Job(
             source=SOURCE_NAME,
@@ -177,6 +191,7 @@ def _map_posting(posting: object) -> Job | None:
             url=url,
             description="",
             source_reference=str(refnr),
+            posting_type=posting_type if isinstance(posting_type, str) else None,
         )
     except ValidationError:
         logger.warning(

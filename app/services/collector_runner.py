@@ -44,10 +44,15 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import JobScorer
+from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XingEmailCollector
+from app.db.candidate_profile_repository import (
+    get_or_create_candidate_profile,
+    to_candidate_profile_response,
+)
 from app.db.models import JobRecord, UserProfile
 from app.db.repositories import (
     get_job_by_fingerprint,
@@ -102,6 +107,21 @@ class TouchedJob:
     recommendation: str
 
 
+def _allowed_employment_types(db: Session, posting_type: str | None) -> frozenset[str]:
+    """The candidate's own stated CandidateJobPreferences.employment_types
+    (Stage 6A), read lazily -- only when `posting_type` is one of the
+    types classify_posting actually needs a preference for
+    (AUSBILDUNG/PRAKTIKUM_TRAINEE) -- so the overwhelming majority of
+    postings (ARBEIT, or no structured type at all) never pay for an
+    extra Candidate Profile read per job scored.
+    """
+    if posting_type not in POSTING_TYPE_REQUIRES_PREFERENCE:
+        return frozenset()
+    profile_record = get_or_create_candidate_profile(db)
+    profile = to_candidate_profile_response(profile_record)
+    return frozenset(profile.job_preferences.employment_types)
+
+
 def score_and_persist(
     db: Session, profile: UserProfile, job: Job
 ) -> tuple[JobRecord, JobScore, bool]:
@@ -109,8 +129,57 @@ def score_and_persist(
 
     Shared by POST /jobs/score and every collector run below so scoring +
     deduplication logic lives in exactly one place.
+
+    **Stage 10 finding:** before running the normal keyword-overlap
+    scorer, `job` is classified (app.agents.posting_classifier) as target
+    employment or not -- a non-employment listing (a training provider's
+    own course, or an apprenticeship/internship/freelance role the
+    candidate hasn't opted into) is persisted like any other job
+    (dedup/ingestion history preserved, "don't silently discard source
+    records") but receives a forced SKIP instead of running through
+    JobScorer, so it can never reach the automatic APPLY/notification/
+    auto-research path (those all gate on `recommendation == "APPLY"`
+    already, see run_bundesagentur below and
+    app.services.collector_runner.run_xing).
+
+    **Re-score cannot lose the classification (Stage 10 follow-up).**
+    `job.posting_type` is transient scoring input, not something every
+    caller necessarily resupplies (a manual POST /jobs/score payload for
+    the SAME fingerprint as an already-persisted, already-excluded
+    listing has no reason to know this derived field exists). If `job`
+    doesn't carry one but a JobRecord with the same fingerprint already
+    does (persisted by a prior upsert_job call — see
+    app/db/repositories.py::_apply_job_update_fields's matching
+    preserve-on-omit rule), that persisted value is reused for
+    classification instead of silently treating the posting as
+    untyped/unknown.
     """
-    result = JobScorer(profile_skills(profile)).score(job)
+    existing = get_job_by_fingerprint(db, job)
+    effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
+    classification = classify_posting(
+        title=job.title,
+        posting_type=effective_posting_type,
+        allowed_employment_types=_allowed_employment_types(db, effective_posting_type),
+    )
+    if not classification.is_target_employment:
+        logger.info(
+            "job_excluded_non_target_posting job_title=%s source=%s reason=%s",
+            job.title,
+            job.source,
+            classification.excluded_reason,
+        )
+        result = JobScore(
+            score=0,
+            matched_skills=[],
+            missing_skills=[],
+            matched_must_have=[],
+            missing_must_have=[],
+            matched_nice_to_have=[],
+            recommendation="SKIP",
+            data_confidence=0.0,
+        )
+    else:
+        result = JobScorer(profile_skills(profile)).score(job)
     record, created = upsert_job(db, job, result)
     result.is_duplicate = not created
     return record, result, created

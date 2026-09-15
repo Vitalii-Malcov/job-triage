@@ -21,6 +21,16 @@ class Job(BaseModel):
     must_have_skills: list[str] = Field(default_factory=list)
     nice_to_have_skills: list[str] = Field(default_factory=list)
     skill_source: SkillSource | None = None
+    # Source-reported posting type (e.g. Bundesagentur's own
+    # "stellenangebotsart": "ARBEIT"/"SELBSTAENDIGKEIT"/"AUSBILDUNG"/
+    # "PRAKTIKUM_TRAINEE"). None for sources with no such structured field
+    # (XING) or when the source omitted it. See
+    # app.agents.posting_classifier for how this is used to keep
+    # non-employment listings (training-provider courses, apprenticeships,
+    # internships) out of the normal APPLY pipeline — Stage 10 shadow-mode
+    # pilot finding. Transient scoring input only, not persisted on
+    # JobRecord.
+    posting_type: str | None = None
 
 
 class JobScore(BaseModel):
