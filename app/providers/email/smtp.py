@@ -57,6 +57,7 @@ from app.providers.email.outbound_base import (
     EmailSendConnectionError,
     EmailSendOutcomeUnknownError,
     OutboundMessage,
+    OutboundSendingDisabledError,
     OutboundSendResult,
 )
 from app.utils.config_flags import is_configured
@@ -177,11 +178,19 @@ class GmailSmtpProvider:
         smtp_client: SmtpClient | None = None,
         timeout_seconds: float = SMTP_OPERATION_TIMEOUT_SECONDS,
         total_deadline_seconds: float = SMTP_TOTAL_DEADLINE_SECONDS,
+        outbound_enabled: bool = False,
     ) -> None:
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
         self.username = username
         self.app_password = app_password
+        # Stage 9 fail-closed kill switch: defaults to False here too (not
+        # just in Settings) -- a caller that constructs this provider
+        # without explicitly passing outbound_enabled=True (e.g. a test,
+        # or a future call site that forgets the argument) can never send,
+        # never merely "inherit" an enabled state. See send()'s own check
+        # and app.providers.email.outbound_base.OutboundSendingDisabledError.
+        self.outbound_enabled = outbound_enabled
         # The account's own address is used as the From header — falls
         # back to `username` (a Gmail username IS the account's email
         # address) when not given a separate value.
@@ -199,6 +208,16 @@ class GmailSmtpProvider:
         self.total_deadline_seconds = total_deadline_seconds
 
     def send(self, message: OutboundMessage) -> OutboundSendResult:
+        # Stage 9 fail-closed kill switch: checked FIRST, before the
+        # credential check and before any message building/network I/O --
+        # a disabled switch must block transmission regardless of whether
+        # credentials also happen to be configured. See
+        # OutboundSendingDisabledError's own docstring.
+        if not self.outbound_enabled:
+            logger.warning("outbound_email_send_blocked_kill_switch_disabled")
+            raise OutboundSendingDisabledError(
+                "Outbound sending is disabled (OUTBOUND_SENDING_ENABLED is not true)"
+            )
         if not is_configured(self.username) or not is_configured(self.app_password):
             raise EmailSendAuthError("GMAIL_USERNAME / GMAIL_APP_PASSWORD is not configured")
 

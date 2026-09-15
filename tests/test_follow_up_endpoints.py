@@ -65,6 +65,10 @@ def client(tmp_path, monkeypatch):
         gmail_username=ACCOUNT,
         gmail_app_password="app-password",
         follow_up_delay_days=1,
+        # Stage 9 fail-closed kill switch: this fixture/suite is about the
+        # existing "NO APPROVAL = NO FOLLOW-UP SEND" gate, not the kill
+        # switch itself (see TestOutboundKillSwitchOverHttp below).
+        outbound_sending_enabled=True,
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
@@ -339,3 +343,107 @@ class TestCrossAccountIsolation:
         assert response.json()["proposals_created"] == 0
         listed = test_client.get("/api/v1/follow-ups", headers=_auth_headers())
         assert listed.json() == []
+
+
+@pytest.fixture()
+def disabled_outbound_client(tmp_path, monkeypatch):
+    """Mirrors the `client` fixture above exactly, except
+    outbound_sending_enabled is left at its real Settings default
+    (False) -- proves the Stage 9 kill switch over HTTP for the
+    follow-up send endpoint too, with real Gmail credentials configured.
+    """
+    db_path = tmp_path / "test_follow_up_endpoints_disabled_outbound.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    def override_get_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    fake_settings = Settings(
+        api_key=API_KEY,
+        rate_limit_requests=1000,
+        rate_limit_window_seconds=60,
+        gmail_username=ACCOUNT,
+        gmail_app_password="app-password",
+        follow_up_delay_days=1,
+        # Deliberately NOT set -- proves the real Settings default (False)
+        # blocks sending.
+    )
+    assert fake_settings.outbound_sending_enabled is False
+    monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    rate_limit_module._requests.clear()
+    rate_limit_module._follow_up_evaluate_requests.clear()
+    rate_limit_module._follow_up_decision_requests.clear()
+    rate_limit_module._follow_up_send_requests.clear()
+
+    def _fail_if_constructed(**_kwargs):
+        raise AssertionError(
+            "GmailSmtpProvider must never be constructed when outbound "
+            "sending is disabled -- the route must fail closed before "
+            "this point"
+        )
+
+    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _fail_if_constructed)
+
+    with TestClient(app) as test_client:
+        yield test_client, session_factory
+
+    app.dependency_overrides.clear()
+    rate_limit_module._requests.clear()
+    rate_limit_module._follow_up_evaluate_requests.clear()
+    rate_limit_module._follow_up_decision_requests.clear()
+    rate_limit_module._follow_up_send_requests.clear()
+
+
+class TestOutboundKillSwitchOverHttp:
+    def _create_proposal(self, test_client, session_factory) -> int:
+        _seed_eligible_job(session_factory)
+        test_client.post("/api/v1/follow-ups/evaluate", headers=_auth_headers())
+        listed = test_client.get("/api/v1/follow-ups", headers=_auth_headers())
+        return listed.json()[0]["id"]
+
+    def test_send_with_disabled_outbound_returns_503_even_when_approved(
+        self, disabled_outbound_client
+    ):
+        test_client, session_factory = disabled_outbound_client
+        follow_up_id = self._create_proposal(test_client, session_factory)
+        decision = test_client.post(
+            f"/api/v1/follow-ups/{follow_up_id}/decision",
+            headers=_auth_headers(),
+            json={"decision": "APPROVED"},
+        )
+        assert decision.status_code == 200
+
+        response = test_client.post(
+            f"/api/v1/follow-ups/{follow_up_id}/send", headers=_auth_headers()
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Outbound sending is disabled"
+
+    def test_disabled_outbound_does_not_touch_send_state(self, disabled_outbound_client):
+        test_client, session_factory = disabled_outbound_client
+        follow_up_id = self._create_proposal(test_client, session_factory)
+        test_client.post(
+            f"/api/v1/follow-ups/{follow_up_id}/decision",
+            headers=_auth_headers(),
+            json={"decision": "APPROVED"},
+        )
+
+        blocked = test_client.post(
+            f"/api/v1/follow-ups/{follow_up_id}/send", headers=_auth_headers()
+        )
+        assert blocked.status_code == 503
+
+        state = test_client.get(f"/api/v1/follow-ups/{follow_up_id}/state", headers=_auth_headers())
+        assert state.status_code == 200
+        assert state.json()["send"] is None

@@ -1577,6 +1577,18 @@ def send_response_draft_endpoint(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Outbound email sending is not configured",
         )
+    # Stage 9 fail-closed kill switch: checked here, BEFORE
+    # send_response_draft is ever called, so a disabled switch never
+    # touches the CAS send-claim state machine at all (no PENDING/FAILED
+    # row is created) — mirrors the is_configured check immediately
+    # above. GmailSmtpProvider itself also refuses to transmit when
+    # outbound_enabled is falsy (see its own send()) as defense in depth
+    # for any future caller that bypasses this route.
+    if not settings.outbound_sending_enabled:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outbound sending is disabled",
+        )
 
     account_key = _current_gmail_account_key(settings)
     provider = GmailSmtpProvider(
@@ -1584,6 +1596,7 @@ def send_response_draft_endpoint(
         smtp_port=settings.gmail_smtp_port,
         username=settings.gmail_username,
         app_password=settings.gmail_app_password,
+        outbound_enabled=settings.outbound_sending_enabled,
     )
     try:
         record = send_response_draft(db, account_key, draft_id, provider)
@@ -1812,6 +1825,13 @@ def send_follow_up_endpoint(follow_up_id: int, db: Session = Depends(get_db)) ->
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Outbound email sending is not configured",
         )
+    # Stage 9 fail-closed kill switch: same rationale as
+    # send_response_draft_endpoint's identical check above.
+    if not settings.outbound_sending_enabled:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outbound sending is disabled",
+        )
 
     account_key = _current_gmail_account_key(settings)
     provider = GmailSmtpProvider(
@@ -1819,6 +1839,7 @@ def send_follow_up_endpoint(follow_up_id: int, db: Session = Depends(get_db)) ->
         smtp_port=settings.gmail_smtp_port,
         username=settings.gmail_username,
         app_password=settings.gmail_app_password,
+        outbound_enabled=settings.outbound_sending_enabled,
     )
     try:
         record = send_follow_up(db, account_key, follow_up_id, provider)

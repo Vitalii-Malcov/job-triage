@@ -65,6 +65,13 @@ def _provider(client: FakeSmtpClient | None = None, **overrides) -> GmailSmtpPro
         username=ACCOUNT,
         app_password="app-password",
         smtp_client=client,
+        # Stage 9 fail-closed kill switch: this suite is about the SMTP
+        # provider's own send/timeout/error-handling behavior, not the
+        # kill switch itself (see TestOutboundKillSwitch below for that),
+        # so the default helper opts every other test into "enabled" —
+        # exactly like ACCOUNT/app_password above are already fixed
+        # stand-ins for real Settings values.
+        outbound_enabled=True,
     )
     kwargs.update(overrides)
     return GmailSmtpProvider(**kwargs)
@@ -178,6 +185,87 @@ class TestSend:
         with pytest.raises(EmailSendConnectionError):
             provider.send(_message(subject="Legit\r\nBcc: attacker@evil.com"))
         assert client.sent_messages == []
+
+
+class TestOutboundKillSwitch:
+    """Stage 9 fail-closed kill switch (Settings.outbound_sending_enabled,
+    threaded through to GmailSmtpProvider(outbound_enabled=...)). Proves
+    the provider itself refuses to transmit -- not merely that the API
+    route happens to also check -- and that the refusal happens BEFORE
+    any client interaction of any kind (no connect, no login, no
+    send_message), for both an injected test double and (implicitly, via
+    the same code path) a real connection.
+    """
+
+    def test_default_constructor_arg_is_disabled(self):
+        """Omitting outbound_enabled entirely (the constructor's own
+        default) must fail closed -- mirrors Settings.outbound_sending_enabled's
+        own False default. A caller that forgets to pass this explicitly
+        can never accidentally send.
+        """
+        client = FakeSmtpClient()
+        provider = GmailSmtpProvider(
+            smtp_host="smtp.gmail.com",
+            smtp_port=465,
+            username=ACCOUNT,
+            app_password="app-password",
+            smtp_client=client,
+        )
+
+        with pytest.raises(outbound_base_module.OutboundSendingDisabledError):
+            provider.send(_message())
+
+    def test_explicit_outbound_enabled_false_blocks_send(self):
+        client = FakeSmtpClient()
+        provider = _provider(client, outbound_enabled=False)
+
+        with pytest.raises(outbound_base_module.OutboundSendingDisabledError):
+            provider.send(_message())
+
+    def test_disabled_switch_never_touches_the_client_at_all(self):
+        """No login, no send_message, no quit -- the block happens
+        strictly before ANY interaction with the (injected) transport,
+        proving this is a pre-connection refusal, not a post-connect
+        abort."""
+        client = FakeSmtpClient()
+        provider = _provider(client, outbound_enabled=False)
+
+        with pytest.raises(outbound_base_module.OutboundSendingDisabledError):
+            provider.send(_message())
+
+        assert client.login_calls == []
+        assert client.sent_messages == []
+        assert client.quit_called is False
+
+    def test_disabled_switch_checked_even_with_valid_credentials(self):
+        """The kill switch is independent of is_configured(username)/
+        is_configured(app_password) -- valid credentials alone must not
+        be sufficient to send."""
+        provider = _provider(client=FakeSmtpClient(), outbound_enabled=False)
+
+        with pytest.raises(outbound_base_module.OutboundSendingDisabledError):
+            provider.send(_message())
+
+    def test_disabled_switch_is_a_definite_pre_transmission_failure(self):
+        """OutboundSendingDisabledError must be a EmailSendConnectionError
+        subclass (a DEFINITE pre-transmission failure), never
+        EmailSendOutcomeUnknownError -- callers' existing FAILED -> PENDING
+        retry CAS handles it identically to any other definite failure,
+        with no new code path needed."""
+        assert issubclass(
+            outbound_base_module.OutboundSendingDisabledError, EmailSendConnectionError
+        )
+
+    def test_enabled_switch_allows_send_to_proceed(self):
+        """Sanity check: outbound_enabled=True (this suite's own default
+        via _provider()) does not itself block a send -- isolates the
+        kill switch from every other TestSend behavior."""
+        client = FakeSmtpClient()
+        provider = _provider(client, outbound_enabled=True)
+
+        provider.send(_message())
+
+        assert len(client.sent_messages) == 1
 
 
 class TestErrorMessagesNeverLeakUpstreamText:
@@ -378,6 +466,7 @@ class TestHardConnectionTimeout:
                 username=ACCOUNT,
                 app_password="app-password",
                 timeout_seconds=0.3,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()
@@ -486,6 +575,7 @@ class TestTotalSendDeadline:
                 # the TOTAL deadline is what bounds this, not this value.
                 timeout_seconds=30.0,
                 total_deadline_seconds=0.5,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()
@@ -739,6 +829,7 @@ class TestTotalSendDeadline:
                 username=ACCOUNT,
                 app_password="app-password",
                 total_deadline_seconds=1.5,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()
@@ -849,6 +940,7 @@ class TestTotalSendDeadline:
                 username=ACCOUNT,
                 app_password="app-password",
                 total_deadline_seconds=1.5,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()
@@ -962,6 +1054,7 @@ class TestTotalSendDeadline:
                 username=ACCOUNT,
                 app_password="app-password",
                 total_deadline_seconds=1.5,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()
@@ -1051,6 +1144,7 @@ class TestTotalSendDeadline:
                 username=ACCOUNT,
                 app_password="app-password",
                 total_deadline_seconds=1.5,
+                outbound_enabled=True,
             )
 
             start = time.monotonic()

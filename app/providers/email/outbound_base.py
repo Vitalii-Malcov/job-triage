@@ -89,6 +89,22 @@ class EmailSendConnectionError(EmailSendError):
     """
 
 
+class OutboundSendingDisabledError(EmailSendConnectionError):
+    """Stage 9 fail-closed kill switch (`Settings.outbound_sending_enabled`)
+    is not explicitly True. Raised strictly BEFORE any network I/O — a
+    subclass of `EmailSendConnectionError` (never
+    `EmailSendOutcomeUnknownError`) because this is always a DEFINITE
+    pre-transmission block, not an ambiguous outcome: no connection is
+    opened, no credential is checked, nothing is sent. Callers that
+    already handle `EmailSendConnectionError` (e.g.
+    `app.services.response_draft_send`/`app.services.follow_up_send`'s
+    FAILED -> PENDING retry CAS) handle this identically without new code
+    — retrying after an operator flips the switch to True is exactly the
+    same "retry a definite pre-transmission failure" path those modules
+    already support.
+    """
+
+
 class EmailSendOutcomeUnknownError(EmailSendError):
     """Transmission to the SMTP server was ATTEMPTED (`send_message()`
     was invoked) but an exception occurred before this package could

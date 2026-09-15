@@ -116,6 +116,12 @@ def client(tmp_path, monkeypatch):
         rate_limit_window_seconds=60,
         gmail_username=ACCOUNT,
         gmail_app_password="app-password",
+        # Stage 9 fail-closed kill switch: this fixture/suite is about the
+        # existing "NO APPROVAL = NO SEND" gate, not the kill switch
+        # itself (see TestOutboundKillSwitch below), so it opts in here --
+        # exactly as it already supplies gmail credentials so the
+        # "not configured" 503 branch doesn't also fire.
+        outbound_sending_enabled=True,
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
@@ -512,3 +518,120 @@ class TestNoOtherSideEffects:
         response = _send(test_client, draft_id)
         assert response.status_code == 500
         assert secret_marker not in response.text
+
+
+@pytest.fixture()
+def disabled_outbound_client(tmp_path, monkeypatch):
+    """Mirrors the `client` fixture above exactly, except
+    outbound_sending_enabled is left at its real Settings default
+    (False) -- proves the Stage 9 kill switch over HTTP, with real
+    Gmail credentials configured (so the pre-existing "not configured"
+    503 branch cannot be what's blocking the send).
+    """
+    db_path = tmp_path / "test_response_draft_send_endpoints_disabled_outbound.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    def override_get_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    fake_settings = Settings(
+        api_key=API_KEY,
+        rate_limit_requests=1000,
+        rate_limit_window_seconds=60,
+        gmail_username=ACCOUNT,
+        gmail_app_password="app-password",
+        # Deliberately NOT set -- proves the real Settings default (False)
+        # blocks sending, not merely a test choosing False explicitly.
+    )
+    assert fake_settings.outbound_sending_enabled is False
+    monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    rate_limit_module._requests.clear()
+    rate_limit_module._gmail_analysis_requests.clear()
+    rate_limit_module._response_draft_requests.clear()
+    rate_limit_module._response_draft_decision_requests.clear()
+    rate_limit_module._response_draft_send_requests.clear()
+
+    def _fail_if_constructed(**_kwargs):
+        raise AssertionError(
+            "GmailSmtpProvider must never be constructed when outbound "
+            "sending is disabled -- the route must fail closed before "
+            "this point"
+        )
+
+    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _fail_if_constructed)
+
+    with TestClient(app) as test_client:
+        yield test_client, session_factory
+
+    app.dependency_overrides.clear()
+    rate_limit_module._requests.clear()
+    rate_limit_module._gmail_analysis_requests.clear()
+    rate_limit_module._response_draft_requests.clear()
+    rate_limit_module._response_draft_decision_requests.clear()
+    rate_limit_module._response_draft_send_requests.clear()
+
+
+class TestOutboundKillSwitchOverHttp:
+    """Stage 9: proves POST /response-drafts/{id}/send refuses to send
+    when Settings.outbound_sending_enabled is at its real default
+    (False), even with a fully approved draft and valid Gmail
+    credentials configured -- and that it fails BEFORE constructing the
+    SMTP provider at all (see disabled_outbound_client's
+    _fail_if_constructed).
+    """
+
+    def test_send_with_disabled_outbound_returns_503_even_when_approved(
+        self, disabled_outbound_client
+    ):
+        test_client, session_factory = disabled_outbound_client
+        draft_id = _seed_and_generate(session_factory, test_client)
+        approve_response = _decide(test_client, draft_id)
+        assert approve_response.status_code == 200
+        assert approve_response.json()["decision"] == "APPROVED"
+
+        response = _send(test_client, draft_id)
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Outbound sending is disabled"
+
+    def test_disabled_outbound_does_not_consume_the_approval_or_touch_send_state(
+        self, disabled_outbound_client
+    ):
+        """A blocked-by-kill-switch attempt must not create/advance any
+        response_draft_sends row -- GET .../state stays send=None, and a
+        later send (once re-enabled) must still be possible. This module
+        never reaches send_response_draft at all when disabled, so there
+        is no CAS state to leave dangling in the first place."""
+        test_client, session_factory = disabled_outbound_client
+        draft_id = _seed_and_generate(session_factory, test_client)
+        _decide(test_client, draft_id)
+
+        blocked = _send(test_client, draft_id)
+        assert blocked.status_code == 503
+
+        state = _state(test_client, draft_id)
+        assert state.status_code == 200
+        assert state.json()["send"] is None
+
+    def test_disabled_outbound_blocks_before_approval_gate_too(self, disabled_outbound_client):
+        """Even an UNAPPROVED draft's send attempt must be blocked by the
+        kill switch specifically -- both fail-closed gates are independent
+        checks, order does not matter for the end result (still refused),
+        but this pins the kill switch's own 503 response."""
+        test_client, session_factory = disabled_outbound_client
+        draft_id = _seed_and_generate(session_factory, test_client)
+
+        response = _send(test_client, draft_id)
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Outbound sending is disabled"

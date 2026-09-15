@@ -58,6 +58,14 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-jobtriage}
       ALEMBIC_AUTO_UPGRADE: "false"
+      # Stage 9: explicit, not merely relying on Settings' own default —
+      # same "state the safety-critical value explicitly in compose"
+      # discipline as ALEMBIC_AUTO_UPGRADE above. See
+      # app/providers/email/smtp.py's GmailSmtpProvider.send and
+      # app/api/routes.py's two real-send endpoints for what this gates;
+      # .env.example's own OUTBOUND_SENDING_ENABLED comment for the
+      # "must stay false outside a deliberate, reviewed send path" rule.
+      OUTBOUND_SENDING_ENABLED: "false"
     ports:
       - "${WEB_PORT:-8000}:8000"
     healthcheck:
@@ -108,6 +116,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-jobtriage}
       ALEMBIC_AUTO_UPGRADE: "false"
+      # Stage 9: see the `web` service's identical OUTBOUND_SENDING_ENABLED
+      # comment above -- the scheduler process never constructs
+      # GmailSmtpProvider itself today, but this is set explicitly here
+      # too so it can never silently default differently from `web` if
+      # that ever changes.
+      OUTBOUND_SENDING_ENABLED: "false"
 
 volumes:
   pgdata:

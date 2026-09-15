@@ -185,6 +185,23 @@ class Settings(BaseSettings):
     gmail_smtp_host: str = "smtp.gmail.com"
     gmail_smtp_port: int = Field(default=465, ge=1, le=65535)
 
+    # Stage 9: fail-closed outbound kill switch. Gates BOTH real-send
+    # endpoints (POST /response-drafts/{id}/send, POST
+    # /follow-ups/{id}/send) -- see app/api/routes.py's early checks and
+    # app/providers/email/smtp.py's GmailSmtpProvider.send, which ALSO
+    # refuses to transmit when its own outbound_enabled constructor arg is
+    # falsy, independent of the route-level check (defense in depth: any
+    # future caller that constructs GmailSmtpProvider directly, bypassing
+    # routes.py, still cannot transmit without this explicitly set True).
+    # Default False on purpose -- an unset/missing env var must always mean
+    # "outbound disabled", not "outbound enabled", for a staging/demo
+    # environment that otherwise has real Gmail credentials configured for
+    # read/sync and draft generation. This is deliberately independent of
+    # is_configured(gmail_username)/is_configured(gmail_app_password):
+    # credentials being present is necessary but not sufficient to permit
+    # a real send.
+    outbound_sending_enabled: bool = False
+
     # Stage 7E follow-up agent. How long to wait, after the latest real
     # OUTBOUND message in a job's matched Gmail thread, before a follow-up
     # becomes eligible — see app/services/follow_up_eligibility.py. Bounded
