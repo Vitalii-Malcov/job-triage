@@ -49,15 +49,16 @@ signal via an explicit closed allowlist of software-development phrases
 applied one level up, not a generic "any word + Developer" scan.
 
 **Positive and irrelevant signals are evaluated INDEPENDENTLY, not as a
-first-match-wins ordered scan.** Both signal sets are checked against the
+first-match-wins ordered scan.** All signal sets are checked against the
 full title before any decision is made:
 
-    positive only      -> RELEVANT
-    irrelevant only     -> IRRELEVANT
-    positive AND irrelevant -> UNKNOWN (genuinely mixed signal, e.g.
-                                "Presales Software Engineer",
-                                "QGIS Developer")
-    neither             -> UNKNOWN
+    positive only                 -> RELEVANT
+    no positive, STRONG irrelevant -> IRRELEVANT
+    no positive, only WEAK ambiguity (no STRONG) -> UNKNOWN
+    positive AND (STRONG or WEAK) -> UNKNOWN (genuinely mixed signal,
+                                     e.g. "Presales Software Engineer",
+                                     "Software Engineer Elektrotechnik")
+    neither                        -> UNKNOWN
 
 This is deliberately NOT "RELEVANT always wins" -- that policy is what
 let a title like "Python Presales Consultant" slip through purely
@@ -65,6 +66,18 @@ because it also matched a technology word. A title carrying BOTH a real
 role-family signal and a real irrelevant-family signal is ambiguous by
 construction and must fail open (UNKNOWN), not be resolved by pattern
 list order.
+
+**S11B-003: STRONG (role-phrase) vs. WEAK (bare domain word) irrelevant
+signals.** A bare domain/technology word ("qgis", "elektrotechnik",
+"projektmanagement") is deliberately too weak to classify IRRELEVANT on
+its own -- "QGIS Developer", "Software Engineer Elektrotechnik", and
+"Python Engineer Projektmanagement" must not be rejected merely because
+a domain word appears in an otherwise plausible or ambiguous technical
+title. Only an explicit non-software ROLE phrase ("QGIS Expert(in)",
+"Ingenieur Elektrotechnik", "Elektroingenieur(in)", "Elektrotechniker
+(in)", "Projektmanager(in)", "Berater (im) Projektmanagement") is a
+STRONG signal, confidently IRRELEVANT by itself. See
+`_WEAK_AMBIGUITY_PATTERNS` and `classify_title_relevance`'s truth table.
 
 **Explicit-signal, title-scoped, whole-word only -- same S11A-001 lesson
 applied from the start here, not learned the hard way a second time.**
@@ -138,18 +151,39 @@ _RELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # Explicit, closed allowlist of title families clearly outside software
 # development -- deliberately narrow and specific (not broad words like
 # bare "Berater"/"Consultant"/"Ingenieur", which also legitimately appear
-# in real software-development titles). Evaluated independently of the
-# relevant-signal scan above -- see module docstring's conflict policy.
+# in real software-development titles). STRONG: alone (no positive
+# signal present) is enough to classify IRRELEVANT outright. Evaluated
+# independently of the relevant-signal scan above -- see module
+# docstring's conflict policy.
 _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE))
     for name, pattern in (
         ("personalcontroller", r"\bpersonalcontroller(?:in)?\b"),
         ("systemadministrator", r"\bsystemadministrator(?:in)?\b"),
         ("administrator", r"\badministrator(?:in)?\b"),
-        ("qgis", r"\bqgis\b"),
         ("presales", r"\bpresales\b"),
-        ("projektmanagement", r"\bprojektmanagement\b"),
-        ("elektrotechnik", r"\belektrotechnik\b"),
+        # S11B-003: explicit ROLE PHRASES, not the bare domain word
+        # "qgis" alone -- "QGIS Developer"/"QGIS Python Engineer"/"QGIS
+        # Software Engineer" must not be forced IRRELEVANT merely because
+        # a GIS tool is named; only an explicit non-dev role attached to
+        # it (Expert(in)/Spezialist(in)) is confidently irrelevant.
+        ("qgis-expert", r"\bqgis\s+(?:expert(?:e|in)?|spezialist(?:in)?)\b"),
+        # S11B-003: explicit ROLE PHRASES, not bare "elektrotechnik" --
+        # "Software Engineer Elektrotechnik"/"Python Engineer
+        # Elektrotechnik" must not be forced IRRELEVANT merely because
+        # the electrical-engineering DOMAIN is named; only an explicit
+        # electrical-engineering ROLE title is confidently irrelevant.
+        ("ingenieur-elektrotechnik", r"\bingenieur\s+elektrotechnik\b"),
+        ("elektroingenieur", r"\belektroingenieur(?:in)?\b"),
+        ("elektrotechniker", r"\belektrotechniker(?:in)?\b"),
+        # S11B-003: explicit ROLE PHRASES, not bare "projektmanagement"
+        # -- "Software Developer Projektmanagement Tools"/"Python
+        # Engineer Projektmanagement" must not be forced IRRELEVANT
+        # merely because the project-management DOMAIN is named; only an
+        # explicit project-management ROLE title is confidently
+        # irrelevant.
+        ("projektmanager", r"\bprojektmanager(?:in)?\b"),
+        ("berater-projektmanagement", r"\bberater\s+(?:im\s+)?projektmanagement\b"),
         # S11B-001: "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard
         # German academic-research-ASSISTANT title family (Stage 11 pilot
         # false positives: Uniklinikum Frankfurt, Statistisches
@@ -171,6 +205,27 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     )
 )
 
+# S11B-003: WEAK ambiguity signals -- bare domain/technology words that
+# must NEVER, on their own (no positive signal, no STRONG irrelevant
+# phrase present), be enough to classify IRRELEVANT ("do NOT reject
+# solely because 'Elektrotechnik' appears somewhere in an otherwise
+# ambiguous technical title"). They still participate in the conflict
+# check: a title carrying BOTH a real positive role-phrase AND one of
+# these bare domain words is genuinely ambiguous ("Software Engineer
+# Elektrotechnik", "Software Developer Projektmanagement Tools") and
+# must fail open to UNKNOWN rather than resolve to RELEVANT purely on
+# the strength of the positive phrase. Bare-alone (no positive, no
+# STRONG phrase) also resolves to UNKNOWN, never IRRELEVANT -- see
+# classify_title_relevance's truth table.
+_WEAK_AMBIGUITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(pattern, re.IGNORECASE))
+    for name, pattern in (
+        ("qgis", r"\bqgis\b"),
+        ("elektrotechnik", r"\belektrotechnik\b"),
+        ("projektmanagement", r"\bprojektmanagement\b"),
+    )
+)
+
 
 @dataclass(frozen=True)
 class TitleRelevanceClassification:
@@ -184,23 +239,43 @@ class TitleRelevanceClassification:
 
 def classify_title_relevance(title: str) -> TitleRelevanceClassification:
     """Whole-word/whole-compound title scan for software-development role
-    relevance -- see the module docstring for the independent-evaluation
-    conflict policy (positive-only -> RELEVANT, irrelevant-only ->
-    IRRELEVANT, both or neither -> UNKNOWN, fail-open).
+    relevance. Three signal sets, evaluated independently (never a
+    first-match-wins ordered scan):
+
+        positive_signal   -- a genuine software-development role phrase
+        strong_signal      -- a genuine non-software ROLE phrase, e.g.
+                              "QGIS Expert", "Ingenieur Elektrotechnik"
+        weak_signal         -- a bare domain/technology word, e.g. "qgis",
+                              "elektrotechnik" (S11B-003)
+
+    Truth table:
+
+        positive, no strong, no weak -> RELEVANT
+        no positive, strong          -> IRRELEVANT
+        no positive, no strong, weak -> UNKNOWN  (bare domain word alone
+                                                    is not enough)
+        positive AND (strong OR weak) -> UNKNOWN (genuinely mixed)
+        neither                       -> UNKNOWN
+
+    See the module docstring for the full rationale.
     """
     text = title or ""
 
     positive_signal = next(
         (name for name, pattern in _RELEVANT_TITLE_PATTERNS if pattern.search(text)), None
     )
-    irrelevant_signal = next(
+    strong_signal = next(
         (name for name, pattern in _IRRELEVANT_TITLE_PATTERNS if pattern.search(text)), None
     )
+    weak_signal = next(
+        (name for name, pattern in _WEAK_AMBIGUITY_PATTERNS if pattern.search(text)), None
+    )
+    any_irrelevant_signal = strong_signal is not None or weak_signal is not None
 
-    if positive_signal is not None and irrelevant_signal is None:
+    if positive_signal is not None and not any_irrelevant_signal:
         return TitleRelevanceClassification(level="RELEVANT", matched_signal=positive_signal)
-    if irrelevant_signal is not None and positive_signal is None:
-        return TitleRelevanceClassification(level="IRRELEVANT", matched_signal=irrelevant_signal)
+    if strong_signal is not None and positive_signal is None:
+        return TitleRelevanceClassification(level="IRRELEVANT", matched_signal=strong_signal)
     return TitleRelevanceClassification(level="UNKNOWN", matched_signal=None)
 
 

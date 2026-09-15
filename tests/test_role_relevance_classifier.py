@@ -141,7 +141,7 @@ def test_systemadministrator_is_irrelevant():
 def test_qgis_expert_is_irrelevant():
     result = classify_title_relevance("QGIS Expertin / Experte")
     assert result.level == "IRRELEVANT"
-    assert result.matched_signal == "qgis"
+    assert result.matched_signal == "qgis-expert"
 
 
 def test_presales_consultant_is_irrelevant():
@@ -154,14 +154,14 @@ def test_berater_projektmanagement_is_irrelevant():
     title = "Berater im Projektmanagement im öffentlichen Sektor - Business Transformation (w/m/d)"
     result = classify_title_relevance(title)
     assert result.level == "IRRELEVANT"
-    assert result.matched_signal == "projektmanagement"
+    assert result.matched_signal == "berater-projektmanagement"
 
 
 def test_ingenieur_elektrotechnik_is_irrelevant():
     title = "Ingenieur Elektrotechnik (m/w/d) Automatisierung / Inbetriebnahme"
     result = classify_title_relevance(title)
     assert result.level == "IRRELEVANT"
-    assert result.matched_signal == "elektrotechnik"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
 
 
 def test_wissenschaftliche_mitarbeiterin_is_irrelevant():
@@ -322,16 +322,17 @@ def test_presales_software_engineer_is_unknown_genuinely_mixed():
     assert result.matched_signal is None
 
 
-def test_qgis_developer_is_irrelevant_after_s11b_002():
-    # S11B-002 narrowed "Developer" to an explicit software-development
-    # phrase allowlist ("QGIS Developer" isn't Python/Backend/Frontend/
-    # Fullstack/Web/Software + Developer) -- bare "developer" no longer
-    # supplies a positive signal here, so this is no longer a genuinely
-    # MIXED title: only "qgis" (irrelevant) remains -> IRRELEVANT. This
-    # intentionally supersedes the pre-S11B-002 UNKNOWN outcome.
+def test_qgis_developer_is_unknown_after_s11b_003():
+    # S11B-003 (fail-open hardening, supersedes the brief S11B-002-era
+    # IRRELEVANT outcome): bare "qgis" is now a WEAK ambiguity signal,
+    # not a STRONG one -- "QGIS Developer" doesn't match the STRONG
+    # "qgis-expert"/"qgis-spezialist" role phrase, and "developer" alone
+    # isn't a positive signal either (S11B-002), so this resolves to
+    # UNKNOWN (neither positive nor strong-irrelevant present), never
+    # IRRELEVANT.
     result = classify_title_relevance("QGIS Developer")
-    assert result.level == "IRRELEVANT"
-    assert result.matched_signal == "qgis"
+    assert result.level == "UNKNOWN"
+    assert result.matched_signal is None
 
 
 def test_wissenschaftlicher_softwareentwickler_is_relevant_after_s11b_001():
@@ -426,3 +427,175 @@ def test_derive_one_ambiguous_role_makes_whole_result_unknown():
 
 def test_derive_single_relevant_target_is_software_development():
     assert derive_candidate_target_domain(["Python Backend Developer"]) == "SOFTWARE_DEVELOPMENT"
+
+
+# --- S11B-003: QGIS restricted to explicit role phrases, not the bare
+# domain word alone ----------------------------------------------------------
+
+
+def test_qgis_expert_english_form_is_irrelevant():
+    result = classify_title_relevance("QGIS Expert (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_expertin_is_irrelevant():
+    result = classify_title_relevance("QGIS Expertin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_spezialist_is_irrelevant():
+    result = classify_title_relevance("QGIS Spezialist (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_spezialistin_is_irrelevant():
+    result = classify_title_relevance("QGIS Spezialistin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_python_engineer_is_not_irrelevant():
+    result = classify_title_relevance("QGIS Python Engineer")
+    assert result.level != "IRRELEVANT"
+
+
+def test_qgis_software_engineer_is_not_irrelevant():
+    # "Software Engineer" is a genuine positive phrase, and bare "qgis"
+    # is only a weak ambiguity signal -- positive + weak -> UNKNOWN, not
+    # IRRELEVANT (and not forced RELEVANT either -- genuinely ambiguous).
+    result = classify_title_relevance("QGIS Software Engineer")
+    assert result.level != "IRRELEVANT"
+    assert result.level == "UNKNOWN"
+
+
+def test_real_pilot_qgis_vacancy_remains_irrelevant():
+    result = classify_title_relevance("QGIS Expertin / Experte")
+    assert result.level == "IRRELEVANT"
+
+
+# --- S11B-003: Elektrotechnik restricted to explicit role phrases ----------
+
+
+def test_ingenieur_elektrotechnik_bare_is_irrelevant():
+    result = classify_title_relevance("Ingenieur Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_elektroingenieur_is_irrelevant():
+    result = classify_title_relevance("Elektroingenieur (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "elektroingenieur"
+
+
+def test_elektroingenieurin_is_irrelevant():
+    result = classify_title_relevance("Elektroingenieurin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "elektroingenieur"
+
+
+def test_elektrotechniker_is_irrelevant():
+    result = classify_title_relevance("Elektrotechniker (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "elektrotechniker"
+
+
+def test_elektrotechnikerin_is_irrelevant():
+    result = classify_title_relevance("Elektrotechnikerin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "elektrotechniker"
+
+
+def test_software_engineer_elektrotechnik_is_unknown_not_irrelevant():
+    # "Elektrotechnik" bare (the DOMAIN) must not reject an otherwise
+    # ambiguous technical title -- genuinely mixed (positive "software
+    # engineer" + weak "elektrotechnik") -> UNKNOWN, not IRRELEVANT, not
+    # forced RELEVANT either.
+    result = classify_title_relevance("Software Engineer Elektrotechnik")
+    assert result.level == "UNKNOWN"
+
+
+def test_python_engineer_elektrotechnik_is_unknown_not_irrelevant():
+    # No positive signal ("Python Engineer" isn't a listed phrase) and
+    # only the WEAK "elektrotechnik" domain word -- must fail open to
+    # UNKNOWN, not IRRELEVANT.
+    result = classify_title_relevance("Python Engineer Elektrotechnik")
+    assert result.level == "UNKNOWN"
+
+
+def test_real_pilot_elektrotechnik_vacancy_remains_irrelevant():
+    title = "Ingenieur Elektrotechnik (m/w/d) Automatisierung / Inbetriebnahme (1687)"
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+
+
+# --- S11B-003: Projektmanagement restricted to explicit role phrases -------
+
+
+def test_projektmanager_is_irrelevant():
+    result = classify_title_relevance("Projektmanager (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "projektmanager"
+
+
+def test_projektmanagerin_is_irrelevant():
+    result = classify_title_relevance("Projektmanagerin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "projektmanager"
+
+
+def test_berater_projektmanagement_bare_is_irrelevant():
+    result = classify_title_relevance("Berater Projektmanagement (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "berater-projektmanagement"
+
+
+def test_software_developer_projektmanagement_tools_is_not_irrelevant():
+    # Bare "Projektmanagement" (the DOMAIN/tool context) must not force
+    # IRRELEVANT on an otherwise positive title -- genuinely mixed
+    # (positive "software developer" + weak "projektmanagement") ->
+    # UNKNOWN or RELEVANT are both acceptable per spec, but never
+    # IRRELEVANT.
+    result = classify_title_relevance("Software Developer Projektmanagement Tools")
+    assert result.level != "IRRELEVANT"
+
+
+def test_python_engineer_projektmanagement_is_unknown_not_irrelevant():
+    result = classify_title_relevance("Python Engineer Projektmanagement")
+    assert result.level == "UNKNOWN"
+
+
+def test_real_pilot_projektmanagement_vacancy_remains_irrelevant():
+    title = "Berater im Projektmanagement im öffentlichen Sektor - Business Transformation (w/m/d)"
+    result = classify_title_relevance(title)
+    assert result.level == "IRRELEVANT"
+
+
+# --- S11B-003: unchanged behaviors (regression guard) -----------------------
+
+
+def test_personalcontroller_still_irrelevant_unchanged():
+    result = classify_title_relevance("Personalcontroller (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "personalcontroller"
+
+
+def test_administrator_still_irrelevant_unchanged():
+    result = classify_title_relevance("MongoDB Administrator (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "administrator"
+
+
+def test_systemadministrator_still_irrelevant_unchanged():
+    result = classify_title_relevance("Systemadministrator (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "systemadministrator"
+
+
+def test_presales_still_irrelevant_unchanged():
+    result = classify_title_relevance("Presales Consultant (m/w/d) - Datacenter")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "presales"
