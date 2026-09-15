@@ -163,6 +163,40 @@ def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: 
         record.description = job.description
 
 
+def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
+    """HARD-007-RR1 (Codex targeted re-review): decides whether a caught
+    `IntegrityError` is SPECIFICALLY attributable to `uq_jobs_fingerprint`
+    — `upsert_job`'s race-recovery below must never convert an unrelated
+    DB invariant violation (a different unique/check/PK constraint, or a
+    trigger) into `created=False` just because a same-fingerprint winner
+    also happens to exist after rollback; that coincidence does not prove
+    causation.
+
+    Inspects the real driver/SQLAlchemy exception metadata rather than a
+    broad "unique" substring match:
+
+    - PostgreSQL (psycopg): the DBAPI exception's `.diag.constraint_name`
+      (libpq's `PG_DIAG_CONSTRAINT_NAME`) is the authoritative, structured
+      signal — set for unique/check/FK/exclusion violations alike, so a
+      same-named-but-different constraint is correctly rejected too.
+    - SQLite (used by the unit-test suite): `sqlite3` exceptions carry no
+      structured diagnostics, only a message string. Narrowly matches the
+      EXACT message SQLite emits for this specific UNIQUE index
+      (`UNIQUE constraint failed: jobs.fingerprint`) — not a generic
+      "unique" substring, which would also match unrelated UNIQUE
+      violations on other columns/tables.
+
+    Returns False (fail closed — the caller re-raises the original
+    exception) for anything that doesn't positively match either check,
+    including a driver exception with no diagnostics at all.
+    """
+    orig = exc.orig
+    diag = getattr(orig, "diag", None)
+    if diag is not None:
+        return getattr(diag, "constraint_name", None) == "uq_jobs_fingerprint"
+    return "UNIQUE constraint failed: jobs.fingerprint" in str(orig)
+
+
 def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
     """HARD-007 (Codex master review): two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
@@ -180,17 +214,23 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
     INSERT (the fingerprint is durably taken by construction — a second
     INSERT attempt would just fail the same way again). Instead it
     rolls back immediately (clears the poisoned transaction so the
-    Session stays usable), re-reads by fingerprint, and — if a winner
-    row is now found — converges on it via the EXACT same update
-    semantics `_apply_job_update_fields` already applies for a
-    sequential "already exists" call (`created=False`), including the
-    `job_reference_tokens` sync (`_finalize_job_write`). This makes a
-    race indistinguishable in outcome from the two calls having simply
-    run sequentially in whichever order actually committed first. If no
-    winner is found after rollback, the `IntegrityError` was NOT this
-    race (some other constraint violation, or the winner's row was
-    deleted between the failed INSERT and this re-read) and is
-    re-raised unchanged rather than silently swallowed.
+    Session stays usable), confirms — via `_is_fingerprint_unique_violation`
+    (HARD-007-RR1, Codex targeted re-review) — that the caught
+    `IntegrityError` is actually attributable to `uq_jobs_fingerprint`
+    specifically (a same-fingerprint winner existing after rollback does
+    NOT by itself prove that; an unrelated constraint/trigger violation
+    could coincide with a concurrent, unrelated insert of the same
+    fingerprint), re-reads by fingerprint, and — if a winner row is now
+    found — converges on it via the EXACT same update semantics
+    `_apply_job_update_fields` already applies for a sequential "already
+    exists" call (`created=False`), including the `job_reference_tokens`
+    sync (`_finalize_job_write`). This makes a race indistinguishable in
+    outcome from the two calls having simply run sequentially in
+    whichever order actually committed first. If the violation is not
+    attributable to `uq_jobs_fingerprint`, or no winner is found after
+    rollback (the winner's row was deleted between the failed INSERT and
+    this re-read), the original `IntegrityError` is re-raised unchanged
+    rather than silently swallowed — never a blind retry of the INSERT.
     """
     fingerprint = _fingerprint(job)
     existing = get_job_by_fingerprint(db, job)
@@ -222,8 +262,10 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
     db.add(record)
     try:
         _finalize_job_write(db, record)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
+        if not _is_fingerprint_unique_violation(exc):
+            raise
         winner = get_job_by_fingerprint(db, job)
         if winner is None:
             raise

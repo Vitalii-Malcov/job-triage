@@ -1,11 +1,14 @@
 import json
 import threading
 import unicodedata
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.db.repositories as repositories_module
 from app.db.base import Base
 from app.db.models import JobRecord, JobReferenceTokenRecord
 from app.db.repositories import _fingerprint, upsert_job
@@ -535,6 +538,144 @@ def test_concurrent_insert_of_the_same_new_job_converges_on_one_row(tmp_path):
         assert rows[0].recommendation == score.recommendation
     finally:
         verify.close()
+
+    verify2 = session_factory()
+    try:
+        # HARD-007-RR1 (E): the converge path applies the SAME
+        # `_finalize_job_write` boundary a sequential update would, which
+        # includes the `job_reference_tokens` sync -- the winner's row
+        # must end up with a token set derived from its own title/url,
+        # not an empty/stale set left over from the initial INSERT.
+        winner_id = list(record_ids)[0]
+        tokens = {
+            row.token
+            for row in verify2.scalars(
+                select(JobReferenceTokenRecord).where(JobReferenceTokenRecord.job_id == winner_id)
+            ).all()
+        }
+        assert tokens, "job_reference_tokens must be populated after the race converges"
+    finally:
+        verify2.close()
+
+
+def test_unrelated_integrity_error_is_reraised_even_with_matching_fingerprint_winner(
+    tmp_path, monkeypatch
+):
+    """HARD-007-RR1 (Codex targeted re-review): `upsert_job`'s race
+    recovery must recover ONLY when the caught `IntegrityError` is
+    SPECIFICALLY attributable to `uq_jobs_fingerprint` -- a same-
+    fingerprint winner existing after rollback does not, by itself,
+    prove the caught error came from that constraint. A different
+    invariant violation (a different unique/check constraint, a
+    trigger) could occur while another concurrent transaction also
+    happens to have created a matching fingerprint. Simulates that
+    exact scenario: a real, already-committed row shares this job's
+    fingerprint (`get_job_by_fingerprint` is patched to miss it on the
+    initial check, reproducing the TOCTOU window the real race-recovery
+    path exists for), but the INSERT attempt fails with an unrelated
+    (non-fingerprint) `IntegrityError`. That error must propagate
+    unchanged -- never silently converted to `created=False` -- and the
+    pre-existing winner row must be left completely untouched by
+    `upsert_job`'s update semantics.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'unrelated_integrity_error.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    score = JobScore(score=80, recommendation="APPLY")
+    job = Job(
+        source="xing",
+        title="Backend Engineer",
+        company="RaceCo",
+        location="Remote",
+        url="https://raceco.example.com/jobs/RACE002",
+    )
+    fingerprint = _fingerprint(job)
+
+    now = datetime.now(UTC)
+    seed = session_factory()
+    try:
+        winner = JobRecord(
+            fingerprint=fingerprint,
+            source="bundesagentur",
+            title="Pre-existing Winner",
+            company="WinnerCo",
+            location="Munich",
+            url="https://example.com/winner",
+            description="",
+            status="NEW",
+            first_seen_at=now,
+            last_seen_at=now,
+            score=42,
+            recommendation="SKIP",
+        )
+        seed.add(winner)
+        seed.commit()
+    finally:
+        seed.close()
+
+    # The initial existence check "misses" the real winner -- reproduces
+    # the TOCTOU window this recovery path exists for (a concurrent
+    # transaction committed a matching-fingerprint row between this
+    # call's own SELECT and its INSERT attempt).
+    monkeypatch.setattr(repositories_module, "get_job_by_fingerprint", lambda _db, _job: None)
+
+    class _UnrelatedOrig(Exception):
+        def __str__(self) -> str:
+            return "NOT NULL constraint failed: jobs.company"
+
+    def _fake_finalize_job_write(_db, _record):
+        raise IntegrityError("INSERT INTO jobs ...", {}, _UnrelatedOrig())
+
+    monkeypatch.setattr(repositories_module, "_finalize_job_write", _fake_finalize_job_write)
+
+    session = session_factory()
+    try:
+        with pytest.raises(IntegrityError):
+            upsert_job(session, job, score)
+    finally:
+        session.close()
+
+    monkeypatch.undo()
+    verify = session_factory()
+    try:
+        row = verify.execute(
+            select(JobRecord).where(JobRecord.fingerprint == fingerprint)
+        ).scalar_one()
+        # The unrelated violation must NOT have been treated as the
+        # fingerprint race: no second row, and the pre-existing winner
+        # is completely untouched by upsert_job's update semantics.
+        assert row.score == 42
+        assert row.recommendation == "SKIP"
+        assert row.title == "Pre-existing Winner"
+    finally:
+        verify.close()
+
+
+def test_is_fingerprint_unique_violation_uses_structured_postgres_diagnostics_not_substring():
+    """HARD-007-RR1: the detector must key off the driver's structured
+    `constraint_name` diagnostic (what a real PostgreSQL/psycopg
+    `IntegrityError.orig.diag` exposes), not a broad "unique" substring
+    match -- a same-shaped UNIQUE violation on a completely different
+    constraint must be rejected.
+    """
+
+    class _Diag:
+        def __init__(self, constraint_name: str | None) -> None:
+            self.constraint_name = constraint_name
+
+    class _Orig(Exception):
+        def __init__(self, constraint_name: str | None) -> None:
+            super().__init__("duplicate key value violates unique constraint")
+            self.diag = _Diag(constraint_name)
+
+    matching = IntegrityError("INSERT ...", {}, _Orig("uq_jobs_fingerprint"))
+    assert repositories_module._is_fingerprint_unique_violation(matching) is True
+
+    other_unique = IntegrityError("INSERT ...", {}, _Orig("uq_response_draft_sends_response_draft"))
+    assert repositories_module._is_fingerprint_unique_violation(other_unique) is False
+
+    no_constraint_name = IntegrityError("INSERT ...", {}, _Orig(None))
+    assert repositories_module._is_fingerprint_unique_violation(no_constraint_name) is False
 
 
 def test_sync_job_reference_tokens_does_not_commit_itself(tmp_path):

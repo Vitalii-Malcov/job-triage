@@ -48,13 +48,15 @@ other PostgreSQL integration test in this directory.
 
 import os
 import threading
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import JobRecord
-from app.db.repositories import _fingerprint, upsert_job
+from app.db.models import JobRecord, JobReferenceTokenRecord
+from app.db.repositories import _fingerprint, _is_fingerprint_unique_violation, upsert_job
 from app.models.job import Job, JobScore
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
@@ -259,3 +261,108 @@ class TestRealConcurrentNewJobInsert:
         finally:
             sessions[winner_index].close()
             loser_session.close()
+
+
+class TestFingerprintViolationDetectionAgainstRealPostgresDiagnostics:
+    """HARD-007-RR1 (Codex targeted re-review): `upsert_job`'s
+    race-recovery must key off the SPECIFIC `uq_jobs_fingerprint`
+    constraint, using the real driver's structured diagnostics
+    (`IntegrityError.orig.diag.constraint_name`) rather than a broad
+    "unique" substring match. The SQLite unit tests
+    (tests/test_repository.py) exercise `_is_fingerprint_unique_violation`
+    against a hand-built fake object that MIMICS psycopg's `.diag`
+    interface -- these two tests instead prove the assumption that mimic
+    rests on: that a REAL psycopg `IntegrityError` raised by REAL
+    PostgreSQL actually carries a populated, correctly-discriminating
+    `.diag.constraint_name` for both a genuine `uq_jobs_fingerprint`
+    violation and an unrelated one (`uq_job_reference_tokens_job_token`).
+    """
+
+    def test_real_fingerprint_unique_violation_is_detected(self, pg_session_factory):
+        job = _make_job(10)
+        fingerprint = _fingerprint(job)
+        now = datetime.now(UTC)
+
+        session = pg_session_factory()
+        try:
+            session.add(
+                JobRecord(
+                    fingerprint=fingerprint,
+                    source="bundesagentur",
+                    title=job.title,
+                    company=job.company,
+                    location=job.location,
+                    url=str(job.url),
+                    description="",
+                    status="NEW",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    score=80,
+                    recommendation="APPLY",
+                )
+            )
+            session.commit()
+
+            # A second row with the SAME fingerprint -- a real
+            # PostgreSQL-raised uq_jobs_fingerprint violation, not a
+            # fabricated stand-in.
+            session.add(
+                JobRecord(
+                    fingerprint=fingerprint,
+                    source="bundesagentur",
+                    title=job.title,
+                    company=job.company,
+                    location=job.location,
+                    url=str(job.url),
+                    description="",
+                    status="NEW",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    score=80,
+                    recommendation="APPLY",
+                )
+            )
+            with pytest.raises(IntegrityError) as excinfo:
+                session.commit()
+            session.rollback()
+
+            assert _is_fingerprint_unique_violation(excinfo.value) is True
+        finally:
+            session.close()
+
+    def test_real_unrelated_unique_violation_is_not_detected(self, pg_session_factory):
+        job = _make_job(11)
+        fingerprint = _fingerprint(job)
+        now = datetime.now(UTC)
+
+        session = pg_session_factory()
+        try:
+            record = JobRecord(
+                fingerprint=fingerprint,
+                source="bundesagentur",
+                title=job.title,
+                company=job.company,
+                location=job.location,
+                url=str(job.url),
+                description="",
+                status="NEW",
+                first_seen_at=now,
+                last_seen_at=now,
+                score=80,
+                recommendation="APPLY",
+            )
+            session.add(record)
+            session.flush()
+
+            session.add(JobReferenceTokenRecord(job_id=record.id, token="DUPTOKEN"))
+            session.flush()
+            # A real, unrelated uq_job_reference_tokens_job_token
+            # violation -- must NOT be mistaken for a fingerprint race.
+            session.add(JobReferenceTokenRecord(job_id=record.id, token="DUPTOKEN"))
+            with pytest.raises(IntegrityError) as excinfo:
+                session.flush()
+            session.rollback()
+
+            assert _is_fingerprint_unique_violation(excinfo.value) is False
+        finally:
+            session.close()
