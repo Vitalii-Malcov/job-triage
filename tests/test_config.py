@@ -313,7 +313,16 @@ def test_xing_lookback_days_matches_gmail_lookback_days_bounds():
 
 
 def test_database_url_default_is_unaffected_when_postgres_host_unset():
-    settings = Settings()
+    # `_env_file=None` deliberately bypasses `Settings.model_config`'s
+    # `env_file=".env"` for THIS instantiation only -- this test proves
+    # the field's actual Python-level default, which must hold
+    # independently of whatever `.env` a developer happens to have
+    # sitting in the repo root locally (e.g. a Stage 10 shadow-mode
+    # pilot's DATABASE_URL=sqlite:///./stage10_pilot.db). Every other
+    # `Settings()` call in this file is unaffected -- this is scoped to
+    # the one test that asserts an exact default value that `.env`
+    # presence can otherwise silently override.
+    settings = Settings(_env_file=None)
     assert settings.database_url == "sqlite:///./job_search.db"
     assert settings.postgres_host == ""
 

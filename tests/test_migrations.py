@@ -48,6 +48,7 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "status",
         "first_seen_at",
         "last_seen_at",
+        "posting_type",  # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type")
     }
 
     profile_columns = {col["name"] for col in inspector.get_columns("user_profiles")}
@@ -3214,4 +3215,6 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    assert heads[0] == "a1b2c3d4e5f6"
+    # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type") -- update this
+    # alongside every new migration's own down_revision chaining.
+    assert heads[0] == "b2c5d8e4f7a1"
