@@ -113,7 +113,14 @@ class Settings(BaseSettings):
     xing_mailbox_imap_host: str = "imap.gmail.com"
     xing_mailbox_imap_port: int = 993
     xing_mailbox_username: str = ""
-    xing_mailbox_app_password: str = ""
+    # ASTRA-01: repr=False, same DEPLOY-001-RR1 rationale as database_url
+    # above -- Pydantic's default model repr otherwise prints every
+    # field's raw value, including this one, in repr(Settings(...))/
+    # str(Settings(...)). Construction/validation/attribute access are
+    # unaffected; only what repr()/str() print changes. hide_input_in_errors
+    # (model_config below) separately suppresses this value from
+    # ValidationError text.
+    xing_mailbox_app_password: str = Field(default="", repr=False)
     # HARD-006: bounded the same way gmail_lookback_days already is --
     # an unvalidated 0/negative value pushed the IMAP `since_date` into
     # the present/future, silently returning zero messages with no
@@ -147,7 +154,12 @@ class Settings(BaseSettings):
     gmail_imap_host: str = "imap.gmail.com"
     gmail_imap_port: int = Field(default=993, ge=1, le=65535)
     gmail_username: str = ""
-    gmail_app_password: str = ""
+    # ASTRA-01: repr=False -- same rationale as xing_mailbox_app_password
+    # above and database_url's own DEPLOY-001-RR1 precedent. This is also
+    # the SMTP password reused by Stage 7D outbound sending (see
+    # gmail_smtp_host/gmail_smtp_port below), so the same leak applied to
+    # both the IMAP read path and the SMTP send path before this fix.
+    gmail_app_password: str = Field(default="", repr=False)
     gmail_mailbox: str = "INBOX"
     # S7E-001 (Codex remediation, HIGH): the real Gmail "Sent Mail" folder —
     # synced in ADDITION to gmail_mailbox (never instead of it). Messages

@@ -510,3 +510,69 @@ def test_explicit_database_url_compatibility_unaffected_by_repr_false():
     compatibility path -- only what repr()/str() print."""
     settings = Settings(database_url="postgresql+psycopg://user:pass@localhost:5432/db")
     assert settings.database_url == "postgresql+psycopg://user:pass@localhost:5432/db"
+
+
+# ---------------------------------------------------------------------------
+# ASTRA-01: Gmail/XING app passwords printed verbatim in
+# repr(Settings(...))/str(Settings(...)) -- same class of leak as
+# DEPLOY-001-RR1's postgres_password/database_url findings above, but for
+# the IMAP/SMTP credentials. Fixed with Field(repr=False) (not SecretStr,
+# unlike postgres_password): these two fields are passed as plain `str` to
+# imaplib/smtplib login calls throughout app/providers/email/ and
+# app/collectors/xing_email.py, so wrapping them would require unwrapping
+# at every call site for no additional leak-closing benefit -- repr=False
+# alone already stops both repr()/str() printing (this section) and
+# ValidationError text (hide_input_in_errors, already asserted generically
+# above) from ever echoing them.
+# ---------------------------------------------------------------------------
+
+_SENTINEL_GMAIL_PASSWORD = "sentinel-gmail-app-pw-leak-check"
+_SENTINEL_XING_PASSWORD = "sentinel-xing-app-pw-leak-check"
+
+
+def _settings_with_sentinel_mail_passwords(**overrides) -> Settings:
+    kwargs = {
+        "gmail_username": "me@example.com",
+        "gmail_app_password": _SENTINEL_GMAIL_PASSWORD,
+        "xing_mailbox_username": "me2@example.com",
+        "xing_mailbox_app_password": _SENTINEL_XING_PASSWORD,
+    }
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+def test_gmail_app_password_still_a_plain_str_with_correct_value():
+    """repr=False must not change the field's type or value -- only
+    what repr()/str() print (mirrors GMAIL/SMTP login call sites, which
+    require a plain str, not a wrapper type)."""
+    settings = _settings_with_sentinel_mail_passwords()
+    assert type(settings.gmail_app_password) is str
+    assert settings.gmail_app_password == _SENTINEL_GMAIL_PASSWORD
+
+
+def test_xing_mailbox_app_password_still_a_plain_str_with_correct_value():
+    settings = _settings_with_sentinel_mail_passwords()
+    assert type(settings.xing_mailbox_app_password) is str
+    assert settings.xing_mailbox_app_password == _SENTINEL_XING_PASSWORD
+
+
+def test_gmail_app_password_absent_from_settings_repr_and_str():
+    settings = _settings_with_sentinel_mail_passwords()
+    assert _SENTINEL_GMAIL_PASSWORD not in repr(settings)
+    assert _SENTINEL_GMAIL_PASSWORD not in str(settings)
+
+
+def test_xing_mailbox_app_password_absent_from_settings_repr_and_str():
+    settings = _settings_with_sentinel_mail_passwords()
+    assert _SENTINEL_XING_PASSWORD not in repr(settings)
+    assert _SENTINEL_XING_PASSWORD not in str(settings)
+
+
+def test_mail_passwords_absent_from_validation_error_text():
+    """Same leak, ValidationError-rendering trigger: real gmail/xing app
+    passwords supplied alongside an unrelated invalid field must not be
+    echoed into the ValidationError text."""
+    with pytest.raises(ValidationError) as exc_info:
+        _settings_with_sentinel_mail_passwords(gmail_lookback_days=-1)
+    assert _SENTINEL_GMAIL_PASSWORD not in str(exc_info.value)
+    assert _SENTINEL_XING_PASSWORD not in str(exc_info.value)
