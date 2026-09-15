@@ -45,6 +45,10 @@ from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import JobScorer
 from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
+from app.agents.role_relevance_classifier import (
+    classify_title_relevance,
+    derive_candidate_target_domain,
+)
 from app.agents.seniority_classifier import (
     classify_title_seniority,
     derive_candidate_target_seniority,
@@ -185,6 +189,32 @@ def _candidate_target_seniority(db: Session):
     return derive_candidate_target_seniority(profile.target_roles)
 
 
+def _candidate_target_domain(db: Session):
+    """The candidate's own stated CandidateProfile.target_roles (Stage
+    6A), read lazily -- only when a job has already cleared posting_type
+    classification, seniority classification, AND scored APPLY/MAYBE
+    (Stage 11B, see _score_for_posting_type below) -- so a job that's
+    already excluded on any earlier ground never pays for this extra
+    Candidate Profile read.
+
+    Mirrors _candidate_target_seniority's own S11A-003/S11A-004 fixes
+    exactly (same lessons applied from the start here, not re-discovered):
+    the PURE `get_candidate_profile` lookup (never
+    `get_or_create_candidate_profile` -- scoring must not create the
+    singleton CandidateProfile row as a side effect), wrapped in
+    `db.no_autoflush` (a plain `Session.get()` autoflushes by default,
+    which could prematurely flush unrelated pending state elsewhere on
+    this same Session).
+    """
+    with db.no_autoflush:
+        profile_record = get_candidate_profile(db)
+        if profile_record is None:
+            return "UNKNOWN"
+        profile = to_candidate_profile_response(profile_record)
+
+    return derive_candidate_target_domain(profile.target_roles)
+
+
 def _excluded_job_score() -> JobScore:
     """The shared zeroed-out shape for a job forced out of the normal
     scoring pipeline -- Stage 10's posting_type exclusion and Stage 11A's
@@ -252,6 +282,32 @@ def _score_for_posting_type(
                     job.source,
                     candidate_target,
                     title_seniority.matched_signal,
+                )
+                return _excluded_job_score()
+
+    # Stage 11B: a confidently IRRELEVANT-titled job (a role family
+    # clearly outside software development -- see
+    # app.agents.role_relevance_classifier) must not reach MAYBE/APPLY
+    # for a candidate whose target roles unanimously name a
+    # software-development role family. Only checked once a job has
+    # already reached APPLY/MAYBE on ordinary skill-match grounds AND
+    # survived Stage 11A's own seniority gate above -- entirely
+    # independent of that gate, never interleaved with it. If the
+    # candidate's target domain or the job's title relevance can't be
+    # determined, this never fires -- UNKNOWN must never be treated as a
+    # rejection signal.
+    if result.recommendation in ("APPLY", "MAYBE"):
+        candidate_domain = _candidate_target_domain(db)
+        if candidate_domain == "SOFTWARE_DEVELOPMENT":
+            title_relevance = classify_title_relevance(job.title)
+            if title_relevance.level == "IRRELEVANT":
+                logger.info(
+                    "job_excluded_role_irrelevant job_title=%s source=%s "
+                    "candidate_target_domain=%s matched_signal=%s",
+                    job.title,
+                    job.source,
+                    candidate_domain,
+                    title_relevance.matched_signal,
                 )
                 return _excluded_job_score()
 
