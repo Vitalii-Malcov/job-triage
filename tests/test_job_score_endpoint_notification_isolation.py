@@ -144,7 +144,7 @@ def test_notification_exception_does_not_turn_successful_score_into_500(
     assert "RuntimeError" in caplog.text
 
 
-def test_notification_failure_returned_false_is_logged_without_raising(client, monkeypatch):
+def test_notification_failure_returned_false_is_logged_without_raising(client, monkeypatch, caplog):
     """Companion case: send_job() returning False (no exception) --
     e.g. the notifier is disabled/misconfigured -- must also stay
     best-effort and never affect the response.
@@ -152,18 +152,48 @@ def test_notification_failure_returned_false_is_logged_without_raising(client, m
     test_client, _session_factory = client
 
     class _FalseNotifier:
+        calls: list = []
+
         def __init__(self, *args, **kwargs) -> None:
             pass
 
         async def send_job(self, job, score) -> bool:
+            _FalseNotifier.calls.append((job, score))
             return False
 
+    _FalseNotifier.calls = []
     monkeypatch.setattr("app.api.routes.TelegramNotifier", _FalseNotifier)
 
-    response = test_client.post(
-        "/api/v1/jobs/score",
-        json=_job_payload(url="https://example.com/jobs/notification-isolation-false"),
-        headers=_auth_headers(),
+    # S11E-002 (Codex Stage 11E review, BLOCKING) follow-up to S11E-001:
+    # same principle as the RuntimeError isolation test above -- /jobs/score
+    # now only reaches the notifier for recommendation=="APPLY", so the
+    # payload needs enough description content to clear
+    # MINIMUM_DECISION_CONFIDENCE and avoid NEEDS_ENRICHMENT.
+    rich_description = (
+        "We build APIs with Python and FastAPI, using SQLAlchemy for the "
+        "data layer and pytest for testing. " * 20
     )
 
+    with caplog.at_level("DEBUG"):
+        response = test_client.post(
+            "/api/v1/jobs/score",
+            json=_job_payload(
+                url="https://example.com/jobs/notification-isolation-false",
+                description=rich_description,
+            ),
+            headers=_auth_headers(),
+        )
+
     assert response.status_code == 200
+    body = response.json()
+    assert body["recommendation"] == "APPLY"
+
+    # The notifier must actually have been invoked -- otherwise the
+    # "isolated without raising" claim below is vacuous.
+    assert len(_FalseNotifier.calls) == 1
+
+    # A False return (no exception) must be logged via the dedicated
+    # warning path, not silently dropped, and must not affect the
+    # already-successful response. JobScore has no `id` field, so match
+    # on the log event name rather than a specific job_id value.
+    assert "job_score_notification_failed job_id=" in caplog.text
