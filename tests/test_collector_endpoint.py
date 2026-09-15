@@ -32,10 +32,19 @@ class FakeJobScorer:
 
 
 def _job_score(**overrides) -> JobScore:
+    # S11E-003: Stage 11E's evidence-cardinality guard downgrades any
+    # APPLY/MAYBE JobScore with fewer than 2 distinct normalized
+    # must/nice evidence signals -- these notification-routing tests
+    # care about orchestration, not scoring realism, but the canned
+    # result still has to be internally consistent with that contract
+    # (matched_must_have=["python", "fastapi"] matches _sample_job's own
+    # default skills=["python"]) or it gets silently downgraded to SKIP
+    # before the notifier is ever reached.
     data = {
         "score": 90,
         "recommendation": "APPLY",
         "data_confidence": 0.9,
+        "matched_must_have": ["python", "fastapi"],
     }
     data.update(overrides)
     return JobScore(**data)

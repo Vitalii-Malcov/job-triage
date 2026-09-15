@@ -26,7 +26,19 @@ class FakeJobScorer:
         pass
 
     def score(self, job: Job) -> JobScore:
-        return JobScore(score=90, recommendation="APPLY", data_confidence=0.9)
+        # S11E-003: Stage 11E's evidence-cardinality guard downgrades any
+        # APPLY/MAYBE JobScore with fewer than 2 distinct normalized
+        # must/nice evidence signals. This class exists to prove the
+        # auto-research budget/fan-out behavior, not to exercise scoring
+        # realism, but the canned result still needs >=2 evidence
+        # signals or it gets silently downgraded to SKIP before the
+        # research call site is ever reached.
+        return JobScore(
+            score=90,
+            recommendation="APPLY",
+            data_confidence=0.9,
+            matched_must_have=["python", "fastapi"],
+        )
 
 
 class FakeCollector:
