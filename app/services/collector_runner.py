@@ -122,6 +122,39 @@ def _allowed_employment_types(db: Session, posting_type: str | None) -> frozense
     return frozenset(profile.job_preferences.employment_types)
 
 
+def _score_for_posting_type(
+    db: Session, profile: UserProfile, job: Job, effective_posting_type: str | None
+) -> JobScore:
+    """The full Stage 10 classify-then-score decision for `job`, given the
+    posting_type to classify against -- pure/no-write, so it can safely
+    be called twice by score_and_persist below (once before persistence,
+    and again as the S10-001 post-write consistency check).
+    """
+    classification = classify_posting(
+        title=job.title,
+        posting_type=effective_posting_type,
+        allowed_employment_types=_allowed_employment_types(db, effective_posting_type),
+    )
+    if not classification.is_target_employment:
+        logger.info(
+            "job_excluded_non_target_posting job_title=%s source=%s reason=%s",
+            job.title,
+            job.source,
+            classification.excluded_reason,
+        )
+        return JobScore(
+            score=0,
+            matched_skills=[],
+            missing_skills=[],
+            matched_must_have=[],
+            missing_must_have=[],
+            matched_nice_to_have=[],
+            recommendation="SKIP",
+            data_confidence=0.0,
+        )
+    return JobScorer(profile_skills(profile)).score(job)
+
+
 def score_and_persist(
     db: Session, profile: UserProfile, job: Job
 ) -> tuple[JobRecord, JobScore, bool]:
@@ -143,44 +176,49 @@ def score_and_persist(
     app.services.collector_runner.run_xing).
 
     **Re-score cannot lose the classification (Stage 10 follow-up).**
-    `job.posting_type` is transient scoring input, not something every
-    caller necessarily resupplies (a manual POST /jobs/score payload for
-    the SAME fingerprint as an already-persisted, already-excluded
-    listing has no reason to know this derived field exists). If `job`
-    doesn't carry one but a JobRecord with the same fingerprint already
-    does (persisted by a prior upsert_job call — see
-    app/db/repositories.py::_apply_job_update_fields's matching
-    preserve-on-omit rule), that persisted value is reused for
+    `job.posting_type` is transient scoring input (persisted on
+    `JobRecord.posting_type` once written -- see
+    app/db/repositories.py::upsert_job/_apply_job_update_fields), not
+    something every caller necessarily resupplies (a manual POST
+    /jobs/score payload for the SAME fingerprint as an already-persisted,
+    already-excluded listing has no reason to know this derived field
+    exists). If `job` doesn't carry one but a JobRecord with the same
+    fingerprint already does, that persisted value is reused for
     classification instead of silently treating the posting as
     untyped/unknown.
+
+    **S10-001 (Codex Stage 10 review, BLOCKING): concurrent-write
+    consistency.** The `existing` read immediately below and
+    `upsert_job`'s OWN separate internal read (plus its HARD-007
+    race-recovery re-read on an INSERT collision) are not atomic with
+    each other -- a concurrent `score_and_persist` call for the SAME
+    fingerprint can commit a DIFFERENT `posting_type` in the window
+    between them. Without a check, `record` returned by `upsert_job`
+    could end up NOT being the row `result` (below) was actually
+    computed for, e.g. persisting `posting_type=SELBSTAENDIGKEIT` with a
+    stale `recommendation=APPLY` computed by a losing writer back when it
+    still believed the posting was untyped. After the write, this
+    function re-checks `record.posting_type` against what `result` was
+    actually classified against and, on a mismatch, reclassifies and
+    corrects `record` in place -- so whichever call returns/commits LAST
+    for a given fingerprint always leaves (score, recommendation)
+    consistent with THAT row's own final, real posting_type, regardless
+    of write interleaving.
     """
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
-    classification = classify_posting(
-        title=job.title,
-        posting_type=effective_posting_type,
-        allowed_employment_types=_allowed_employment_types(db, effective_posting_type),
-    )
-    if not classification.is_target_employment:
-        logger.info(
-            "job_excluded_non_target_posting job_title=%s source=%s reason=%s",
-            job.title,
-            job.source,
-            classification.excluded_reason,
-        )
-        result = JobScore(
-            score=0,
-            matched_skills=[],
-            missing_skills=[],
-            matched_must_have=[],
-            missing_must_have=[],
-            matched_nice_to_have=[],
-            recommendation="SKIP",
-            data_confidence=0.0,
-        )
-    else:
-        result = JobScorer(profile_skills(profile)).score(job)
+    result = _score_for_posting_type(db, profile, job, effective_posting_type)
     record, created = upsert_job(db, job, result)
+
+    if record.posting_type != effective_posting_type:
+        result = _score_for_posting_type(db, profile, job, record.posting_type)
+        if record.score != result.score or record.recommendation != result.recommendation:
+            record.score = result.score
+            record.recommendation = result.recommendation
+            record.data_confidence = result.data_confidence
+            db.commit()
+            db.refresh(record)
+
     result.is_duplicate = not created
     return record, result, created
 

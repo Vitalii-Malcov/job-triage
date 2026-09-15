@@ -102,6 +102,36 @@ def test_praktikum_allowed_with_internship_preference():
     assert result.is_target_employment is True
 
 
+def test_arbeit_role_with_weiterbildung_in_title_is_not_excluded():
+    # S10-002 (Codex Stage 10 review, BLOCKING): a real L&D-department
+    # staff role -- "Weiterbildung" is the role's SUBJECT MATTER (the
+    # employee works ON training), not an offer to sell a course. A
+    # structurally-confirmed ARBEIT posting must never be excluded by the
+    # weaker title-keyword fallback.
+    result = classify_posting(title="Mitarbeiter Weiterbildung (m/w/d)", posting_type="ARBEIT")
+    assert result.is_target_employment is True
+    assert result.excluded_reason is None
+
+
+def test_arbeit_role_with_schulung_in_title_is_not_excluded():
+    result = classify_posting(title="Referent Schulung und Qualifizierung", posting_type="ARBEIT")
+    assert result.is_target_employment is True
+
+
+def test_arbeit_role_with_kurs_in_title_is_not_excluded():
+    result = classify_posting(title="Leitung Kursplanung (m/w/d)", posting_type="ARBEIT")
+    assert result.is_target_employment is True
+
+
+def test_non_arbeit_course_title_is_still_excluded():
+    # The ARBEIT bypass must not weaken exclusion for postings that
+    # actually lack structural confirmation -- an untyped source with an
+    # obvious course title is still caught.
+    result = classify_posting(title="Python Weiterbildung für Fortgeschrittene", posting_type=None)
+    assert result.is_target_employment is False
+    assert result.excluded_reason == "course_title_pattern"
+
+
 def test_legitimate_junior_python_backend_job_unaffected():
     result = classify_posting(title="Junior Python Backend Developer", posting_type="ARBEIT")
     assert result.is_target_employment is True

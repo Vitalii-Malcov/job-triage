@@ -35,17 +35,33 @@ Signal is drawn from, in order:
 1. The source's own structured posting-type field, when present
    (currently: Bundesagentur's `stellenangebotsart`, passed through as
    `Job.posting_type`). Most reliable -- set by the employer/poster at
-   submission time, not inferred from free text.
+   submission time, not inferred from free text. A structurally-confirmed
+   `ARBEIT` posting is trusted outright and never reaches step 2 below.
 2. A conservative, whole-word title pattern (German training/course
-   vocabulary) as a fallback for sources with no structured type, or a
-   posting mislabeled upstream. Deliberately title-only (never the full
+   vocabulary) as a fallback for postings this module has NO reliable
+   structural confirmation for (no structured type at all, or a type
+   that itself needs corroborating -- SELBSTAENDIGKEIT/AUSBILDUNG/
+   PRAKTIKUM_TRAINEE). Deliberately title-only (never the full
    description) and whole-word (so German compounds like
    "Schülerkurse" -- a real trainer job title -- never false-positive
    purely by containing "kurs" as a substring).
+
+**Stage 10 review finding (S10-002, blocking).** An earlier version ran
+the title-pattern fallback unconditionally, including against
+`ARBEIT`-typed postings -- "Mitarbeiter Weiterbildung (m/w/d)" (a real
+L&D-department staff role -- training is the role's SUBJECT MATTER, not
+something being sold) false-excluded purely because "Weiterbildung"
+appeared as a clean whole word in the title. `ARBEIT` is the strongest,
+most authoritative signal this module has (the employer/poster's own
+explicit declaration of real employment) and must never be second-guessed
+by the weaker title heuristic -- the fallback now only ever runs for
+postings without that structural confirmation.
 """
 
 import re
 from dataclasses import dataclass
+
+ARBEIT = "ARBEIT"
 
 # Bundesagentur "stellenangebotsart" values observed live (2026-09-15,
 # keyword="Python", Frankfurt am Main +50km, 328 postings across 3 pages):
@@ -102,6 +118,12 @@ def classify_posting(
     required_preference = POSTING_TYPE_REQUIRES_PREFERENCE.get(posting_type or "")
     if required_preference is not None and required_preference not in allowed_employment_types:
         return PostingClassification(False, f"posting_type_requires_preference:{posting_type}")
+
+    # S10-002: a structurally-confirmed ARBEIT posting is trusted outright
+    # -- the title-keyword fallback below is reserved for postings with no
+    # such confirmation and must never override it (see module docstring).
+    if posting_type == ARBEIT:
+        return PostingClassification(True, None)
 
     if _COURSE_TITLE_PATTERN.search(title or ""):
         return PostingClassification(False, "course_title_pattern")

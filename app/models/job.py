@@ -28,9 +28,13 @@ class Job(BaseModel):
     # app.agents.posting_classifier for how this is used to keep
     # non-employment listings (training-provider courses, apprenticeships,
     # internships) out of the normal APPLY pipeline — Stage 10 shadow-mode
-    # pilot finding. Transient scoring input only, not persisted on
-    # JobRecord.
-    posting_type: str | None = None
+    # pilot finding. S10-004: persisted on JobRecord.posting_type (see
+    # app/db/models.py and app/db/repositories.py::upsert_job) so a later
+    # re-score that omits this field can reuse the stored value instead
+    # of losing the classification — see
+    # app.services.collector_runner.score_and_persist's own docstring.
+    # S10-003: max_length matches JobRecord.posting_type's VARCHAR(64).
+    posting_type: str | None = Field(default=None, max_length=64)
 
 
 class JobScore(BaseModel):
