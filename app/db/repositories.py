@@ -4,7 +4,6 @@ import re
 import unicodedata
 from datetime import UTC, datetime
 from enum import StrEnum
-from urllib.parse import urlsplit
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
@@ -479,66 +478,6 @@ def normalize_company_name(name: str) -> str:
     normalized = unicodedata.normalize("NFKC", name)
     normalized = _WHITESPACE_RUN.sub(" ", normalized)
     return normalized.strip().casefold()
-
-
-def normalize_domain(url_or_domain: str) -> str | None:
-    """Extract a canonical hostname from a URL or bare domain, or None if
-    one can't be determined or is unsafe to treat as a hostname.
-
-    Reserved for a future provider with a genuine, trusted company-domain
-    source — Company Research v1's service layer never derives a domain
-    from `Job.url` (a job-posting/job-board URL is not the company's own
-    website; see app/services/company_research.py) and its only provider
-    makes no network calls at all, so this function has no v1 call site
-    that reaches it with untrusted input. Kept deliberately strict anyway:
-
-    - Only bare hostnames ("example.com", "www.example.com") or explicit
-      http(s) URLs are accepted; any other scheme (javascript:, file:,
-      ftp:, ...) or a colon-before-the-first-slash with no "//" (a
-      malformed/foreign scheme prefix like "http:example.com") is rejected
-      rather than guessed at.
-    - Whitespace and control characters anywhere in the input are rejected.
-    - Userinfo tricks (`https://example.com@evil.com`) canonicalize to the
-      real hostname after the last "@" (`evil.com`), matching how
-      browsers/HTTP clients actually resolve the authority — never the
-      misleading userinfo-looking prefix.
-    - An invalid port (`https://example.com:abc/`) is rejected.
-    - Output is always lowercase with a leading "www." stripped, never
-      including scheme/path/port.
-    """
-    # Only plain leading/trailing spaces are trimmed here — a tab, newline,
-    # or other whitespace/control char anywhere (including the edges) is
-    # rejected outright by the check below rather than silently stripped,
-    # since a legitimate domain never contains one.
-    candidate = url_or_domain.strip(" ")
-    if not candidate or any(ch.isspace() or ord(ch) < 0x20 for ch in candidate):
-        return None
-
-    if "://" in candidate:
-        scheme = candidate.partition("://")[0].lower()
-        if scheme not in ("http", "https"):
-            return None
-    elif ":" in candidate.split("/", 1)[0]:
-        # A colon before the first "/" with no "//" is a malformed/foreign
-        # scheme prefix ("http:example.com", "javascript:alert(1)"), not a
-        # bare hostname — reject rather than guess.
-        return None
-    else:
-        candidate = f"https://{candidate}"
-
-    try:
-        parsed = urlsplit(candidate)
-        host = parsed.hostname
-        _ = parsed.port  # Accessed only to trigger ValueError on a bad port.
-    except ValueError:
-        return None
-
-    if not host:
-        return None
-    host = host.lower()
-    if host.startswith("www."):
-        host = host[len("www.") :]
-    return host or None
 
 
 class CompanyResearchWriteOutcome(StrEnum):

@@ -18,10 +18,10 @@ different companies both posting via the same ATS would otherwise risk
 being merged, or a domain wrongly attributed) and it has been removed
 entirely rather than patched with a longer blacklist. Company Research v1
 therefore only ever has a `normalized_company_name` identity — domain-based
-identity (`app.db.repositories.normalize_domain` /
-`get_company_research_by_identity`'s domain-preferred lookup) remains
-supported at the persistence layer for a future provider with a genuine,
-trusted domain source, but nothing in this module produces one today.
+identity (`get_company_research_by_identity`'s domain-preferred lookup)
+remains supported at the persistence layer for a future provider with a
+genuine, trusted domain source, but nothing in this module produces one
+today.
 """
 
 import json

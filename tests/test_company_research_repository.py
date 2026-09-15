@@ -12,7 +12,6 @@ from app.db.repositories import (
     get_known_domains_for_company_name,
     is_usable_company_research,
     normalize_company_name,
-    normalize_domain,
     record_failed_attempt,
     resolve_name_only_company_research,
     upsert_company_research,
@@ -74,47 +73,6 @@ def test_normalize_company_name_unicode_equivalent_forms_match():
 
 def test_normalize_company_name_mixed_case_matches():
     assert normalize_company_name("ACME gmbh") == normalize_company_name("Acme GmbH")
-
-
-# --- normalize_domain (adversarial matrix) ----------------------------------
-
-
-def test_normalize_domain_accepts_bare_and_prefixed_forms():
-    assert normalize_domain("example.com") == "example.com"
-    assert normalize_domain("www.example.com") == "example.com"
-    assert normalize_domain("https://example.com") == "example.com"
-    assert normalize_domain("https://www.Example.com/path") == "example.com"
-    assert normalize_domain("https://example.com:443/path") == "example.com"
-
-
-def test_normalize_domain_rejects_dangerous_schemes():
-    assert normalize_domain("javascript:alert(1)") is None
-    assert normalize_domain("file:///etc/passwd") is None
-    assert normalize_domain("ftp://example.com") is None
-
-
-def test_normalize_domain_rejects_malformed_authority():
-    assert normalize_domain("http:example.com/path") is None
-
-
-def test_normalize_domain_rejects_control_and_whitespace_chars():
-    assert normalize_domain("not a url") is None
-    assert normalize_domain("example.com\n") is None
-    assert normalize_domain("exa\tmple.com") is None
-    assert normalize_domain("example.com\x00") is None
-
-
-def test_normalize_domain_rejects_invalid_port():
-    assert normalize_domain("https://example.com:abc/path") is None
-
-
-def test_normalize_domain_userinfo_resolves_to_real_hostname():
-    assert normalize_domain("https://example.com@evil.com") == "evil.com"
-
-
-def test_normalize_domain_rejects_blank():
-    assert normalize_domain("") is None
-    assert normalize_domain("   ") is None
 
 
 # --- H-01: identity collision (same name, different known domains) --------
