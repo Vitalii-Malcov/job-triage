@@ -45,27 +45,52 @@ _JUNIOR_PATTERN = re.compile(r"\bjunior\b", re.IGNORECASE)
 # German "-leiter"/"-leiterin" is a genuinely productive compounding
 # suffix for leadership titles ("Abteilungsleiter" = department head,
 # "Projektleiter" = project lead, "Entwicklungsleiter" = head of
-# development, "Bereichsleiter" = division head, ...) -- an open-ended
-# set no fixed prefix whitelist could enumerate generically. But
-# "Leiter" is also a genuine German homonym for "conductor" (physics:
-# "elektrischer Leiter"), which produces a small, closed set of
-# well-known engineering/physics compound nouns that are NOT leadership
-# titles: "Halbleiter" (semiconductor), "Supraleiter" (superconductor),
-# "Ableiter"/"Blitzableiter" (arrester/lightning rod), "Nichtleiter"
-# (insulator/non-conductor). These are real, common terms in German
-# engineering job postings (e.g. "Halbleiter-Ingenieur") and must not be
-# misread as a leadership signal merely because they end in "-leiter" --
-# excluded by exact whole-word negative lookahead below, not by
-# disabling compound matching altogether.
-_LEITER_NON_ROLE_COMPOUNDS = (
+# development, "Bereichsleiter" = division head, "Bauleiter" = site
+# manager, ...) -- an open-ended set no fixed prefix whitelist could
+# enumerate generically. But "Leiter" is ALSO a genuine German homonym
+# for "conductor" (physics: "elektrischer Leiter"), and "-leiter" is
+# separately the tail-end of the UNRELATED word "Begleiter" (companion/
+# escort/attendant, from "begleiten" = to accompany -- nothing to do
+# with "leiten" = to lead). Both are false-positive classes this matcher
+# must stay high-precision against ("Unknown is safer than falsely
+# excluding a legitimate non-senior vacancy" -- Stage 11A hardening):
+#
+# 1. Conductor/physics homonyms -- a SMALL, CLOSED, enumerable set of
+#    real German engineering/physics compound nouns ("Halbleiter" =
+#    semiconductor, "Supraleiter" = superconductor, "Wellenleiter" =
+#    waveguide, "Lichtleiter" = light guide/optical fiber, "Ableiter"/
+#    "Blitzableiter" = arrester/lightning rod, "Nichtleiter" =
+#    insulator). Excluded by exact whole-word denylist -- this is a
+#    general German-language vocabulary fact, not vacancy-specific, but
+#    each new physics compound needs its own denylist entry since there
+#    is no shared *structural* marker distinguishing "Team+leiter"
+#    (organizational) from "Licht+leiter" (physics) beyond the meaning
+#    of the specific prefix noun.
+#
+# 2. The "-begleiter"/"-begleiterin" WORD FAMILY -- "Flugbegleiter"
+#    (flight attendant), "Alltagsbegleiter" (everyday-life companion/
+#    caregiver), "Schulbegleiter" (school aide), "Integrationsbegleiter"
+#    (integration companion), and any OTHER "[X]begleiter(in)" compound
+#    not enumerated here (e.g. a future "Reisebegleiter" = travel
+#    companion) all share the literal suffix "begleiter"/"begleiterin"
+#    -- unlike the physics homonyms above, this is excluded as a whole
+#    SUFFIX FAMILY (any word ending in "begleiter(in)?"), not as
+#    individually enumerated words, so it generalizes to compounds never
+#    explicitly listed.
+_LEITER_NON_ROLE_EXACT_WORDS = (
     "halbleiter",
     "supraleiter",
+    "wellenleiter",
+    "lichtleiter",
     "ableiter",
     "blitzableiter",
     "nichtleiter",
 )
 _LEITER_COMPOUND_PATTERN = (
-    r"\b(?!(?:" + "|".join(_LEITER_NON_ROLE_COMPOUNDS) + r")\b)\w*leiter(?:in)?\b"
+    r"\b"
+    r"(?!(?:" + "|".join(_LEITER_NON_ROLE_EXACT_WORDS) + r")\b)"  # (1) exact physics homonyms
+    r"(?!\w*begleiter(?:in)?\b)"  # (2) the whole "-begleiter(in)" family
+    r"\w*leiter(?:in)?\b"
 )
 
 # The single canonical senior/lead-level signal vocabulary, shared by

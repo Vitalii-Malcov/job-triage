@@ -60,6 +60,10 @@ def test_bereichsleiter_compound_title_is_classified_senior():
     assert classify_title_seniority("Bereichsleiter IT (m/w/d)").level == "SENIOR"
 
 
+def test_bauleiter_compound_title_is_classified_senior():
+    assert classify_title_seniority("Bauleiter (m/w/d)").level == "SENIOR"
+
+
 def test_halbleiter_semiconductor_word_is_not_a_substring_false_positive():
     # "Halbleiter" (semiconductor) is a genuine, common German engineering
     # term ending in "-leiter" but has nothing to do with job seniority --
@@ -72,6 +76,50 @@ def test_blitzableiter_word_is_not_a_substring_false_positive():
     # "Blitzableiter" (lightning rod) similarly ends in "-leiter" but is
     # not a leadership title.
     assert classify_title_seniority("Blitzableiter-Techniker (m/w/d)").level == "UNKNOWN"
+
+
+def test_wellenleiter_waveguide_word_is_not_a_substring_false_positive():
+    # "Wellenleiter" (waveguide) -- same physics-conductor homonym class
+    # as Halbleiter/Supraleiter, just a different first-part noun.
+    assert classify_title_seniority("Wellenleiter-Ingenieur (m/w/d)").level == "UNKNOWN"
+
+
+def test_lichtleiter_optical_fiber_word_is_not_a_substring_false_positive():
+    # "Lichtleiter" (light guide / optical fiber) -- same physics-
+    # conductor homonym class.
+    assert classify_title_seniority("Lichtleiter-Techniker (m/w/d)").level == "UNKNOWN"
+
+
+def test_flugbegleiter_flight_attendant_is_not_a_leadership_compound():
+    # "Flugbegleiter" (flight attendant) ends in "-leiter" purely as a
+    # string coincidence of the UNRELATED word "Begleiter" (companion/
+    # escort, from "begleiten" = to accompany) -- must not be
+    # misclassified as a leadership compound.
+    assert classify_title_seniority("Flugbegleiter (m/w/d)").level == "UNKNOWN"
+
+
+def test_flugbegleiterin_feminine_form_is_not_a_leadership_compound():
+    assert classify_title_seniority("Flugbegleiterin (m/w/d)").level == "UNKNOWN"
+
+
+def test_alltagsbegleiter_everyday_companion_is_not_a_leadership_compound():
+    assert classify_title_seniority("Alltagsbegleiter (m/w/d)").level == "UNKNOWN"
+
+
+def test_schulbegleiter_school_aide_is_not_a_leadership_compound():
+    assert classify_title_seniority("Schulbegleiter (m/w/d)").level == "UNKNOWN"
+
+
+def test_integrationsbegleiter_is_not_a_leadership_compound():
+    assert classify_title_seniority("Integrationsbegleiter (m/w/d)").level == "UNKNOWN"
+
+
+def test_unlisted_begleiter_compound_is_generically_excluded_by_family():
+    # The "-begleiter" exclusion is a whole SUFFIX FAMILY, not an
+    # enumerated word list -- a compound never explicitly named anywhere
+    # in this module must still be excluded as long as it ends in
+    # "begleiter"/"begleiterin".
+    assert classify_title_seniority("Reisebegleiter (m/w/d)").level == "UNKNOWN"
 
 
 def test_junior_title_is_not_senior():
