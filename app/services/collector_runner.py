@@ -238,6 +238,28 @@ def score_and_persist(
     HARD-007's own fingerprint-race recovery (inside `upsert_job`) is
     untouched by any of this -- this loop only ever runs AFTER
     `upsert_job` has already returned a durably-persisted row.
+
+    **S10-RR-002 (Codex Stage 10 re-re-review, BLOCKING): never manually
+    reassign the score fields onto `record` after a successful CAS.**
+    `update_job_score_if_posting_type_unchanged` commits -- and a commit
+    EXPIRES every object in this Session's identity map, `record`
+    included. Setting `record.score = result.score` (etc.) on an expired
+    instance stages those as PENDING attribute writes, marking `record`
+    dirty again -- with values that, at that exact instant, happen to
+    equal what the CAS just durably wrote, so nothing looks wrong yet.
+    The real danger is a LATER, wholly unrelated `db.commit()` on this
+    SAME Session (e.g. this job is one of many processed in one
+    collector run, and a subsequent job's own write commits): the ORM's
+    ordinary flush has no idea these three attributes are supposed to be
+    guarded by posting_type -- it just flushes them via a plain
+    `UPDATE ... WHERE id = :id`, no CAS predicate at all. If SOME OTHER
+    session has legitimately changed this row's recommendation in the
+    meantime, that later flush silently replays THIS call's
+    now-stale values over it, defeating the entire CAS. `db.refresh(record)`
+    instead reloads every column fresh from the database (exactly what
+    the CAS just wrote, so `record` ends up correct either way) WITHOUT
+    marking anything dirty -- there is nothing to leak into any later,
+    unrelated commit.
     """
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
@@ -256,12 +278,14 @@ def score_and_persist(
                 recommendation=result.recommendation,
                 data_confidence=result.data_confidence,
             )
-            if applied:
-                record.score = result.score
-                record.recommendation = result.recommendation
-                record.data_confidence = result.data_confidence
-                break
+            # S10-RR-002: reload from the DB instead of assigning onto
+            # `record` -- see the docstring section above. Applies
+            # whether the CAS succeeded (picks up exactly what was just
+            # written) or failed (picks up the current posting_type to
+            # retry against); either way `record` leaves this call clean.
             db.refresh(record)
+            if applied:
+                break
             observed_posting_type = record.posting_type
         else:
             raise JobScoreReconciliationError(

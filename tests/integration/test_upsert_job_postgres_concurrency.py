@@ -56,8 +56,13 @@ from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from app.db.candidate_profile_repository import (
+    apply_candidate_profile_patch,
+    get_or_create_candidate_profile,
+)
 from app.db.models import CandidateProfileRecord, JobRecord, JobReferenceTokenRecord, UserProfile
 from app.db.repositories import _fingerprint, _is_fingerprint_unique_violation, upsert_job
+from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.models.job import Job, JobScore
 from app.services.collector_runner import score_and_persist
 
@@ -530,3 +535,191 @@ class TestPostingTypeConcurrencyReconciliation:
             assert result2.recommendation == "SKIP"
         finally:
             session2.close()
+
+
+class TestS10RR002StaleDirtyScoreFieldsNotReplayed:
+    """S10-RR-002 (Codex Stage 10 re-re-review, BLOCKING): proves that a
+    successful CAS reconciliation inside `score_and_persist` does NOT
+    leave stale score/recommendation/data_confidence values pending on
+    the Session, ready to be silently replayed (with no posting_type
+    guard at all) by a LATER, wholly unrelated commit on that SAME
+    Session against REAL PostgreSQL.
+
+    **The scenario (sequential, not a true concurrent race -- see
+    below):**
+    1. Session A reconciles a SELBSTAENDIGKEIT posting via CAS. FREELANCE
+       is granted up front so this legitimately converges on APPLY --
+       needed so a stale replay of A's OLD values would reproduce the
+       exact literal bad pairing this test guards against
+       (SELBSTAENDIGKEIT + APPLY), not some other mismatched pairing.
+    2. Session B revokes the FREELANCE preference and re-scores the SAME
+       posting -- now legitimately SKIP. B's own write is a plain,
+       non-reconciling update (its own observed posting_type already
+       matches what it computes against), so B is unaffected by this bug
+       either way.
+    3. Session A performs another, LATER, UNRELATED `commit()`.
+
+    Pre-fix, `record_a` (from step 1) still carries dirty score=X/
+    recommendation=APPLY/data_confidence=Y from step 1's manual
+    reassignment (see `score_and_persist`'s S10-RR-002 docstring section)
+    -- step 3's commit flushes those via a plain `UPDATE ... WHERE id =
+    :id`, no posting_type predicate at all, silently resurrecting APPLY
+    over B's legitimate SKIP. Post-fix, `db.refresh()` left `record_a`
+    clean after step 1, so step 3 is a true no-op.
+
+    Deliberately uses the SAME monkeypatched-read-point technique as
+    `TestPostingTypeConcurrencyReconciliation` above (not real threading)
+    -- this scenario is fundamentally SEQUENTIAL (A reconciles, THEN B
+    acts, THEN A commits again), so a real race isn't what's being
+    proven; the monkeypatch only exists to force A into the
+    CAS-reconciliation branch deterministically, exactly like a genuine
+    concurrent writer would.
+
+    **Critical test-methodology note:** this test deliberately never
+    touches any attribute of `record_a` between step 1 and step 3.
+    Reading an EXPIRED attribute (e.g. `record_a.posting_type`, never
+    manually re-set) triggers SQLAlchemy's own lazy-refresh-on-access,
+    which would reload the row fresh from the database and incidentally
+    launder away the exact dirty state this test exists to catch --
+    discovered while developing the companion SQLite unit test
+    (tests/test_collector_runner_posting_classification.py), which
+    originally asserted `record not in db.dirty` AFTER already asserting
+    `record.posting_type == ...` and so never actually caught the
+    pre-fix bug until the assertion order was corrected.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_candidate_profile_singleton(self, pg_session_factory):
+        session = pg_session_factory()
+        try:
+            session.execute(delete(CandidateProfileRecord).where(CandidateProfileRecord.id == 1))
+            session.commit()
+        finally:
+            session.close()
+
+    def test_later_unrelated_commit_does_not_resurrect_a_stale_apply_over_a_legitimate_skip(
+        self, pg_session_factory, monkeypatch
+    ):
+        marker = f"{FINGERPRINT_MARKER}-rr002-stale-replay"
+
+        setup_session = pg_session_factory()
+        try:
+            get_or_create_candidate_profile(setup_session)
+            apply_candidate_profile_patch(
+                setup_session,
+                CandidateProfilePatchRequest(
+                    expected_profile_version=1,
+                    job_preferences={"employment_types": ["FREELANCE"]},
+                ),
+            )
+        finally:
+            setup_session.close()
+
+        profile = UserProfile(
+            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
+        )
+        # A real (non-empty) description is required for both -- with no
+        # description, data_confidence is too low to ever reach APPLY
+        # (it lands on NEEDS_ENRICHMENT instead), which would still prove
+        # a stale replay corrupted B's row but not the EXACT literal
+        # SELBSTAENDIGKEIT+APPLY pairing this test targets.
+        rich_description = "We build REST APIs with Python, FastAPI and SQLAlchemy. " * 15
+        job_a = Job(
+            source="bundesagentur",
+            title=f"Backend Engineer {marker}",
+            company="RaceCo",
+            url=f"https://example.com/jobs/{marker}",
+            description=rich_description,
+            must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
+            posting_type=None,
+        )
+        job_seed = Job(
+            source="bundesagentur",
+            title=f"Backend Engineer {marker}",
+            company="RaceCo",
+            url=f"https://example.com/jobs/{marker}",
+            description=rich_description,
+            must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
+            posting_type="SELBSTAENDIGKEIT",
+        )
+
+        from app.db.repositories import get_job_by_fingerprint as real_get_job_by_fingerprint
+
+        call_count = {"n": 0}
+
+        def interleaving(db_, job_):
+            call_count["n"] += 1
+            result = real_get_job_by_fingerprint(db_, job_)
+            if call_count["n"] == 1:
+                monkeypatch.setattr(
+                    "app.services.collector_runner.get_job_by_fingerprint",
+                    real_get_job_by_fingerprint,
+                )
+                meanwhile = pg_session_factory()
+                try:
+                    score_and_persist(meanwhile, profile, job_seed)
+                finally:
+                    meanwhile.close()
+                monkeypatch.setattr(
+                    "app.services.collector_runner.get_job_by_fingerprint", interleaving
+                )
+            return result
+
+        monkeypatch.setattr("app.services.collector_runner.get_job_by_fingerprint", interleaving)
+
+        session_a = pg_session_factory()
+        try:
+            # --- Step 1: Session A reconciles via CAS (legitimately to
+            # APPLY, freelance granted + good skills). No assertions on
+            # record_a's attributes here -- see the class docstring.
+            record_a, _result_a, _created_a = score_and_persist(session_a, profile, job_a)
+
+            # --- Step 2: Session B revokes the freelance preference and
+            # re-scores the SAME posting -- now legitimately SKIP.
+            session_b = pg_session_factory()
+            try:
+                profile_record_b = get_or_create_candidate_profile(session_b)
+                apply_candidate_profile_patch(
+                    session_b,
+                    CandidateProfilePatchRequest(
+                        expected_profile_version=profile_record_b.profile_version,
+                        job_preferences={"employment_types": []},
+                    ),
+                )
+                job_b = Job(
+                    source="bundesagentur",
+                    title=f"Backend Engineer {marker}",
+                    company="RaceCo",
+                    url=f"https://example.com/jobs/{marker}",
+                    must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
+                    posting_type="SELBSTAENDIGKEIT",
+                )
+                record_b, result_b, _created_b = score_and_persist(session_b, profile, job_b)
+                assert record_b.posting_type == "SELBSTAENDIGKEIT"
+                assert result_b.recommendation == "SKIP"
+            finally:
+                session_b.close()
+
+            # --- Step 3: Session A performs another, LATER, UNRELATED
+            # commit. Pre-fix, this flushes record_a's stale dirty APPLY
+            # values with no posting_type guard, resurrecting APPLY over
+            # B's legitimate SKIP.
+            session_a.commit()
+        finally:
+            session_a.close()
+
+        verify = pg_session_factory()
+        try:
+            row = verify.scalar(
+                select(JobRecord).where(JobRecord.fingerprint == _fingerprint(job_seed))
+            )
+            assert row is not None
+            # The literal bad pairing this whole Stage 10 effort exists
+            # to prevent must never reappear via this mechanism either.
+            assert not (row.posting_type == "SELBSTAENDIGKEIT" and row.recommendation == "APPLY")
+            # The precise, positive claim: Session A's later commit
+            # preserved Session B's consistent values exactly.
+            assert row.posting_type == "SELBSTAENDIGKEIT"
+            assert row.recommendation == "SKIP"
+        finally:
+            verify.close()

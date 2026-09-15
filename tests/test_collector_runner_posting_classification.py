@@ -223,6 +223,24 @@ def test_concurrent_typed_and_untyped_upserts_converge_on_a_consistent_recommend
 
     record, result, _created = score_and_persist(db, profile, job_a)
 
+    # S10-RR-002 (Codex Stage 10 re-re-review, BLOCKING): checked BEFORE
+    # touching any other attribute of `record` below -- reading an
+    # EXPIRED attribute (e.g. `record.posting_type`, never manually
+    # re-set) triggers SQLAlchemy's own lazy-refresh-on-access, which
+    # would reload every column fresh from the DB and incidentally
+    # launder away exactly the dirty state this assertion exists to
+    # catch. A real caller has no reason to access attributes in this
+    # specific order either -- this proves the FIX (db.refresh(), not
+    # manual reassignment) leaves the object clean unconditionally, not
+    # merely "clean by the time something else happens to touch it".
+    assert record not in db.dirty
+    assert db.is_modified(record, include_collections=False) is False
+
+    # The concrete failure mode this proves: an unrelated LATER commit on
+    # this SAME Session must not touch this row at all -- there is
+    # nothing pending to flush.
+    db.commit()
+
     # The final persisted state must be internally consistent regardless
     # of interleaving: an excluded posting (SELBSTAENDIGKEIT, no FREELANCE
     # preference) must never end up recommendation=APPLY.
