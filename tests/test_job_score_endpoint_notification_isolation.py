@@ -101,9 +101,23 @@ def test_notification_exception_does_not_turn_successful_score_into_500(
     test_client, session_factory = client
     monkeypatch.setattr("app.api.routes.TelegramNotifier", _RaisingNotifier)
 
+    # S11E-001 follow-up: the notifier is now only reached for
+    # recommendation=="APPLY". The original short description put
+    # data_confidence below MINIMUM_DECISION_CONFIDENCE (forcing
+    # NEEDS_ENRICHMENT regardless of score), so the notifier -- and thus
+    # this test's exception-isolation path -- was never exercised. A
+    # longer description raises data_confidence enough to reach APPLY,
+    # without changing anything about what the test asserts.
+    rich_description = (
+        "We build APIs with Python and FastAPI, using SQLAlchemy for the "
+        "data layer and pytest for testing. " * 20
+    )
+
     with caplog.at_level("DEBUG"):
         response = test_client.post(
-            "/api/v1/jobs/score", json=_job_payload(), headers=_auth_headers()
+            "/api/v1/jobs/score",
+            json=_job_payload(description=rich_description),
+            headers=_auth_headers(),
         )
 
     # The job scoring/persistence already durably succeeded before the

@@ -302,7 +302,24 @@ async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
         result.is_duplicate,
     )
 
-    if created and result.score >= settings.min_job_score_to_notify:
+    # S11E-001 (Codex Stage 11E review, BLOCKING): Stage 11E (and Stage
+    # 11A/11B before it) can deliberately leave a job at a HIGH score
+    # with recommendation="SKIP" -- e.g. a low-unique-evidence-cardinality
+    # single-signal match, or a senior/irrelevant title excluded after
+    # scoring. A score-only condition here would still fire a Telegram
+    # notification for exactly those Stage-11E-rejected jobs. Must
+    # require recommendation=="APPLY" in addition to the score threshold
+    # -- the same recommendation+score semantics already used by every
+    # collector run's own notification gate (see
+    # app.services.collector_runner.run_bundesagentur/run_xing:
+    # `result.recommendation == "APPLY" and result.score >= settings.
+    # min_job_score_to_notify`), never scored/gated as an independent,
+    # duplicate condition.
+    if (
+        created
+        and result.recommendation == "APPLY"
+        and result.score >= settings.min_job_score_to_notify
+    ):
         # Codex gate follow-up (Astra R4B, NEW-005: Telegram isolation):
         # `record`/`result` above are ALREADY durably committed by
         # `score_and_persist` -- notification is best-effort orchestration
