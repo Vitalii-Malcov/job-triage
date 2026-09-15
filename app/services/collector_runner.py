@@ -43,6 +43,10 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from app.agents.evidence_cardinality_classifier import (
+    classify_evidence_cardinality,
+    unique_evidence_signals,
+)
 from app.agents.evidence_quality_classifier import classify_evidence_quality
 from app.agents.job_scorer import JobScorer
 from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
@@ -311,6 +315,48 @@ def _score_for_posting_type(
                     title_relevance.matched_signal,
                 )
                 return _excluded_job_score()
+
+    # Stage 11E: an APPLY/MAYBE recommendation must be supported by at
+    # least MINIMUM_UNIQUE_EVIDENCE_SIGNALS DISTINCT normalized
+    # structured skill signals -- not merely that many CATEGORY entries.
+    # Deliberately placed AFTER Stage 11A/11B (so their own specific,
+    # audit-logged exclusions always fire first -- this never runs for a
+    # job either of them already excluded) and BEFORE Stage 11C (so a
+    # genuinely relevant, thin-evidence posting can still be rescued by
+    # that already-approved, independently-gated mechanism below).
+    #
+    # `resolved_must_evidence` is JobScorer's OWN already-resolved
+    # must-have set (`matched_must_have + missing_must_have`) -- this
+    # module never re-derives JobScorer's `must = {...} or legacy`
+    # fallback itself, only consumes its result. The concrete pilot
+    # example this guards against: a posting with an EMPTY
+    # `must_have_skills` whose legacy fallback resolves to the SAME
+    # skill already present in `nice_to_have_skills` (e.g. both resolve
+    # to "python") was counted as 2 category entries by a naive
+    # `len(must) + len(nice)` sum, even though it is exactly ONE
+    # underlying piece of evidence -- `classify_evidence_cardinality`
+    # normalizes and deduplicates across both collections instead.
+    if result.recommendation in ("APPLY", "MAYBE"):
+        resolved_must_evidence = result.matched_must_have + result.missing_must_have
+        evidence_cardinality = classify_evidence_cardinality(
+            resolved_must_evidence, job.nice_to_have_skills
+        )
+        if evidence_cardinality == "LOW_CARDINALITY":
+            unique_signals = unique_evidence_signals(
+                resolved_must_evidence, job.nice_to_have_skills
+            )
+            logger.info(
+                "job_recommendation_downgraded_low_cardinality job_title=%s source=%s "
+                "original_recommendation=%s score=%s unique_evidence_count=%s "
+                "unique_evidence_signals=%s",
+                job.title,
+                job.source,
+                result.recommendation,
+                result.score,
+                len(unique_signals),
+                sorted(unique_signals),
+            )
+            result = result.model_copy(update={"recommendation": "SKIP"})
 
     # Stage 11C: a plausibly software-development-titled job must not be
     # left at an automatic SKIP purely because STRUCTURED skill
