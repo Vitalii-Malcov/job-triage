@@ -162,28 +162,39 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("systemadministrator", r"\bsystemadministrator(?:in)?\b"),
         ("administrator", r"\badministrator(?:in)?\b"),
         ("presales", r"\bpresales\b"),
-        # S11B-003: explicit ROLE PHRASES, not the bare domain word
-        # "qgis" alone -- "QGIS Developer"/"QGIS Python Engineer"/"QGIS
-        # Software Engineer" must not be forced IRRELEVANT merely because
-        # a GIS tool is named; only an explicit non-dev role attached to
-        # it (Expert(in)/Spezialist(in)) is confidently irrelevant.
-        ("qgis-expert", r"\bqgis\s+(?:expert(?:e|in)?|spezialist(?:in)?)\b"),
-        # S11B-003: explicit ROLE PHRASES, not bare "elektrotechnik" --
-        # "Software Engineer Elektrotechnik"/"Python Engineer
-        # Elektrotechnik" must not be forced IRRELEVANT merely because
-        # the electrical-engineering DOMAIN is named; only an explicit
-        # electrical-engineering ROLE title is confidently irrelevant.
-        ("ingenieur-elektrotechnik", r"\bingenieur\s+elektrotechnik\b"),
+        # S11B-003/S11B-004: explicit ROLE PHRASES, not the bare domain
+        # word "qgis" alone -- "QGIS Developer"/"QGIS Python Engineer"/
+        # "QGIS Software Engineer" must not be forced IRRELEVANT merely
+        # because a GIS tool is named; only an explicit non-dev role
+        # attached to it (Expert(e/in)/Spezialist(in)) is confidently
+        # irrelevant. `[\s-]+` (not just `\s+`) covers both the spaced
+        # ("QGIS Experte") and hyphenated ("QGIS-Experte") real-world
+        # connector forms.
+        ("qgis-expert", r"\bqgis[\s-]+(?:expert(?:e|in)?|spezialist(?:in)?)\b"),
+        # S11B-003/S11B-004: explicit ROLE PHRASES, not bare
+        # "elektrotechnik" -- "Software Engineer Elektrotechnik"/"Python
+        # Engineer Elektrotechnik" must not be forced IRRELEVANT merely
+        # because the electrical-engineering DOMAIN is named; only an
+        # explicit electrical-engineering ROLE title is confidently
+        # irrelevant. `ingenieur(?:in)?` covers the feminine
+        # "Ingenieurin" form; the optional `(?:f(?:ü|ue)r\s+)?` covers
+        # both "Ingenieur Elektrotechnik" (no connector) and "Ingenieur
+        # für/fuer Elektrotechnik" (explicit connector -- "fuer" is the
+        # ASCII transliteration of "für", "ü" -> "ue", not a single-
+        # character substitution, so `f[üu]r` alone would NOT match it).
+        ("ingenieur-elektrotechnik", r"\bingenieur(?:in)?\s+(?:f(?:ü|ue)r\s+)?elektrotechnik\b"),
         ("elektroingenieur", r"\belektroingenieur(?:in)?\b"),
         ("elektrotechniker", r"\belektrotechniker(?:in)?\b"),
-        # S11B-003: explicit ROLE PHRASES, not bare "projektmanagement"
-        # -- "Software Developer Projektmanagement Tools"/"Python
-        # Engineer Projektmanagement" must not be forced IRRELEVANT
-        # merely because the project-management DOMAIN is named; only an
-        # explicit project-management ROLE title is confidently
-        # irrelevant.
+        # S11B-003/S11B-004: explicit ROLE PHRASES, not bare
+        # "projektmanagement" -- "Software Developer Projektmanagement
+        # Tools"/"Python Engineer Projektmanagement" must not be forced
+        # IRRELEVANT merely because the project-management DOMAIN is
+        # named; only an explicit project-management ROLE title is
+        # confidently irrelevant. `berater(?:in)?` covers the feminine
+        # "Beraterin" form, and the optional `(?:im\s+)?` covers both
+        # "Berater Projektmanagement" and "Berater im Projektmanagement".
         ("projektmanager", r"\bprojektmanager(?:in)?\b"),
-        ("berater-projektmanagement", r"\bberater\s+(?:im\s+)?projektmanagement\b"),
+        ("berater-projektmanagement", r"\bberater(?:in)?\s+(?:im\s+)?projektmanagement\b"),
         # S11B-001: "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard
         # German academic-research-ASSISTANT title family (Stage 11 pilot
         # false positives: Uniklinikum Frankfurt, Statistisches

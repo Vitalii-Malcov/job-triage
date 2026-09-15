@@ -599,3 +599,151 @@ def test_presales_still_irrelevant_unchanged():
     result = classify_title_relevance("Presales Consultant (m/w/d) - Datacenter")
     assert result.level == "IRRELEVANT"
     assert result.matched_signal == "presales"
+
+
+# --- S11B-004: German feminine/hyphenated/connector variants ---------------
+
+
+def test_qgis_expert_english_bare_is_irrelevant():
+    assert classify_title_relevance("QGIS Expert").level == "IRRELEVANT"
+
+
+def test_qgis_experte_spaced_is_irrelevant():
+    result = classify_title_relevance("QGIS Experte")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_expertin_spaced_is_irrelevant():
+    result = classify_title_relevance("QGIS Expertin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_hyphen_experte_is_irrelevant():
+    result = classify_title_relevance("QGIS-Experte")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_hyphen_expertin_is_irrelevant():
+    result = classify_title_relevance("QGIS-Expertin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_spazialist_spaced_is_irrelevant():
+    result = classify_title_relevance("QGIS Spezialist")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_spezialistin_spaced_is_irrelevant():
+    result = classify_title_relevance("QGIS Spezialistin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_hyphen_spezialist_is_irrelevant():
+    result = classify_title_relevance("QGIS-Spezialist")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_qgis_hyphen_spezialistin_is_irrelevant():
+    result = classify_title_relevance("QGIS-Spezialistin")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "qgis-expert"
+
+
+def test_bare_qgis_alone_is_still_not_strong():
+    # Regression guard: the hyphen-connector widening must not make bare
+    # "QGIS" (no role word at all) a STRONG signal.
+    result = classify_title_relevance("QGIS")
+    assert result.level == "UNKNOWN"
+
+
+def test_qgis_developer_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("QGIS Developer")
+    assert result.level == "UNKNOWN"
+
+
+def test_qgis_python_engineer_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("QGIS Python Engineer")
+    assert result.level == "UNKNOWN"
+
+
+def test_qgis_software_engineer_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("QGIS Software Engineer")
+    assert result.level == "UNKNOWN"
+
+
+def test_ingenieurin_elektrotechnik_is_irrelevant():
+    result = classify_title_relevance("Ingenieurin Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_ingenieur_fuer_elektrotechnik_umlaut_is_irrelevant():
+    result = classify_title_relevance("Ingenieur für Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_ingenieurin_fuer_elektrotechnik_umlaut_is_irrelevant():
+    result = classify_title_relevance("Ingenieurin für Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_ingenieur_fuer_elektrotechnik_ascii_is_irrelevant():
+    # "fuer" is the ASCII transliteration of "für" ("ü" -> "ue", a
+    # two-character substitution, not "u" alone) -- common in real job
+    # postings that avoid non-ASCII characters.
+    result = classify_title_relevance("Ingenieur fuer Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_ingenieurin_fuer_elektrotechnik_ascii_is_irrelevant():
+    result = classify_title_relevance("Ingenieurin fuer Elektrotechnik (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "ingenieur-elektrotechnik"
+
+
+def test_software_engineer_elektrotechnik_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("Software Engineer Elektrotechnik")
+    assert result.level == "UNKNOWN"
+
+
+def test_python_engineer_elektrotechnik_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("Python Engineer Elektrotechnik")
+    assert result.level == "UNKNOWN"
+
+
+def test_beraterin_projektmanagement_is_irrelevant():
+    result = classify_title_relevance("Beraterin Projektmanagement (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "berater-projektmanagement"
+
+
+def test_beraterin_im_projektmanagement_is_irrelevant():
+    result = classify_title_relevance("Beraterin im Projektmanagement (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "berater-projektmanagement"
+
+
+def test_berater_im_projektmanagement_is_irrelevant():
+    result = classify_title_relevance("Berater im Projektmanagement (m/w/d)")
+    assert result.level == "IRRELEVANT"
+    assert result.matched_signal == "berater-projektmanagement"
+
+
+def test_software_developer_projektmanagement_tools_remains_not_irrelevant():
+    result = classify_title_relevance("Software Developer Projektmanagement Tools")
+    assert result.level != "IRRELEVANT"
+
+
+def test_python_engineer_projektmanagement_remains_unknown_after_s11b_004():
+    result = classify_title_relevance("Python Engineer Projektmanagement")
+    assert result.level == "UNKNOWN"
