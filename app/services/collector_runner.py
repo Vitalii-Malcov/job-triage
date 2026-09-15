@@ -163,11 +163,25 @@ def _candidate_target_seniority(db: Session):
     "cannot be determined, do not penalize" outcome as an empty
     `target_roles` list) -- there is nothing to derive from a profile
     that doesn't exist yet.
+
+    S11A-004 (Codex review): `db.no_autoflush` wraps the ENTIRE read path
+    -- `get_candidate_profile` (a `Session.get()`, which autoflushes by
+    default) AND `to_candidate_profile_response`'s own relationship
+    access (`record.skills`, `.experiences`, etc. -- lazy-loaded
+    collections that would ALSO trigger autoflush on first access). This
+    is a read-only helper called mid-scoring, potentially with an
+    unrelated, still-uncommitted change already pending elsewhere on this
+    SAME Session (e.g. a sibling job's own upsert, staged but not yet
+    flushed) -- an incidental autoflush here would prematurely flush that
+    unrelated pending state purely as a side effect of a seniority check,
+    not because anything actually needed it persisted yet.
     """
-    profile_record = get_candidate_profile(db)
-    if profile_record is None:
-        return "UNKNOWN"
-    profile = to_candidate_profile_response(profile_record)
+    with db.no_autoflush:
+        profile_record = get_candidate_profile(db)
+        if profile_record is None:
+            return "UNKNOWN"
+        profile = to_candidate_profile_response(profile_record)
+
     return derive_candidate_target_seniority(profile.target_roles)
 
 

@@ -7,7 +7,7 @@ classification (Stage 10) is untouched and must keep working unchanged.
 
 import json
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
@@ -322,3 +322,68 @@ def test_seniority_lookup_uses_pure_get_not_get_or_create(monkeypatch):
     _record, result, _created = score_and_persist(db, profile, job)
 
     assert result.recommendation == "APPLY"
+
+
+# --- S11A-004: the seniority lookup must never autoflush an unrelated,
+# still-pending ORM object on this SAME Session ------------------------------
+
+
+def test_candidate_target_seniority_lookup_never_autoflushes_no_profile():
+    # Codex reproduced: unrelated pending ORM state -> _candidate_target_
+    # seniority() -> one autoflush occurred (Session.get() autoflushes by
+    # default). Uses a PLAIN Session (autoflush=True, SQLAlchemy's
+    # default) -- unlike production's SessionLocal (autoflush=False) --
+    # specifically so this test exercises the exact risk the fix guards
+    # against, not the app's own separately-safe default configuration.
+    import app.services.collector_runner as collector_runner_module
+    from app.db.candidate_profile_repository import count_candidate_profiles
+
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    db = Session(engine)
+
+    flush_count = {"n": 0}
+    event.listen(
+        db, "before_flush", lambda *_a, **_k: flush_count.__setitem__("n", flush_count["n"] + 1)
+    )
+
+    unrelated = UserProfile(name="unrelated-pending-1", skills_json="[]")
+    db.add(unrelated)
+
+    result = collector_runner_module._candidate_target_seniority(db)
+
+    assert result == "UNKNOWN"
+    assert flush_count["n"] == 0
+    assert unrelated.id is None
+    assert unrelated in db.new
+    assert count_candidate_profiles(db) == 0
+
+
+def test_candidate_target_seniority_lookup_never_autoflushes_with_existing_profile():
+    # Same probe, but with a REAL CandidateProfile already persisted --
+    # proves the fix covers to_candidate_profile_response's own
+    # relationship access (skills/experiences/etc.), not just the
+    # Session.get() call, and that the correct JUNIOR result is still
+    # derived from the existing target_roles despite the unrelated
+    # pending object never being flushed.
+    import app.services.collector_runner as collector_runner_module
+
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    db = Session(engine)
+    _set_target_roles(db, ["Junior Python Developer", "Junior Backend Developer"])
+
+    flush_count = {"n": 0}
+    event.listen(
+        db, "before_flush", lambda *_a, **_k: flush_count.__setitem__("n", flush_count["n"] + 1)
+    )
+
+    unrelated = UserProfile(name="unrelated-pending-2", skills_json="[]")
+    db.add(unrelated)
+
+    result = collector_runner_module._candidate_target_seniority(db)
+
+    assert result == "JUNIOR"
+    assert flush_count["n"] == 0
+    assert unrelated.id is None
+    assert unrelated in db.new
