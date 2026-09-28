@@ -5,8 +5,6 @@ app.services.collector_runner._score_for_posting_type. posting_type
 classification (Stage 10) is untouched and must keep working unchanged.
 """
 
-import json
-
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
@@ -30,12 +28,13 @@ def _db() -> Session:
     return Session(engine)
 
 
-def _profile(db: Session, skills: list[str]) -> UserProfile:
-    profile = UserProfile(name="default", skills_json=json.dumps(skills))
-    db.add(profile)
-    db.commit()
-    db.refresh(profile)
-    return profile
+def _profile(db: Session, skills: list[str]) -> frozenset[str]:
+    """CSP-001: score_and_persist takes the CandidateProfile-derived
+    immutable skill collection directly now (see
+    app.db.candidate_profile_repository.get_candidate_skills_for_scoring)
+    -- this just builds that collection, no legacy UserProfile involved.
+    """
+    return frozenset(skills)
 
 
 def _set_target_roles(db: Session, target_roles: list[str]) -> None:

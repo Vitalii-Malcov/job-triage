@@ -377,19 +377,37 @@ def test_postgres_host_set_without_password_fails_closed():
     """Required, testable configuration contract: partially-configured
     postgres_* parts must fail Settings() construction with a clear error
     rather than building a broken URL or silently falling back to SQLite.
+
+    `_env_file=None` (see test_database_url_default_is_unaffected_when_postgres_host_unset's
+    own comment above) isolates this from a developer's local `.env` --
+    without it, a repo-root `.env` that sets POSTGRES_PASSWORD (e.g. for a
+    Stage 12 pilot Postgres) would silently fill in the omitted kwarg
+    below, and this "missing part" contract would never actually fire.
     """
     with pytest.raises(ValidationError):
-        Settings(postgres_host="db", postgres_user="jobtriage", postgres_db="jobtriage")
+        Settings(
+            _env_file=None, postgres_host="db", postgres_user="jobtriage", postgres_db="jobtriage"
+        )
 
 
 def test_postgres_host_set_without_user_fails_closed():
     with pytest.raises(ValidationError):
-        Settings(postgres_host="db", postgres_password="secret", postgres_db="jobtriage")
+        Settings(
+            _env_file=None,
+            postgres_host="db",
+            postgres_password="secret",
+            postgres_db="jobtriage",
+        )
 
 
 def test_postgres_host_set_without_db_fails_closed():
     with pytest.raises(ValidationError):
-        Settings(postgres_host="db", postgres_user="jobtriage", postgres_password="secret")
+        Settings(
+            _env_file=None,
+            postgres_host="db",
+            postgres_user="jobtriage",
+            postgres_password="secret",
+        )
 
 
 def test_postgres_password_never_appears_in_default_string_repr():
@@ -491,6 +509,7 @@ def test_raw_password_absent_from_validation_error_when_postgres_parts_incomplet
     by Pydantic's error rendering either."""
     with pytest.raises(ValidationError) as exc_info:
         Settings(
+            _env_file=None,
             postgres_host="db",
             postgres_user="jobtriage",
             postgres_password=_SENTINEL_PASSWORD,

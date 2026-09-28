@@ -46,7 +46,6 @@ other PostgreSQL integration test in this directory.
 `scheduler-postgres` job.
 """
 
-import json
 import os
 import threading
 from datetime import UTC, datetime
@@ -60,7 +59,7 @@ from app.db.candidate_profile_repository import (
     apply_candidate_profile_patch,
     get_or_create_candidate_profile,
 )
-from app.db.models import CandidateProfileRecord, JobRecord, JobReferenceTokenRecord, UserProfile
+from app.db.models import CandidateProfileRecord, JobRecord, JobReferenceTokenRecord
 from app.db.repositories import _fingerprint, _is_fingerprint_unique_violation, upsert_job
 from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.models.job import Job, JobScore
@@ -434,9 +433,10 @@ class TestPostingTypeConcurrencyReconciliation:
             url=f"https://example.com/jobs/{marker}",
             posting_type="SELBSTAENDIGKEIT",
         )
-        profile = UserProfile(
-            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
-        )
+        # CSP-001: score_and_persist takes the CandidateProfile-derived
+        # immutable skill collection directly now, never a legacy
+        # UserProfile ORM object.
+        candidate_skills = frozenset(["python", "fastapi", "sqlalchemy"])
 
         read_barrier = threading.Barrier(2)
         monkeypatch.setattr(
@@ -449,7 +449,7 @@ class TestPostingTypeConcurrencyReconciliation:
         def worker(index: int, job: Job) -> None:
             session = pg_session_factory()
             try:
-                results[index] = score_and_persist(session, profile, job)
+                results[index] = score_and_persist(session, candidate_skills, job)
             except BaseException as exc:  # noqa: BLE001
                 results[index] = exc
             finally:
@@ -494,9 +494,10 @@ class TestPostingTypeConcurrencyReconciliation:
         self, pg_session_factory
     ):
         marker = f"{FINGERPRINT_MARKER}-blank-erase"
-        profile = UserProfile(
-            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
-        )
+        # CSP-001: score_and_persist takes the CandidateProfile-derived
+        # immutable skill collection directly now, never a legacy
+        # UserProfile ORM object.
+        candidate_skills = frozenset(["python", "fastapi", "sqlalchemy"])
         original = Job(
             source="bundesagentur",
             title=f"Python Advanced {marker}",
@@ -507,7 +508,7 @@ class TestPostingTypeConcurrencyReconciliation:
 
         session1 = pg_session_factory()
         try:
-            record1, result1, created1 = score_and_persist(session1, profile, original)
+            record1, result1, created1 = score_and_persist(session1, candidate_skills, original)
             assert created1 is True
             assert record1.posting_type == "SELBSTAENDIGKEIT"
             assert result1.recommendation == "SKIP"
@@ -528,7 +529,9 @@ class TestPostingTypeConcurrencyReconciliation:
 
         session2 = pg_session_factory()
         try:
-            record2, result2, created2 = score_and_persist(session2, profile, blank_resubmit)
+            record2, result2, created2 = score_and_persist(
+                session2, candidate_skills, blank_resubmit
+            )
             assert created2 is False
             assert record2.id == record1.id
             assert record2.posting_type == "SELBSTAENDIGKEIT"
@@ -615,9 +618,10 @@ class TestS10RR002StaleDirtyScoreFieldsNotReplayed:
         finally:
             setup_session.close()
 
-        profile = UserProfile(
-            name="default", skills_json=json.dumps(["python", "fastapi", "sqlalchemy"])
-        )
+        # CSP-001: score_and_persist takes the CandidateProfile-derived
+        # immutable skill collection directly now, never a legacy
+        # UserProfile ORM object.
+        candidate_skills = frozenset(["python", "fastapi", "sqlalchemy"])
         # A real (non-empty) description is required for both -- with no
         # description, data_confidence is too low to ever reach APPLY
         # (it lands on NEEDS_ENRICHMENT instead), which would still prove
@@ -657,7 +661,7 @@ class TestS10RR002StaleDirtyScoreFieldsNotReplayed:
                 )
                 meanwhile = pg_session_factory()
                 try:
-                    score_and_persist(meanwhile, profile, job_seed)
+                    score_and_persist(meanwhile, candidate_skills, job_seed)
                 finally:
                     meanwhile.close()
                 monkeypatch.setattr(
@@ -672,7 +676,7 @@ class TestS10RR002StaleDirtyScoreFieldsNotReplayed:
             # --- Step 1: Session A reconciles via CAS (legitimately to
             # APPLY, freelance granted + good skills). No assertions on
             # record_a's attributes here -- see the class docstring.
-            record_a, _result_a, _created_a = score_and_persist(session_a, profile, job_a)
+            record_a, _result_a, _created_a = score_and_persist(session_a, candidate_skills, job_a)
 
             # --- Step 2: Session B revokes the freelance preference and
             # re-scores the SAME posting -- now legitimately SKIP.
@@ -694,7 +698,9 @@ class TestS10RR002StaleDirtyScoreFieldsNotReplayed:
                     must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
                     posting_type="SELBSTAENDIGKEIT",
                 )
-                record_b, result_b, _created_b = score_and_persist(session_b, profile, job_b)
+                record_b, result_b, _created_b = score_and_persist(
+                    session_b, candidate_skills, job_b
+                )
                 assert record_b.posting_type == "SELBSTAENDIGKEIT"
                 assert result_b.recommendation == "SKIP"
             finally:

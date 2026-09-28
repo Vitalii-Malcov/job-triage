@@ -58,6 +58,7 @@ from app.db.candidate_job_match_repository import get_latest_match, to_candidate
 from app.db.candidate_profile_repository import (
     CandidateProfileVersionConflictError,
     apply_candidate_profile_patch,
+    get_candidate_skills_for_scoring,
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
@@ -90,7 +91,6 @@ from app.db.gmail_repository import (
 from app.db.models import JobRecord
 from app.db.repositories import (
     get_job_by_id,
-    get_or_create_default_profile,
     list_jobs,
     update_job_status,
 )
@@ -291,8 +291,11 @@ def health() -> dict[str, str]:
 )
 async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
     settings = get_settings()
-    profile = get_or_create_default_profile(db)
-    record, result, created = score_and_persist(db, profile, job)
+    # CSP-001: CandidateProfile is the sole runtime source of candidate
+    # skills for JobScorer -- see get_candidate_skills_for_scoring's own
+    # docstring. Never the legacy UserProfile table.
+    candidate_skills = get_candidate_skills_for_scoring(db)
+    record, result, created = score_and_persist(db, candidate_skills, job)
 
     logger.info(
         "job_scored job_id=%s score=%s recommendation=%s duplicate=%s",

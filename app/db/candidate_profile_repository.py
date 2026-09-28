@@ -55,6 +55,7 @@ from app.models.candidate_profile import (
     CandidateProject,
     CandidateSkill,
     FieldTrust,
+    is_usable_for_generation,
     normalize_text_identity,
 )
 
@@ -162,6 +163,54 @@ def get_candidate_profile(db: Session) -> CandidateProfileRecord | None:
     initializes the singleton — see `get_or_create_candidate_profile`.
     """
     return db.get(CandidateProfileRecord, _CANDIDATE_PROFILE_SINGLETON_ID)
+
+
+def get_candidate_skills_for_scoring(db: Session) -> frozenset[str]:
+    """CSP-001: the single, canonical runtime source of candidate skills
+    for `app.agents.job_scorer.JobScorer` — a pure, read-only projection of
+    the singleton CandidateProfile's trusted skill names.
+
+    Replaces the previous split-brain architecture (legacy
+    `app.db.models.UserProfile.skills_json` feeding JobScorer, while
+    CandidateProfile already fed Stage 10/11's seniority/domain/preference
+    checks). This function is the ONLY thing JobScorer's skill input may
+    come from now — never UserProfile, and never an invented default skill
+    set (there is no `DEFAULT_PROFILE_SKILLS` equivalent here: a missing
+    profile, or one with no trusted skills, yields an empty collection).
+
+    **Pure read, no side effects.** Uses `get_candidate_profile` (not
+    `get_or_create_candidate_profile`) so a scoring call never creates the
+    singleton CandidateProfile row -- mirrors
+    `app.services.collector_runner._candidate_target_seniority`/
+    `_candidate_target_domain`'s own S11A-003/S11A-004 rationale exactly,
+    including the `db.no_autoflush` wrap (a plain `Session.get()` plus the
+    lazy `skills` relationship access would otherwise autoflush unrelated
+    pending state on this same Session as a side effect of a read-only
+    scoring lookup).
+
+    **Trust rule, not a raw dump.** Only skills passing
+    `app.models.candidate_profile.is_usable_for_generation` (a directly
+    human-asserted source AND confidence == CONFIRMED) are included -- the
+    exact same provenance rule `app.agents.candidate_job_matcher` already
+    applies to skill matching, so JobScorer can never treat a skill as
+    evidence that Stage 6B would refuse to cite as a candidate fact.
+
+    Returns an immutable `frozenset` -- callers load this once per request/
+    collector run (never once per vacancy) and pass it into
+    `app.services.collector_runner.score_and_persist` for every job scored
+    in that run.
+    """
+    with db.no_autoflush:
+        profile_record = get_candidate_profile(db)
+        if profile_record is None:
+            return frozenset()
+        profile = to_candidate_profile_response(profile_record)
+
+    return frozenset(
+        skill.name
+        for skill in profile.skills
+        if is_usable_for_generation(skill.source, skill.confidence)
+    )
 
 
 def _skill_to_record(skill: CandidateSkill) -> CandidateSkillRecord:

@@ -20,8 +20,13 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
+from app.db.candidate_profile_repository import (
+    apply_candidate_profile_patch,
+    get_or_create_candidate_profile,
+)
 from app.db.session import get_db
 from app.main import app
+from app.models.candidate_profile import CandidateProfilePatchRequest, CandidateSkill
 from app.security import rate_limit as rate_limit_module
 
 API_KEY = "test-api-key"
@@ -82,10 +87,40 @@ def client(tmp_path, monkeypatch):
     rate_limit_module._requests.clear()
 
     with TestClient(app) as test_client:
+        # CSP-001: POST /jobs/score now sources candidate skills solely
+        # from the canonical CandidateProfile (see
+        # app.db.candidate_profile_repository.get_candidate_skills_for_scoring's
+        # docstring) -- an unseeded profile scores every job against an
+        # empty skill set, which always yields SKIP regardless of this
+        # test's intended scenario. Stash session_factory on the client so
+        # each test can seed exactly the CandidateProfile skills its
+        # scenario needs via _seed_candidate_skills below.
+        test_client.session_factory = session_factory
         yield test_client
 
     app.dependency_overrides.clear()
     rate_limit_module._requests.clear()
+
+
+def _seed_candidate_skills(session_factory, skills: list[str]) -> None:
+    """Sets the singleton CandidateProfile's skills to exactly `skills`,
+    mirroring tests/test_csp001_csp002_canonical_skills.py's own
+    `_set_candidate_skills` helper -- seeds MANUAL_ENTRY/CONFIRMED skills
+    (the trusted default), the only kind `get_candidate_skills_for_scoring`
+    counts as scoring evidence.
+    """
+    db = session_factory()
+    try:
+        current = get_or_create_candidate_profile(db)
+        apply_candidate_profile_patch(
+            db,
+            CandidateProfilePatchRequest(
+                expected_profile_version=current.profile_version,
+                skills=[CandidateSkill(name=name) for name in skills],
+            ),
+        )
+    finally:
+        db.close()
 
 
 def _auth_headers() -> dict[str, str]:
@@ -115,6 +150,7 @@ def test_1_created_high_score_skip_sends_no_notification(client):
     # "Solution Architect" is deliberately NOT a Stage 11B RELEVANT title
     # (no "developer"/"engineer"/"entwickler" phrase), so Stage 11C's own
     # rescue never re-raises it back to MAYBE.
+    _seed_candidate_skills(client.session_factory, ["Python"])
     response = client.post(
         "/api/v1/jobs/score",
         json=_job_payload(
@@ -138,6 +174,7 @@ def test_2_created_high_score_maybe_sends_no_notification(client):
     # cardinality is SUFFICIENT), so it stays a genuine MAYBE via the
     # existing Stage 10 sparse-must-have APPLY cap. MAYBE must still
     # never notify.
+    _seed_candidate_skills(client.session_factory, ["Python", "FastAPI"])
     response = client.post(
         "/api/v1/jobs/score",
         json=_job_payload(
@@ -156,6 +193,7 @@ def test_2_created_high_score_maybe_sends_no_notification(client):
 
 
 def test_3_created_high_score_apply_still_notifies(client):
+    _seed_candidate_skills(client.session_factory, ["Python", "FastAPI", "Flask"])
     response = client.post(
         "/api/v1/jobs/score",
         json=_job_payload(
@@ -173,6 +211,7 @@ def test_3_created_high_score_apply_still_notifies(client):
 
 
 def test_4_duplicate_submission_apply_does_not_notify_again(client):
+    _seed_candidate_skills(client.session_factory, ["Python", "FastAPI", "Flask"])
     payload = _job_payload(
         url="https://example.com/jobs/s11e-001-test-duplicate",
         must_have_skills=["Python", "FastAPI", "Flask"],

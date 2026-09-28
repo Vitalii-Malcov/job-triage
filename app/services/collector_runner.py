@@ -38,7 +38,7 @@ public contract, not an implementation detail of routes.py.
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -64,17 +64,16 @@ from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_conf
 from app.collectors.xing_email import XingEmailCollector
 from app.db.candidate_profile_repository import (
     get_candidate_profile,
+    get_candidate_skills_for_scoring,
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
-from app.db.models import JobRecord, UserProfile
+from app.db.models import JobRecord
 from app.db.repositories import (
     get_job_by_fingerprint,
     get_job_by_id,
-    get_or_create_default_profile,
     is_message_processed,
     mark_message_processed,
-    profile_skills,
     update_job_score_if_posting_type_unchanged,
     upsert_job,
 )
@@ -243,12 +242,19 @@ def _excluded_job_score() -> JobScore:
 
 
 def _score_for_posting_type(
-    db: Session, profile: UserProfile, job: Job, effective_posting_type: str | None
+    db: Session, candidate_skills: Collection[str], job: Job, effective_posting_type: str | None
 ) -> JobScore:
     """The full Stage 10 classify-then-score decision for `job`, given the
     posting_type to classify against -- pure/no-write, so it can safely
     be called twice by score_and_persist below (once before persistence,
     and again as the S10-001 post-write consistency check).
+
+    CSP-001: `candidate_skills` is the CandidateProfile-derived, immutable
+    projection from `app.db.candidate_profile_repository.
+    get_candidate_skills_for_scoring` -- callers load it ONCE per request/
+    collector run (never once per vacancy) and pass the SAME collection
+    into every call. This function never reads the legacy
+    `app.db.models.UserProfile` table, directly or indirectly.
     """
     classification = classify_posting(
         title=job.title,
@@ -264,7 +270,7 @@ def _score_for_posting_type(
         )
         return _excluded_job_score()
 
-    result = JobScorer(profile_skills(profile)).score(job)
+    result = JobScorer(candidate_skills).score(job)
 
     # Stage 11A: an explicit senior/lead-level TITLE must not reach
     # MAYBE/APPLY for a candidate who has explicitly (and unambiguously --
@@ -433,9 +439,18 @@ def _score_for_posting_type(
 
 
 def score_and_persist(
-    db: Session, profile: UserProfile, job: Job
+    db: Session, candidate_skills: Collection[str], job: Job
 ) -> tuple[JobRecord, JobScore, bool]:
-    """Score a Job against the given profile and persist it.
+    """Score a Job against the given candidate skills and persist it.
+
+    CSP-001: `candidate_skills` is the CandidateProfile-derived, immutable
+    skill projection from `app.db.candidate_profile_repository.
+    get_candidate_skills_for_scoring` -- the SOLE runtime source of
+    candidate skills for `app.agents.job_scorer.JobScorer`. Never the
+    legacy `app.db.models.UserProfile` ORM object; callers load the
+    projection once per request/collector run and pass the same immutable
+    collection into every score_and_persist call in that run, never
+    re-querying CandidateProfile per vacancy.
 
     Shared by POST /jobs/score and every collector run below so scoring +
     deduplication logic lives in exactly one place.
@@ -521,13 +536,13 @@ def score_and_persist(
     """
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
-    result = _score_for_posting_type(db, profile, job, effective_posting_type)
+    result = _score_for_posting_type(db, candidate_skills, job, effective_posting_type)
     record, created = upsert_job(db, job, result)
 
     observed_posting_type = record.posting_type
     if observed_posting_type != effective_posting_type:
         for _attempt in range(MAX_POSTING_TYPE_RECONCILE_ATTEMPTS):
-            result = _score_for_posting_type(db, profile, job, observed_posting_type)
+            result = _score_for_posting_type(db, candidate_skills, job, observed_posting_type)
             applied = update_job_score_if_posting_type_unchanged(
                 db,
                 record.id,
@@ -716,7 +731,9 @@ async def run_bundesagentur(
 
     jobs = await collector.fetch()
 
-    profile = get_or_create_default_profile(db)
+    # CSP-001: loaded ONCE for this whole collector run, never once per
+    # vacancy -- see get_candidate_skills_for_scoring's own docstring.
+    candidate_skills = get_candidate_skills_for_scoring(db)
     # One notifier per collector run (not per job): send_job() opens its own
     # httpx.AsyncClient per call, so this only avoids repeated construction
     # overhead, but it also keeps the flood-limit pacing below scoped to a
@@ -778,7 +795,7 @@ async def run_bundesagentur(
                 # committed by upsert_job. If scoring/persistence fails, the
                 # surrounding rollback also restores the previous description.
                 existing.description = description
-            job_record, result, created = score_and_persist(db, profile, job)
+            job_record, result, created = score_and_persist(db, candidate_skills, job)
         except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and
@@ -941,7 +958,9 @@ async def run_xing(
     message_batches = await collector.fetch_message_batches()
     jobs = [job for batch in message_batches for job in batch.jobs]
 
-    profile = get_or_create_default_profile(db)
+    # CSP-001: loaded ONCE for this whole collector run, never once per
+    # vacancy -- see get_candidate_skills_for_scoring's own docstring.
+    candidate_skills = get_candidate_skills_for_scoring(db)
     # One notifier for the whole run (all batches), so the flood-limit pacing
     # via notified_count below is scoped per collector run, not per message.
     notifier = TelegramNotifier(
@@ -966,7 +985,7 @@ async def run_xing(
         batch_failed = False
         for job in batch.jobs:
             try:
-                job_record, result, created = score_and_persist(db, profile, job)
+                job_record, result, created = score_and_persist(db, candidate_skills, job)
             except Exception as exc:
                 # One bad job must not abort the run, but its source message
                 # must remain unacknowledged. A later run will parse the whole
