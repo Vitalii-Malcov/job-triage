@@ -152,7 +152,7 @@ def test_auto_research_is_bounded_by_budget_per_collector_run(client, monkeypatc
         "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     CountingResearchService.call_count = 0
@@ -187,7 +187,7 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
         "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     disabled_settings = Settings(
@@ -238,7 +238,7 @@ def test_auto_research_failure_does_not_leak_exception_text(client, monkeypatch,
         lambda **kwargs: FakeCollector([job]),
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr(
@@ -349,7 +349,7 @@ def test_research_session_poisoning_does_not_abort_later_job_persistence(
         "app.services.collector_runner.BundesagenturCollector", lambda **kwargs: FakeCollector(jobs)
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     _SessionPoisoningResearchService.call_count = 0

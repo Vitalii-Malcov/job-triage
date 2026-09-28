@@ -389,7 +389,7 @@ class TestXingCollectorNotifications:
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
         monkeypatch.setattr(
-            "app.services.collector_runner.JobScorer",
+            "app.agents.job_score_evaluator.JobScorer",
             lambda profile_skills: FakeJobScorer(scores_by_title),
         )
         monkeypatch.setattr(
@@ -580,7 +580,7 @@ class TestSanitizedFailureLogging:
             lambda **kwargs: FakeCollector(jobs=[job]),
         )
         monkeypatch.setattr(
-            "app.services.collector_runner.JobScorer",
+            "app.agents.job_score_evaluator.JobScorer",
             lambda profile_skills: FakeJobScorer(
                 {"Junior Informatiker (m/w/d)": _job_score(score=90, recommendation="APPLY")}
             ),

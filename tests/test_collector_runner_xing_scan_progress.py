@@ -174,7 +174,7 @@ async def test_bounded_scan_progress_eventually_reaches_message_after_large_pref
     _seed_already_processed(db, OLD_UIDS)
     monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
@@ -254,7 +254,7 @@ async def test_uid_validity_mismatch_resets_watermark_instead_of_skipping_blindl
     _seed_already_processed(db, OLD_UIDS[:1])  # only uid 1 actually processed already
     monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
@@ -342,7 +342,7 @@ async def test_watermark_never_advances_past_unresolved_uid(db, monkeypatch):
         "app.services.collector_runner.XingEmailCollector", _FakeXingCollectorUnresolvedUid
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
@@ -377,7 +377,7 @@ async def test_mailbox_scope_isolates_watermark_between_mailboxes(db, monkeypatc
     """
     monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
@@ -680,7 +680,7 @@ async def test_run_xing_uses_early_captured_epoch_not_late_reread_after_commits(
         "app.services.collector_runner.XingEmailCollector", _FakeCollectorRowChangesMidRun
     )
     monkeypatch.setattr(
-        "app.services.collector_runner.JobScorer",
+        "app.agents.job_score_evaluator.JobScorer",
         lambda profile_skills: FakeJobScorer(profile_skills),
     )
     monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)

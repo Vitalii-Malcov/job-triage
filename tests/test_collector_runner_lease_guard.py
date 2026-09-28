@@ -185,7 +185,7 @@ class TestBundesagenturLeaseGuard:
             lambda **kwargs: FakeBundesagenturCollector(jobs),
         )
         monkeypatch.setattr(
-            "app.services.collector_runner.JobScorer",
+            "app.agents.job_score_evaluator.JobScorer",
             lambda profile_skills: FakeJobScorer(profile_skills),
         )
         monkeypatch.setattr(
@@ -316,7 +316,7 @@ class TestXingLeaseGuard:
 
         monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _FakeXingCollector)
         monkeypatch.setattr(
-            "app.services.collector_runner.JobScorer",
+            "app.agents.job_score_evaluator.JobScorer",
             lambda profile_skills: FakeJobScorer(profile_skills),
         )
         monkeypatch.setattr(

@@ -43,21 +43,10 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from app.agents.evidence_cardinality_classifier import (
-    classify_evidence_cardinality,
-    unique_evidence_signals,
-)
-from app.agents.evidence_quality_classifier import classify_evidence_quality
-from app.agents.job_scorer import JobScorer
-from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
-from app.agents.role_relevance_classifier import (
-    classify_title_relevance,
-    derive_candidate_target_domain,
-)
-from app.agents.seniority_classifier import (
-    classify_title_seniority,
-    derive_candidate_target_seniority,
-)
+from app.agents.job_score_evaluator import evaluate_job_score
+from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE
+from app.agents.role_relevance_classifier import derive_candidate_target_domain
+from app.agents.seniority_classifier import derive_candidate_target_seniority
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
@@ -219,35 +208,13 @@ def _candidate_target_domain(db: Session):
     return derive_candidate_target_domain(profile.target_roles)
 
 
-def _excluded_job_score() -> JobScore:
-    """The shared zeroed-out shape for a job forced out of the normal
-    scoring pipeline -- Stage 10's posting_type exclusion and Stage 11A's
-    seniority-mismatch exclusion both return exactly this (same
-    score=0/SKIP/zero-confidence result), so neither invents a new magic
-    score threshold. The two exclusion reasons are indistinguishable from
-    the JobScore/JobRecord shape alone by design -- each call site logs
-    its own specific reason (see the two call sites below) as the
-    auditable record of WHY.
-    """
-    return JobScore(
-        score=0,
-        matched_skills=[],
-        missing_skills=[],
-        matched_must_have=[],
-        missing_must_have=[],
-        matched_nice_to_have=[],
-        recommendation="SKIP",
-        data_confidence=0.0,
-    )
-
-
 def _score_for_posting_type(
     db: Session, candidate_skills: Collection[str], job: Job, effective_posting_type: str | None
 ) -> JobScore:
-    """The full Stage 10 classify-then-score decision for `job`, given the
-    posting_type to classify against -- pure/no-write, so it can safely
-    be called twice by score_and_persist below (once before persistence,
-    and again as the S10-001 post-write consistency check).
+    """The full Stage 10/11A/11B/11E/11C classify-then-score decision for
+    `job`, given the posting_type to classify against -- pure/no-write, so
+    it can safely be called twice by score_and_persist below (once before
+    persistence, and again as the S10-001 post-write consistency check).
 
     CSP-001: `candidate_skills` is the CandidateProfile-derived, immutable
     projection from `app.db.candidate_profile_repository.
@@ -255,187 +222,28 @@ def _score_for_posting_type(
     collector run (never once per vacancy) and pass the SAME collection
     into every call. This function never reads the legacy
     `app.db.models.UserProfile` table, directly or indirectly.
+
+    **Thin DB-reading wrapper only.** The actual gate/threshold decision
+    logic (Stage 10 posting-type exclusion through Stage 11C sparse-evidence
+    rescue) lives in `app.agents.job_score_evaluator.evaluate_job_score` --
+    extracted so `scripts/offline_rescore_stage12.py`'s read-only preview
+    path can reuse the EXACT same decision logic without a live database
+    Session and without duplicating it. This wrapper's only remaining job is
+    supplying that pure function with `db`-backed reads, LAZILY at the exact
+    same points the original inline logic read them (never for a job
+    that's already excluded or already SKIP on skill grounds alone) --
+    `get_candidate_target_seniority`/`get_candidate_target_domain` are
+    passed as zero-argument callables specifically to preserve that, not
+    resolved eagerly here.
     """
-    classification = classify_posting(
-        title=job.title,
-        posting_type=effective_posting_type,
+    return evaluate_job_score(
+        job,
+        effective_posting_type,
+        candidate_skills=candidate_skills,
         allowed_employment_types=_allowed_employment_types(db, effective_posting_type),
+        get_candidate_target_seniority=lambda: _candidate_target_seniority(db),
+        get_candidate_target_domain=lambda: _candidate_target_domain(db),
     )
-    if not classification.is_target_employment:
-        logger.info(
-            "job_excluded_non_target_posting job_title=%s source=%s reason=%s",
-            job.title,
-            job.source,
-            classification.excluded_reason,
-        )
-        return _excluded_job_score()
-
-    result = JobScorer(candidate_skills).score(job)
-
-    # Stage 11A: an explicit senior/lead-level TITLE must not reach
-    # MAYBE/APPLY for a candidate who has explicitly (and unambiguously --
-    # see derive_candidate_target_seniority) targeted junior roles. Only
-    # checked once a job has already reached APPLY/MAYBE on ordinary
-    # skill-match grounds -- an already-SKIP job gains nothing from also
-    # being seniority-excluded. If the candidate's target seniority can't
-    # be determined (no target_roles, or an ambiguous/mixed set), this
-    # never fires -- "cannot be determined" must never be treated as a
-    # rejection signal.
-    if result.recommendation in ("APPLY", "MAYBE"):
-        candidate_target = _candidate_target_seniority(db)
-        if candidate_target == "JUNIOR":
-            title_seniority = classify_title_seniority(job.title)
-            if title_seniority.level == "SENIOR":
-                logger.info(
-                    "job_excluded_seniority_mismatch job_title=%s source=%s "
-                    "candidate_target_seniority=%s matched_signal=%s",
-                    job.title,
-                    job.source,
-                    candidate_target,
-                    title_seniority.matched_signal,
-                )
-                return _excluded_job_score()
-
-    # Stage 11B: a confidently IRRELEVANT-titled job (a role family
-    # clearly outside software development -- see
-    # app.agents.role_relevance_classifier) must not reach MAYBE/APPLY
-    # for a candidate whose target roles unanimously name a
-    # software-development role family. Only checked once a job has
-    # already reached APPLY/MAYBE on ordinary skill-match grounds AND
-    # survived Stage 11A's own seniority gate above -- entirely
-    # independent of that gate, never interleaved with it. If the
-    # candidate's target domain or the job's title relevance can't be
-    # determined, this never fires -- UNKNOWN must never be treated as a
-    # rejection signal.
-    if result.recommendation in ("APPLY", "MAYBE"):
-        candidate_domain = _candidate_target_domain(db)
-        if candidate_domain == "SOFTWARE_DEVELOPMENT":
-            title_relevance = classify_title_relevance(job.title)
-            if title_relevance.level == "IRRELEVANT":
-                logger.info(
-                    "job_excluded_role_irrelevant job_title=%s source=%s "
-                    "candidate_target_domain=%s matched_signal=%s",
-                    job.title,
-                    job.source,
-                    candidate_domain,
-                    title_relevance.matched_signal,
-                )
-                return _excluded_job_score()
-
-    # Stage 11E: an APPLY/MAYBE recommendation must be supported by at
-    # least MINIMUM_UNIQUE_EVIDENCE_SIGNALS DISTINCT normalized
-    # structured skill signals -- not merely that many CATEGORY entries.
-    # Deliberately placed AFTER Stage 11A/11B (so their own specific,
-    # audit-logged exclusions always fire first -- this never runs for a
-    # job either of them already excluded) and BEFORE Stage 11C (so a
-    # genuinely relevant, thin-evidence posting can still be rescued by
-    # that already-approved, independently-gated mechanism below).
-    #
-    # `resolved_must_evidence` is JobScorer's OWN already-resolved
-    # must-have set (`matched_must_have + missing_must_have`) -- this
-    # module never re-derives JobScorer's `must = {...} or legacy`
-    # fallback itself, only consumes its result. The concrete pilot
-    # example this guards against: a posting with an EMPTY
-    # `must_have_skills` whose legacy fallback resolves to the SAME
-    # skill already present in `nice_to_have_skills` (e.g. both resolve
-    # to "python") was counted as 2 category entries by a naive
-    # `len(must) + len(nice)` sum, even though it is exactly ONE
-    # underlying piece of evidence -- `classify_evidence_cardinality`
-    # normalizes and deduplicates across both collections instead.
-    if result.recommendation in ("APPLY", "MAYBE"):
-        resolved_must_evidence = result.matched_must_have + result.missing_must_have
-        evidence_cardinality = classify_evidence_cardinality(
-            resolved_must_evidence, job.nice_to_have_skills
-        )
-        if evidence_cardinality == "LOW_CARDINALITY":
-            unique_signals = unique_evidence_signals(
-                resolved_must_evidence, job.nice_to_have_skills
-            )
-            logger.info(
-                "job_recommendation_downgraded_low_cardinality job_title=%s source=%s "
-                "original_recommendation=%s score=%s unique_evidence_count=%s "
-                "unique_evidence_signals=%s",
-                job.title,
-                job.source,
-                result.recommendation,
-                result.score,
-                len(unique_signals),
-                sorted(unique_signals),
-            )
-            result = result.model_copy(update={"recommendation": "SKIP"})
-
-    # Stage 11C: a plausibly software-development-titled job must not be
-    # left at an automatic SKIP purely because STRUCTURED skill
-    # extraction was thin -- "strong absence of evidence is not evidence
-    # of mismatch" (see app.agents.evidence_quality_classifier's own
-    # docstring for the full rationale and the concrete pilot example
-    # this distinction is built on). Only ever raises an ALREADY-SKIP
-    # result to MAYBE, never invents a higher score, never touches
-    # APPLY/MAYBE/NEEDS_ENRICHMENT results, and stacks strictly on top of
-    # every earlier gate rather than replacing any of them:
-    #
-    # - posting_type-excluded and Stage 11A/11B-excluded jobs already
-    #   returned _excluded_job_score() above and never reach this point.
-    # - Stage 11A's own seniority gate above only runs on APPLY/MAYBE
-    #   results, so it never sees an already-SKIP job -- a SKIP-scored
-    #   posting with an explicit senior title for a junior-targeting
-    #   candidate ("Senior Python Developer") is independently re-checked
-    #   here via the SAME classify_title_seniority/
-    #   _candidate_target_seniority pair (reused, not reimplemented) so
-    #   it is never rescued either.
-    # - Only a RELEVANT title (never IRRELEVANT, never UNKNOWN -- UNKNOWN
-    #   fails open to "leave it alone", not to "assume it's a dev role")
-    #   is eligible at all.
-    #
-    # Two additional guards (hardening pass, post-A/B review):
-    #
-    # 1. A CONCRETE missing must-have is never sparse evidence, no matter
-    #    how small the total signal count is. `must=["Java"]` against a
-    #    Python-only candidate is ONE genuine, identified requirement the
-    #    candidate does not meet -- that is a real mismatch signal, not
-    #    an absence of evidence, even though the total count (1) would
-    #    otherwise clear SPARSE_EVIDENCE_THRESHOLD. Only a job with ZERO
-    #    concrete missing must-haves (an empty must-have set, or one
-    #    where every extracted must-have already matched) is eligible.
-    #
-    # 2. The candidate's own target domain must be CONFIDENTLY
-    #    SOFTWARE_DEVELOPMENT (reusing _candidate_target_domain, the same
-    #    pure/no-create/no-autoflush helper Stage 11B already uses -- not
-    #    duplicated here). A missing CandidateProfile, or a mixed/
-    #    ambiguous target_roles set that only resolves to UNKNOWN, must
-    #    leave the original recommendation untouched -- rescuing a job
-    #    the candidate's OWN stated targets don't confidently support
-    #    would be exactly the "blindly boost" this floor must not do.
-    if result.recommendation == "SKIP":
-        title_relevance = classify_title_relevance(job.title)
-        title_seniority = classify_title_seniority(job.title)
-        senior_mismatch = title_seniority.level == "SENIOR" and (
-            _candidate_target_seniority(db) == "JUNIOR"
-        )
-        if (
-            title_relevance.level == "RELEVANT"
-            and not senior_mismatch
-            and _candidate_target_domain(db) == "SOFTWARE_DEVELOPMENT"
-        ):
-            must_have_total = len(result.matched_must_have) + len(result.missing_must_have)
-            nice_to_have_total = len(job.nice_to_have_skills)
-            no_concrete_missing_must = len(result.missing_must_have) == 0
-            evidence_quality = classify_evidence_quality(must_have_total, nice_to_have_total)
-            if evidence_quality == "SPARSE" and no_concrete_missing_must:
-                logger.info(
-                    "job_recommendation_floor_sparse_evidence job_title=%s source=%s "
-                    "must_have_total=%s nice_to_have_total=%s original_score=%s "
-                    "matched_signal=%s",
-                    job.title,
-                    job.source,
-                    must_have_total,
-                    nice_to_have_total,
-                    result.score,
-                    title_relevance.matched_signal,
-                )
-                result = result.model_copy(update={"recommendation": "MAYBE"})
-
-    return result
 
 
 def score_and_persist(
