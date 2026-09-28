@@ -186,6 +186,7 @@ one explicitly-approved `OutboundEmailProvider.send` call in
 
 import json
 import logging
+import sys
 import threading
 from datetime import UTC, datetime
 
@@ -565,6 +566,16 @@ def _fail_closed_if_reply_raced_dispatch(
         )
 
 
+class _ThreadLockHeartbeatStopTimeoutError(Exception):
+    """Codex (heartbeat lifecycle hardening): `_ThreadLockHeartbeat.stop()`
+    could not confirm, within its bounded join, that the background
+    renewal thread actually terminated -- i.e. a `renew_thread_lock`
+    call/commit may still be in flight. `stop()` raises this instead of
+    returning as though shutdown succeeded; see `stop()`'s own docstring
+    for why the join is bounded rather than unbounded.
+    """
+
+
 class _ThreadLockHeartbeat:
     """S7E-015 (Codex re-review, final lock hardening): periodically
     renews `thread_id`'s guard on `holder`'s behalf for as long as
@@ -675,8 +686,25 @@ class _ThreadLockHeartbeat:
             session.close()
 
     def stop(self) -> None:
+        """Signals the background thread to stop and blocks until it has
+        -- bounded by a generous multiple of one wait/renewal tick, never
+        unbounded (Codex, heartbeat lifecycle hardening: an unbounded join
+        would let a single wedged DB call hang the caller's request/
+        shutdown path forever). If the thread has not actually terminated
+        by the time that bounded join returns, this raises
+        `_ThreadLockHeartbeatStopTimeoutError` instead of silently
+        returning as though shutdown succeeded -- a still-alive thread may
+        have a `renew_thread_lock` call/commit still in flight, and the
+        caller must never treat persisted state read after a successful
+        `stop()` as final unless termination was actually confirmed.
+        """
         self._stop_event.set()
         self._thread.join(timeout=self._interval_seconds + 1.0)
+        if self._thread.is_alive():
+            raise _ThreadLockHeartbeatStopTimeoutError(
+                f"gmail_thread_id={self._thread_id!r} holder={self._holder!r}: heartbeat "
+                "thread did not terminate within the bounded stop() join"
+            )
 
 
 def send_follow_up(
@@ -882,8 +910,36 @@ def send_follow_up(
         logger.info("follow_up_sent follow_up_proposal_id=%s", proposal.id)
         return send_record
     finally:
-        heartbeat.stop()
+        # Codex (heartbeat lifecycle hardening): heartbeat.stop() can now
+        # raise (see _ThreadLockHeartbeat.stop()'s docstring) if it could
+        # not confirm the background thread actually terminated. Two
+        # things must both remain true regardless:
+        #   1. release_thread_lock must ALWAYS still run -- even if
+        #      stop() failed to confirm termination, releasing here is
+        #      safe: renew_thread_lock's own CAS requires
+        #      lock_holder == holder, so once release clears the holder,
+        #      any still-in-flight/late renewal from this exact heartbeat
+        #      can only ever no-op (0 rows matched), never resurrect or
+        #      extend the lease out from under the release.
+        #   2. a heartbeat-stop failure must never SILENTLY REPLACE an
+        #      exception already propagating from the guarded section
+        #      above (e.g. FollowUpSendFailedError/UncertainError) --
+        #      that would mask the real, already-classified outcome
+        #      behind an unrelated lifecycle error. It is only raised
+        #      here when nothing else is already propagating, i.e. the
+        #      guarded section otherwise would have returned successfully.
+        heartbeat_stop_error: _ThreadLockHeartbeatStopTimeoutError | None = None
+        try:
+            heartbeat.stop()
+        except _ThreadLockHeartbeatStopTimeoutError as exc:
+            heartbeat_stop_error = exc
+            logger.error(
+                "follow_up_send_lock_heartbeat_stop_timeout follow_up_proposal_id=%s",
+                proposal.id,
+            )
         release_thread_lock(db, proposal.gmail_thread_id, holder=lock_holder)
+        if heartbeat_stop_error is not None and sys.exc_info()[0] is None:
+            raise heartbeat_stop_error
 
 
 def get_follow_up_state(db: Session, account_key: str, follow_up_proposal_id: int) -> FollowUpState:
