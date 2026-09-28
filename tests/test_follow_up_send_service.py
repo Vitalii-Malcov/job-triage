@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
+from app.db.datetime_utils import ensure_utc
 from app.db.follow_up_approval_repository import (
     begin_transmission,
     claim_send_attempt,
@@ -30,7 +31,12 @@ from app.db.gmail_repository import (
     release_thread_lock,
     upsert_message,
 )
-from app.db.models import GmailMessageAnalysisRecord, GmailMessageRecord, JobRecord
+from app.db.models import (
+    GmailMessageAnalysisRecord,
+    GmailMessageRecord,
+    GmailThreadRecord,
+    JobRecord,
+)
 from app.providers.email.base import ParsedGmailMessage
 from app.providers.email.outbound_base import (
     EmailSendConnectionError,
@@ -829,6 +835,42 @@ class TestThreadGuardSharedWithGmailSync:
         assert reply.thread_id == outbound.thread_id
 
 
+def _read_lock_state(engine, thread_id):
+    """Reads `(lock_holder, lock_expires_at)` for `thread_id` on a
+    brand-new Session (opened and closed within this call) so every read
+    sees the current committed value from the database, never a stale
+    snapshot held open by a longer-lived Session/transaction. `lock_expires_at`
+    is normalized via `ensure_utc`. Used by `TestLeaseRenewalHeartbeat` to
+    observe the heartbeat's actual persisted state instead of inferring it
+    from a fixed wall-clock sleep or a post-`stop()` wall-clock comparison
+    (see `test_heartbeat_stopping_lets_the_lease_expire_and_be_recovered`'s
+    docstring for why the latter is unsound).
+    """
+    session = sessionmaker(bind=engine)()
+    try:
+        record = session.get(GmailThreadRecord, thread_id)
+        expires_at = ensure_utc(record.lock_expires_at) if record.lock_expires_at else None
+        return record.lock_holder, expires_at
+    finally:
+        session.close()
+
+
+def _wait_until(condition, *, timeout_seconds, interval_seconds=0.01, description):
+    """Polls `condition` (a zero-arg callable) until it returns truthy or
+    `timeout_seconds` elapses, using the monotonic clock so the deadline
+    is immune to wall-clock adjustments. Raises `AssertionError` with
+    `description` on timeout rather than letting a caller's own assertion
+    fail with a misleading message about what was actually being awaited.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(interval_seconds)
+    if not condition():
+        raise AssertionError(f"timed out after {timeout_seconds}s waiting for {description}")
+
+
 class TestLeaseRenewalHeartbeat:
     """S7E-015 (Codex re-review, final lock hardening):
     SMTP_OPERATION_TIMEOUT_SECONDS only bounds EACH socket operation, not
@@ -1003,40 +1045,178 @@ class TestLeaseRenewalHeartbeat:
         TTL actually elapses, and not a moment before -- proving
         TTL-based recovery does not depend on anyone explicitly
         releasing.
+
+        Codex (heartbeat blocker): asserting `datetime.now(UTC) <
+        final_expires_at` immediately after `stop()` returns is
+        structurally flaky -- `stop()` joining the heartbeat thread, plus
+        scheduling, plus a fresh-session DB read, can legitimately consume
+        the remainder of a short TTL by the time that assertion runs. So
+        this test proves the persisted-state contract instead -- the lock
+        holder and expiry survive `stop()` unchanged/un-cleared -- and
+        only makes a wall-clock claim in the one place it's actually
+        sound: waiting, bounded, for the clock to genuinely pass the
+        lease's own already-persisted expiry before asserting recovery.
+
+        Codex (heartbeat lifecycle hardening, follow-up): `stop()` now
+        confirms real thread termination (raising
+        `_ThreadLockHeartbeatStopTimeoutError` instead of returning as
+        though shutdown succeeded if it can't) -- so a successful return
+        from `heartbeat.stop()` below now really does mean "no further
+        renewal can occur," not merely "we asked it to stop."
         """
         proposal, outbound, _approval = _seed_and_approve(db)
         thread_id = outbound.thread_id
-        session_b = sessionmaker(bind=db.get_bind())()
+        engine = db.get_bind()
+        session_b = sessionmaker(bind=engine)()
         try:
             import app.services.follow_up_send as send_module
 
             holder = "sender-that-crashes"
-            assert acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=0.15) is True
+            ttl_seconds = 0.15
+            assert (
+                acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=ttl_seconds) is True
+            )
+            initial_holder, initial_expires_at = _read_lock_state(engine, thread_id)
+            assert initial_holder == holder
 
             heartbeat = send_module._ThreadLockHeartbeat(
-                db, thread_id, holder=holder, ttl_seconds=0.15, interval_seconds=0.05
+                db, thread_id, holder=holder, ttl_seconds=ttl_seconds, interval_seconds=0.05
             )
             heartbeat.start()
-            time.sleep(0.12)  # a couple of real renewals happen here
+            try:
+                # 1. Observe at least one persisted heartbeat renewal (the
+                # persisted expiry actually advancing past its initial
+                # value) instead of sleeping a fixed duration and hoping
+                # at least one heartbeat tick fit inside it.
+                def _renewed_past_initial() -> bool:
+                    _, expires_at = _read_lock_state(engine, thread_id)
+                    return expires_at is not None and expires_at > initial_expires_at
 
-            # While the heartbeat is alive and renewing, B cannot acquire.
-            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is False
+                _wait_until(
+                    _renewed_past_initial,
+                    timeout_seconds=2.0,
+                    description="the heartbeat to renew the lease at least once",
+                )
 
-            # Simulate the heartbeat (and, by extension, its owning
-            # process) dying: stop it WITHOUT releasing the lock.
-            heartbeat.stop()
+                # 2. While the heartbeat is alive and renewing, a
+                # competing holder cannot acquire.
+                assert acquire_thread_lock(session_b, thread_id, holder="session-B") is False
 
-            # Immediately after stopping, the lease is still technically
-            # live (the TTL hasn't elapsed since the last renewal) -- B
-            # still cannot acquire yet.
-            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is False
+                # 3. Before stop: read the current persisted holder +
+                # expiry.
+                pre_stop_holder, pre_stop_expires_at = _read_lock_state(engine, thread_id)
+                assert pre_stop_holder == holder
+                assert pre_stop_expires_at is not None
 
-            # Once the TTL has actually elapsed with no further renewal,
-            # B recovers the lock.
-            time.sleep(0.2)
-            assert acquire_thread_lock(session_b, thread_id, holder="session-B") is True
+                # 4. Simulate the heartbeat (and, by extension, its
+                # owning process) dying: stop it WITHOUT releasing the
+                # lock. A successful return here now PROVES the
+                # background thread has actually terminated (see the
+                # docstring's "follow-up" note above) -- not merely that
+                # a stop signal was sent.
+                heartbeat.stop()
+
+                # 5. After stop, using a fresh DB session (a brand-new
+                # Session opened inside `_read_lock_state`), prove: the
+                # original holder is still persisted; stop() did NOT
+                # release/clear the lock; `lock_expires_at` is still
+                # persisted; and the final expiry is >= the pre-stop
+                # observed expiry (stop() itself never renews, but it
+                # must never roll the expiry back either).
+                final_holder, final_expires_at = _read_lock_state(engine, thread_id)
+                assert final_holder == holder, "stop() must not release/clear the lock holder"
+                assert final_expires_at is not None, "stop() must not clear the persisted expiry"
+                assert final_expires_at >= pre_stop_expires_at, (
+                    "final expiry must never regress below the last observed pre-stop expiry"
+                )
+
+                # 7. Because stop() joins the heartbeat thread AND now
+                # confirms it actually terminated before returning
+                # successfully, no further renewals can occur after it
+                # returns -- by the time we reach this line the
+                # background thread is provably dead, so the persisted
+                # state read above is already the final, frozen value;
+                # nothing further to wait on.
+
+                # 8. Wait, bounded, until the real clock actually passes
+                # the lease's own already-persisted final expiry -- never
+                # asserted as "already true" right after stop(), only
+                # waited for.
+                _wait_until(
+                    lambda: datetime.now(UTC) > final_expires_at,
+                    timeout_seconds=2.0,
+                    description="the persisted lease to actually pass its own expiry",
+                )
+
+                # 9. Once the TTL has actually elapsed with no further
+                # renewal, a competing holder recovers the lock.
+                assert acquire_thread_lock(session_b, thread_id, holder="session-B") is True
+            finally:
+                # Test cleanup hardening (Codex): if an assertion above
+                # raised BEFORE the explicit `heartbeat.stop()` call at
+                # step 4 ran, the background thread must still never leak
+                # into a later test. A second `stop()` call on an
+                # already-terminated heartbeat is a fast no-op (the join
+                # returns immediately since the thread is already dead)
+                # -- see `stop()`'s own docstring -- so calling it
+                # unconditionally here is always safe, never redundant
+                # work that could itself flake.
+                heartbeat.stop()
         finally:
             session_b.close()
+
+    def test_stop_raises_when_heartbeat_thread_fails_to_terminate_in_time(self, db, monkeypatch):
+        """Codex (heartbeat lifecycle hardening): `stop()` must never
+        silently return success while the background thread is still
+        alive -- the old `join(timeout=...)` with no aliveness check
+        afterward let it do exactly that, meaning a `renew_thread_lock`
+        call/commit already in flight could complete AFTER `stop()`
+        returned, with the caller none the wiser.
+
+        Deterministic, no sleep-based race: `renew_thread_lock` is
+        patched to block on a real `threading.Event` the test itself
+        controls, so the heartbeat thread provably cannot reach its next
+        `_stop_event` check (and therefore cannot observe the stop
+        signal) until the test explicitly releases it -- genuinely
+        simulating "a renewal is still in flight" rather than guessing at
+        timing.
+        """
+        import app.services.follow_up_send as send_module
+
+        proposal, outbound, _approval = _seed_and_approve(db)
+        thread_id = outbound.thread_id
+        holder = "stuck-holder"
+        assert acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=5.0) is True
+
+        renewal_entered = threading.Event()
+        release_renewal = threading.Event()
+
+        def _blocking_renew(*args, **kwargs):
+            renewal_entered.set()
+            release_renewal.wait(timeout=5.0)
+            return True
+
+        monkeypatch.setattr(send_module, "renew_thread_lock", _blocking_renew)
+
+        heartbeat = send_module._ThreadLockHeartbeat(
+            db, thread_id, holder=holder, ttl_seconds=5.0, interval_seconds=0.01
+        )
+        heartbeat.start()
+        try:
+            assert renewal_entered.wait(timeout=2.0), (
+                "the heartbeat must have entered the blocked renewal call"
+            )
+
+            with pytest.raises(send_module._ThreadLockHeartbeatStopTimeoutError):
+                heartbeat.stop()
+        finally:
+            # Unblock the in-flight renewal so the background thread can
+            # actually finish and does not linger into later tests, then
+            # confirm a SECOND stop() call (now unblocked) succeeds --
+            # proving this was genuinely a bounded-join timeout while a
+            # renewal was in flight, not a permanently wedged thread.
+            release_renewal.set()
+            heartbeat.stop()
 
     def test_renewal_reports_ownership_lost_when_lease_expires_with_nobody_else_acquiring(self, db):
         """S7E-016 (Codex re-review, correctness fix): the heartbeat's
