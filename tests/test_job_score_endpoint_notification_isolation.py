@@ -17,13 +17,34 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.db.base import Base
+from app.db.candidate_profile_repository import apply_candidate_profile_patch
 from app.db.models import JobRecord
 from app.db.session import get_db
 from app.main import app
+from app.models.candidate_profile import CandidateProfilePatchRequest, CandidateSkill
 from app.security import rate_limit as rate_limit_module
 
 API_KEY = "test-api-key"
 SECRET_TEXT = "secret-telegram-upstream-detail-must-not-leak"
+
+# CSP-001: /jobs/score now scores against the CandidateProfile projection,
+# never a legacy UserProfile default -- a CandidateProfile matching the
+# job payload's own skills=["python", "fastapi"] has to exist for these
+# notification-isolation tests to still reach recommendation="APPLY",
+# exactly as they did against the old default profile.
+_CANDIDATE_TEST_SKILLS = ["python", "fastapi"]
+
+
+def _seed_candidate_profile_skills(session_factory, skills: list[str]) -> None:
+    db = session_factory()
+    try:
+        patch = CandidateProfilePatchRequest(
+            expected_profile_version=1,
+            skills=[CandidateSkill(name=skill) for skill in skills],
+        )
+        apply_candidate_profile_patch(db, patch)
+    finally:
+        db.close()
 
 
 class _RaisingNotifier:
@@ -47,6 +68,7 @@ def client(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    _seed_candidate_profile_skills(session_factory, _CANDIDATE_TEST_SKILLS)
 
     def override_get_db():
         db = session_factory()

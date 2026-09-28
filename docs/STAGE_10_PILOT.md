@@ -29,7 +29,7 @@ committed:
 | `XING_MAILBOX_USERNAME` / `XING_MAILBOX_APP_PASSWORD` | `.env` | Real job ingestion via XING digest emails |
 | `GMAIL_USERNAME` / `GMAIL_APP_PASSWORD` | `.env` | Real inbox read/sync, response-draft/follow-up generation |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | `.env` | Real notifications |
-| Real candidate profile (`PATCH /api/v1/candidate-profile`) | DB, via API | Meaningful scoring/matching/CV drafts (defaults to a placeholder skill set otherwise — see `DEFAULT_PROFILE_SKILLS` in `app/db/repositories.py`) |
+| Real candidate profile (`PATCH /api/v1/candidate-profile`) | DB, via API | Required for scoring/matching/CV drafts — `JobScorer` reads candidate skills exclusively from `CandidateProfile` (see `get_candidate_skills_for_scoring` in `app/db/candidate_profile_repository.py`); with no profile set, scoring sees an empty skill set, never a placeholder default |
 
 Copy `.env.stage10.example` to `.env` and fill in the blanks to proceed.
 Any subset of the three collectors/read-paths (Bundesagentur, XING, Gmail)

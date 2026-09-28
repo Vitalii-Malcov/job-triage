@@ -6,12 +6,34 @@ from sqlalchemy.orm import sessionmaker
 from app.collectors.bundesagentur import BundesagenturAPIError
 from app.core.config import Settings
 from app.db.base import Base
+from app.db.candidate_profile_repository import apply_candidate_profile_patch
 from app.db.session import get_db
 from app.main import app
+from app.models.candidate_profile import CandidateProfilePatchRequest, CandidateSkill
 from app.models.job import Job, JobScore
 from app.security import rate_limit as rate_limit_module
 
 API_KEY = "test-api-key"
+
+# CSP-001: these endpoint tests exercise the REAL JobScorer (not a fake)
+# for a handful of cases that assert an actual recommendation, so a
+# CandidateProfile with a matching skill set has to exist -- JobScorer no
+# longer falls back to a legacy UserProfile default. Mirrors the old
+# app.db.repositories.DEFAULT_PROFILE_SKILLS list exactly, so this changes
+# nothing about what those tests were already verifying.
+_CANDIDATE_TEST_SKILLS = ["python", "fastapi", "flask", "mysql", "mongodb", "git", "pytest"]
+
+
+def _seed_candidate_profile_skills(session_factory, skills: list[str]) -> None:
+    db = session_factory()
+    try:
+        patch = CandidateProfilePatchRequest(
+            expected_profile_version=1,
+            skills=[CandidateSkill(name=skill) for skill in skills],
+        )
+        apply_candidate_profile_patch(db, patch)
+    finally:
+        db.close()
 
 
 class FakeJobScorer:
@@ -97,6 +119,7 @@ def client(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    _seed_candidate_profile_skills(session_factory, _CANDIDATE_TEST_SKILLS)
 
     def override_get_db():
         db = session_factory()

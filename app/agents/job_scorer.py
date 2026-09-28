@@ -24,6 +24,14 @@ ALIASES = {
     "ci/cd": "cicd",
     "ci cd": "cicd",
     "github actions": "github-actions",
+    # CSP-002: "REST"/"rest" and "REST API"/"rest-api" are the same
+    # underlying evidence signal (a RESTful HTTP API skill) -- without
+    # this, "REST API" normalized to "rest-api" while bare "REST"
+    # normalized to "rest", so the two never matched each other despite
+    # naming the same skill. Deliberately narrow: only these two textual
+    # variants of this one skill, no fuzzy/semantic matching.
+    "rest api": "rest",
+    "rest-api": "rest",
 }
 
 
