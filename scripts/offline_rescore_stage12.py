@@ -27,7 +27,11 @@ the preview call graph ever calls `db.commit()`, `db.flush()`, or any
 
 APPLY (`--apply`): a SINGLE atomic transaction. Computes the complete
 rescore first (via preview, using an identical `ScoringContext`), then opens
-one transaction, re-locks the exact target rows (`SELECT ... FOR UPDATE`),
+one transaction, takes a PostgreSQL `SHARE ROW EXCLUSIVE` table lock on
+`jobs`/`automation_runs` as that transaction's very first statement so the
+approved pilot POPULATION cannot be inserted into or deleted from by any
+other writer until this transaction ends (see `POPULATION_LOCK_TABLES`),
+re-locks the exact target rows (`SELECT ... FOR UPDATE`),
 re-verifies every row's identity AND every scoring-input field against the
 snapshot preview captured, re-verifies the `CandidateProfile`-derived
 context hasn't changed, recomputes each score with the SAME pure evaluator
@@ -78,10 +82,16 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session
 
-from app.agents.job_score_evaluator import evaluate_job_score
-from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE
-from app.agents.role_relevance_classifier import derive_candidate_target_domain
-from app.agents.seniority_classifier import derive_candidate_target_seniority
+from app.agents.job_score_evaluator import EvaluationTrace, evaluate_job_score
+from app.agents.posting_classifier import POSTING_TYPE_REQUIRES_PREFERENCE, classify_posting
+from app.agents.role_relevance_classifier import (
+    classify_title_relevance,
+    derive_candidate_target_domain,
+)
+from app.agents.seniority_classifier import (
+    classify_title_seniority,
+    derive_candidate_target_seniority,
+)
 from app.db.candidate_profile_repository import (
     count_candidate_profiles,
     get_candidate_profile,
@@ -129,6 +139,66 @@ STAGE12_PILOT_CANDIDATE_PROFILE_COUNT = 1
 # metadata, never touched by apply.
 SCORE_FIELD_ALLOWLIST = ("score", "recommendation", "data_confidence")
 
+# M1 remediation (Astra Stage 12 audit, round 2) -- the tables whose ROW
+# POPULATION the Stage 12 pilot-identity invariant is defined over. The
+# invariant `verify_pilot_identity` checks is a set of COUNTS (222 jobs,
+# 222 distinct fingerprints, 1 CandidateProfile, 2 automation runs), and a
+# count predicate cannot be protected by row locks: `SELECT ... FOR UPDATE`
+# takes ROW SHARE on `jobs` and locks the rows it actually returned, which
+# says nothing about a row that does not exist yet. Astra's reproduction:
+# the final `verify_pilot_identity` returns OK, another transaction INSERTs
+# an automation run (or a brand-new job with a new fingerprint) and commits,
+# and apply then commits scores computed for a population that no longer
+# matches the one a human approved.
+#
+# The mechanism below is a PostgreSQL table-level lock, taken as the very
+# first statement of apply's transaction and held by PostgreSQL until that
+# transaction commits or rolls back:
+#
+#     LOCK TABLE jobs, automation_runs IN SHARE ROW EXCLUSIVE MODE
+#
+# SHARE ROW EXCLUSIVE conflicts with ROW EXCLUSIVE -- the mode EVERY
+# INSERT/UPDATE/DELETE acquires -- and with itself, SHARE, EXCLUSIVE and
+# ACCESS EXCLUSIVE. It does NOT conflict with ACCESS SHARE (plain SELECT)
+# or ROW SHARE (SELECT ... FOR UPDATE). Consequences, which are exactly the
+# required invariant:
+#   * no other transaction can insert, delete or update ANY row of `jobs`
+#     or `automation_runs` between the moment apply takes this lock and the
+#     moment apply's transaction ends -- including rows that did not exist
+#     when the lock was taken, because the lock is on the TABLE, not on
+#     rows;
+#   * concurrent READERS are unaffected (the API, dashboards, and a
+#     concurrent preview keep working);
+#   * two concurrent offline applies serialize against each other, because
+#     the mode is self-conflicting;
+#   * crucially, NO cooperation is required from any other writer. Unlike
+#     an advisory lock or a manifest row, correctness does not depend on
+#     every collector/scheduler/API writer remembering to participate --
+#     which is why this was chosen over those options, and why no
+#     production writer needed to be modified.
+#
+# Apply itself later UPDATEs `jobs` (ROW EXCLUSIVE) and re-selects rows FOR
+# UPDATE (ROW SHARE); a transaction never conflicts with its own locks, and
+# because the strongest lock is taken FIRST there is no lock-upgrade
+# deadlock window. Ownership/scope: this lock belongs to the Stage 12
+# offline rescore workflow only. It is deliberately NOT introduced anywhere
+# in the normal application, whose writers are not part of the pilot
+# workflow and must not be globally serialized.
+#
+# LIMITATION, stated explicitly: this is a PostgreSQL mechanism. SQLite
+# (every unit test here) has no `LOCK TABLE`, so `lock_pilot_population` is
+# a documented no-op there and the SQLite tests can only verify the
+# PROTOCOL (that the lock is requested, with the right SQL, before any
+# identity check, and is never released before commit) -- not PostgreSQL's
+# blocking behavior itself. See the M1 tests in
+# tests/test_offline_rescore_stage12.py.
+POPULATION_LOCK_TABLES = ("jobs", "automation_runs")
+POPULATION_LOCK_MODE = "SHARE ROW EXCLUSIVE"
+# Bounded wait: if some other transaction is already holding a conflicting
+# lock, apply fails loudly (and rolls back, writing nothing) instead of
+# hanging indefinitely against a production database.
+POPULATION_LOCK_TIMEOUT = "15s"
+
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 SENTINEL_TITLES = (
@@ -150,6 +220,32 @@ HUMAN_REVIEW_COLUMNS = [
     "recommendation",
     "matched_skills",
     "missing_must_have",
+    # Stage 12 review-export remediation (Astra M4 finding): a reviewer
+    # could not reconstruct WHY a score/recommendation happened from the
+    # original export -- all `gate_reason` cells were empty, and the
+    # resolved must/nice lists, cardinality, and title classifications
+    # were absent entirely. Round 2 added the PRE-EXCLUSION base result
+    # (`base_score`/`base_recommendation`) and the explicit
+    # `matched_must_have` column: for an excluded job the final JobScore
+    # is a zeroed `excluded_job_score()`, so the final columns above
+    # cannot show what the scorer saw -- these do. All of them are purely
+    # EXPLANATORY, read out of the `EvaluationTrace` the evaluator
+    # recorded WHILE deciding; none can change a score or recommendation.
+    "base_score",
+    "base_recommendation",
+    "resolved_must_have",
+    "resolved_nice_to_have",
+    # Explicitly exported (Astra M4 point 2): `matched_skills` above is
+    # NOT a substitute -- it also contains optional and unclassified
+    # source skills, and it is empty for every excluded job.
+    "matched_must_have",
+    "matched_optional",
+    "unique_evidence_count",
+    "evidence_cardinality",
+    "role_relevance",
+    "seniority_classification",
+    "posting_classification",
+    "data_confidence",
     "gate_reason",
     "description_or_url",
     "human_relevant",
@@ -207,6 +303,64 @@ class ScoringContext:
     employment_types: frozenset[str]
 
 
+@dataclass(frozen=True)
+class ReviewEvidence:
+    """Stage 12 review-export remediation (Astra M4 finding): the
+    structured facts a human reviewer needs to reconstruct WHY a job
+    received its score/recommendation, WITHOUT re-deciding anything.
+
+    Round 2: every evidence field here is now read out of the
+    `app.agents.job_score_evaluator.EvaluationTrace` the evaluator
+    recorded WHILE deciding -- NOT reconstructed afterwards from the
+    returned `JobScore`. Astra's M4 point 1: for a posting/seniority/role
+    exclusion the evaluator returns `excluded_job_score()`, whose match
+    lists are all empty, so a post-hoc reconstruction reported
+    `resolved_must_have=[] matched_must_have=[] unique_evidence_count=1
+    LOW_CARDINALITY` for a job that had actually scored 90/APPLY on two
+    explicit must-have matches. `base_*` below is the pre-exclusion
+    result; `final_*` on the surrounding `JobScore`/`JobSnapshot` is the
+    post-gate outcome; `gate_trace` says which gate moved one to the
+    other. See `_compute_review_evidence`.
+    """
+
+    base_score: int | None
+    base_recommendation: str
+    resolved_must_have: list[str]
+    resolved_nice_to_have: list[str]
+    matched_must_have: list[str]
+    missing_must_have: list[str]
+    matched_optional: list[str]
+    unique_evidence_count: int
+    evidence_cardinality: str
+    role_relevance: str
+    seniority_classification: str
+    posting_classification: str
+    gate_trace: list[str]
+
+
+# The zero-evidence sentinel used for "before" snapshots (see the H1/P
+# "legacy historical explanation behavior remains separate from new
+# scoring" invariant -- the historical baseline is never recomputed
+# against current-code gates, so it never gets a current-code evidence
+# trace either) and for any synthetic `JobSnapshot` a test constructs
+# directly without going through `preview_all_jobs`.
+EMPTY_REVIEW_EVIDENCE = ReviewEvidence(
+    base_score=None,
+    base_recommendation="",
+    resolved_must_have=[],
+    resolved_nice_to_have=[],
+    matched_must_have=[],
+    missing_must_have=[],
+    matched_optional=[],
+    unique_evidence_count=0,
+    evidence_cardinality="",
+    role_relevance="",
+    seniority_classification="",
+    posting_classification="",
+    gate_trace=[],
+)
+
+
 @dataclass
 class JobSnapshot:
     id: int
@@ -243,6 +397,11 @@ class JobSnapshot:
     persisted_recommendation: str = ""
     persisted_data_confidence: float = 0.0
     matched_skills_source: str = "recomputed"
+    # Explanatory-only (Stage 12 review export) -- never compared by
+    # `input_snapshot()` below, never influences a decision. Defaults to
+    # the zero-evidence sentinel for "before" snapshots and any snapshot
+    # built outside `preview_all_jobs`/`apply_rescore`.
+    evidence: ReviewEvidence = EMPTY_REVIEW_EVIDENCE
 
     def input_snapshot(self) -> tuple:
         """Every scoring-INPUT field this job's re-evaluation depends on,
@@ -312,18 +471,25 @@ def _job_from_record(record: JobRecord) -> Job:
     )
 
 
-def load_scoring_context(db: Session) -> ScoringContext:
+def load_scoring_context(db: Session, *, for_update: bool = False) -> ScoringContext:
     """Read-only. Requires an existing canonical CandidateProfile --
     NEVER creates one, NEVER falls back to UserProfile or any invented
     default skill set. Raises `MissingCandidateProfileError` /
     `CandidateProfileIntegrityError` rather than degrading silently.
+
+    `for_update=True` (Stage 12 H2 remediation): locks the singleton
+    CandidateProfileRecord row for the remainder of the caller's
+    transaction -- see `app.db.candidate_profile_repository.
+    get_candidate_profile`'s own docstring. Only `apply_rescore` passes
+    this; `preview_all_jobs` never does (its transaction is `SET
+    TRANSACTION READ ONLY`, which rejects `FOR UPDATE`).
     """
     profile_count = count_candidate_profiles(db)
     if profile_count > 1:
         raise CandidateProfileIntegrityError(
             f"expected at most 1 candidate_profiles row, found {profile_count}"
         )
-    profile_record = get_candidate_profile(db)
+    profile_record = get_candidate_profile(db, for_update=for_update)
     if profile_record is None:
         raise MissingCandidateProfileError(
             "no CandidateProfile exists -- offline rescore refuses to proceed "
@@ -347,7 +513,13 @@ def _allowed_employment_types_for(
     return context.employment_types
 
 
-def _evaluate(context: ScoringContext, job: Job, posting_type: str | None) -> JobScore:
+def _evaluate(
+    context: ScoringContext,
+    job: Job,
+    posting_type: str | None,
+    *,
+    trace: EvaluationTrace | None = None,
+) -> JobScore:
     return evaluate_job_score(
         job,
         posting_type,
@@ -355,6 +527,59 @@ def _evaluate(context: ScoringContext, job: Job, posting_type: str | None) -> Jo
         allowed_employment_types=_allowed_employment_types_for(context, posting_type),
         get_candidate_target_seniority=lambda: context.target_seniority,
         get_candidate_target_domain=lambda: context.target_domain,
+        trace=trace,
+    )
+
+
+def _compute_review_evidence(
+    context: ScoringContext,
+    job: Job,
+    posting_type: str | None,
+    trace: EvaluationTrace,
+) -> ReviewEvidence:
+    """Explanatory-only (Stage 12 review-export remediation, Astra M4
+    finding): projects the `EvaluationTrace` the evaluator already
+    recorded into the export shape -- it never re-decides, re-scores, or
+    reconstructs anything from the (possibly zeroed) final `JobScore`.
+
+    Round 2 (Astra M4 point 1): the evidence lists come from
+    `trace.resolved_must_have`/`matched_must_have`/... , which the
+    evaluator captured from the BASE `JobScorer` result BEFORE any
+    posting/seniority/role gate could replace it with
+    `excluded_job_score()`. The three classification fields prefer what
+    the gates actually observed (`trace.*_classification`) and fall back
+    to an independently pure classifier call only for a gate that never
+    ran -- so a reviewer sees the full picture either way, and the
+    displayed value is never in conflict with the gate that used it.
+    """
+    posting_classification = trace.posting_classification
+    if not posting_classification:
+        posting = classify_posting(
+            title=job.title,
+            posting_type=posting_type,
+            allowed_employment_types=_allowed_employment_types_for(context, posting_type),
+        )
+        posting_classification = (
+            "TARGET_EMPLOYMENT"
+            if posting.is_target_employment
+            else f"EXCLUDED:{posting.excluded_reason}"
+        )
+    return ReviewEvidence(
+        base_score=trace.base_score,
+        base_recommendation=trace.base_recommendation or "",
+        resolved_must_have=list(trace.resolved_must_have),
+        resolved_nice_to_have=list(trace.resolved_nice_to_have),
+        matched_must_have=list(trace.matched_must_have),
+        missing_must_have=list(trace.missing_must_have),
+        matched_optional=list(trace.matched_optional),
+        unique_evidence_count=trace.unique_evidence_count,
+        evidence_cardinality=trace.evidence_cardinality,
+        role_relevance=trace.role_relevance or classify_title_relevance(job.title).level,
+        seniority_classification=(
+            trace.seniority_classification or classify_title_seniority(job.title).level
+        ),
+        posting_classification=posting_classification,
+        gate_trace=list(trace.events),
     )
 
 
@@ -377,7 +602,13 @@ def _legacy_candidate_skills(db: Session) -> frozenset[str] | None:
     return frozenset(json.loads(profile.skills_json))
 
 
-def _snapshot(record: JobRecord, score: JobScore, *, matched_skills_source: str) -> JobSnapshot:
+def _snapshot(
+    record: JobRecord,
+    score: JobScore,
+    *,
+    matched_skills_source: str,
+    evidence: ReviewEvidence = EMPTY_REVIEW_EVIDENCE,
+) -> JobSnapshot:
     return JobSnapshot(
         id=record.id,
         fingerprint=record.fingerprint,
@@ -408,6 +639,7 @@ def _snapshot(record: JobRecord, score: JobScore, *, matched_skills_source: str)
         persisted_recommendation=record.recommendation,
         persisted_data_confidence=record.data_confidence,
         matched_skills_source=matched_skills_source,
+        evidence=evidence,
     )
 
 
@@ -474,8 +706,15 @@ def preview_all_jobs(db: Session) -> tuple[ScoringContext, list[RescoreResult]]:
             before_source = "persisted_score_only"
         before = _snapshot(record, before_score, matched_skills_source=before_source)
 
-        after_score = _evaluate(context, job, record.posting_type)
-        after = _snapshot(record, after_score, matched_skills_source="preview_no_write")
+        gate_trace = EvaluationTrace()
+        after_score = _evaluate(context, job, record.posting_type, trace=gate_trace)
+        after_evidence = _compute_review_evidence(context, job, record.posting_type, gate_trace)
+        after = _snapshot(
+            record,
+            after_score,
+            matched_skills_source="preview_no_write",
+            evidence=after_evidence,
+        )
 
         results.append(RescoreResult(before=before, after=after, applied=False))
 
@@ -488,21 +727,45 @@ def preview_all_jobs(db: Session) -> tuple[ScoringContext, list[RescoreResult]]:
 def apply_rescore(
     engine, preview_context: ScoringContext, preview_results: list[RescoreResult]
 ) -> list[RescoreResult]:
-    """SINGLE ATOMIC TRANSACTION. Re-locks the exact target rows, re-
-    verifies every row's identity/input snapshot AND the CandidateProfile-
-    derived context against what preview captured, recomputes each score
-    with the SAME pure evaluator and asserts it matches preview's own
-    result, and ONLY THEN writes -- exclusively `SCORE_FIELD_ALLOWLIST`
-    columns. Any mismatch/exception aborts before any write; `with
-    db.begin():` rolls back the ENTIRE transaction on exception, so there
-    is no partial apply.
+    """SINGLE ATOMIC TRANSACTION. Takes the `jobs`/`automation_runs`
+    population lock as its FIRST statement (M1 -- see
+    `POPULATION_LOCK_TABLES`), re-locks the exact target rows and the
+    singleton CandidateProfile row, re-verifies every row's identity/input
+    snapshot AND the CandidateProfile-derived context against what preview
+    captured, recomputes each score with the SAME pure evaluator and
+    asserts it matches preview's own result, and ONLY THEN writes --
+    exclusively `SCORE_FIELD_ALLOWLIST` columns. Any mismatch/exception
+    aborts before any write; `with db.begin():` rolls back the ENTIRE
+    transaction on exception, so there is no partial apply.
     """
     expected_by_id = {r.before.id: r for r in preview_results}
     job_ids = sorted(expected_by_id)
     applied_results: list[RescoreResult] = []
 
     with Session(engine) as db, db.begin():
-        apply_context = load_scoring_context(db)
+        # M1 remediation (Astra Stage 12 audit, round 2): FIRST statement of
+        # the transaction -- takes the table-level population lock on
+        # `jobs`/`automation_runs` that every INSERT/UPDATE/DELETE against
+        # those tables must block on until this transaction commits or rolls
+        # back. Without it, the pilot-identity COUNTS below are only ever a
+        # point-in-time observation: Astra reproduced a competing
+        # automation-run insert landing strictly AFTER the final
+        # `verify_pilot_identity` returned and before commit, which no
+        # additional count, and no row-level lock on already-existing rows,
+        # can prevent. See POPULATION_LOCK_TABLES for the lock semantics,
+        # its ownership/scope, and the PostgreSQL-only limitation.
+        lock_pilot_population(db)
+
+        # H2 remediation (Astra Stage 12 audit): `for_update=True` locks the
+        # singleton CandidateProfileRecord row for the rest of this
+        # transaction -- a concurrent `apply_candidate_profile_patch` CAS
+        # against that same row now blocks until this transaction commits
+        # or rolls back, instead of silently landing in the gap between
+        # this read and the eventual commit (Astra's reproduced race:
+        # "apply captures context, another session changes the profile,
+        # apply still commits the stale score"). See the final recheck
+        # below for the second, dialect-independent half of this fix.
+        apply_context = load_scoring_context(db, for_update=True)
         if apply_context != preview_context:
             raise RescoreConcurrentModificationError(
                 "CandidateProfile-derived scoring context changed since preview -- "
@@ -577,14 +840,88 @@ def apply_rescore(
             applied_results.append(
                 RescoreResult(
                     before=expected.before,
-                    after=_snapshot(record, after_score, matched_skills_source="applied"),
+                    after=_snapshot(
+                        record,
+                        after_score,
+                        matched_skills_source="applied",
+                        # The review evidence is a pure, deterministic
+                        # function of (job, context, trace) -- already
+                        # computed once during preview and, immediately
+                        # above, already verified to reproduce the exact
+                        # same score/recommendation/data_confidence.
+                        # Recomputing it here would be redundant work with
+                        # zero additional safety value; carry preview's
+                        # already-verified evidence forward instead.
+                        evidence=expected.after.evidence,
+                    ),
                     applied=True,
                 )
             )
+
+        # H2/M1 remediation (Astra Stage 12 audit): a final recheck,
+        # immediately before the implicit commit below, of the SAME two
+        # checks already run earlier in this transaction. This is the
+        # SECOND, dialect-independent layer, not the primary defense:
+        #   * pilot identity (population counts) is primarily protected by
+        #     the SHARE ROW EXCLUSIVE table lock taken as this
+        #     transaction's first statement -- on PostgreSQL no competing
+        #     insert/delete can land in this window at all, whether before
+        #     or after this final count;
+        #   * the CandidateProfile-derived context is primarily protected
+        #     by the `FOR UPDATE` row lock on the singleton profile row.
+        # Both rechecks still run because they cost one query each, they
+        # catch anything a future refactor might let slip past the locks,
+        # and they are the only protection available on a dialect where
+        # the locks are no-ops (SQLite, in these tests). Ordered
+        # context-then-identity so the population count is the very last
+        # observation before commit. Any mismatch raises, and
+        # `with db.begin():` rolls back the ENTIRE transaction -- no stale
+        # score is ever persisted.
+        final_context = load_scoring_context(db, for_update=True)
+        if final_context != apply_context:
+            raise RescoreConcurrentModificationError(
+                "CandidateProfile-derived scoring context changed during apply -- "
+                "aborting, transaction will roll back, ZERO jobs changed"
+            )
+        verify_pilot_identity(db)
         # Single commit on successful context-manager exit. Any exception
         # above rolls back everything via `with db.begin():`.
 
     return applied_results
+
+
+def population_lock_statements() -> tuple[str, ...]:
+    """The exact SQL `lock_pilot_population` issues on PostgreSQL, as a
+    separate pure function so a test can assert the statements without a
+    live PostgreSQL server (and so the statements exist in exactly one
+    place). See `POPULATION_LOCK_TABLES`' own comment for why this
+    specific lock mode.
+    """
+    return (
+        f"SET LOCAL lock_timeout = '{POPULATION_LOCK_TIMEOUT}'",
+        f"LOCK TABLE {', '.join(POPULATION_LOCK_TABLES)} IN {POPULATION_LOCK_MODE} MODE",
+    )
+
+
+def lock_pilot_population(db: Session) -> bool:
+    """M1 remediation: takes the through-commit population lock described
+    at `POPULATION_LOCK_TABLES`. MUST be the first statement of apply's
+    transaction, before `load_scoring_context`, before any row lock, and
+    before any `verify_pilot_identity` call -- so that every subsequent
+    identity observation is made under a population that no other writer
+    can change until this transaction ends.
+
+    Returns True if the real lock was taken, False on a dialect that has
+    no `LOCK TABLE` (SQLite, used by every unit test here) -- callers must
+    treat False as "the population invariant is NOT protected by the
+    database on this dialect". Never called by preview (whose transaction
+    is `SET TRANSACTION READ ONLY` and which writes nothing).
+    """
+    if db.bind is None or db.bind.dialect.name != "postgresql":
+        return False
+    for statement in population_lock_statements():
+        db.execute(text(statement))
+    return True
 
 
 def _actual_database_name(db: Session) -> str | None:
@@ -612,12 +949,15 @@ def _apply_target_authorized(postgres_db: str, confirm_database: str) -> bool:
 
 
 def verify_pilot_identity(db: Session) -> None:
-    """MANDATORY for --apply only: once as a preflight before preview, and
-    AGAIN inside the apply transaction itself (immediately after row locks
-    are acquired, immediately before any score field is assigned) -- the
-    exact same check both times, via this one shared helper, so there is
-    never a second, divergent implementation of "is this really the
-    Stage 12 pilot". Refuses to write unless the database's actual
+    """MANDATORY for --apply only, called three times via this one shared
+    helper (never a second, divergent implementation of "is this really
+    the Stage 12 pilot"): once as a preflight before preview, once inside
+    the apply transaction after the population lock and row locks are
+    acquired and before any score field is assigned, and once as the last
+    observation before commit. On PostgreSQL every in-transaction call is
+    made while the `jobs`/`automation_runs` population lock is held, so
+    the counts it observes cannot change before commit. Refuses to write
+    unless the database's actual
     identity matches the Stage 12 pilot exactly, hard-pinned to
     `STAGE12_PILOT_DATABASE` (never a caller-supplied value). Preview may
     report a mismatch but always remains zero-write regardless (this
@@ -727,6 +1067,7 @@ def _build_human_review_rows(results: list[RescoreResult], *, sample_seed: int):
 
     rows = []
     for r in selected:
+        evidence = r.after.evidence
         rows.append(
             {
                 "job_id": r.after.id,
@@ -739,7 +1080,19 @@ def _build_human_review_rows(results: list[RescoreResult], *, sample_seed: int):
                 "recommendation": r.after.recommendation,
                 "matched_skills": _csv_safe(";".join(r.after.matched_skills)),
                 "missing_must_have": _csv_safe(";".join(r.after.missing_must_have)),
-                "gate_reason": "",
+                "base_score": "" if evidence.base_score is None else evidence.base_score,
+                "base_recommendation": _csv_safe(evidence.base_recommendation),
+                "resolved_must_have": _csv_safe(";".join(evidence.resolved_must_have)),
+                "resolved_nice_to_have": _csv_safe(";".join(evidence.resolved_nice_to_have)),
+                "matched_must_have": _csv_safe(";".join(evidence.matched_must_have)),
+                "matched_optional": _csv_safe(";".join(evidence.matched_optional)),
+                "unique_evidence_count": evidence.unique_evidence_count,
+                "evidence_cardinality": _csv_safe(evidence.evidence_cardinality),
+                "role_relevance": _csv_safe(evidence.role_relevance),
+                "seniority_classification": _csv_safe(evidence.seniority_classification),
+                "posting_classification": _csv_safe(evidence.posting_classification),
+                "data_confidence": r.after.data_confidence,
+                "gate_reason": _csv_safe(";".join(evidence.gate_trace)),
                 "description_or_url": _csv_safe(r.after.url),
                 "human_relevant": "",
                 "human_decision": "",

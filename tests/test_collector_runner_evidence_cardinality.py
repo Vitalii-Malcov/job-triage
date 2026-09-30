@@ -306,6 +306,57 @@ def test_k_stage_11b_irrelevant_exclusion_unaffected():
     assert result.score == 0
 
 
+# --- M2 (Astra Stage 12 audit): sparse-rescue eligibility must use ---------
+# --- DISTINCT evidence, not raw must+nice category-entry counts ------------
+
+
+def test_m2_duplicate_evidence_across_categories_gets_the_same_rescue_as_single_category():
+    # Astra's exact repro: must=[python], nice=[] rescues to MAYBE (one
+    # unique signal, SPARSE, RELEVANT title -> Stage 11C rescue). The SAME
+    # underlying evidence duplicated into nice-to-have too
+    # (must=[python], nice=[python] -- still just ONE distinct skill) must
+    # reach the identical MAYBE outcome, not a confident SKIP purely
+    # because the raw must_have_total + nice_to_have_total category sum
+    # (1 + 1 = 2) cleared the SPARSE threshold on a double-counted signal.
+    db = _db()
+    profile = _profile(db, ["python"])
+    _set_target_roles(db, SOFTWARE_DEV_TARGET_ROLES)
+    title = "JUNIOR SOFTWARE DEVELOPER / ENTWICKLER (M/W/D)"
+
+    single_category_job = _job(title=title, must_have_skills=["Python"], nice_to_have_skills=[])
+    _record, single_result, _created = score_and_persist(db, profile, single_category_job)
+    assert single_result.recommendation == "MAYBE"
+
+    db2 = _db()
+    profile2 = _profile(db2, ["python"])
+    _set_target_roles(db2, SOFTWARE_DEV_TARGET_ROLES)
+    duplicated_job = _job(title=title, must_have_skills=["Python"], nice_to_have_skills=["Python"])
+    _record2, duplicated_result, _created2 = score_and_persist(db2, profile2, duplicated_job)
+
+    assert duplicated_result.recommendation == "MAYBE", (
+        "duplicate evidence across must/nice must not lose sparse-rescue "
+        f"eligibility (got {duplicated_result.recommendation})"
+    )
+
+
+def test_m2_genuinely_two_distinct_signals_still_sufficient_no_rescue_needed():
+    # Two DIFFERENT skills (not a duplicate) must keep behaving exactly as
+    # before -- SUFFICIENT evidence, no rescue mechanism even invoked
+    # (JobScorer's own math already reaches MAYBE/APPLY on its own merit).
+    db = _db()
+    profile = _profile(db, ["python", "sql"])
+    _set_target_roles(db, SOFTWARE_DEV_TARGET_ROLES)
+    job = _job(
+        title="Python Entwickler (m/w/d)",
+        must_have_skills=["Python"],
+        nice_to_have_skills=["SQL"],
+    )
+
+    _record, result, _created = score_and_persist(db, profile, job)
+
+    assert result.recommendation == "MAYBE"
+
+
 # --- Regression guards -------------------------------------------------------
 
 

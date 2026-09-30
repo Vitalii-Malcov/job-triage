@@ -19,13 +19,15 @@ data_confidence, never a legacy-profile recomputation.
 import csv
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy import create_engine, delete, event, func, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
 import scripts.offline_rescore_stage12 as offline_rescore_stage12
-from app.agents.job_score_evaluator import evaluate_job_score
+from app.agents.job_score_evaluator import EvaluationTrace, evaluate_job_score
 from app.db.base import Base
 from app.db.candidate_profile_repository import (
     apply_candidate_profile_patch,
@@ -50,6 +52,8 @@ from app.services.collector_runner import score_and_persist
 from scripts.offline_rescore_stage12 import (
     DETERMINISTIC_SKIP_SAMPLE_SIZE,
     HIGH_SCORE_SKIP_THRESHOLD,
+    HUMAN_REVIEW_COLUMNS,
+    POPULATION_LOCK_TABLES,
     STAGE12_PILOT_DATABASE,
     JobSnapshot,
     MissingCandidateProfileError,
@@ -61,8 +65,11 @@ from scripts.offline_rescore_stage12 import (
     _csv_safe,
     _is_sentinel,
     _write_before_after_csv,
+    _write_human_review_csv,
     apply_rescore,
+    lock_pilot_population,
     main,
+    population_lock_statements,
     preview_all_jobs,
     verify_pilot_identity,
 )
@@ -83,15 +90,24 @@ def _engine():
 
 
 def _set_candidate_skills(
-    db: Session, skills: list[str], *, employment_types: list[str] | None = None
+    db: Session,
+    skills: list[str],
+    *,
+    employment_types: list[str] | None = None,
+    target_roles: list[str] | None = None,
 ) -> None:
     current = get_or_create_candidate_profile(db)
+    # `target_roles` must stay OUT of the patch's `model_fields_set` unless
+    # the caller actually asked for it -- the repository applies any
+    # explicitly-provided field, including an explicit None.
+    extra = {} if target_roles is None else {"target_roles": target_roles}
     apply_candidate_profile_patch(
         db,
         CandidateProfilePatchRequest(
             expected_profile_version=current.profile_version,
             skills=[CandidateSkill(name=name) for name in skills],
             job_preferences=CandidateJobPreferences(employment_types=employment_types or []),
+            **extra,
         ),
     )
 
@@ -979,6 +995,103 @@ def test_main_rejects_apply_with_correct_postgres_db_but_wrong_confirm(tmp_path,
     assert "ABORT" in capsys.readouterr().err
 
 
+# --- Review export (Astra M4 finding): each reviewed vacancy's decision ---
+# --- must be reconstructable from the exported evidence, without ----------
+# --- changing any score/recommendation -------------------------------------
+
+
+def test_review_export_includes_resolved_evidence_and_populated_gate_trace():
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]))
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    assert results[0].after.recommendation in ("APPLY", "MAYBE")
+    rows, _counts = _build_human_review_rows(results, sample_seed=1)
+    assert len(rows) == 1
+    row = rows[0]
+
+    # The decision is reconstructable: resolved must/nice, matches, and a
+    # non-empty gate trace explaining how the recommendation was reached
+    # -- M4's exact complaint was that `gate_reason` was always "".
+    assert row["resolved_must_have"] != ""
+    assert row["gate_reason"] != ""
+    assert "posting:TARGET" in row["gate_reason"]
+    assert "base_score:" in row["gate_reason"]
+    assert "final:" in row["gate_reason"]
+    assert row["role_relevance"] in ("RELEVANT", "IRRELEVANT", "UNKNOWN")
+    assert row["seniority_classification"] in ("SENIOR", "UNKNOWN")
+    assert row["posting_classification"] == "TARGET_EMPLOYMENT"
+    assert row["evidence_cardinality"] in ("SUFFICIENT", "LOW_CARDINALITY")
+    assert int(row["unique_evidence_count"]) >= 2
+    assert row["data_confidence"] == results[0].after.data_confidence
+
+
+def test_review_export_gate_trace_explains_early_posting_exclusion():
+    # A job excluded at the very first gate (Stage 10 posting-type
+    # exclusion) must still carry a gate trace explaining WHY -- not an
+    # empty string just because later gates never ran.
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Programmierung mit Python",
+            posting_type="SELBSTAENDIGKEIT",
+        )
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    assert results[0].after.recommendation == "SKIP"
+    assert results[0].after.score == 0
+    evidence = results[0].after.evidence
+    assert evidence.gate_trace
+    assert evidence.gate_trace[0].startswith("posting_excluded:")
+    assert evidence.posting_classification.startswith("EXCLUDED:")
+
+
+def test_review_export_before_snapshot_never_gets_current_code_evidence():
+    # Ties to the H1/P invariant: the historical BEFORE baseline is never
+    # recomputed against current-code gates -- so it must never carry a
+    # current-code gate trace either, only the canonical AFTER result
+    # does.
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]))
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    assert results[0].before.evidence.gate_trace == []
+    assert results[0].before.evidence.resolved_must_have == []
+    assert results[0].after.evidence.gate_trace != []
+
+
+def test_review_export_evidence_survives_apply_unchanged(monkeypatch):
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]))
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    preview_evidence = results[0].after.evidence
+    _authorize_pilot_identity(monkeypatch, jobs=1)
+    applied_results = apply_rescore(engine, context, results)
+
+    assert applied_results[0].after.evidence == preview_evidence
+
+    rows, _counts = _build_human_review_rows(applied_results, sample_seed=1)
+    assert rows[0]["gate_reason"] == ";".join(preview_evidence.gate_trace)
+
+
 def test_actual_database_name_mismatch_is_rejected(monkeypatch):
     monkeypatch.setattr(
         offline_rescore_stage12, "_actual_database_name", lambda db: "some_other_database"
@@ -987,3 +1100,844 @@ def test_actual_database_name_mismatch_is_rejected(monkeypatch):
     with Session(engine) as db:
         with pytest.raises(PilotIdentityMismatchError):
             verify_pilot_identity(db)
+
+
+# --- H2 (Astra Stage 12 audit): CandidateProfile changed strictly BETWEEN --
+# --- apply's own context read and its commit must not produce a stale -----
+# --- commit -- not merely "changed before preview", which the pre-existing
+# --- tests above already covered. --------------------------------------
+
+
+def test_H2_candidate_profile_change_mid_apply_transaction_blocks_stale_commit(monkeypatch):
+    """Reproduces Astra's exact H2 probe: preview captures a rich-skill
+    CandidateProfile context; a SEPARATE session commits a profile change
+    (skills replaced with something that would score very differently)
+    strictly AFTER `apply_rescore` has already read its own context (and,
+    with the H2 fix, locked the row) but BEFORE `apply_rescore` commits.
+    Without the fix, apply would silently finish and persist a score
+    computed against the now-stale in-memory context. With the fix, the
+    interleaved write is detected (either by blocking behind the FOR
+    UPDATE lock on a real PostgreSQL, or by the dialect-independent final
+    recheck exercised here against SQLite) and the WHOLE transaction rolls
+    back -- zero jobs changed.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        seeded = _seed_job(db, frozenset(["Python"]))
+        job_id = seeded.id
+        original = (seeded.score, seeded.recommendation, seeded.data_confidence)
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    _authorize_pilot_identity(monkeypatch, jobs=1)
+
+    interleaved = {"done": False}
+    real_evaluate = offline_rescore_stage12._evaluate
+
+    def _evaluate_then_interleave_profile_change(*args, **kwargs):
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            # A SEPARATE session/transaction, entirely independent of the
+            # one apply_rescore is using -- exactly what Astra's probe
+            # did: a concurrent write landing strictly inside apply's own
+            # read-compute-commit window.
+            with Session(engine) as concurrent_db:
+                _set_candidate_skills(concurrent_db, ["Cobol"])
+        return real_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        offline_rescore_stage12, "_evaluate", _evaluate_then_interleave_profile_change
+    )
+
+    with pytest.raises(RescoreConcurrentModificationError):
+        apply_rescore(engine, context, results)
+
+    with Session(engine) as db:
+        reloaded = db.get(JobRecord, job_id)
+        assert (reloaded.score, reloaded.recommendation, reloaded.data_confidence) == original
+        # The concurrent session's write itself is NOT rolled back --
+        # only apply_rescore's own (aborted) transaction is. This proves
+        # the interleave genuinely landed, not merely one that never ran.
+    with Session(engine) as db:
+        fresh_context, _ = preview_all_jobs(db)
+    assert fresh_context.candidate_skills == frozenset({"Cobol"})
+
+
+# --- M1 (Astra Stage 12 audit): pilot identity changed strictly BETWEEN ---
+# --- apply's own in-transaction recheck and its commit ---------------------
+
+
+def test_M1_automation_run_inserted_mid_apply_transaction_blocks_stale_commit(monkeypatch):
+    """Reproduces Astra's M1 probe: a separate session inserts an
+    AutomationRunRecord strictly AFTER `apply_rescore`'s own
+    `verify_pilot_identity(db)` in-transaction recheck has already run,
+    but BEFORE the transaction commits. Existing coverage
+    (`test_pilot_automation_runs_drift_after_preview_blocks_apply`) only
+    proves drift *before* that recheck is caught; this proves drift
+    *after* it is caught too.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        seeded = _seed_job(db, frozenset(["Python"]), url="https://example.com/jobs/m1-1")
+        job_id = seeded.id
+        original = (seeded.score, seeded.recommendation, seeded.data_confidence)
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    _authorize_pilot_identity(monkeypatch, jobs=1, automation_runs=0)
+
+    interleaved = {"done": False}
+    real_evaluate = offline_rescore_stage12._evaluate
+
+    def _evaluate_then_interleave_automation_run(*args, **kwargs):
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            with Session(engine) as concurrent_db:
+                concurrent_db.add(
+                    AutomationRunRecord(
+                        account_key="concurrent@example.com",
+                        status="COMPLETED",
+                        started_at=datetime.now(UTC),
+                        finished_at=datetime.now(UTC),
+                        results_json="{}",
+                    )
+                )
+                concurrent_db.commit()
+        return real_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        offline_rescore_stage12, "_evaluate", _evaluate_then_interleave_automation_run
+    )
+
+    with pytest.raises(PilotIdentityMismatchError):
+        apply_rescore(engine, context, results)
+
+    with Session(engine) as db:
+        reloaded = db.get(JobRecord, job_id)
+        assert (reloaded.score, reloaded.recommendation, reloaded.data_confidence) == original
+        assert db.scalar(select(func.count()).select_from(AutomationRunRecord)) == 1, (
+            "the concurrent session's own insert is not itself rolled back"
+        )
+
+
+# =========================================================================
+# Astra Stage 12 remediation, ROUND 2 (H1 residual / M1 OPEN / M4 PARTIAL)
+# =========================================================================
+
+
+def _statement_log(engine) -> list[str]:
+    """Captures every SQL statement the engine actually sends to the
+    driver, in order -- the only way to assert what apply/preview really
+    do at the database level (FOR UPDATE, LOCK TABLE, DML) rather than
+    what their Python-level call graph suggests.
+    """
+    log: list[str] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        log.append(" ".join(statement.split()))
+
+    return log
+
+
+# --- H1 (round 2): unclassified/source skills must never become ----------
+# --- mandatory evidence for a FRESHLY INGESTED record --------------------
+
+
+def test_H1_freshly_ingested_source_skills_never_become_must_have_evidence():
+    """Astra's round-2 H1 reproduction, end to end through the real
+    persistence path and the real offline preview -- not a pure-scorer
+    probe.
+
+    A brand-new Backend Developer whose description merely MENTIONS
+    Python and PostgreSQL extracts to `must_have_skills=[]`,
+    `nice_to_have_skills=[]`, `skill_source="description_extracted"`,
+    while the ingestion union keeps both technologies in `skills`. That
+    shape is NOT evidence of pre-must/nice-split historical data -- the
+    current extractor produces it every day -- and the removed
+    `must = job.skills` fallback used to turn it into a fully-matched
+    two-signal must-have set worth 90/APPLY.
+    """
+    engine = _engine()
+    descriptive_only = (
+        "Our platform uses Python and PostgreSQL to support customers around "
+        "the world. We care about clean code and good documentation. " * 8
+    )
+    with Session(engine) as db:
+        _set_candidate_skills(db, ["Python", "PostgreSQL"])
+        seeded = _seed_job(
+            db,
+            frozenset(["Python", "PostgreSQL"]),
+            title="Backend Developer",
+            description=descriptive_only,
+            skills=["Python", "PostgreSQL"],
+            must_have_skills=[],
+            nice_to_have_skills=[],
+            skill_source="description_extracted",
+        )
+        job_id = seeded.id
+        # Sanity: the fixture really is the shape under test.
+        assert json.loads(seeded.must_have_skills_json) == []
+        assert json.loads(seeded.nice_to_have_skills_json) == []
+        assert seeded.skill_source == "description_extracted"
+        assert set(json.loads(seeded.skills_json)) == {"Python", "PostgreSQL"}
+        # Ingestion itself must not have produced a false APPLY.
+        assert seeded.recommendation != "APPLY"
+
+    with Session(engine) as db:
+        _context, results = preview_all_jobs(db)
+
+    assert len(results) == 1
+    after = results[0].after
+    assert after.id == job_id
+    assert after.recommendation != "APPLY"
+    assert after.matched_must_have == []
+    assert after.missing_must_have == []
+    # The source skills are still VISIBLE as descriptive evidence -- they
+    # are simply not mandatory evidence any more.
+    assert "python" in after.matched_skills
+    assert after.evidence.matched_must_have == []
+    assert after.evidence.resolved_must_have == []
+
+
+def test_H1_explicit_must_have_still_reaches_apply_through_the_offline_path():
+    """The legitimate counterpart of the test above, through the same
+    persistence + preview path: removing the fallback must not suppress a
+    posting whose requirements really were extracted.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, ["Python", "PostgreSQL"])
+        _seed_job(
+            db,
+            frozenset(["Python", "PostgreSQL"]),
+            title="Backend Developer",
+            description=("You will build backend services with Python and PostgreSQL. " * 10),
+            skills=["Python", "PostgreSQL"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=[],
+            skill_source="description_extracted",
+        )
+
+    with Session(engine) as db:
+        _context, results = preview_all_jobs(db)
+
+    after = results[0].after
+    assert after.recommendation == "APPLY"
+    assert set(after.matched_must_have) == {"postgresql", "python"}
+    assert set(after.evidence.matched_must_have) == {"postgresql", "python"}
+
+
+# --- M1 (round 2): the pilot POPULATION is locked through commit ---------
+
+
+class _FakePostgresSession:
+    """Just enough of a `Session` for `lock_pilot_population` -- it only
+    reads `db.bind.dialect.name` and calls `db.execute(text(...))`. Lets
+    the exact PostgreSQL statements be asserted with no server, no
+    driver, and no connection.
+    """
+
+    def __init__(self) -> None:
+        self.bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        self.executed: list[str] = []
+
+    def execute(self, statement):
+        self.executed.append(str(statement))
+
+
+def test_M1_population_lock_statements_are_the_documented_postgresql_table_lock():
+    assert population_lock_statements() == (
+        "SET LOCAL lock_timeout = '15s'",
+        "LOCK TABLE jobs, automation_runs IN SHARE ROW EXCLUSIVE MODE",
+    )
+    # The lock covers exactly the two tables the pilot-identity COUNT
+    # predicate is defined over.
+    assert POPULATION_LOCK_TABLES == ("jobs", "automation_runs")
+
+
+def test_M1_lock_pilot_population_issues_those_statements_on_postgresql():
+    db = _FakePostgresSession()
+    assert lock_pilot_population(db) is True
+    assert db.executed == list(population_lock_statements())
+
+
+def test_M1_lock_pilot_population_is_a_documented_noop_on_sqlite():
+    """SQLite has no LOCK TABLE. The helper reports False so a caller (and
+    a reader of these tests) can never mistake a passing SQLite test for
+    evidence of PostgreSQL blocking behavior -- see the module comment on
+    POPULATION_LOCK_TABLES.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        assert lock_pilot_population(db) is False
+
+
+def test_M1_apply_takes_the_population_lock_before_any_identity_observation(monkeypatch):
+    """Protocol/ordering regression: the lock must be the FIRST thing
+    apply's transaction does. A lock taken after the first count would
+    leave exactly the window Astra reproduced.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]), url="https://example.com/jobs/m1-order-1")
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    _authorize_pilot_identity(monkeypatch, jobs=1)
+
+    order: list[str] = []
+    real_lock = offline_rescore_stage12.lock_pilot_population
+    real_verify = offline_rescore_stage12.verify_pilot_identity
+    real_load_context = offline_rescore_stage12.load_scoring_context
+
+    def _spy_lock(db):
+        order.append("lock_population")
+        return real_lock(db)
+
+    def _spy_verify(db):
+        order.append("verify_pilot_identity")
+        return real_verify(db)
+
+    def _spy_load_context(db, **kwargs):
+        order.append(f"load_scoring_context(for_update={kwargs.get('for_update', False)})")
+        return real_load_context(db, **kwargs)
+
+    monkeypatch.setattr(offline_rescore_stage12, "lock_pilot_population", _spy_lock)
+    monkeypatch.setattr(offline_rescore_stage12, "verify_pilot_identity", _spy_verify)
+    monkeypatch.setattr(offline_rescore_stage12, "load_scoring_context", _spy_load_context)
+
+    apply_rescore(engine, context, results)
+
+    assert order[0] == "lock_population", order
+    assert order.count("lock_population") == 1, order
+    assert order.count("verify_pilot_identity") == 2, order
+    # Nothing observes the population before the lock is held.
+    assert order.index("lock_population") < order.index("verify_pilot_identity")
+    # The population count is the LAST observation before commit.
+    assert order[-1] == "verify_pilot_identity", order
+
+
+def test_M1_competing_population_writer_arriving_after_the_final_check_cannot_commit(monkeypatch):
+    """The regression Astra explicitly requires: the competing mutation
+    starts ONLY AFTER the FINAL successful `verify_pilot_identity` has
+    returned, i.e. inside the final-check-to-commit window that a second
+    or third COUNT cannot close.
+
+    SQLite has no `LOCK TABLE`, so this test cannot (and does not claim
+    to) demonstrate PostgreSQL blocking. What it demonstrates is the
+    PROTOCOL that makes PostgreSQL's blocking apply to this exact window:
+    the `jobs`/`automation_runs` population lock is acquired before the
+    first identity observation and is STILL HELD when the competing
+    writer arrives after the final one -- because a PostgreSQL table lock
+    is released only by the transaction ending, and this transaction has
+    not ended until `apply_rescore` returns. The competing writer is
+    therefore routed through a model of PostgreSQL's SHARE ROW EXCLUSIVE
+    conflict rule (its INSERT needs ROW EXCLUSIVE, which conflicts) and
+    must be blocked until apply's transaction is over.
+
+    STILL REQUIRES POSTGRESQL INTEGRATION VALIDATION: that PostgreSQL
+    actually enforces that conflict. That is documented server behavior;
+    what is asserted here is only that this code follows the protocol
+    which makes it applicable.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        seeded = _seed_job(db, frozenset(["Cobol"]), url="https://example.com/jobs/m1-final-1")
+        job_id = seeded.id
+        original = (seeded.score, seeded.recommendation, seeded.data_confidence)
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    # Non-vacuous: apply really is going to write a different score.
+    assert (results[0].after.score, results[0].after.recommendation) != original[:2]
+
+    _authorize_pilot_identity(monkeypatch, jobs=1, automation_runs=0)
+
+    # Model of the PostgreSQL table lock: held from acquisition until the
+    # transaction ends (which, for `apply_rescore`, is when it returns).
+    lock = {"held": False}
+    timeline: list[str] = []
+    verify_calls = {"n": 0}
+    competing = {"attempted": False, "blocked": None, "inserted": False}
+
+    real_lock = offline_rescore_stage12.lock_pilot_population
+    real_verify = offline_rescore_stage12.verify_pilot_identity
+
+    def _tracked_lock(db):
+        lock["held"] = True
+        timeline.append("population_lock_acquired")
+        return real_lock(db)
+
+    def _competing_automation_run_insert():
+        """A writer obeying the protocol: an INSERT into
+        `automation_runs` needs ROW EXCLUSIVE, which conflicts with the
+        SHARE ROW EXCLUSIVE lock apply holds.
+        """
+        competing["attempted"] = True
+        if lock["held"]:
+            competing["blocked"] = True
+            timeline.append("competing_writer_blocked_by_population_lock")
+            return
+        competing["blocked"] = False
+        timeline.append("competing_writer_committed")
+        with Session(engine) as concurrent_db:
+            concurrent_db.add(
+                AutomationRunRecord(
+                    account_key="concurrent@example.com",
+                    status="COMPLETED",
+                    started_at=datetime.now(UTC),
+                    finished_at=datetime.now(UTC),
+                    results_json="{}",
+                )
+            )
+            concurrent_db.commit()
+        competing["inserted"] = True
+
+    def _verify_then_maybe_interleave(db):
+        verify_calls["n"] += 1
+        result = real_verify(db)  # only reached if the check PASSED
+        timeline.append(f"verify_pilot_identity_returned_ok:{verify_calls['n']}")
+        if verify_calls["n"] == 2:
+            # STRICTLY after the FINAL successful identity check.
+            _competing_automation_run_insert()
+        return result
+
+    monkeypatch.setattr(offline_rescore_stage12, "lock_pilot_population", _tracked_lock)
+    monkeypatch.setattr(
+        offline_rescore_stage12, "verify_pilot_identity", _verify_then_maybe_interleave
+    )
+
+    applied = apply_rescore(engine, context, results)
+    lock["held"] = False  # apply's transaction has now ended
+    timeline.append("apply_transaction_committed")
+
+    # 1. The competing mutation really was attempted, and only after the
+    #    FINAL identity check had already returned successfully.
+    assert competing["attempted"], "the competing writer never ran -- test proves nothing"
+    assert timeline.index("verify_pilot_identity_returned_ok:2") < timeline.index(
+        "competing_writer_blocked_by_population_lock"
+    )
+    # 2. The lock was taken before the FIRST identity observation and was
+    #    still held at the moment the competing writer arrived.
+    assert timeline[0] == "population_lock_acquired"
+    assert competing["blocked"] is True
+    assert not competing["inserted"]
+    # 3. The approved population identity survived through commit.
+    with Session(engine) as db:
+        assert db.scalar(select(func.count()).select_from(AutomationRunRecord)) == 0
+        assert db.scalar(select(func.count()).select_from(JobRecord)) == 1
+        reloaded = db.get(JobRecord, job_id)
+        assert (reloaded.score, reloaded.recommendation) == (
+            applied[0].after.score,
+            applied[0].after.recommendation,
+        )
+    # 4. The lock is released only by the transaction ending.
+    assert timeline[-1] == "apply_transaction_committed"
+
+
+def test_M1_no_lock_table_statement_is_emitted_on_sqlite(monkeypatch):
+    """Makes the dialect gap explicit in the suite itself, so a future
+    reader cannot mistake the SQLite M1 tests above for PostgreSQL
+    evidence.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]), url="https://example.com/jobs/m1-sqlite-1")
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    _authorize_pilot_identity(monkeypatch, jobs=1)
+    log = _statement_log(engine)
+    apply_rescore(engine, context, results)
+
+    assert log, "no SQL captured -- the spy is not wired up"
+    assert not any("LOCK TABLE" in s.upper() for s in log)
+
+
+# --- H2 regression (must not regress): preview never locks, apply does ---
+
+
+def _postgresql_compiled_statement_log(monkeypatch) -> list[str]:
+    """Every statement the code hands to the Session (`execute`, `scalar`
+    and `scalars` all funnel through `Session._execute_internal`),
+    compiled with the PostgreSQL dialect.
+
+    Necessary because SQLite's dialect silently DROPS `FOR UPDATE` when
+    rendering SQL, so the raw cursor log can never show it. Compiling the
+    real ORM statement objects for PostgreSQL shows what the production
+    dialect would actually send -- the same technique Astra used to verify
+    the H2 lock.
+    """
+    seen: list[str] = []
+    real_execute = Session._execute_internal
+
+    def _spy(self, statement, *args, **kwargs):
+        try:
+            seen.append(str(statement.compile(dialect=postgresql.dialect())))
+        except Exception:  # pragma: no cover - defensive, non-compilable stmt
+            seen.append(str(statement))
+        return real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "_execute_internal", _spy)
+    return seen
+
+
+def test_H2_regression_preview_issues_no_for_update_and_no_write(monkeypatch):
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]), url="https://example.com/jobs/h2-preview-1")
+
+    raw_log = _statement_log(engine)
+    compiled_log = _postgresql_compiled_statement_log(monkeypatch)
+    with Session(engine) as db:
+        preview_all_jobs(db)
+
+    assert raw_log, "no SQL captured -- the spy is not wired up"
+    for statement in raw_log:
+        upper = statement.upper()
+        assert not upper.startswith("INSERT"), statement
+        assert not upper.startswith("UPDATE"), statement
+        assert not upper.startswith("DELETE"), statement
+        assert "LOCK TABLE" not in upper, statement
+
+    assert compiled_log, "no ORM statement captured -- the spy is not wired up"
+    for statement in compiled_log:
+        assert "FOR UPDATE" not in statement.upper(), statement
+
+
+def test_H2_regression_apply_locks_the_candidate_profile_row_for_update(monkeypatch):
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Cobol"]), url="https://example.com/jobs/h2-apply-1")
+
+    with Session(engine) as db:
+        context, results = preview_all_jobs(db)
+
+    _authorize_pilot_identity(monkeypatch, jobs=1)
+    compiled_log = _postgresql_compiled_statement_log(monkeypatch)
+    apply_rescore(engine, context, results)
+
+    for_update = [s for s in compiled_log if "FOR UPDATE" in s.upper()]
+    assert any("candidate_profiles" in s for s in for_update), for_update
+    assert any("FROM jobs" in s for s in for_update), for_update
+
+
+# --- M4 (round 2): pre-exclusion evidence survives every exclusion gate --
+
+
+def _preview_single(engine):
+    with Session(engine) as db:
+        _context, results = preview_all_jobs(db)
+    assert len(results) == 1
+    return results[0]
+
+
+def test_M4_seniority_exclusion_preserves_pre_exclusion_evidence():
+    """Astra's exact M4 reproduction: a Senior Backend Developer with
+    must=[python, postgresql] and nice=[REST API, rest] scored 90/APPLY
+    and was then correctly excluded by the Stage 11A seniority gate. The
+    export used to report resolved_must_have=[], matched_must_have=[],
+    unique_evidence_count=1, LOW_CARDINALITY -- all false.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(
+            db,
+            ["Python", "PostgreSQL", "REST API"],
+            target_roles=["Junior Python Developer"],
+        )
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Senior Backend Developer",
+            description=("Build REST APIs with Python against PostgreSQL. " * 12),
+            skills=["Python", "PostgreSQL", "REST API"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=["REST API", "rest"],
+            url="https://example.com/jobs/m4-seniority-1",
+        )
+
+    result = _preview_single(engine)
+    evidence = result.after.evidence
+
+    # The FINAL decision is the exclusion -- unchanged behavior.
+    assert result.after.recommendation == "SKIP"
+    assert result.after.score == 0
+
+    # The BASE decision and its evidence are fully preserved.
+    assert evidence.base_recommendation == "APPLY"
+    assert evidence.base_score is not None and evidence.base_score >= 80
+    assert evidence.resolved_must_have == ["postgresql", "python"]
+    assert evidence.matched_must_have == ["postgresql", "python"]
+    assert evidence.missing_must_have == []
+    assert evidence.unique_evidence_count == 3
+    assert evidence.evidence_cardinality == "SUFFICIENT"
+    assert evidence.seniority_classification == "SENIOR"
+
+    # And which gate changed the outcome is explicit.
+    assert "seniority_excluded:senior" in evidence.gate_trace
+    assert f"base_score:{evidence.base_score}:APPLY" in evidence.gate_trace
+    assert "final:0:SKIP" in evidence.gate_trace
+
+
+def test_M4_posting_exclusion_preserves_pre_exclusion_evidence():
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, ["Python", "PostgreSQL"])
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Backend Developer",
+            description=("Build backend services with Python and PostgreSQL. " * 12),
+            skills=["Python", "PostgreSQL"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=[],
+            posting_type="SELBSTAENDIGKEIT",
+            url="https://example.com/jobs/m4-posting-1",
+        )
+
+    result = _preview_single(engine)
+    evidence = result.after.evidence
+
+    assert result.after.recommendation == "SKIP"
+    assert result.after.score == 0
+    assert evidence.posting_classification.startswith("EXCLUDED:")
+    assert evidence.gate_trace[0].startswith("posting_excluded:")
+    # Evidence the scorer WOULD have seen is still exported, even though
+    # the posting gate returned before the normal scoring path.
+    assert evidence.matched_must_have == ["postgresql", "python"]
+    assert evidence.resolved_must_have == ["postgresql", "python"]
+    assert evidence.base_recommendation != ""
+    assert evidence.unique_evidence_count == 2
+    assert "final:0:SKIP" in evidence.gate_trace
+    # Gates that never ran say so explicitly rather than being absent.
+    assert "seniority_not_applicable:posting_excluded" in evidence.gate_trace
+    assert "role_not_applicable:posting_excluded" in evidence.gate_trace
+
+
+def test_M4_role_exclusion_preserves_pre_exclusion_evidence():
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(
+            db,
+            ["Python", "PostgreSQL"],
+            target_roles=["Python Developer"],
+        )
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Python Systemadministrator",
+            description=("Administer Python tooling and PostgreSQL servers. " * 12),
+            skills=["Python", "PostgreSQL"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=[],
+            url="https://example.com/jobs/m4-role-1",
+        )
+
+    result = _preview_single(engine)
+    evidence = result.after.evidence
+
+    assert result.after.recommendation == "SKIP"
+    assert result.after.score == 0
+    assert evidence.role_relevance == "IRRELEVANT"
+    assert any(e.startswith("role_excluded:") for e in evidence.gate_trace), evidence.gate_trace
+    assert evidence.base_recommendation in ("APPLY", "MAYBE")
+    assert evidence.matched_must_have == ["postgresql", "python"]
+    assert evidence.resolved_must_have == ["postgresql", "python"]
+    assert evidence.unique_evidence_count == 2
+    assert "cardinality_not_applicable:role_excluded" in evidence.gate_trace
+
+
+def test_M4_matched_must_have_is_an_explicit_human_review_csv_column(tmp_path):
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, RICH_SKILLS)
+        _seed_job(db, frozenset(["Python"]), url="https://example.com/jobs/m4-csv-1")
+
+    with Session(engine) as db:
+        _context, results = preview_all_jobs(db)
+
+    assert "matched_must_have" in HUMAN_REVIEW_COLUMNS
+    assert "base_score" in HUMAN_REVIEW_COLUMNS
+    assert "base_recommendation" in HUMAN_REVIEW_COLUMNS
+
+    rows, _counts = _build_human_review_rows(results, sample_seed=1)
+    path = tmp_path / "human_review.csv"
+    _write_human_review_csv(path, rows)
+    with path.open(newline="", encoding="utf-8") as f:
+        csv_rows = list(csv.DictReader(f))
+
+    assert len(csv_rows) == 1
+    evidence = results[0].after.evidence
+    assert evidence.matched_must_have, "fixture must produce non-empty matched must-have"
+    assert csv_rows[0]["matched_must_have"] == ";".join(evidence.matched_must_have)
+    # matched_skills is NOT a substitute: it is a strictly wider set here.
+    assert csv_rows[0]["matched_skills"] != csv_rows[0]["matched_must_have"]
+    assert csv_rows[0]["base_recommendation"] == evidence.base_recommendation
+    assert csv_rows[0]["base_score"] == str(evidence.base_score)
+
+
+def test_M4_matched_must_have_column_is_populated_for_an_excluded_row(tmp_path):
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(
+            db,
+            ["Python", "PostgreSQL", "REST API"],
+            target_roles=["Junior Python Developer"],
+        )
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Senior Backend Developer",
+            description=("Build REST APIs with Python against PostgreSQL. " * 12),
+            skills=["Python", "PostgreSQL", "REST API"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=["REST API", "rest"],
+            url="https://example.com/jobs/m4-csv-excluded-1",
+        )
+
+    with Session(engine) as db:
+        _context, results = preview_all_jobs(db)
+
+    rows, _counts = _build_human_review_rows(results, sample_seed=1)
+    assert len(rows) == 1
+    path = tmp_path / "human_review_excluded.csv"
+    _write_human_review_csv(path, rows)
+    with path.open(newline="", encoding="utf-8") as f:
+        row = next(iter(csv.DictReader(f)))
+
+    assert row["recommendation"] == "SKIP"
+    assert row["score"] == "0"
+    # The FINAL columns are legitimately empty for an excluded row...
+    assert row["matched_skills"] == ""
+    # ...but the pre-exclusion evidence columns are not.
+    assert row["matched_must_have"] == "postgresql;python"
+    assert row["resolved_must_have"] == "postgresql;python"
+    assert row["base_recommendation"] == "APPLY"
+    assert "seniority_excluded:senior" in row["gate_reason"]
+
+
+def test_M4_rest_aliases_export_as_one_canonical_resolved_nice_signal():
+    """Astra M4 point 3: `resolved_nice_to_have` was a raw
+    `sorted(set(...))` of the stored strings, so "REST API" and "rest"
+    both appeared even though the classifier correctly counts them as ONE
+    signal. It must use the same canonical normalization scoring uses.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(db, ["Python", "PostgreSQL", "REST API"])
+        _seed_job(
+            db,
+            frozenset(["Python"]),
+            title="Backend Developer",
+            description=("Build REST APIs with Python against PostgreSQL. " * 12),
+            skills=["Python", "PostgreSQL", "REST API"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=["REST API", "rest-api", "REST"],
+            url="https://example.com/jobs/m4-alias-1",
+        )
+
+    result = _preview_single(engine)
+    evidence = result.after.evidence
+
+    assert evidence.resolved_nice_to_have == ["rest"]
+    # Consistent with the cardinality count the scorer itself used.
+    assert evidence.unique_evidence_count == 3
+
+
+def test_M4_trace_and_no_trace_produce_identical_job_scores():
+    """The audit object must be strictly observational: passing a trace
+    must never change the returned JobScore.
+    """
+    cases = [
+        ("Senior Backend Developer", "ARBEIT", ["Python", "PostgreSQL"], ["REST API", "rest"]),
+        ("Python Systemadministrator", "ARBEIT", ["Python", "PostgreSQL"], []),
+        ("Programmierung mit Python", "SELBSTAENDIGKEIT", ["Python"], []),
+        ("Junior Python Developer", "ARBEIT", ["Python", "PostgreSQL"], ["Docker"]),
+        ("Backend Developer", "ARBEIT", [], []),
+    ]
+    for title, posting_type, must, nice in cases:
+        job = Job(
+            source="bundesagentur",
+            title=title,
+            company="Example GmbH",
+            url="https://example.com/jobs/trace-eq",
+            description=RICH_TECH_DESCRIPTION,
+            posting_type=posting_type,
+            skills=[*must, *nice, "Python"],
+            must_have_skills=must,
+            nice_to_have_skills=nice,
+        )
+        kwargs = {
+            "candidate_skills": frozenset(RICH_SKILLS),
+            "allowed_employment_types": frozenset(),
+            "get_candidate_target_seniority": lambda: "JUNIOR",
+            "get_candidate_target_domain": lambda: "SOFTWARE_DEVELOPMENT",
+        }
+        untraced = evaluate_job_score(job, posting_type, **kwargs)
+        trace = EvaluationTrace()
+        traced = evaluate_job_score(job, posting_type, trace=trace, **kwargs)
+        assert untraced == traced, title
+        assert trace.final_recommendation == untraced.recommendation, title
+        assert trace.final_score == untraced.score, title
+        assert trace.events, title
+
+
+def test_M4_historical_before_keeps_persisted_values_and_gets_no_current_gate_trace():
+    """M4 item 7 / the H1-P invariant: the BEFORE snapshot's
+    score/recommendation/data_confidence stay exactly what Stage 12
+    persisted, and BEFORE never receives a current-code evaluation trace
+    -- even for a job the CURRENT gates exclude.
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        _set_candidate_skills(
+            db,
+            ["Python", "PostgreSQL", "REST API"],
+            target_roles=["Junior Python Developer"],
+        )
+        seeded = _seed_job(
+            db,
+            frozenset(["Python", "PostgreSQL", "REST API"]),
+            title="Senior Backend Developer",
+            description=("Build REST APIs with Python against PostgreSQL. " * 12),
+            skills=["Python", "PostgreSQL", "REST API"],
+            must_have_skills=["Python", "PostgreSQL"],
+            nice_to_have_skills=["REST API"],
+            url="https://example.com/jobs/m4-historical-1",
+        )
+        # Force a persisted historical result that the CURRENT gates would
+        # never produce, exactly as a pre-Stage-11 pilot row would look.
+        seeded.score = 91
+        seeded.recommendation = "APPLY"
+        seeded.data_confidence = 0.73
+        db.commit()
+        db.add(UserProfile(name="default", skills_json=json.dumps(RICH_SKILLS)))
+        db.commit()
+
+    result = _preview_single(engine)
+
+    assert (result.before.score, result.before.recommendation, result.before.data_confidence) == (
+        91,
+        "APPLY",
+        0.73,
+    )
+    assert result.before.evidence.gate_trace == []
+    assert result.before.evidence.base_score is None
+    assert result.before.evidence.base_recommendation == ""
+    # The AFTER result is the one the current gates decide.
+    assert result.after.recommendation == "SKIP"
+    assert result.after.evidence.gate_trace != []

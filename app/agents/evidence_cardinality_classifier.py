@@ -8,23 +8,20 @@ actually support a job's recommendation?
 **Category entries are not evidence identities.** Stage 11E's own
 pre-implementation analysis found that `must_score`/`nice_score`'s
 cardinality (`len(must)`, `len(nice)`) can double-count a SINGLE piece
-of underlying evidence: `app.agents.job_scorer.JobScorer`'s
-`must = {...} or legacy` fallback can resolve an empty
-`must_have_skills` to the SAME skill already present in
-`nice_to_have_skills` (a live example found in the Stage 11 pilot
-snapshot: "Data Consultant" had `must_have_skills=[]`, which resolved
-via the legacy fallback to `{"python"}`, while `nice_to_have_skills`
-was ALSO `["python"]` -- two category entries, one real signal). Naively
-summing `len(must) + len(nice)` counts that as 2; this module counts it
-as 1.
+of underlying evidence: the SAME skill can appear in both
+`must_have_skills` and `nice_to_have_skills` (a live example found in
+the Stage 11 pilot snapshot: "Data Consultant" resolved `{"python"}` as
+its must-have evidence while `nice_to_have_skills` was ALSO `["python"]`
+-- two category entries, one real signal), or under two different
+textual aliases of one skill ("REST API" / "rest"). Naively summing
+`len(must) + len(nice)` counts those as 2; this module counts them as 1.
 
 This module never re-derives JobScorer's OWN must-have resolution logic
-(the `or legacy` fallback stays entirely inside `JobScorer` -- Stage
-11E is explicitly forbidden from touching or duplicating it). Callers
-pass in the ALREADY-RESOLVED evidence: `JobScore.matched_must_have +
-JobScore.missing_must_have` (the exact set JobScorer itself decided the
-job's must-have requirements to be, post-fallback) and the job's own
-`nice_to_have_skills`. This module's only job is to normalize
+(Stage 11E is explicitly forbidden from touching or duplicating it).
+Callers pass in the ALREADY-RESOLVED evidence:
+`JobScore.matched_must_have + JobScore.missing_must_have` (the exact set
+JobScorer itself decided the job's must-have requirements to be) and the
+job's own `nice_to_have_skills`. This module's only job is to normalize
 (reusing `app.agents.job_scorer.normalize_skill`, not a new
 normalization layer) and deduplicate ACROSS those two collections.
 

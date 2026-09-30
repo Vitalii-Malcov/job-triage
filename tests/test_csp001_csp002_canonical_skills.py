@@ -508,6 +508,14 @@ def _score_job_payload(**overrides) -> dict:
         "url": "https://example.com/jobs/csp-001-endpoint",
         "description": "We build reliable backend software for our customers. " * 20,
         "skills": ["python", "git"],
+        # H1 (Astra Stage 12 audit, round 2): the unclassified `skills`
+        # union is no longer promoted to must-have evidence when
+        # must_have_skills is empty, so a payload carrying only `skills`
+        # can no longer reach APPLY. These tests are about WHICH skill set
+        # the scorer compares against (CandidateProfile, not the legacy
+        # UserProfile), not about that fallback -- stating the posting's
+        # requirements explicitly keeps them testing what they mean to.
+        "must_have_skills": ["python", "git"],
     }
     data.update(overrides)
     return data

@@ -148,7 +148,9 @@ def get_or_create_candidate_profile(db: Session) -> CandidateProfileRecord:
     return profile
 
 
-def get_candidate_profile(db: Session) -> CandidateProfileRecord | None:
+def get_candidate_profile(
+    db: Session, *, for_update: bool = False
+) -> CandidateProfileRecord | None:
     """Pure lookup of the singleton `CandidateProfileRecord` — `None` if
     it has never been created, with **no create-on-miss side effect**.
 
@@ -161,7 +163,25 @@ def get_candidate_profile(db: Session) -> CandidateProfileRecord | None:
     authority that actually produced the reviewed content. Do not use this
     for `GET /api/v1/candidate-profile`, which deliberately always
     initializes the singleton — see `get_or_create_candidate_profile`.
+
+    `for_update=True` (Stage 12 H2 remediation, Astra audit) issues
+    `SELECT ... FOR UPDATE` instead of a plain identity-map lookup —
+    acquires a row lock on the singleton row for the remainder of the
+    caller's own transaction, so a concurrent `apply_candidate_profile_patch`
+    (whose CAS is itself an `UPDATE ... WHERE id=1 ...` against this same
+    row) blocks until the caller commits or rolls back, instead of
+    silently committing underneath a long-running read-compute-commit
+    sequence such as `scripts.offline_rescore_stage12.apply_rescore`. Only
+    meaningful inside a transaction that intends to hold the lock through
+    its own commit — never use this for an ordinary read, and never inside
+    a `SET TRANSACTION READ ONLY` transaction (PostgreSQL rejects `FOR
+    UPDATE` there; `preview_all_jobs` must keep using the default).
     """
+    if for_update:
+        stmt = select(CandidateProfileRecord).where(
+            CandidateProfileRecord.id == _CANDIDATE_PROFILE_SINGLETON_ID
+        )
+        return db.scalars(stmt.with_for_update()).one_or_none()
     return db.get(CandidateProfileRecord, _CANDIDATE_PROFILE_SINGLETON_ID)
 
 

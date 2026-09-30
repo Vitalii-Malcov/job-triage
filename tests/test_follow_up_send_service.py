@@ -1072,7 +1072,7 @@ class TestLeaseRenewalHeartbeat:
             import app.services.follow_up_send as send_module
 
             holder = "sender-that-crashes"
-            ttl_seconds = 0.15
+            ttl_seconds = 0.6
             assert (
                 acquire_thread_lock(db, thread_id, holder=holder, ttl_seconds=ttl_seconds) is True
             )

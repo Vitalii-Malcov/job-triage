@@ -96,6 +96,22 @@ _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 )
 
 
+def _is_unambiguous_junior_role(role: str) -> bool:
+    """M3 fix (Astra Stage 12 audit): a role STRING containing both an
+    explicit "junior" marker AND an explicit senior-level marker (e.g.
+    "Senior/Junior Python Developer") is genuinely ambiguous about which
+    level the candidate is targeting -- it must not count as an
+    unambiguous junior signal just because "junior" happens to appear in
+    it. Reuses the SAME `_SENIOR_LEVEL_PATTERNS` vocabulary
+    `classify_title_seniority` checks a job title against below, so the
+    two directions can never silently drift apart on what counts as
+    "senior".
+    """
+    if not _JUNIOR_PATTERN.search(role):
+        return False
+    return not any(pattern.search(role) for _, pattern in _SENIOR_LEVEL_PATTERNS)
+
+
 def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSeniorityTarget:
     """S11A-002 (Codex review): JUNIOR only if EVERY target role
     explicitly says "junior" -- fails open (UNKNOWN) on any ambiguity,
@@ -114,10 +130,15 @@ def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSenio
         ["Junior Python Developer", "Senior Backend Developer"] -> UNKNOWN
         ["Python Backend Developer"]                            -> UNKNOWN
         []                                                      -> UNKNOWN
+
+    M3 fix (Astra Stage 12 audit): the same ambiguity check also applies
+    WITHIN a single role string -- ["Senior/Junior Python Developer"] must
+    not derive JUNIOR, since that one target role explicitly includes
+    senior-level work too. See `_is_unambiguous_junior_role`.
     """
     if not target_roles:
         return "UNKNOWN"
-    if all(_JUNIOR_PATTERN.search(role) for role in target_roles):
+    if all(_is_unambiguous_junior_role(role) for role in target_roles):
         return "JUNIOR"
     return "UNKNOWN"
 
@@ -136,8 +157,20 @@ def classify_title_seniority(title: str) -> TitleSeniorityClassification:
     """Whole-word/whole-compound title scan for an explicit senior/lead-
     level marker -- see the module docstring for why this never inspects
     description text or does bare substring matching.
+
+    M3 fix (Astra Stage 12 audit): a title naming BOTH an explicit senior
+    marker AND an explicit "junior" marker (e.g. "Senior/Junior Python
+    Developer", or a junior title with a company suffix like "- Senior
+    GmbH") is genuinely ambiguous, not a confident SENIOR exclusion --
+    consistent with this module's own stated risk direction ("false
+    SENIOR is more dangerous than missed SENIOR", see S11A-001 above): a
+    junior candidate must not be silently excluded from a posting whose
+    title also, just as explicitly, offers a junior track.
     """
+    text = title or ""
     for name, pattern in _SENIOR_LEVEL_PATTERNS:
-        if pattern.search(title or ""):
+        if pattern.search(text):
+            if _JUNIOR_PATTERN.search(text):
+                return TitleSeniorityClassification(level="UNKNOWN", matched_signal=None)
             return TitleSeniorityClassification(level="SENIOR", matched_signal=name)
     return TitleSeniorityClassification(level="UNKNOWN", matched_signal=None)

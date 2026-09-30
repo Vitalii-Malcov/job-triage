@@ -255,3 +255,65 @@ def test_derive_senior_only_target_is_unknown_not_senior():
 
 def test_derive_single_junior_target_is_junior():
     assert derive_candidate_target_seniority(["Junior Python Developer"]) == "JUNIOR"
+
+
+# --- M3 (Astra Stage 12 audit): mixed senior/junior markers in the SAME ----
+# --- title/target-role string is ambiguous, not confidently one or the -----
+# --- other -------------------------------------------------------------------
+
+
+def test_mixed_senior_junior_title_is_unknown_not_senior():
+    # Astra repro: a title offering both a senior AND a junior track must
+    # not be confidently excluded as SENIOR -- that would incorrectly
+    # deny a junior candidate a posting explicitly open to junior
+    # applicants too.
+    result = classify_title_seniority("Senior/Junior Python Developer")
+    assert result.level == "UNKNOWN"
+    assert result.matched_signal is None
+
+
+def test_junior_title_with_senior_company_suffix_in_title_is_unknown():
+    # Astra repro: "title contamination" -- a junior title with a company
+    # name embedded IN the title string itself (e.g. via a dash suffix)
+    # that happens to contain "Senior" must not flip to SENIOR either.
+    result = classify_title_seniority("Junior Python Developer - Senior GmbH")
+    assert result.level == "UNKNOWN"
+
+
+def test_derive_mixed_senior_junior_single_target_role_is_unknown():
+    # The candidate-side mirror of the title-side fix: a single target
+    # role string that itself names both levels must not derive JUNIOR.
+    assert derive_candidate_target_seniority(["Senior/Junior Python Developer"]) == "UNKNOWN"
+
+
+# --- Explicit-signal isolation through the FULL evaluator (Astra test-------
+# --- quality finding: the existing unit test never actually supplied a ----
+# --- description to the production evaluator) ------------------------------
+
+
+def test_full_evaluator_description_mentioning_senior_does_not_exclude_junior_candidate():
+    from app.agents.job_score_evaluator import evaluate_job_score
+    from app.models.job import Job
+
+    job = Job(
+        source="test",
+        title="Junior Python Developer",
+        company="Example GmbH",
+        url="https://example.com/job/1",
+        description=(
+            "You will report to a senior manager and work alongside senior "
+            "engineers on our Python backend. " * 10
+        ),
+        posting_type="ARBEIT",
+        must_have_skills=["Python", "SQL"],
+        nice_to_have_skills=["Docker"],
+    )
+    result = evaluate_job_score(
+        job,
+        "ARBEIT",
+        candidate_skills=frozenset({"python", "sql", "docker"}),
+        allowed_employment_types=frozenset(),
+        get_candidate_target_seniority=lambda: "JUNIOR",
+        get_candidate_target_domain=lambda: "UNKNOWN",
+    )
+    assert result.recommendation != "SKIP"

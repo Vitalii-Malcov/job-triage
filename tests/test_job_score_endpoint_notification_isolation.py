@@ -112,6 +112,14 @@ def _job_payload(**overrides) -> dict:
         "url": "https://example.com/jobs/notification-isolation",
         "description": "We build APIs with Python and FastAPI.",
         "skills": ["python", "fastapi"],
+        # H1 (Astra Stage 12 audit, round 2): a payload carrying only the
+        # unclassified `skills` union can no longer reach APPLY --
+        # unclassified source skills are never promoted to must-have
+        # evidence (see app.agents.job_scorer.JobScorer.score). These
+        # notification-isolation tests need a genuine APPLY to reach the
+        # notifier at all, so the payload now states the requirements
+        # explicitly. Nothing about what these tests assert changes.
+        "must_have_skills": ["python", "fastapi"],
     }
     data.update(overrides)
     return data

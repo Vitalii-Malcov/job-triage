@@ -47,8 +47,43 @@ class JobScorer:
         self.profile_skills = {normalize_skill(skill) for skill in profile_skills}
 
     def score(self, job: Job) -> JobScore:
-        legacy = {normalize_skill(skill) for skill in job.skills}
-        must = {normalize_skill(skill) for skill in job.must_have_skills} or legacy
+        # H1 fix (Astra Stage 12 audit, round 2): `job.skills` is the
+        # ingestion UNION of must-have + nice-to-have + any source-provided
+        # / unclassified skills (see app.services.collector_runner's
+        # `all_skills = set(job.skills) | must | nice`), and
+        # `app.api.routes`' authenticated /jobs/score path accepts a `Job`
+        # with arbitrary caller-supplied `skills` too. It is therefore NOT
+        # requirement evidence: nothing about a skill appearing in it says
+        # the posting demands that skill.
+        #
+        # This used to fall back to `job.skills` as the must-have set
+        # whenever BOTH explicit categories were empty, justified as
+        # "pre-must/nice-split legacy data". Astra's round-2 re-review
+        # showed that shape is not proof of historical provenance -- a
+        # FRESH posting whose description merely MENTIONS technologies
+        # ("Our platform uses Python and PostgreSQL to serve customers")
+        # extracts to must=[], nice=[], skill_source="description_extracted"
+        # while source skills survive the ingestion union, and the fallback
+        # then promoted those descriptive mentions to mandatory evidence
+        # and reached 90/APPLY.
+        #
+        # There is no trustworthy discriminator available to separate the
+        # two cases: `skill_source` is NULL both for pre-enrichment
+        # historical rows (the column was added nullable by migration
+        # c4e72b1a8d9f) and for any current caller that simply omits it,
+        # and nothing else on `Job`/`JobRecord` records ingestion-schema
+        # provenance. Per the remediation direction, the unsafe fallback
+        # is therefore REMOVED outright rather than gated on a guess:
+        # unclassified source skills still contribute to `matched_skills`/
+        # `missing_skills` and to `data_confidence` below (descriptive
+        # context), but they can never become must-have evidence, so they
+        # can never manufacture must_score=1.0 or clear
+        # MINIMUM_MUST_HAVE_SIGNALS_FOR_APPLY. A job with no extracted
+        # must-have requirements now scores on the neutral
+        # "no evidence" path (must_score=0.5) exactly like any other
+        # posting whose requirements could not be determined.
+        source_skills = {normalize_skill(skill) for skill in job.skills}
+        must = {normalize_skill(skill) for skill in job.must_have_skills}
         nice = {normalize_skill(skill) for skill in job.nice_to_have_skills}
 
         matched_must = must & self.profile_skills
@@ -78,7 +113,7 @@ class JobScorer:
 
         data_confidence = calculate_data_confidence(
             job.description,
-            legacy | must | nice,
+            source_skills | must | nice,
         )
 
         if data_confidence < MINIMUM_DECISION_CONFIDENCE:
@@ -99,8 +134,8 @@ class JobScorer:
         else:
             recommendation = "SKIP"
 
-        matched = (must | nice | legacy) & self.profile_skills
-        missing = (must | nice | legacy) - self.profile_skills
+        matched = (must | nice | source_skills) & self.profile_skills
+        missing = (must | nice | source_skills) - self.profile_skills
         return JobScore(
             score=score,
             matched_skills=sorted(matched),
