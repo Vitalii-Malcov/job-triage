@@ -133,8 +133,6 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     )
 )
 
-KNOWN_TECHNOLOGIES: tuple[str, ...] = tuple(name for name, _ in _TECHNOLOGY_PATTERNS)
-
 _NICE_TO_HAVE_MARKERS = re.compile(
     r"\b(?:nice[ -]to[ -]have|good[ -]to[ -]have|preferred|desirable|optional|bonus|"
     r"wünschenswert|von vorteil|idealerweise|nicht erforderlich|not required|"
