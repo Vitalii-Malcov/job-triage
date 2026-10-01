@@ -54,11 +54,25 @@ Usage (PREVIEW):
         --postgres-db stage12_pilot_r2 \\
         --export-dir /path/outside/repo
 
-Usage (APPLY -- requires the full pilot-identity preflight to pass):
+Usage (APPLY -- requires the full pilot-identity preflight to pass AND a
+completed human review of the exact preview being applied):
     python -m scripts.offline_rescore_stage12 \\
         --postgres-db stage12_pilot_r2 \\
         --export-dir /path/outside/repo \\
-        --apply --confirm-database stage12_pilot_r2
+        --apply --confirm-database stage12_pilot_r2 \\
+        --human-review /path/to/reviewed_copy.csv
+
+HUMAN REVIEW GATE (--apply only): `--human-review` names a reviewed copy of
+the human-review CSV that a PREVIEW run exported. Before `apply_rescore` is
+ever called, the file must (see `verify_human_review`): have exactly the
+expected columns; carry the `review_provenance` digest of the very preview
+apply just recomputed; contain exactly the deterministic review population
+(no duplicate/missing/extra job_id or fingerprint, unchanged score/
+recommendation per job_id); and have every row marked
+`human_relevant` in {YES, NO} and `human_decision` == APPROVE. REJECT,
+REVIEW, UNSURE, blank or unknown values all abort before any database
+write. The gate never changes a recommendation -- APPROVE only means the
+human accepts the preview's own result for that row.
 
 The PostgreSQL password is read ONLY from the environment variable named by
 --postgres-password-env (default POSTGRES_PASSWORD) -- never accepted as a
@@ -70,12 +84,20 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import hashlib
+import io
 import json
+import math
 import os
 import random
+import re
+import stat
 import sys
+import tempfile
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from sqlalchemy import create_engine, func, select, text
@@ -248,6 +270,11 @@ HUMAN_REVIEW_COLUMNS = [
     "data_confidence",
     "gate_reason",
     "description_or_url",
+    # Human Review Gate: the same digest on every row, identifying the exact
+    # preview this review population was generated from -- see
+    # `compute_review_provenance`. --apply refuses a reviewed CSV whose
+    # provenance does not equal the digest of the preview it is applying.
+    "review_provenance",
     "human_relevant",
     "human_decision",
     "human_notes",
@@ -293,6 +320,115 @@ class PilotIdentityMismatchError(RuntimeError):
     --apply requires -- refuses to write against a database that hasn't
     been positively confirmed to be the intended target.
     """
+
+
+class HumanReviewError(RuntimeError):
+    """Base class: the human-review gate refused --apply. Always raised
+    before `apply_rescore` is called, so no mutating transaction is ever
+    opened and nothing is written to the database. Messages name only
+    validated numeric job_ids, schema column names, counts and row
+    positions -- never untrusted cell/header content. `main` turns these
+    into a one-line ABORT with exit status 2 (no traceback).
+    """
+
+
+class HumanReviewFileMissingError(HumanReviewError):
+    """`--human-review` does not name an existing, readable file."""
+
+
+class HumanReviewMalformedError(HumanReviewError):
+    """Unparseable CSV, empty file, no data rows, missing or unexpected
+    columns, a row with too many/too few fields, or a job_id that is not a
+    canonical positive integer."""
+
+
+class HumanReviewProvenanceMismatchError(HumanReviewError):
+    """The review was not produced from the exact preview being applied
+    (stale or foreign file, different population/seed/profile), or any
+    immutable (non-human) cell differs from the freshly regenerated
+    evidence for that job_id."""
+
+
+class HumanReviewExpectedPopulationError(HumanReviewError):
+    """Internal: the expected review population derived from the preview is
+    empty or not well-formed (bad/duplicate job_id or fingerprint, missing
+    or inconsistent provenance). Never reached with DB-derived rows; checked
+    explicitly so a duplicate can never silently collapse."""
+
+
+class HumanReviewAuditError(HumanReviewError):
+    """The exact approved bytes could not be preserved as a new protected
+    audit artifact, or the input would alias an output/audit artifact.
+    Apply never proceeds without that preserved evidence."""
+
+
+class ApprovalEvidenceAliasError(RuntimeError):
+    """A post-apply export destination unexpectedly resolves to (or is the
+    same file as) protected approval evidence; the export is refused rather
+    than risk touching it."""
+
+
+class HumanReviewDuplicateIdentityError(HumanReviewError):
+    """The same job_id or fingerprint appears on more than one row."""
+
+
+class HumanReviewMissingRowError(HumanReviewError):
+    """An expected review-population job_id is absent from the file."""
+
+
+class HumanReviewUnexpectedRowError(HumanReviewError):
+    """The file contains a job_id outside the expected review population."""
+
+
+class HumanReviewIncompleteError(HumanReviewError):
+    """A required human field (`human_relevant`/`human_decision`) is blank."""
+
+
+class HumanReviewInvalidValueError(HumanReviewError):
+    """A human field holds a value outside the canonical vocabulary."""
+
+
+class HumanReviewRejectedError(HumanReviewError):
+    """At least one row is `human_decision=REJECT`."""
+
+
+class HumanReviewUnresolvedError(HumanReviewError):
+    """At least one row is unresolved (`human_decision=REVIEW` or
+    `human_relevant=UNSURE`)."""
+
+
+class HumanRelevance(StrEnum):
+    YES = "YES"
+    NO = "NO"
+    UNSURE = "UNSURE"
+
+
+class HumanDecision(StrEnum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    REVIEW = "REVIEW"
+
+
+@dataclass(frozen=True)
+class ReviewedRow:
+    job_id: int
+    fingerprint: str
+    human_relevant: HumanRelevance
+    human_decision: HumanDecision
+    human_notes: str
+
+
+@dataclass(frozen=True)
+class ApprovedReview:
+    """A fully-approved review: the parsed rows plus the EXACT bytes they
+    were parsed from (what `preserve_approval_evidence` writes)."""
+
+    rows: list[ReviewedRow]
+    data: bytes
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1001,7 +1137,51 @@ def _is_sentinel(title: str) -> bool:
     return any(sentinel.casefold() in title.casefold() for sentinel in SENTINEL_TITLES)
 
 
-def _write_before_after_csv(path: Path, results: list[RescoreResult]) -> None:
+def _paths_alias(a: Path, b: Path) -> bool:
+    """True if `a` and `b` may name the same file: equal after resolving
+    (relative/`..`/symlink/junction) and case-normalizing, or -- when both
+    exist -- the same file identity (`samefile`, which also catches
+    hardlinks). Any error deciding this counts as an alias (fail closed).
+    """
+    try:
+        if os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve())):
+            return True
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except (OSError, RuntimeError):
+        return True
+
+
+def _publish_csv(
+    path: Path, fieldnames: list[str], rows: list[dict], *, protected: tuple[Path, ...] = ()
+) -> None:
+    """Writes to a temporary file in the destination directory, then
+    atomically replaces `path`. `os.replace` swaps the directory entry, so
+    a pre-existing file/hardlink/symlink at `path` is never written
+    THROUGH -- whatever it pointed at keeps its bytes. Refuses outright if
+    `path` aliases any `protected` approval evidence.
+    """
+    if any(_paths_alias(path, p) for p in protected):
+        raise ApprovalEvidenceAliasError("export destination aliases protected approval evidence")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        if any(_paths_alias(path, p) for p in protected):
+            raise ApprovalEvidenceAliasError(
+                "export destination aliases protected approval evidence"
+            )
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _write_before_after_csv(
+    path: Path, results: list[RescoreResult], *, protected: tuple[Path, ...] = ()
+) -> None:
     fieldnames = [
         "job_id",
         "fingerprint",
@@ -1020,33 +1200,135 @@ def _write_before_after_csv(path: Path, results: list[RescoreResult]) -> None:
         "first_seen_at",
         "last_seen_at",
     ]
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(
-                {
-                    "job_id": r.after.id,
-                    "fingerprint": r.after.fingerprint,
-                    "title": _csv_safe(r.after.title),
-                    "company": _csv_safe(r.after.company),
-                    "posting_type": _csv_safe(r.after.posting_type or ""),
-                    "before_score": r.before.score,
-                    "before_recommendation": r.before.recommendation,
-                    "before_matched_skills": _csv_safe(";".join(r.before.matched_skills)),
-                    "before_missing_must_have": _csv_safe(";".join(r.before.missing_must_have)),
-                    "before_matched_skills_source": r.before.matched_skills_source,
-                    "after_score": r.after.score,
-                    "after_recommendation": r.after.recommendation,
-                    "after_matched_skills": _csv_safe(";".join(r.after.matched_skills)),
-                    "after_missing_must_have": _csv_safe(";".join(r.after.missing_must_have)),
-                    "first_seen_at": r.after.first_seen_at.isoformat(),
-                    "last_seen_at": r.after.last_seen_at.isoformat(),
-                }
-            )
+    rows = [
+        {
+            "job_id": r.after.id,
+            "fingerprint": r.after.fingerprint,
+            "title": _csv_safe(r.after.title),
+            "company": _csv_safe(r.after.company),
+            "posting_type": _csv_safe(r.after.posting_type or ""),
+            "before_score": r.before.score,
+            "before_recommendation": r.before.recommendation,
+            "before_matched_skills": _csv_safe(";".join(r.before.matched_skills)),
+            "before_missing_must_have": _csv_safe(";".join(r.before.missing_must_have)),
+            "before_matched_skills_source": r.before.matched_skills_source,
+            "after_score": r.after.score,
+            "after_recommendation": r.after.recommendation,
+            "after_matched_skills": _csv_safe(";".join(r.after.matched_skills)),
+            "after_missing_must_have": _csv_safe(";".join(r.after.missing_must_have)),
+            "first_seen_at": r.after.first_seen_at.isoformat(),
+            "last_seen_at": r.after.last_seen_at.isoformat(),
+        }
+        for r in results
+    ]
+    _publish_csv(path, fieldnames, rows, protected=protected)
 
 
-def _build_human_review_rows(results: list[RescoreResult], *, sample_seed: int):
+# v2: canonical typed serialization (`_canonical_provenance_value`) -- no
+# arbitrary stringification, datetimes normalized to UTC and tagged, NaN/inf
+# rejected. A v1 digest can never equal a v2 one, so no v1 review authorizes.
+REVIEW_PROVENANCE_VERSION = "stage12-human-review-v2"
+
+# Datetimes are serialized as {DATETIME_TAG: "<ISO-8601 UTC>"} so they can
+# never collide with a plain string of the same text; caller dict keys may
+# therefore not start with "$".
+_PROVENANCE_DATETIME_TAG = "$datetime_utc"
+
+
+def _canonical_provenance_value(value):
+    """Maps a provenance input onto plain JSON types, accepting ONLY:
+    None, bool, int, str (subclasses such as StrEnum reduced to their exact
+    base value), finite float, list/tuple (order kept), dict with str keys
+    (sorted by `json.dumps(sort_keys=True)`), and datetime. Anything else --
+    Decimal, date, set, custom objects -- raises TypeError; NaN/inf raise
+    ValueError.
+
+    Datetime policy: an aware datetime is converted to UTC; a NAIVE one is
+    taken to already be UTC -- the project-wide persistence semantic
+    (`app.db.datetime_utils.ensure_utc`: every timestamp column is written
+    as UTC, SQLite merely drops tzinfo on read). Both are rendered as
+    `isoformat(timespec="microseconds")` of the UTC value, e.g.
+    "2026-01-02T03:04:05.000000+00:00", so equal instants hash equally
+    whatever the session time zone or backend.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        return str.__str__(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite float in review provenance")
+        return float(value)
+    if isinstance(value, datetime):
+        utc = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return {_PROVENANCE_DATETIME_TAG: utc.isoformat(timespec="microseconds")}
+    if isinstance(value, list | tuple):
+        return [_canonical_provenance_value(item) for item in value]
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) and not key.startswith("$") for key in value):
+            raise TypeError("review provenance dict keys must be str not starting with '$'")
+        return {str.__str__(key): _canonical_provenance_value(item) for key, item in value.items()}
+    raise TypeError(f"unsupported type in review provenance: {type(value).__name__}")
+
+
+def compute_review_provenance(
+    context: ScoringContext, results: list[RescoreResult], *, sample_seed: int
+) -> str:
+    """Deterministic digest identifying ONE exact preview: the
+    CandidateProfile-derived scoring context, the sample seed (which,
+    together with the results, fixes the review population), and for EVERY
+    previewed job (the whole population, not only the reviewed rows) its id,
+    the full `input_snapshot()` it was scored from, and the preview result.
+    Reproducible from the same preview inputs; contains no timestamp of its
+    own and no randomness. Any drift -- a job added/removed, an input or
+    persisted score changed (including by a previous apply), a profile
+    change, a different seed -- yields a different digest, so a stale or
+    foreign review file can never authorize --apply.
+
+    The digest identifies the preview's INPUT state and outcome; it is not
+    what binds the displayed evidence -- `verify_human_review` compares
+    every immutable cell against the freshly regenerated row for that.
+    Serialization is strict (`_canonical_provenance_value`): unsupported
+    types or non-finite floats fail closed instead of being stringified.
+    """
+    payload = {
+        "version": REVIEW_PROVENANCE_VERSION,
+        "sample_seed": sample_seed,
+        "context": {
+            "candidate_skills": sorted(context.candidate_skills),
+            "target_seniority": context.target_seniority,
+            "target_domain": context.target_domain,
+            "employment_types": sorted(context.employment_types),
+        },
+        "jobs": [
+            {
+                "id": r.before.id,
+                "input": r.before.input_snapshot(),
+                "after": [r.after.score, r.after.recommendation, r.after.data_confidence],
+            }
+            for r in sorted(results, key=lambda r: r.before.id)
+        ],
+    }
+    canonical = json.dumps(
+        _canonical_provenance_value(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_human_review_rows(
+    results: list[RescoreResult], *, sample_seed: int, review_provenance: str = ""
+):
+    """`review_provenance` defaults to blank only for export-shape tests; a
+    blank provenance can never satisfy `verify_human_review`, which always
+    compares against a freshly computed digest. `main` always passes the
+    real one.
+    """
     apply_rows = [r for r in results if r.after.recommendation == "APPLY"]
     maybe_rows = [r for r in results if r.after.recommendation == "MAYBE"]
     skip_rows = [r for r in results if r.after.recommendation == "SKIP"]
@@ -1094,6 +1376,7 @@ def _build_human_review_rows(results: list[RescoreResult], *, sample_seed: int):
                 "data_confidence": r.after.data_confidence,
                 "gate_reason": _csv_safe(";".join(evidence.gate_trace)),
                 "description_or_url": _csv_safe(r.after.url),
+                "review_provenance": review_provenance,
                 "human_relevant": "",
                 "human_decision": "",
                 "human_notes": "",
@@ -1108,12 +1391,375 @@ def _build_human_review_rows(results: list[RescoreResult], *, sample_seed: int):
     return rows, counts
 
 
-def _write_human_review_csv(path: Path, rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=HUMAN_REVIEW_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def _write_human_review_csv(
+    path: Path, rows: list[dict], *, protected: tuple[Path, ...] = ()
+) -> None:
+    _publish_csv(path, HUMAN_REVIEW_COLUMNS, rows, protected=protected)
+
+
+# The ONLY columns a reviewer may fill in. Every other review column --
+# derived from the schema, so a column added to HUMAN_REVIEW_COLUMNS later is
+# protected by default -- is immutable evidence that must be byte-for-byte
+# the cell the current exporter would write for that job_id.
+HUMAN_EDITABLE_COLUMNS = frozenset({"human_relevant", "human_decision", "human_notes"})
+IMMUTABLE_REVIEW_COLUMNS = tuple(c for c in HUMAN_REVIEW_COLUMNS if c not in HUMAN_EDITABLE_COLUMNS)
+
+# ASCII decimal, no sign/whitespace/leading zero.
+_CANONICAL_JOB_ID = re.compile(r"[1-9][0-9]*")
+# `jobs.id` is `sa.Integer` (app/db/models.py JobRecord, alembic baseline
+# 36d26376ef62): PostgreSQL int4, so a real job_id is 1..2_147_483_647.
+MAX_JOB_ID = 2_147_483_647
+_MAX_JOB_ID_DIGITS = len(str(MAX_JOB_ID))
+
+
+def _parse_job_id(raw: str, *, row_index: int) -> int:
+    """The submitted job_id as a bounded int, or HumanReviewMalformedError.
+    Length is checked BEFORE conversion, so no oversized digit string ever
+    reaches `int()`; the raw text is never echoed -- only the parsed,
+    in-range int is ever used in a diagnostic."""
+    if len(raw) <= _MAX_JOB_ID_DIGITS and _CANONICAL_JOB_ID.fullmatch(raw):
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if 1 <= value <= MAX_JOB_ID:
+            return value
+    raise HumanReviewMalformedError(
+        f"data row {row_index}: job_id is not a canonical positive integer within 1..{MAX_JOB_ID}"
+    )
+
+
+def _csv_cell(value) -> str:
+    """The exact text `csv.writer` writes for `value` in
+    `_write_human_review_csv`: None -> "", float -> repr, else str. No
+    stripping, case folding or Unicode normalization -- an immutable cell
+    passes only if it is exactly what the exporter would produce now.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def _validate_expected_rows(expected_rows: list[dict]) -> tuple[str, dict[str, dict]]:
+    """Explicitly validates the regenerated review population before it is
+    indexed, so duplicates can never silently collapse in a dict. Returns
+    (the single provenance, rows keyed by canonical job_id text)."""
+    if not expected_rows:
+        raise HumanReviewExpectedPopulationError(
+            "no reviewable population was derived from this preview"
+        )
+    for row in expected_rows:
+        if set(row) != set(HUMAN_REVIEW_COLUMNS):
+            raise HumanReviewExpectedPopulationError(
+                "an expected review row does not match the review schema"
+            )
+        job_id = row["job_id"]
+        if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
+            raise HumanReviewExpectedPopulationError("an expected review row has an invalid job_id")
+        fingerprint = row["fingerprint"]
+        if not isinstance(fingerprint, str) or not fingerprint.strip():
+            raise HumanReviewExpectedPopulationError(
+                f"expected job_id={job_id} has a blank fingerprint"
+            )
+    id_counts = Counter(row["job_id"] for row in expected_rows)
+    duplicate_ids = sorted(job_id for job_id, n in id_counts.items() if n > 1)
+    if duplicate_ids:
+        raise HumanReviewExpectedPopulationError(f"duplicate expected job_id(s): {duplicate_ids}")
+    fingerprint_counts = Counter(row["fingerprint"] for row in expected_rows)
+    duplicate_fp_ids = sorted(
+        row["job_id"] for row in expected_rows if fingerprint_counts[row["fingerprint"]] > 1
+    )
+    if duplicate_fp_ids:
+        raise HumanReviewExpectedPopulationError(
+            f"duplicate expected fingerprint on job_id(s): {duplicate_fp_ids}"
+        )
+    provenances = {row["review_provenance"] for row in expected_rows}
+    if len(provenances) != 1:
+        raise HumanReviewExpectedPopulationError(
+            "expected review population does not carry exactly one provenance"
+        )
+    (provenance,) = provenances
+    if not isinstance(provenance, str) or not provenance.strip():
+        raise HumanReviewExpectedPopulationError("expected review population has no provenance")
+    return provenance, {str(row["job_id"]): row for row in expected_rows}
+
+
+def _read_review_bytes(path: Path) -> bytes:
+    """Reads the review file ONCE; everything downstream (validation and the
+    preserved audit copy) works on these exact bytes."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise HumanReviewFileMissingError("human review file could not be read") from None
+
+
+def _read_review_csv(data: bytes) -> list[dict[str, str]]:
+    try:
+        # utf-8-sig: tolerate the BOM spreadsheet tools add on save; it is
+        # not part of any value.
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HumanReviewMalformedError("human review file is not valid UTF-8") from None
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+        header = reader.fieldnames
+        if not header:
+            raise HumanReviewMalformedError("human review file is empty")
+        if len(header) != len(set(header)):
+            raise HumanReviewMalformedError("human review file has duplicate column names")
+        missing = [c for c in HUMAN_REVIEW_COLUMNS if c not in header]
+        if missing:
+            raise HumanReviewMalformedError(f"missing required column(s): {missing}")
+        unexpected_count = sum(1 for c in header if c not in HUMAN_REVIEW_COLUMNS)
+        if unexpected_count:
+            # Count only: an unexpected header is untrusted text.
+            raise HumanReviewMalformedError(
+                f"human review file has {unexpected_count} unexpected column(s)"
+            )
+        rows = []
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise HumanReviewMalformedError(f"line {reader.line_num}: wrong number of fields")
+            rows.append(row)
+    except csv.Error:
+        raise HumanReviewMalformedError("human review file is not valid CSV") from None
+    if not rows:
+        raise HumanReviewMalformedError("human review file has no data rows")
+    return rows
+
+
+def _parse_human_value(enum_cls, raw: str, *, column: str, job_id: int):
+    value = raw.strip()
+    if not value:
+        raise HumanReviewIncompleteError(f"job_id={job_id}: {column} is blank")
+    try:
+        return enum_cls(value.upper())
+    except ValueError:
+        allowed = ", ".join(member.value for member in enum_cls)
+        raise HumanReviewInvalidValueError(
+            f"job_id={job_id}: {column} is not one of {allowed}"
+        ) from None
+
+
+def verify_human_review_bytes(data: bytes, expected_rows: list[dict]) -> list[ReviewedRow]:
+    """Validates reviewed-CSV bytes against `expected_rows` -- the review
+    population `_build_human_review_rows` deterministically regenerates from
+    the preview being applied, carrying that preview's `review_provenance`.
+    Matches rows by job_id, never by position. Every IMMUTABLE column
+    (everything but HUMAN_EDITABLE_COLUMNS) must equal, exactly, the cell
+    the exporter would write for that job_id now -- a copied valid
+    provenance cannot vouch for edited evidence. Raises a `HumanReviewError`
+    subclass on the first problem; returns the parsed rows only if the file
+    is structurally valid, evidence-identical, complete and canonical. Does
+    NOT decide whether apply may proceed -- see `require_full_approval`.
+    """
+    provenance, expected_by_id = _validate_expected_rows(expected_rows)
+    rows = _read_review_csv(data)
+
+    # Parsed once, bounded; every later use (sorting, diagnostics, lookup)
+    # works on these ints, never on the raw untrusted text.
+    job_ids = [_parse_job_id(row["job_id"], row_index=i) for i, row in enumerate(rows, start=1)]
+
+    if any(row["review_provenance"] != provenance for row in rows):
+        raise HumanReviewProvenanceMismatchError(
+            "review_provenance does not match the preview being applied -- the review "
+            "file belongs to a different (or stale) preview"
+        )
+
+    duplicate_ids = sorted(i for i, n in Counter(job_ids).items() if n > 1)
+    if duplicate_ids:
+        raise HumanReviewDuplicateIdentityError(f"duplicate job_id(s): {duplicate_ids}")
+    fingerprint_counts = Counter(row["fingerprint"] for row in rows)
+    duplicate_fp_ids = sorted(
+        job_id
+        for job_id, row in zip(job_ids, rows, strict=True)
+        if fingerprint_counts[row["fingerprint"]] > 1
+    )
+    if duplicate_fp_ids:
+        raise HumanReviewDuplicateIdentityError(
+            f"duplicate fingerprint on job_id(s): {duplicate_fp_ids}"
+        )
+
+    # Expected keys are str(int) of DB-derived ids (validated as int > 0).
+    expected_by_int = {int(key): row for key, row in expected_by_id.items()}
+    unexpected_ids = sorted(set(job_ids) - set(expected_by_int))
+    if unexpected_ids:
+        raise HumanReviewUnexpectedRowError(
+            f"job_id(s) outside the expected review population: {unexpected_ids}"
+        )
+    missing_ids = sorted(set(expected_by_int) - set(job_ids))
+    if missing_ids:
+        raise HumanReviewMissingRowError(f"expected job_id(s) missing: {missing_ids}")
+
+    reviewed: list[ReviewedRow] = []
+    for job_id, row in zip(job_ids, rows, strict=True):
+        expected = expected_by_int[job_id]
+        for column in IMMUTABLE_REVIEW_COLUMNS:
+            if row[column] != _csv_cell(expected[column]):
+                raise HumanReviewProvenanceMismatchError(
+                    f"job_id={job_id}: immutable column {column} differs from the evidence "
+                    "regenerated for the preview being applied"
+                )
+        reviewed.append(
+            ReviewedRow(
+                job_id=job_id,
+                fingerprint=row["fingerprint"],
+                human_relevant=_parse_human_value(
+                    HumanRelevance, row["human_relevant"], column="human_relevant", job_id=job_id
+                ),
+                human_decision=_parse_human_value(
+                    HumanDecision, row["human_decision"], column="human_decision", job_id=job_id
+                ),
+                human_notes=row["human_notes"].strip(),
+            )
+        )
+    return sorted(reviewed, key=lambda r: r.job_id)
+
+
+def verify_human_review(path: Path, expected_rows: list[dict]) -> list[ReviewedRow]:
+    """`verify_human_review_bytes` on the file's contents."""
+    return verify_human_review_bytes(_read_review_bytes(path), expected_rows)
+
+
+def require_full_approval(rows: list[ReviewedRow]) -> None:
+    """Apply may proceed only if EVERY reviewed row is
+    `human_decision=APPROVE` with `human_relevant` YES or NO. Never
+    converts a decision into a different recommendation."""
+    rejected = [r.job_id for r in rows if r.human_decision is HumanDecision.REJECT]
+    if rejected:
+        raise HumanReviewRejectedError(f"human_decision=REJECT on job_id(s): {rejected}")
+    unresolved = [
+        r.job_id
+        for r in rows
+        if r.human_decision is not HumanDecision.APPROVE
+        or r.human_relevant not in (HumanRelevance.YES, HumanRelevance.NO)
+    ]
+    if unresolved:
+        raise HumanReviewUnresolvedError(
+            f"unresolved review (REVIEW/UNSURE) on job_id(s): {unresolved}"
+        )
+
+
+def enforce_human_review_gate(path: Path, expected_rows: list[dict]) -> ApprovedReview:
+    """The complete gate --apply must pass before `apply_rescore` is called.
+    Reads the file exactly once and returns those exact bytes with the
+    validated rows, for `preserve_approval_evidence`."""
+    data = _read_review_bytes(path)
+    rows = verify_human_review_bytes(data, expected_rows)
+    require_full_approval(rows)
+    return ApprovedReview(rows=rows, data=data)
+
+
+def _sync_existing_artifact(path: Path, data: bytes) -> None:
+    """Accepts an already-existing audit artifact ONLY after a successful
+    fsync of it in THIS attempt -- byte equality alone is not durability (a
+    previous attempt may have written the bytes and then failed fsync).
+    Opens one stable, non-truncating handle and does every check on it:
+    the opened object must be the very regular, single-link, non-symlink
+    file that lstat saw (same st_dev/st_ino), hold exactly `data`, and fsync
+    successfully. Any failure raises (fail closed); a later retry repeats
+    the fsync. The artifact is never rewritten or replaced.
+    """
+    unexpected = HumanReviewAuditError(
+        "an unexpected file already occupies the approval audit path"
+    )
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):  # symlink, directory, device, ...
+        raise unexpected
+    # O_RDWR without O_TRUNC: Windows needs a writable handle for fsync.
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise unexpected
+        chunks = []
+        remaining = len(data) + 1  # one extra byte detects a longer file
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if b"".join(chunks) != data:
+            raise HumanReviewAuditError(
+                "the approval audit path holds bytes different from the approved review"
+            )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _create_exclusive(path: Path, data: bytes) -> None:
+    """Creates `path` holding exactly `data`, never overwriting, and fsyncs
+    it. An existing file (a retry of the same approval) is accepted only via
+    `_sync_existing_artifact`, i.e. only once it has itself been fsynced
+    successfully in this attempt; anything else fails closed. Re-reads the
+    result to confirm the bytes on disk."""
+    try:
+        try:
+            with path.open("xb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except FileExistsError:
+            _sync_existing_artifact(path, data)
+        if path.read_bytes() != data:
+            raise HumanReviewAuditError(
+                "the approval audit path holds bytes different from the approved review"
+            )
+    except OSError:
+        raise HumanReviewAuditError("could not preserve the approved review bytes") from None
+
+
+def approval_audit_paths(
+    export_dir: Path, database: str, approval: ApprovedReview, review_provenance: str
+) -> tuple[Path, Path]:
+    """(audit CSV, manifest JSON). Named by provenance AND approval-bytes
+    digest, so a different approval of the same preview never collides."""
+    stem = f"stage12_approved_review_{database}_{review_provenance[:16]}_{approval.sha256[:16]}"
+    return export_dir / f"{stem}.csv", export_dir / f"{stem}.json"
+
+
+def preserve_approval_evidence(
+    export_dir: Path,
+    database: str,
+    approval: ApprovedReview,
+    review_provenance: str,
+    *,
+    source: Path,
+) -> tuple[Path, Path]:
+    """Preserves the EXACT validated approval bytes (byte-for-byte the
+    reviewed CSV that was parsed) plus a manifest recording their SHA-256
+    and the provenance, as NEW files under `export_dir`, BEFORE any DB
+    mutation. Whatever later happens to the --human-review path, the
+    accepted evidence survives unchanged. Raises `HumanReviewAuditError`
+    (so apply never starts) if it cannot.
+    """
+    csv_path, manifest_path = approval_audit_paths(
+        export_dir, database, approval, review_provenance
+    )
+    manifest = {
+        "approval_sha256": approval.sha256,
+        "approval_byte_length": len(approval.data),
+        "review_provenance": review_provenance,
+        "review_provenance_version": REVIEW_PROVENANCE_VERSION,
+        "audit_csv": csv_path.name,
+    }
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    for path, data in ((csv_path, approval.data), (manifest_path, manifest_bytes)):
+        if _paths_alias(path, source):
+            raise HumanReviewAuditError(
+                "--human-review must not be an approval audit artifact; review a copy"
+            )
+        _create_exclusive(path, data)
+    return csv_path, manifest_path
 
 
 def _transition(before: str, after: str) -> str:
@@ -1163,7 +1809,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "foo` is rejected even though the two agree."
         ),
     )
+    parser.add_argument(
+        "--human-review",
+        type=Path,
+        default=None,
+        help=(
+            "Required with --apply (rejected without it): a reviewed copy of the "
+            "human-review CSV exported by a preview of the SAME database state and "
+            "--sample-seed, with every row human_relevant in YES/NO and "
+            "human_decision=APPROVE. Must not be (or alias) any file this run writes; "
+            "its exact bytes are preserved as a new audit artifact before apply."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _human_review_path(args: argparse.Namespace) -> Path:
+    return args.export_dir / f"stage12_human_review_{args.postgres_db}.csv"
+
+
+def _before_after_path(args: argparse.Namespace) -> Path:
+    return args.export_dir / f"stage12_rescore_{args.postgres_db}_before_after.csv"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1177,6 +1843,32 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.human_review is not None and not args.apply:
+        print("ABORT: --human-review is only valid together with --apply", file=sys.stderr)
+        return 2
+    review_path = _human_review_path(args)
+    before_after_path = _before_after_path(args)
+    if args.apply:
+        if args.human_review is None:
+            print(
+                "ABORT: --apply requires --human-review pointing at a completed review of "
+                "this exact preview",
+                file=sys.stderr,
+            )
+            return 2
+        # Checked before any engine/connection exists.
+        if not args.human_review.is_file():
+            print("ABORT: --human-review does not name an existing file", file=sys.stderr)
+            return 2
+        # This run publishes both exports after apply; the approval must not
+        # be (or alias -- relative/case/symlink/junction/hardlink) either.
+        if any(_paths_alias(args.human_review, out) for out in (before_after_path, review_path)):
+            print(
+                "ABORT: --human-review must not be (or alias) an export path this run "
+                "writes; review a copy",
+                file=sys.stderr,
+            )
+            return 2
 
     args.export_dir.mkdir(parents=True, exist_ok=True)
     engine = build_engine(args)
@@ -1187,16 +1879,42 @@ def main(argv: list[str] | None = None) -> int:
 
     with Session(engine) as db:
         context, results = preview_all_jobs(db)
+    review_provenance = compute_review_provenance(context, results, sample_seed=args.sample_seed)
 
+    protected: tuple[Path, ...] = ()
     if args.apply:
+        # Human Review Gate: an ADDITIONAL gate in front of every existing
+        # apply safeguard. Validate the whole file, require full approval,
+        # then preserve its exact bytes as a new audit artifact -- all before
+        # apply_rescore opens its transaction. Any refusal is a concise ABORT
+        # (no traceback, no untrusted file content) and nothing is written.
+        expected_review_rows, _ = _build_human_review_rows(
+            results, sample_seed=args.sample_seed, review_provenance=review_provenance
+        )
+        try:
+            approval = enforce_human_review_gate(args.human_review, expected_review_rows)
+            audit_paths = preserve_approval_evidence(
+                args.export_dir,
+                args.postgres_db,
+                approval,
+                review_provenance,
+                source=args.human_review,
+            )
+        except HumanReviewError as exc:
+            print(
+                f"ABORT: human review gate refused --apply ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        protected = (*audit_paths, args.human_review)
         results = apply_rescore(engine, context, results)
 
-    before_after_path = args.export_dir / f"stage12_rescore_{args.postgres_db}_before_after.csv"
-    _write_before_after_csv(before_after_path, results)
+    _write_before_after_csv(before_after_path, results, protected=protected)
 
-    review_rows, review_counts = _build_human_review_rows(results, sample_seed=args.sample_seed)
-    review_path = args.export_dir / f"stage12_human_review_{args.postgres_db}.csv"
-    _write_human_review_csv(review_path, review_rows)
+    review_rows, review_counts = _build_human_review_rows(
+        results, sample_seed=args.sample_seed, review_provenance=review_provenance
+    )
+    _write_human_review_csv(review_path, review_rows, protected=protected)
 
     before_counts: dict[str, int] = {}
     after_counts: dict[str, int] = {}
@@ -1231,6 +1949,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"HIGH_SCORE_SKIP_THRESHOLD: {HIGH_SCORE_SKIP_THRESHOLD}")
     print(f"before/after export: {before_after_path}")
     print(f"human review export: {review_path}")
+    if args.apply:
+        print(f"approved review audit: {audit_paths[0]}")
+        print(f"approved review sha256: {approval.sha256}")
+        print(f"review provenance: {review_provenance}")
     return 0
 
 
