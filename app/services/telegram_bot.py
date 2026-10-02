@@ -34,12 +34,22 @@ import functools
 import logging
 
 from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.core.config import Settings, get_settings
 from app.db.repositories import get_job_by_id, list_jobs, update_job_status
 from app.db.session import SessionLocal
+from app.db.telegram_vacancy_review_repository import (
+    get_review_by_callback_token,
+    record_decision,
+)
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
@@ -51,6 +61,13 @@ from app.services.collector_runner import (
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
 from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
+from app.services.telegram_vacancy_feed import (
+    ACTION_APPLY,
+    ACTION_DETAILS,
+    ACTION_SAVE,
+    parse_callback_data,
+    render_vacancy_details,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +442,91 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text)
 
 
+_DECISION_REPLIES = {
+    "SAVED": ("⭐ Gespeichert.", "Bereits gespeichert."),
+    "SKIPPED": ("❌ Übersprungen.", "Bereits übersprungen."),
+}
+
+
+@require_authorized
+async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9A: inline-button presses on a vacancy card.
+
+    Authorization is the SAME `@require_authorized` chat gate every command
+    uses (for a callback query, `update.effective_chat` is the chat the card
+    lives in) -- an unauthorized press gets no answer at all.
+
+    `callback_data` is untrusted client input: it is strictly parsed
+    (`parse_callback_data`) and resolved ONLY through the review row's
+    opaque random `callback_token` -- never through a job id the client
+    supplies. An unknown/malformed token gets a generic answer and touches
+    nothing.
+
+    Save/Skip only record review state (`record_decision`); they never
+    write `JobRecord.status`. "Bewerbung erstellen" is a placeholder in
+    Stage 9A: it changes nothing and generates/sends nothing.
+    """
+    query = update.callback_query
+    parsed = parse_callback_data(query.data)
+    if parsed is None:
+        logger.warning("telegram_vacancy_callback_rejected reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    action, token = parsed
+
+    db = SessionLocal()
+    try:
+        review = get_review_by_callback_token(db, token)
+        if review is None:
+            logger.warning("telegram_vacancy_callback_rejected reason=unknown_token")
+            await query.answer("Unbekannte oder abgelaufene Stelle.")
+            return
+
+        if action == ACTION_DETAILS:
+            record = get_job_by_id(db, review.job_id)
+            if record is None:
+                await query.answer("Stelle existiert nicht mehr.")
+                return
+            details = render_vacancy_details(record)
+            await query.answer()
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=details)
+            logger.info("telegram_vacancy_callback action=details review_id=%s", review.id)
+            return
+
+        if action == ACTION_APPLY:
+            await query.answer(
+                "Bewerbung erstellen ist noch nicht verfügbar - es wurde nichts erstellt "
+                "oder gesendet.",
+                show_alert=True,
+            )
+            logger.info(
+                "telegram_vacancy_callback action=apply_placeholder review_id=%s", review.id
+            )
+            return
+
+        decision = "SAVED" if action == ACTION_SAVE else "SKIPPED"
+        changed = record_decision(db, review, decision)
+    finally:
+        db.close()
+
+    done_reply, already_reply = _DECISION_REPLIES[decision]
+    if changed:
+        await query.answer(done_reply)
+        result = "changed"
+    elif review.state == decision:
+        await query.answer(already_reply)
+        result = "unchanged"
+    else:
+        await query.answer("Für diese Stelle gerade nicht möglich.")
+        result = "not_decidable"
+    logger.info(
+        "telegram_vacancy_callback action=%s review_id=%s result=%s",
+        decision.lower(),
+        review.id,
+        result,
+    )
+
+
 async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Catch-all for exceptions raised by any command handler.
 
@@ -470,6 +572,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("run", cmd_run))
     application.add_handler(CommandHandler("research", cmd_research))
     application.add_handler(CommandHandler("digest", cmd_digest))
+    application.add_handler(CallbackQueryHandler(on_vacancy_callback, pattern=r"^vf:"))
     application.add_error_handler(_handle_error)
     return application
 
