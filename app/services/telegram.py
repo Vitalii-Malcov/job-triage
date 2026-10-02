@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
@@ -26,6 +27,26 @@ class TelegramSendOutcome(StrEnum):
     SENT = "SENT"
     FAILED = "FAILED"
     UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass(frozen=True)
+class TelegramSendResult:
+    """`send_telegram_message`'s result: the outcome plus, when SENT and
+    Telegram's response carried one, the delivered message's id."""
+
+    outcome: TelegramSendOutcome
+    message_id: int | None = None
+
+
+def _extract_message_id(response: httpx.Response) -> int | None:
+    """Best-effort read of `result.message_id` from a 2xx sendMessage
+    response. A body that can't be parsed never turns a confirmed SENT into
+    anything else -- the message_id is bookkeeping, not proof of delivery."""
+    try:
+        message_id = response.json()["result"]["message_id"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return message_id if isinstance(message_id, int) else None
 
 
 async def send_telegram_text(
@@ -74,23 +95,46 @@ async def send_telegram_text(
     message/traceback -- only the outcome and, on failure,
     `type(exc).__name__`.
     """
+    result = await send_telegram_message(bot_token, chat_id, text, timeout_seconds=timeout_seconds)
+    return result.outcome
+
+
+async def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    reply_markup: dict | None = None,
+    timeout_seconds: float = 5.0,
+) -> TelegramSendResult:
+    """`send_telegram_text`'s implementation, additionally accepting an
+    optional `reply_markup` (e.g. an inline keyboard, Stage 9A vacancy
+    cards) and returning the delivered `message_id`. Same single-attempt,
+    no-retry contract and the SAME outcome classification and logging
+    hardening documented on `send_telegram_text`. Plain text only -- no
+    `parse_mode`, so untrusted job content can never be interpreted as
+    markup.
+    """
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload: dict = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(url, json={"chat_id": chat_id, "text": text})
+            response = await client.post(url, json=payload)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         # A response WAS received -- Telegram itself rejected the
         # request (e.g. bad token, chat not found). Provably not
         # delivered.
         logger.warning("telegram_send_failed error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.FAILED
+        return TelegramSendResult(TelegramSendOutcome.FAILED)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         # The connection was never established (or timed out before it
         # was) -- no request bytes were ever transmitted. Provably not
         # delivered, safe to retry.
         logger.warning("telegram_send_failed error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.FAILED
+        return TelegramSendResult(TelegramSendOutcome.FAILED)
     except httpx.HTTPError as exc:
         # Everything else (ReadTimeout/WriteTimeout/ReadError/
         # WriteError/RemoteProtocolError/any other RequestError or
@@ -99,10 +143,10 @@ async def send_telegram_text(
         # be disproven. Never classified FAILED -- see this function's
         # docstring's classification rule.
         logger.warning("telegram_send_uncertain error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.UNCERTAIN
+        return TelegramSendResult(TelegramSendOutcome.UNCERTAIN)
 
     logger.info("telegram_send_sent")
-    return TelegramSendOutcome.SENT
+    return TelegramSendResult(TelegramSendOutcome.SENT, _extract_message_id(response))
 
 
 class TelegramNotifier:
