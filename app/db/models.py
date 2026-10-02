@@ -2439,3 +2439,97 @@ class TelegramDigestDeliveryRecord(Base):
         onupdate=lambda: datetime.now(UTC),
         nullable=False,
     )
+
+
+# Stage 9A: every state a `TelegramVacancyReviewRecord` row can be in --
+# kept as one module-level tuple so the ORM CheckConstraint, the Alembic
+# migration, and the repository's own transitions can never drift apart.
+VACANCY_REVIEW_STATES = (
+    "DISCOVERED",
+    "QUEUED_FOR_REVIEW",
+    "SENDING",
+    "TELEGRAM_SENT",
+    "DELIVERY_UNCERTAIN",
+    "DELIVERY_FAILED",
+    "SAVED",
+    "SKIPPED",
+)
+
+
+class TelegramVacancyReviewRecord(Base):
+    """Stage 9A: the Telegram vacancy-feed review state of ONE `JobRecord`.
+
+    **Deliberately separate from `JobRecord.status`.** `JobRecord.status`
+    is the APPLICATION lifecycle (`ApplicationStatus`: NEW/SAVED/APPLIED/
+    ...). Whether a vacancy card was delivered to Telegram, and whether
+    the operator pressed Save/Skip on it, is REVIEW state -- mixing the two
+    would make e.g. "Telegram send failed" indistinguishable from an
+    application-lifecycle transition. Nothing in Stage 9A writes
+    `JobRecord.status`.
+
+    **Identity is `job_id` -- `UNIQUE`, enforced by the database.** A
+    "logical vacancy" is already exactly one `JobRecord` (fingerprint
+    dedup, `app.db.repositories.upsert_job`), so one row per job_id is
+    what guarantees the same vacancy is never carded twice: every
+    re-collection of the same fingerprint lands on the SAME row, and
+    `app.db.telegram_vacancy_review_repository.ensure_review` is an
+    INSERT + IntegrityError-catch, never a check-then-act.
+
+    **`state`:**
+    - `DISCOVERED` -- collected and persisted, not (yet) eligible for review.
+    - `QUEUED_FOR_REVIEW` -- eligible, waiting for delivery. Also where a
+      provably-failed send (`TelegramSendOutcome.FAILED`) returns to, so the
+      next sweep retries it.
+    - `SENDING` -- claimed by exactly one sweep (CAS), send in flight. A
+      claim older than the stale TTL is reconciled to `DELIVERY_UNCERTAIN`.
+    - `TELEGRAM_SENT` -- Telegram positively confirmed delivery.
+    - `DELIVERY_UNCERTAIN` -- outcome could not be proven either way;
+      terminal for automatic delivery (retrying risks a duplicate card,
+      same policy as `TelegramDigestDeliveryRecord.UNCERTAIN`).
+    - `DELIVERY_FAILED` -- provably failed `attempt_count` times in a row
+      (bounded so a permanently rejected message can't retry forever).
+    - `SAVED` / `SKIPPED` -- the operator's decision via the card buttons.
+
+    `callback_token` is a random, opaque, per-row token embedded in the
+    card's inline-button `callback_data` -- callbacks are resolved ONLY by
+    this token, never by a job id the client sends back.
+
+    No job content lives here -- only bookkeeping and a short, sanitized
+    `last_error` (an exception type / outcome name, never a Telegram
+    response body or the bot token).
+    """
+
+    __tablename__ = "telegram_vacancy_reviews"
+    __table_args__ = (
+        UniqueConstraint("job_id", name="uq_telegram_vacancy_reviews_job_id"),
+        UniqueConstraint("callback_token", name="uq_telegram_vacancy_reviews_callback_token"),
+        CheckConstraint(
+            "state IN ("
+            "'DISCOVERED', 'QUEUED_FOR_REVIEW', 'SENDING', 'TELEGRAM_SENT', "
+            "'DELIVERY_UNCERTAIN', 'DELIVERY_FAILED', 'SAVED', 'SKIPPED')",
+            name="ck_telegram_vacancy_reviews_state_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    callback_token: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
