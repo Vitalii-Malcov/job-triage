@@ -378,14 +378,128 @@ class TestDelivery:
         checks = {"n": 0}
 
         def is_lease_lost():
+            # Two checks per row (before claim, before send): loss is
+            # confirmed after the first row's send, before the second claim.
             checks["n"] += 1
-            return checks["n"] > 1
+            return checks["n"] > 2
 
         await deliver_queued_vacancy_cards(
             db, _settings(), is_lease_lost=is_lease_lost, sleep=_no_sleep
         )
 
         assert len(sender.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_during_claim_sends_nothing_and_requeues(
+        self, db, sender, monkeypatch
+    ):
+        """Codex S9A-CODEX-002 (A): lease confirmed lost while the claim
+        commits -> zero HTTP calls; the row is released back to the queue."""
+        job = _persist_job(db)
+        ensure_review(db, job.id, eligible=True)
+        lost = {"value": False}
+
+        def claim_then_lose(db_, review):
+            won = claim_for_sending(db_, review)
+            lost["value"] = True
+            return won
+
+        monkeypatch.setattr(feed, "claim_for_sending", claim_then_lose)
+
+        stats = await deliver_queued_vacancy_cards(
+            db, _settings(), is_lease_lost=lambda: lost["value"], sleep=_no_sleep
+        )
+
+        assert sender.calls == []
+        assert stats.sent == stats.failed == stats.uncertain == 0
+        review = get_review_for_job(db, job.id)
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == 0
+
+        # Recoverable: a later sweep that owns its lease sends it exactly once.
+        monkeypatch.setattr(feed, "claim_for_sending", claim_for_sending)
+        await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+        db.refresh(review)
+        assert len(sender.calls) == 1
+        assert review.state == "TELEGRAM_SENT"
+        assert review.attempt_count == 1
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_during_render_sends_nothing_and_requeues(
+        self, db, sender, monkeypatch
+    ):
+        """Codex S9A-CODEX-002 (B): lease confirmed lost while the card
+        renders -> zero HTTP calls; the row is released and the sweep stops
+        before touching the next queued row."""
+        first = _persist_job(db, suffix="1")
+        second = _persist_job(db, suffix="2")
+        ensure_review(db, first.id, eligible=True)
+        ensure_review(db, second.id, eligible=True)
+        lost = {"value": False}
+        real_render = feed.render_vacancy_card
+
+        def render_then_lose(card):
+            text = real_render(card)
+            lost["value"] = True
+            return text
+
+        monkeypatch.setattr(feed, "render_vacancy_card", render_then_lose)
+
+        await deliver_queued_vacancy_cards(
+            db, _settings(), is_lease_lost=lambda: lost["value"], sleep=_no_sleep
+        )
+
+        assert sender.calls == []
+        for job in (first, second):
+            review = get_review_for_job(db, job.id)
+            assert review.state == "QUEUED_FOR_REVIEW"
+            assert review.attempt_count == 0
+
+    @pytest.mark.asyncio
+    async def test_lease_already_lost_before_claim_claims_nothing(self, db, sender):
+        """Codex S9A-CODEX-002 (C): pre-existing behavior -- no claim, no send."""
+        job = _persist_job(db)
+        ensure_review(db, job.id, eligible=True)
+
+        await deliver_queued_vacancy_cards(
+            db, _settings(), is_lease_lost=lambda: True, sleep=_no_sleep
+        )
+
+        assert sender.calls == []
+        review = get_review_for_job(db, job.id)
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == 0
+        assert review.last_error is None
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_during_in_flight_send_finishes_and_resolves(
+        self, db, sender, monkeypatch
+    ):
+        """Codex S9A-CODEX-002 (D): an HTTP request already started is not
+        cancelled -- it completes and is resolved durably; only the NEXT row
+        is not sent."""
+        first = _persist_job(db, suffix="1")
+        second = _persist_job(db, suffix="2")
+        ensure_review(db, first.id, eligible=True)
+        ensure_review(db, second.id, eligible=True)
+        lost = {"value": False}
+
+        async def send_then_lose(*args, **kwargs):
+            lost["value"] = True  # heartbeat confirms loss mid-request
+            return await sender(*args, **kwargs)
+
+        monkeypatch.setattr(feed, "send_telegram_message", send_then_lose)
+
+        stats = await deliver_queued_vacancy_cards(
+            db, _settings(), is_lease_lost=lambda: lost["value"], sleep=_no_sleep
+        )
+
+        assert len(sender.calls) == 1
+        assert stats.sent == 1
+        assert get_review_for_job(db, first.id).state == "TELEGRAM_SENT"
+        later = get_review_for_job(db, second.id)
+        assert later.state == "QUEUED_FOR_REVIEW"
+        assert later.attempt_count == 0
 
     @pytest.mark.asyncio
     async def test_unconfigured_telegram_sends_nothing_and_keeps_queue(self, db, sender):

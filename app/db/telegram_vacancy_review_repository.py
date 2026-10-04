@@ -173,6 +173,33 @@ def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> bool:
     return won
 
 
+def release_claim(db: Session, record: TelegramVacancyReviewRecord, *, reason: str) -> bool:
+    """CAS `SENDING -> QUEUED_FOR_REVIEW` for a claim abandoned BEFORE any
+    Telegram request was started (e.g. the run's lease was confirmed lost
+    between claim and send, Codex S9A-CODEX-002). Nothing reached Telegram,
+    so the row is known-not-sent: it goes back to the queue with its
+    `queued_at` position kept and the claim's `attempt_count` increment
+    undone, so an abandoned claim never consumes a delivery attempt."""
+    result = db.execute(
+        update(TelegramVacancyReviewRecord)
+        .where(
+            TelegramVacancyReviewRecord.id == record.id,
+            TelegramVacancyReviewRecord.state == "SENDING",
+            TelegramVacancyReviewRecord.attempt_count > 0,
+        )
+        .values(
+            state="QUEUED_FOR_REVIEW",
+            attempt_count=TelegramVacancyReviewRecord.attempt_count - 1,
+            last_error=reason[:200],
+            updated_at=datetime.now(UTC),
+        )
+    )
+    db.commit()
+    won = result.rowcount == 1
+    db.refresh(record)
+    return won
+
+
 def mark_sent(db: Session, record: TelegramVacancyReviewRecord, *, message_id: int | None) -> bool:
     """CAS `SENDING -> TELEGRAM_SENT`, only after Telegram confirmed (2xx)."""
     now = datetime.now(UTC)

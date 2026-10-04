@@ -27,6 +27,7 @@ from app.db.telegram_vacancy_review_repository import (
     mark_uncertain,
     reconcile_stale_sending,
     record_decision,
+    release_claim,
 )
 from app.models.job import Job, JobScore
 
@@ -186,6 +187,52 @@ class TestDeliveryTransitions:
         db.refresh(live)
         assert stale.state == "DELIVERY_UNCERTAIN"
         assert live.state == "SENDING"
+
+    def test_release_claim_returns_known_unsent_row_to_queue(self, db):
+        """Codex S9A-CODEX-002: a claim abandoned before any HTTP request
+        goes back to the queue in its original position, and the claim's
+        attempt increment is undone (no send was attempted)."""
+        review = ensure_review(db, _job_id(db), eligible=True)
+        queued_at = review.queued_at
+        claim_for_sending(db, review)
+
+        assert release_claim(db, review, reason="lease_lost_before_send") is True
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == 0
+        assert review.queued_at == queued_at
+        assert review.last_error == "lease_lost_before_send"
+        assert [r.id for r in list_queued(db, limit=10)] == [review.id]
+        assert _row_count(db) == 1
+
+    @pytest.mark.parametrize("resolve", ["sent", "uncertain", "queued"])
+    def test_release_claim_never_touches_a_non_sending_row(self, db, resolve):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        if resolve != "queued":
+            claim_for_sending(db, review)
+            if resolve == "sent":
+                mark_sent(db, review, message_id=1)
+            else:
+                mark_uncertain(db, review, last_error="UNCERTAIN")
+        state, attempts = review.state, review.attempt_count
+
+        assert release_claim(db, review, reason="lease_lost_before_send") is False
+        assert (review.state, review.attempt_count) == (state, attempts)
+
+    def test_release_claim_preserves_max_attempt_accounting(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        for _ in range(MAX_DELIVERY_ATTEMPTS - 1):
+            claim_for_sending(db, review)
+            mark_send_failed(db, review, last_error="FAILED")
+        claim_for_sending(db, review)
+        release_claim(db, review, reason="lease_lost_before_send")
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS - 1
+
+        claim_for_sending(db, review)
+        mark_send_failed(db, review, last_error="FAILED")
+
+        assert review.state == "DELIVERY_FAILED"
+        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS
 
     def test_list_queued_is_oldest_first_and_bounded(self, db):
         ids = [ensure_review(db, _job_id(db, str(i)), eligible=True).id for i in range(3)]

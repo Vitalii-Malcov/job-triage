@@ -48,6 +48,7 @@ from app.db.telegram_vacancy_review_repository import (
     mark_sent,
     mark_uncertain,
     reconcile_stale_sending,
+    release_claim,
 )
 from app.models.application_status import ApplicationStatus
 from app.services.telegram import TelegramSendOutcome, send_telegram_message
@@ -376,7 +377,9 @@ async def deliver_queued_vacancy_cards(
     then resolve: SENT -> `TELEGRAM_SENT`; provably FAILED -> back to the
     queue (retried next run, bounded by MAX_DELIVERY_ATTEMPTS); UNCERTAIN ->
     `DELIVERY_UNCERTAIN` (never auto-retried). `is_lease_lost` is checked
-    before every send, exactly like the legacy collector alert.
+    before every claim AND again immediately before the HTTP request; a
+    claim whose lease was lost before networking is released back to the
+    queue untouched (`release_claim`).
     """
     stats = VacancyFeedDeliveryStats()
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
@@ -422,6 +425,22 @@ async def deliver_queued_vacancy_cards(
                 type(exc).__name__,
             )
             continue
+
+        # Re-check immediately before networking (Codex S9A-CODEX-002): the
+        # heartbeat thread may have confirmed lease loss during the claim's
+        # commit/refresh or the render above. No HTTP request has started,
+        # so the row is known-not-sent -- release it back to the queue
+        # (not DELIVERY_UNCERTAIN) and stop. A request that HAS started is
+        # never cancelled; it finishes and resolves below.
+        if is_lease_lost is not None and is_lease_lost():
+            released = release_claim(db, review, reason="lease_lost_before_send")
+            logger.info(
+                "vacancy_feed_delivery_stopped reason=lease_lost_after_claim "
+                "review_id=%s released=%s",
+                review.id,
+                released,
+            )
+            break
 
         result = await send_telegram_message(
             settings.telegram_bot_token,
