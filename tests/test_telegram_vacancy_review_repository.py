@@ -124,47 +124,54 @@ class TestDeliveryTransitions:
     def test_claim_is_won_only_once(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
 
-        assert claim_for_sending(db, review) is True
+        claim = claim_for_sending(db, review)
+        assert claim is not None
         assert review.state == "SENDING"
         assert review.attempt_count == 1
-        assert claim_for_sending(db, review) is False
+        assert review.claim_token == claim
+        assert claim_for_sending(db, review) is None
 
     def test_sent_records_message_id(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
-        claim_for_sending(db, review)
+        claim = claim_for_sending(db, review)
 
-        assert mark_sent(db, review, message_id=777) is True
+        assert mark_sent(db, review, claim_token=claim, message_id=777) is True
         assert review.state == "TELEGRAM_SENT"
         assert review.telegram_message_id == 777
         assert review.sent_at is not None
+        assert review.claim_token is None
 
     def test_failed_send_returns_to_queue_for_retry(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
-        claim_for_sending(db, review)
+        claim = claim_for_sending(db, review)
 
-        assert mark_send_failed(db, review, last_error="FAILED") is True
+        assert mark_send_failed(db, review, claim_token=claim, last_error="FAILED") is True
         assert review.state == "QUEUED_FOR_REVIEW"
         assert review.last_error == "FAILED"
+        assert review.claim_token is None
         assert [r.id for r in list_queued(db, limit=10)] == [review.id]
         assert _row_count(db) == 1
 
     def test_failed_send_stops_after_max_attempts(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
         for _ in range(MAX_DELIVERY_ATTEMPTS):
-            assert claim_for_sending(db, review) is True
-            mark_send_failed(db, review, last_error="FAILED")
+            claim = claim_for_sending(db, review)
+            assert claim is not None
+            mark_send_failed(db, review, claim_token=claim, last_error="FAILED")
 
         assert review.state == "DELIVERY_FAILED"
         assert review.attempt_count == MAX_DELIVERY_ATTEMPTS
+        assert review.claim_token is None
         assert list_queued(db, limit=10) == []
 
     def test_uncertain_is_terminal_for_delivery(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
-        claim_for_sending(db, review)
+        claim = claim_for_sending(db, review)
 
-        assert mark_uncertain(db, review, last_error="UNCERTAIN") is True
+        assert mark_uncertain(db, review, claim_token=claim, last_error="UNCERTAIN") is True
         assert review.state == "DELIVERY_UNCERTAIN"
-        assert claim_for_sending(db, review) is False
+        assert review.claim_token is None
+        assert claim_for_sending(db, review) is None
 
     def test_dequeue_moves_queued_back_to_discovered(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
@@ -176,8 +183,8 @@ class TestDeliveryTransitions:
     def test_stale_sending_reconciled_to_uncertain_but_live_claim_untouched(self, db):
         stale = ensure_review(db, _job_id(db, "1"), eligible=True)
         live = ensure_review(db, _job_id(db, "2"), eligible=True)
-        claim_for_sending(db, stale)
-        claim_for_sending(db, live)
+        stale_claim = claim_for_sending(db, stale)
+        live_claim = claim_for_sending(db, live)
         stale.updated_at = datetime.now(UTC) - timedelta(hours=1)
         db.commit()
 
@@ -186,53 +193,12 @@ class TestDeliveryTransitions:
         db.refresh(stale)
         db.refresh(live)
         assert stale.state == "DELIVERY_UNCERTAIN"
+        assert stale.claim_token is None
         assert live.state == "SENDING"
-
-    def test_release_claim_returns_known_unsent_row_to_queue(self, db):
-        """Codex S9A-CODEX-002: a claim abandoned before any HTTP request
-        goes back to the queue in its original position, and the claim's
-        attempt increment is undone (no send was attempted)."""
-        review = ensure_review(db, _job_id(db), eligible=True)
-        queued_at = review.queued_at
-        claim_for_sending(db, review)
-
-        assert release_claim(db, review, reason="lease_lost_before_send") is True
-        assert review.state == "QUEUED_FOR_REVIEW"
-        assert review.attempt_count == 0
-        assert review.queued_at == queued_at
-        assert review.last_error == "lease_lost_before_send"
-        assert [r.id for r in list_queued(db, limit=10)] == [review.id]
-        assert _row_count(db) == 1
-
-    @pytest.mark.parametrize("resolve", ["sent", "uncertain", "queued"])
-    def test_release_claim_never_touches_a_non_sending_row(self, db, resolve):
-        review = ensure_review(db, _job_id(db), eligible=True)
-        if resolve != "queued":
-            claim_for_sending(db, review)
-            if resolve == "sent":
-                mark_sent(db, review, message_id=1)
-            else:
-                mark_uncertain(db, review, last_error="UNCERTAIN")
-        state, attempts = review.state, review.attempt_count
-
-        assert release_claim(db, review, reason="lease_lost_before_send") is False
-        assert (review.state, review.attempt_count) == (state, attempts)
-
-    def test_release_claim_preserves_max_attempt_accounting(self, db):
-        review = ensure_review(db, _job_id(db), eligible=True)
-        for _ in range(MAX_DELIVERY_ATTEMPTS - 1):
-            claim_for_sending(db, review)
-            mark_send_failed(db, review, last_error="FAILED")
-        claim_for_sending(db, review)
-        release_claim(db, review, reason="lease_lost_before_send")
-        assert review.state == "QUEUED_FOR_REVIEW"
-        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS - 1
-
-        claim_for_sending(db, review)
-        mark_send_failed(db, review, last_error="FAILED")
-
-        assert review.state == "DELIVERY_FAILED"
-        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS
+        assert live.claim_token == live_claim
+        # The reconciled claim's late outcome can no longer be applied.
+        assert mark_sent(db, stale, claim_token=stale_claim, message_id=1) is False
+        assert stale.state == "DELIVERY_UNCERTAIN"
 
     def test_list_queued_is_oldest_first_and_bounded(self, db):
         ids = [ensure_review(db, _job_id(db, str(i)), eligible=True).id for i in range(3)]
@@ -240,11 +206,134 @@ class TestDeliveryTransitions:
         assert [r.id for r in list_queued(db, limit=2)] == ids[:2]
 
 
+class TestClaimOwnership:
+    """Codex S9A-CODEX-002 / S9A-CODEX-004: a known-unsent claim can be
+    released back to the queue, but only by the exact claim that acquired
+    `SENDING` -- enforced by the UPDATE's WHERE clause on `claim_token`."""
+
+    def test_release_returns_known_unsent_row_to_queue_and_invalidates_claim(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        queued_at = review.queued_at
+        claim = claim_for_sending(db, review)
+
+        assert release_claim(db, review, claim_token=claim, reason="lease_lost_before_send")
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == 0
+        assert review.claim_token is None
+        assert review.queued_at == queued_at
+        assert review.last_error == "lease_lost_before_send"
+        assert [r.id for r in list_queued(db, limit=10)] == [review.id]
+        assert _row_count(db) == 1
+
+    def test_repeated_release_with_old_claim_is_rejected(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        claim = claim_for_sending(db, review)
+        release_claim(db, review, claim_token=claim, reason="lease_lost_before_send")
+        before = (review.state, review.attempt_count, review.claim_token, review.updated_at)
+
+        assert release_claim(db, review, claim_token=claim, reason="again") is False
+        assert (review.state, review.attempt_count, review.claim_token, review.updated_at) == (
+            before
+        )
+        assert review.last_error == "lease_lost_before_send"
+
+    def test_stale_release_cannot_release_a_newer_workers_claim(self, db):
+        """The reproduced S9A-CODEX-004 scenario, with worker A and worker B
+        in separate sessions so the stale caller's ORM object is never
+        refreshed by B's claim: only the database predicate protects B."""
+        job_id = _job_id(db)
+        ensure_review(db, job_id, eligible=True)
+        other = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)()
+        try:
+            review_a = db.scalar(
+                select(TelegramVacancyReviewRecord).where(
+                    TelegramVacancyReviewRecord.job_id == job_id
+                )
+            )
+            claim_a = claim_for_sending(db, review_a)
+            assert release_claim(db, review_a, claim_token=claim_a, reason="lease_lost")
+
+            review_b = other.get(TelegramVacancyReviewRecord, review_a.id)
+            claim_b = claim_for_sending(other, review_b)
+            assert claim_b is not None and claim_b != claim_a
+
+            # Stale A presents its OLD claim identity against B's live claim.
+            assert release_claim(db, review_a, claim_token=claim_a, reason="stale") is False
+            assert mark_send_failed(db, review_a, claim_token=claim_a, last_error="x") is False
+            assert mark_uncertain(db, review_a, claim_token=claim_a, last_error="x") is False
+            assert mark_sent(db, review_a, claim_token=claim_a, message_id=9) is False
+
+            other.refresh(review_b)
+            assert review_b.state == "SENDING"
+            assert review_b.attempt_count == 1
+            assert review_b.claim_token == claim_b
+            assert review_b.telegram_message_id is None
+            assert list_queued(other, limit=10) == []  # not re-claimable by a third worker
+
+            # B's own claim still resolves normally.
+            assert mark_sent(other, review_b, claim_token=claim_b, message_id=5) is True
+            assert review_b.state == "TELEGRAM_SENT"
+        finally:
+            other.close()
+
+    @pytest.mark.parametrize("terminal", ["TELEGRAM_SENT", "DELIVERY_UNCERTAIN", "DELIVERY_FAILED"])
+    def test_stale_release_never_touches_a_terminal_row(self, db, terminal):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        attempts = MAX_DELIVERY_ATTEMPTS if terminal == "DELIVERY_FAILED" else 1
+        for _ in range(attempts):
+            claim = claim_for_sending(db, review)
+            if terminal == "TELEGRAM_SENT":
+                mark_sent(db, review, claim_token=claim, message_id=1)
+            elif terminal == "DELIVERY_UNCERTAIN":
+                mark_uncertain(db, review, claim_token=claim, last_error="UNCERTAIN")
+            else:
+                mark_send_failed(db, review, claim_token=claim, last_error="FAILED")
+        assert review.state == terminal
+        before = (review.state, review.attempt_count, review.claim_token, review.updated_at)
+
+        assert release_claim(db, review, claim_token=claim, reason="stale") is False
+        assert (review.state, review.attempt_count, review.claim_token, review.updated_at) == (
+            before
+        )
+
+    def test_release_of_a_queued_row_is_rejected(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+
+        assert release_claim(db, review, claim_token="never-issued", reason="x") is False
+        assert (review.state, review.attempt_count) == ("QUEUED_FOR_REVIEW", 0)
+
+    def test_claim_tokens_never_repeat_across_release_reclaim_cycles(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        seen = set()
+        for _ in range(50):
+            claim = claim_for_sending(db, review)
+            assert claim not in seen
+            seen.add(claim)
+            release_claim(db, review, claim_token=claim, reason="cycle")
+        assert review.attempt_count == 0  # known-unsent releases consume no attempts
+
+    def test_release_preserves_max_attempt_accounting(self, db):
+        review = ensure_review(db, _job_id(db), eligible=True)
+        for _ in range(MAX_DELIVERY_ATTEMPTS - 1):
+            claim = claim_for_sending(db, review)
+            mark_send_failed(db, review, claim_token=claim, last_error="FAILED")
+            claim = claim_for_sending(db, review)
+            release_claim(db, review, claim_token=claim, reason="lease_lost_before_send")
+        assert review.state == "QUEUED_FOR_REVIEW"
+        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS - 1
+
+        claim = claim_for_sending(db, review)
+        mark_send_failed(db, review, claim_token=claim, last_error="FAILED")
+
+        assert review.state == "DELIVERY_FAILED"
+        assert review.attempt_count == MAX_DELIVERY_ATTEMPTS
+
+
 class TestDecisions:
     def _sent_review(self, db):
         review = ensure_review(db, _job_id(db), eligible=True)
-        claim_for_sending(db, review)
-        mark_sent(db, review, message_id=1)
+        claim = claim_for_sending(db, review)
+        mark_sent(db, review, claim_token=claim, message_id=1)
         return review
 
     def test_save_persists(self, db):
@@ -332,6 +421,23 @@ def test_migration_upgrade_and_downgrade(tmp_path):
     ]
     assert ["job_id"] in unique_sets
     assert ["callback_token"] in unique_sets
+
+    columns = {c["name"]: c for c in inspector.get_columns("telegram_vacancy_reviews")}
+    assert columns["claim_token"]["nullable"] is True
+
+    # S9A-CODEX-004 migration: down to Stage 9A's table revision drops only
+    # claim_token; up again restores it.
+    downgrade(cfg, "9a1f4c7e2b3d")
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    columns = {col["name"] for col in inspector.get_columns("telegram_vacancy_reviews")}
+    assert "claim_token" not in columns
+    assert columns == {c.name for c in TelegramVacancyReviewRecord.__table__.columns} - {
+        "claim_token"
+    }
+    upgrade(cfg, "head")
+    inspector = inspect(create_engine(f"sqlite:///{db_path}"))
+    columns = {col["name"] for col in inspector.get_columns("telegram_vacancy_reviews")}
+    assert "claim_token" in columns
 
     downgrade(cfg, "b2c5d8e4f7a1")
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))

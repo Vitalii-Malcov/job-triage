@@ -59,8 +59,8 @@ def sent_review(session_factory):
         record.must_have_skills_json = json.dumps(["Python", "SQL"])
         db.commit()
         review = ensure_review(db, record.id, eligible=True)
-        claim_for_sending(db, review)
-        mark_sent(db, review, message_id=1)
+        claim = claim_for_sending(db, review)
+        mark_sent(db, review, claim_token=claim, message_id=1)
         return {"id": review.id, "job_id": record.id, "token": review.callback_token}
     finally:
         db.close()

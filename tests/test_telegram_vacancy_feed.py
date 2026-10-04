@@ -19,6 +19,7 @@ from app.db.telegram_vacancy_review_repository import (
     claim_for_sending,
     ensure_review,
     get_review_for_job,
+    release_claim,
 )
 from app.models.job import Job, JobScore
 from app.services.collector_runner import run_bundesagentur
@@ -500,6 +501,60 @@ class TestDelivery:
         later = get_review_for_job(db, second.id)
         assert later.state == "QUEUED_FOR_REVIEW"
         assert later.attempt_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_release_during_in_flight_send_cannot_enable_duplicate(
+        self, db, sender, monkeypatch
+    ):
+        """Codex S9A-CODEX-004: worker A claims and releases a known-unsent
+        card; worker B re-claims it and starts its HTTP send; while B is in
+        flight, stale A replays its release and worker C sweeps. A's old
+        claim identity must be rejected by the database, so C finds nothing
+        to claim and only B's request ever reaches Telegram."""
+        job = _persist_job(db)
+        review_id = ensure_review(db, job.id, eligible=True).id
+        make_session = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+        session_a, session_c = make_session(), make_session()
+        try:
+            review_a = session_a.get(TelegramVacancyReviewRecord, review_id)
+            claim_a = claim_for_sending(session_a, review_a)
+            assert release_claim(session_a, review_a, claim_token=claim_a, reason="lease_lost")
+
+            observed = {}
+
+            async def b_send_with_interleaving(*args, **kwargs):
+                if not observed:  # B's request is now in flight
+                    observed["stale_release"] = release_claim(
+                        session_a, review_a, claim_token=claim_a, reason="stale"
+                    )
+                    observed["c_stats"] = await deliver_queued_vacancy_cards(
+                        session_c, _settings(), sleep=_no_sleep
+                    )
+                    row = make_session()
+                    try:
+                        live = row.get(TelegramVacancyReviewRecord, review_id)
+                        observed["during"] = (live.state, live.attempt_count)
+                    finally:
+                        row.close()
+                return await sender(*args, **kwargs)
+
+            monkeypatch.setattr(feed, "send_telegram_message", b_send_with_interleaving)
+
+            b_stats = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+        finally:
+            session_a.close()
+            session_c.close()
+
+        assert observed["stale_release"] is False
+        assert observed["during"] == ("SENDING", 1)
+        assert observed["c_stats"].sent == 0 and observed["c_stats"].failed == 0
+        assert len(sender.calls) == 1  # only B's external acceptance exists
+        assert b_stats.sent == 1
+        review = get_review_for_job(db, job.id)
+        db.refresh(review)
+        assert review.state == "TELEGRAM_SENT"
+        assert review.attempt_count == 1
+        assert review.claim_token is None
 
     @pytest.mark.asyncio
     async def test_unconfigured_telegram_sends_nothing_and_keeps_queue(self, db, sender):

@@ -12,7 +12,7 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,13 @@ class TelegramVacancyReviewRepositoryConsistencyError(Exception):
 
 def _new_callback_token() -> str:
     return secrets.token_urlsafe(12)
+
+
+def _new_claim_token() -> str:
+    # 128 random bits per claim (Codex S9A-CODEX-004): an identity that does
+    # not repeat across release/reclaim cycles, processes or restarts, so a
+    # stale claim's token can never become valid again.
+    return secrets.token_urlsafe(16)
 
 
 def get_review_for_job(db: Session, job_id: int) -> TelegramVacancyReviewRecord | None:
@@ -152,9 +159,17 @@ def list_queued(db: Session, *, limit: int) -> list[TelegramVacancyReviewRecord]
     return list(db.scalars(stmt).all())
 
 
-def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> bool:
+def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> str | None:
     """CAS `QUEUED_FOR_REVIEW -> SENDING`. Exactly one concurrent caller
-    wins; only the winner may call Telegram for this row."""
+    wins; only the winner may call Telegram for this row.
+
+    Returns the winner's fresh `claim_token`, or None if the claim was lost.
+    The token is this claim's identity (Codex S9A-CODEX-004): every
+    transition out of `SENDING` must present it in its UPDATE's WHERE
+    clause, and every such transition clears it. A stale caller holding an
+    older claim's token can therefore never resolve or release a newer
+    claim on the same row."""
+    claim_token = _new_claim_token()
     result = db.execute(
         update(TelegramVacancyReviewRecord)
         .where(
@@ -163,6 +178,7 @@ def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> bool:
         )
         .values(
             state="SENDING",
+            claim_token=claim_token,
             attempt_count=TelegramVacancyReviewRecord.attempt_count + 1,
             updated_at=datetime.now(UTC),
         )
@@ -170,25 +186,42 @@ def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> bool:
     db.commit()
     won = result.rowcount == 1
     db.refresh(record)
-    return won
+    return claim_token if won else None
 
 
-def release_claim(db: Session, record: TelegramVacancyReviewRecord, *, reason: str) -> bool:
+def _owns_claim(claim_token: str) -> tuple:
+    """WHERE predicates binding a `SENDING -> *` transition to the exact
+    claim that acquired it. Enforced by the database UPDATE itself -- never
+    a check on the caller's (possibly stale) ORM object."""
+    return (
+        TelegramVacancyReviewRecord.state == "SENDING",
+        TelegramVacancyReviewRecord.claim_token == claim_token,
+    )
+
+
+def release_claim(
+    db: Session, record: TelegramVacancyReviewRecord, *, claim_token: str, reason: str
+) -> bool:
     """CAS `SENDING -> QUEUED_FOR_REVIEW` for a claim abandoned BEFORE any
     Telegram request was started (e.g. the run's lease was confirmed lost
     between claim and send, Codex S9A-CODEX-002). Nothing reached Telegram,
     so the row is known-not-sent: it goes back to the queue with its
     `queued_at` position kept and the claim's `attempt_count` increment
-    undone, so an abandoned claim never consumes a delivery attempt."""
+    undone, so an abandoned claim never consumes a delivery attempt.
+
+    Only the claim identified by `claim_token` can be released (Codex
+    S9A-CODEX-004): a repeated or stale release -- even after the row was
+    re-claimed by another worker -- matches no row and changes nothing."""
     result = db.execute(
         update(TelegramVacancyReviewRecord)
         .where(
             TelegramVacancyReviewRecord.id == record.id,
-            TelegramVacancyReviewRecord.state == "SENDING",
+            *_owns_claim(claim_token),
             TelegramVacancyReviewRecord.attempt_count > 0,
         )
         .values(
             state="QUEUED_FOR_REVIEW",
+            claim_token=None,
             attempt_count=TelegramVacancyReviewRecord.attempt_count - 1,
             last_error=reason[:200],
             updated_at=datetime.now(UTC),
@@ -200,17 +233,22 @@ def release_claim(db: Session, record: TelegramVacancyReviewRecord, *, reason: s
     return won
 
 
-def mark_sent(db: Session, record: TelegramVacancyReviewRecord, *, message_id: int | None) -> bool:
-    """CAS `SENDING -> TELEGRAM_SENT`, only after Telegram confirmed (2xx)."""
+def mark_sent(
+    db: Session,
+    record: TelegramVacancyReviewRecord,
+    *,
+    claim_token: str,
+    message_id: int | None,
+) -> bool:
+    """CAS `SENDING -> TELEGRAM_SENT` for the claim `claim_token`, only after
+    Telegram confirmed (2xx)."""
     now = datetime.now(UTC)
     result = db.execute(
         update(TelegramVacancyReviewRecord)
-        .where(
-            TelegramVacancyReviewRecord.id == record.id,
-            TelegramVacancyReviewRecord.state == "SENDING",
-        )
+        .where(TelegramVacancyReviewRecord.id == record.id, *_owns_claim(claim_token))
         .values(
             state="TELEGRAM_SENT",
+            claim_token=None,
             telegram_message_id=message_id,
             sent_at=now,
             last_error=None,
@@ -227,21 +265,28 @@ def mark_send_failed(
     db: Session,
     record: TelegramVacancyReviewRecord,
     *,
+    claim_token: str,
     last_error: str,
     max_attempts: int = MAX_DELIVERY_ATTEMPTS,
 ) -> bool:
     """CAS `SENDING -> QUEUED_FOR_REVIEW` (retried by the next sweep) for a
-    send that provably did NOT reach Telegram -- or `SENDING ->
-    DELIVERY_FAILED` once `attempt_count` reached `max_attempts`."""
-    record_attempts = record.attempt_count
-    next_state = "DELIVERY_FAILED" if record_attempts >= max_attempts else "QUEUED_FOR_REVIEW"
+    send under claim `claim_token` that provably did NOT reach Telegram --
+    or `SENDING -> DELIVERY_FAILED` once `attempt_count` reached
+    `max_attempts`. The cap is evaluated by the database against the row's
+    current `attempt_count`, not the caller's ORM copy."""
+    next_state = case(
+        (TelegramVacancyReviewRecord.attempt_count >= max_attempts, "DELIVERY_FAILED"),
+        else_="QUEUED_FOR_REVIEW",
+    )
     result = db.execute(
         update(TelegramVacancyReviewRecord)
-        .where(
-            TelegramVacancyReviewRecord.id == record.id,
-            TelegramVacancyReviewRecord.state == "SENDING",
+        .where(TelegramVacancyReviewRecord.id == record.id, *_owns_claim(claim_token))
+        .values(
+            state=next_state,
+            claim_token=None,
+            last_error=last_error[:200],
+            updated_at=datetime.now(UTC),
         )
-        .values(state=next_state, last_error=last_error[:200], updated_at=datetime.now(UTC))
     )
     db.commit()
     won = result.rowcount == 1
@@ -249,16 +294,17 @@ def mark_send_failed(
     return won
 
 
-def mark_uncertain(db: Session, record: TelegramVacancyReviewRecord, *, last_error: str) -> bool:
-    """CAS `SENDING -> DELIVERY_UNCERTAIN` -- never automatically retried."""
+def mark_uncertain(
+    db: Session, record: TelegramVacancyReviewRecord, *, claim_token: str, last_error: str
+) -> bool:
+    """CAS `SENDING -> DELIVERY_UNCERTAIN` for the claim `claim_token` --
+    never automatically retried."""
     result = db.execute(
         update(TelegramVacancyReviewRecord)
-        .where(
-            TelegramVacancyReviewRecord.id == record.id,
-            TelegramVacancyReviewRecord.state == "SENDING",
-        )
+        .where(TelegramVacancyReviewRecord.id == record.id, *_owns_claim(claim_token))
         .values(
             state="DELIVERY_UNCERTAIN",
+            claim_token=None,
             last_error=last_error[:200],
             updated_at=datetime.now(UTC),
         )
@@ -289,6 +335,7 @@ def reconcile_stale_sending(
         )
         .values(
             state="DELIVERY_UNCERTAIN",
+            claim_token=None,
             last_error="stale_sending_reconciled",
             updated_at=effective_now,
         )

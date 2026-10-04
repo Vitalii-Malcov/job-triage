@@ -409,7 +409,8 @@ async def deliver_queued_vacancy_cards(
         if is_lease_lost is not None and is_lease_lost():
             logger.info("vacancy_feed_delivery_stopped reason=lease_lost")
             break
-        if not claim_for_sending(db, review):
+        claim_token = claim_for_sending(db, review)
+        if claim_token is None:
             continue
         attempted += 1
 
@@ -417,7 +418,9 @@ async def deliver_queued_vacancy_cards(
             text = render_vacancy_card(build_vacancy_card(job, candidate_skills))
         except Exception as exc:
             # Nothing reached Telegram -- provably failed, retryable.
-            mark_send_failed(db, review, last_error=f"render:{type(exc).__name__}")
+            mark_send_failed(
+                db, review, claim_token=claim_token, last_error=f"render:{type(exc).__name__}"
+            )
             stats.failed += 1
             logger.warning(
                 "vacancy_feed_render_failed review_id=%s error_type=%s",
@@ -433,7 +436,9 @@ async def deliver_queued_vacancy_cards(
         # (not DELIVERY_UNCERTAIN) and stop. A request that HAS started is
         # never cancelled; it finishes and resolves below.
         if is_lease_lost is not None and is_lease_lost():
-            released = release_claim(db, review, reason="lease_lost_before_send")
+            released = release_claim(
+                db, review, claim_token=claim_token, reason="lease_lost_before_send"
+            )
             logger.info(
                 "vacancy_feed_delivery_stopped reason=lease_lost_after_claim "
                 "review_id=%s released=%s",
@@ -450,7 +455,7 @@ async def deliver_queued_vacancy_cards(
             timeout_seconds=settings.telegram_timeout_seconds,
         )
         if result.outcome is TelegramSendOutcome.SENT:
-            mark_sent(db, review, message_id=result.message_id)
+            mark_sent(db, review, claim_token=claim_token, message_id=result.message_id)
             stats.sent += 1
             logger.info(
                 "vacancy_feed_card_sent review_id=%s job_id=%s attempt=%s",
@@ -459,7 +464,7 @@ async def deliver_queued_vacancy_cards(
                 review.attempt_count,
             )
         elif result.outcome is TelegramSendOutcome.FAILED:
-            mark_send_failed(db, review, last_error=result.outcome.value)
+            mark_send_failed(db, review, claim_token=claim_token, last_error=result.outcome.value)
             stats.failed += 1
             logger.warning(
                 "vacancy_feed_card_failed review_id=%s job_id=%s attempt=%s state=%s",
@@ -469,7 +474,7 @@ async def deliver_queued_vacancy_cards(
                 review.state,
             )
         else:
-            mark_uncertain(db, review, last_error=result.outcome.value)
+            mark_uncertain(db, review, claim_token=claim_token, last_error=result.outcome.value)
             stats.uncertain += 1
             logger.warning(
                 "vacancy_feed_card_uncertain review_id=%s job_id=%s attempt=%s",

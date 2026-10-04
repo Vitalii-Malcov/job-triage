@@ -2517,6 +2517,11 @@ class TelegramVacancyReviewRecord(Base):
     )
     state: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     callback_token: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Identity of the CURRENT `SENDING` claim (random, set by the winning
+    # claim, cleared whenever the row leaves `SENDING`). Every `SENDING -> *`
+    # transition must present it, so a stale worker can never resolve or
+    # release a newer claim (Codex S9A-CODEX-004). NULL outside `SENDING`.
+    claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
