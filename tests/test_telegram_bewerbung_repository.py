@@ -342,6 +342,27 @@ class TestPreviewDelivery:
         assert record.preview_state == "SENDING"
         assert record.preview_claim_token == current.token
 
+    def test_claim_bound_to_expected_package_never_claims_a_replacement(self, db):
+        record = _prepared(db)
+        old_generation, old_token = record.generation, record.package_token
+        newer = claim_preparation(db, record, input_identity=IDENTITY_B)
+        _publish(db, newer)
+        current = _reload(db, record.id)  # the row now carries generation 2
+        assert current.package_token != old_token
+
+        assert (
+            claim_preview(
+                db,
+                current,
+                allowed_states=("NONE",),
+                expected_generation=old_generation,
+                expected_package_token=old_token,
+            )
+            is None
+        )
+        current = _reload(db, record.id)
+        assert (current.preview_state, current.preview_claim_token) == ("NONE", None)
+
     def test_stale_sending_becomes_uncertain_not_failed(self, db):
         record = _prepared(db)
         claim = claim_preview(db, record, allowed_states=("NONE",))

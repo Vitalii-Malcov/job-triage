@@ -284,16 +284,29 @@ def publish_preparation(
 
 
 def claim_preview(
-    db: Session, record: Prep, *, allowed_states: tuple[str, ...]
+    db: Session,
+    record: Prep,
+    *,
+    allowed_states: tuple[str, ...],
+    expected_generation: int | None = None,
+    expected_package_token: str | None = None,
 ) -> PreviewClaim | None:
     """CAS `preview_state IN allowed_states -> SENDING` for the exact
     observed PREPARED package (`generation` + `package_token`), committed
-    BEFORE any Telegram request. Exactly one concurrent caller wins."""
+    BEFORE any Telegram request. Exactly one concurrent caller wins.
+
+    A caller holding a capability passes the generation/package token it
+    originally authorized; the SQL predicate then uses THOSE values, never
+    ones a replacement generation may have since loaded into `record`."""
     if record.state != "PREPARED" or record.package_token is None:
         return None
     if "SENDING" in allowed_states:
         raise ValueError("A preview claim can never be taken over from SENDING.")
-    observed = (record.id, record.generation, record.package_token)
+    generation = record.generation if expected_generation is None else expected_generation
+    package_token = (
+        record.package_token if expected_package_token is None else expected_package_token
+    )
+    observed = (record.id, generation, package_token)
     token = _new_claim_token()
     now = _now()
     result = db.execute(
@@ -301,8 +314,8 @@ def claim_preview(
         .where(
             Prep.id == record.id,
             Prep.state == "PREPARED",
-            Prep.generation == record.generation,
-            Prep.package_token == record.package_token,
+            Prep.generation == generation,
+            Prep.package_token == package_token,
             Prep.preview_state.in_(allowed_states),
         )
         .values(

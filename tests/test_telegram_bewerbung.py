@@ -16,6 +16,7 @@ import imaplib
 import json
 import smtplib
 import socket
+import threading
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1286,6 +1287,159 @@ class TestVorschau:
         )
         assert outcome.code == "PREVIEW_EXPIRED"
         assert len(sender.calls) == calls
+
+    @staticmethod
+    def _publish_replacement(session_factory, seeded) -> tuple:
+        """Another worker, in its own session and thread: change the
+        company, run Apply to completion, publish generation 2."""
+        _update_db(
+            session_factory,
+            update(JobRecord)
+            .where(JobRecord.id == seeded["job_id"])
+            .values(company="Replacement Company"),
+        )
+        other_sender = FakeSender()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            outcome = pool.submit(
+                asyncio.run, _apply(session_factory, seeded, other_sender)
+            ).result()
+        return outcome, other_sender
+
+    @staticmethod
+    def _spy_claims(monkeypatch) -> list:
+        """Records preview claims made by the handler under test (this
+        thread only; the replacement worker runs in its own thread)."""
+        real_claim = tb.claim_preview
+        claims: list = []
+        caller = threading.get_ident()
+
+        def claim(db, record, **kw):
+            result = real_claim(db, record, **kw)
+            if threading.get_ident() == caller:
+                claims.append(
+                    (kw.get("expected_generation"), kw.get("expected_package_token"), result)
+                )
+            return result
+
+        monkeypatch.setattr(tb, "claim_preview", claim)
+        return claims
+
+    def _assert_old_capability_left_replacement_alone(
+        self, session_factory, old_token, replacement, outcome, sender, calls_before
+    ):
+        replaced, other_sender = replacement
+        assert replaced.code == "PREVIEW_SENT"
+        prep = _prep(session_factory)
+        assert prep.generation == 2 and prep.package_token != old_token
+        assert outcome.code == "PREVIEW_EXPIRED"
+        # Nothing was sent for the old request: no replacement content and
+        # no navigation buttons carrying the old token.
+        assert len(sender.calls) == calls_before
+        assert not any("Replacement Company" in c["text"] for c in sender.calls)
+        # Generation 2's own summary delivery is untouched by the old token.
+        assert len(other_sender.calls) == 1
+        assert (prep.preview_state, prep.preview_claim_token) == ("SENT", None)
+        assert prep.preview_message_id == 9001
+
+    @pytest.mark.asyncio
+    async def test_replacement_after_token_validation_is_never_displayed(
+        self, session_factory, seeded, sender, monkeypatch
+    ):
+        """S9B-CODEX-001 (1): generation 2 publishes after the old token is
+        validated but before the handler reloads the preparation."""
+        old_token = await self._prepared(session_factory, seeded, sender)
+        calls_before = len(sender.calls)
+        real_eligible = tb._job_still_eligible
+        replacement: dict = {}
+
+        def eligible(db, job_id):
+            if "result" not in replacement:
+                replacement["result"] = None  # one-shot: the worker's own call passes through
+                replacement["result"] = self._publish_replacement(session_factory, seeded)
+            return real_eligible(db, job_id)
+
+        monkeypatch.setattr(tb, "_job_still_eligible", eligible)
+        claims = self._spy_claims(monkeypatch)
+
+        outcome = await tb.handle_preview_page(
+            session_factory, _settings(), old_token, 1, send=sender
+        )
+
+        self._assert_old_capability_left_replacement_alone(
+            session_factory, old_token, replacement["result"], outcome, sender, calls_before
+        )
+        assert claims == []  # rejected before artifact load and before any claim
+
+    @pytest.mark.asyncio
+    async def test_replacement_after_content_selection_loses_the_bound_claim(
+        self, session_factory, seeded, sender, monkeypatch
+    ):
+        """S9B-CODEX-001 (2): generation 1's letter is already loaded and
+        paginated when generation 2 publishes; the claim stays bound to
+        generation 1 + token_1, so the CAS fails and nothing is sent."""
+        old_token = await self._prepared(session_factory, seeded, sender)
+        calls_before = len(sender.calls)
+        real_paginate = tb.paginate_letter
+        replacement: dict = {}
+
+        def paginate(draft):
+            pages = real_paginate(draft)
+            if "result" not in replacement:
+                replacement["result"] = None  # one-shot: the worker's own call passes through
+                replacement["result"] = self._publish_replacement(session_factory, seeded)
+            return pages
+
+        monkeypatch.setattr(tb, "paginate_letter", paginate)
+        claims = self._spy_claims(monkeypatch)
+
+        outcome = await tb.handle_preview_page(
+            session_factory, _settings(), old_token, 1, send=sender
+        )
+
+        self._assert_old_capability_left_replacement_alone(
+            session_factory, old_token, replacement["result"], outcome, sender, calls_before
+        )
+        assert claims == [(1, old_token, None)]  # bound to generation 1; CAS lost
+
+    @pytest.mark.asyncio
+    async def test_unchanged_package_claim_is_bound_to_its_own_generation(
+        self, session_factory, seeded, sender, monkeypatch
+    ):
+        token = await self._prepared(session_factory, seeded, sender)
+        claims = self._spy_claims(monkeypatch)
+
+        outcome = await tb.handle_preview_page(session_factory, _settings(), token, 1, send=sender)
+
+        assert outcome.code == "PAGE_SENT"
+        assert len(claims) == 1 and claims[0][:2] == (1, token) and claims[0][2] is not None
+        prep = _prep(session_factory)
+        assert (prep.generation, prep.package_token, prep.preview_state) == (1, token, "SENT")
+        letter = json.loads(_letters(session_factory)[0].draft_json)
+        assert letter["opening"] in sender.calls[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_replacement_before_callback_expires_without_a_claim(
+        self, session_factory, seeded, sender, monkeypatch
+    ):
+        old_token = await self._prepared(session_factory, seeded, sender)
+        replaced, _ = self._publish_replacement(session_factory, seeded)
+        assert replaced.code == "PREVIEW_SENT"
+        calls_before = len(sender.calls)
+        before = _prep(session_factory)
+        claims = self._spy_claims(monkeypatch)
+
+        outcome = await tb.handle_preview_page(
+            session_factory, _settings(), old_token, 1, send=sender
+        )
+
+        assert outcome.code == "PREVIEW_EXPIRED"
+        assert claims == [] and len(sender.calls) == calls_before
+        after = _prep(session_factory)
+        assert (after.generation, after.package_token, after.preview_state) == (
+            before.generation,
+            before.package_token,
+            before.preview_state,
+        )
 
     @pytest.mark.asyncio
     async def test_out_of_range_page_and_unknown_capability(self, session_factory, seeded, sender):

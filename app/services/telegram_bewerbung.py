@@ -337,6 +337,36 @@ def _reload_preparation(db: Session, preparation_id: int) -> TelegramBewerbungPr
 
 
 @dataclass(frozen=True)
+class _ExpectedPackage:
+    """The exact package a preview capability authorized, captured once at
+    token lookup. It stays authoritative for the whole request: a reloaded
+    row must match it exactly, and it is never re-derived from a reload."""
+
+    preparation_id: int
+    generation: int
+    package_token: str
+    match_id: int
+    cv_draft_id: int
+    bewerbung_draft_id: int
+    preview_renderer_version: str | None
+
+    @classmethod
+    def of(cls, prep: TelegramBewerbungPreparationRecord) -> "_ExpectedPackage":
+        return cls(
+            prep.id,
+            prep.generation,
+            prep.package_token,
+            prep.match_id,
+            prep.cv_draft_id,
+            prep.bewerbung_draft_id,
+            prep.preview_renderer_version,
+        )
+
+    def matches(self, prep: TelegramBewerbungPreparationRecord | None) -> bool:
+        return prep is not None and prep.state == "PREPARED" and _ExpectedPackage.of(prep) == self
+
+
+@dataclass(frozen=True)
 class _Package:
     match: CandidateJobMatchRecord
     cv: CandidateCVDraftRecord
@@ -547,11 +577,19 @@ async def _deliver(
     reply_markup: dict | None,
     allowed_states: tuple[str, ...],
     send: Sender,
+    expected: _ExpectedPackage | None = None,
 ) -> str:
     """Claim the preview delivery (committed BEFORE networking), send once,
     resolve by token. Returns the resulting preview state, or "BUSY" if
-    another delivery holds the claim. No DB lock is held during the send."""
-    claim = claim_preview(db, prep, allowed_states=allowed_states)
+    another delivery holds the claim. No DB lock is held during the send.
+    With `expected`, the claim is bound to that exact generation/package."""
+    claim = claim_preview(
+        db,
+        prep,
+        allowed_states=allowed_states,
+        expected_generation=expected.generation if expected else None,
+        expected_package_token=expected.package_token if expected else None,
+    )
     if claim is None:
         return "BUSY"
     try:
@@ -736,13 +774,18 @@ async def handle_preview_page(
             return _outcome("PREVIEW_EXPIRED")
         if prep.preview_state == "SENDING":
             return _outcome("PREVIEW_BUSY")
+        # The capability authorizes exactly this package, for the whole
+        # request; a replacement published meanwhile is never adopted.
+        expected = _ExpectedPackage.of(prep)
         review = _review(db, prep.review_id)
         if review is None:
             return _outcome("PREVIEW_EXPIRED")
         job = _job_still_eligible(db, review.job_id)
         if job is None:
             return _outcome("JOB_NOT_ELIGIBLE")
-        prep = _reload_preparation(db, prep.id)
+        prep = _reload_preparation(db, expected.preparation_id)
+        if not expected.matches(prep):
+            return _outcome("PREVIEW_EXPIRED")
         package = _load_pinned_package(db, prep, job)
         if package is None:
             return _outcome("PACKAGE_UNAVAILABLE")
@@ -754,13 +797,18 @@ async def handle_preview_page(
             settings,
             prep,
             text=pages[page - 1],
-            reply_markup=page_keyboard(package_token, page, len(pages)),
+            reply_markup=page_keyboard(expected.package_token, page, len(pages)),
             allowed_states=_EXPLICIT_PREVIEW_STATES,
             send=send,
+            expected=expected,
         )
         if state == "SENT":
             return BewerbungOutcome("PAGE_SENT")
         if state == "BUSY":
+            # The bound claim lost: either a send of this exact package is in
+            # flight, or the package was replaced after content selection.
+            if not expected.matches(_reload_preparation(db, expected.preparation_id)):
+                return _outcome("PREVIEW_EXPIRED")
             return _outcome("PREVIEW_BUSY")
         if state == "FAILED":
             return _outcome("PREVIEW_FAILED")
