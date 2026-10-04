@@ -85,13 +85,11 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.agents.bewerbung_generator import BEWERBUNG_GENERATOR_VERSION
 from app.db.bewerbung_repository import get_latest_bewerbung_draft
 from app.db.candidate_cv_draft_repository import get_draft_by_id
-from app.db.models import CandidateCVDraftRecord
 from app.db.repositories import get_jobs_by_ids_if_eligible
 from app.models.automation import AutomationJobFailure, ShortlistDraftItem
-from app.providers.bewerbung.deterministic import PROVIDER_NAME as DETERMINISTIC_BEWERBUNG_PROVIDER
+from app.services.bewerbung_reuse import bewerbung_draft_is_current
 from app.services.candidate_preparation import (
     prepare_bewerbung_draft,
     prepare_candidate_cv_draft_with_outcome,
@@ -105,28 +103,6 @@ __all__ = ["prepare_shortlist_drafts"]
 
 _ELIGIBLE_STATUSES = frozenset({"NEW", "SAVED"})
 _ELIGIBLE_RECOMMENDATIONS = frozenset({"APPLY", "MAYBE"})
-
-
-def _bewerbung_is_current(existing, cv_draft_record: CandidateCVDraftRecord) -> bool:
-    """Stage 8C automation-level reuse identity (spec section 8) — ALL of
-    these must match the just-prepared CV draft's own pins for an
-    existing `BewerbungDraftRecord` to be reused instead of generating a
-    new one. `provider` is pinned to the deterministic default
-    (`DETERMINISTIC_BEWERBUNG_PROVIDER`) because automation always calls
-    `BewerbungService()` uninjected — the exact same default the manual
-    endpoint uses.
-    """
-    return (
-        existing is not None
-        and existing.cv_draft_id == cv_draft_record.id
-        and existing.match_id == cv_draft_record.match_id
-        and existing.candidate_profile_version == cv_draft_record.candidate_profile_version
-        and existing.job_snapshot_fingerprint == cv_draft_record.job_snapshot_fingerprint
-        and existing.match_algorithm_version == cv_draft_record.match_algorithm_version
-        and existing.cv_adapter_version == cv_draft_record.cv_adapter_version
-        and existing.bewerbung_generator_version == BEWERBUNG_GENERATOR_VERSION
-        and existing.provider == DETERMINISTIC_BEWERBUNG_PROVIDER
-    )
 
 
 def _preselect_candidate_job_ids(
@@ -261,7 +237,9 @@ async def prepare_shortlist_drafts(
         try:
             cv_draft_record = get_draft_by_id(db, cv_draft.id)
             existing_bewerbung = get_latest_bewerbung_draft(db, job.id)
-            if _bewerbung_is_current(existing_bewerbung, cv_draft_record):
+            # Shared, strengthened reuse identity (Stage 9B) -- the same
+            # decision the Telegram preparation path makes.
+            if bewerbung_draft_is_current(existing_bewerbung, cv_draft_record, job):
                 bewerbung_draft_id = existing_bewerbung.id
                 bewerbung_was_reused = True
                 bewerbung_reused += 1

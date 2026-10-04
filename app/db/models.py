@@ -2538,3 +2538,136 @@ class TelegramVacancyReviewRecord(Base):
         onupdate=lambda: datetime.now(UTC),
         nullable=False,
     )
+
+
+class TelegramBewerbungPreparationRecord(Base):
+    """Stage 9B: the workflow ledger for ONE vacancy-review row's Telegram
+    "Bewerbung erstellen" request -- who currently owns the preparation,
+    which exact immutable 6B/6C/6D package was published, and whether its
+    preview reached the operator's private chat.
+
+    **Workflow metadata only.** No CV/match/letter content is copied here:
+    `match_id`/`cv_draft_id`/`bewerbung_draft_id` pin immutable snapshot
+    rows (deliberately not FKs, same retention rationale as
+    `BewerbungDraftRecord` -- every reader validates they still exist and
+    belong together, failing closed on a dangling pin). The only stored
+    text is the frozen summary `preview_text`, so a re-sent preview always
+    shows exactly what was prepared, never facts re-derived from a later
+    profile. `review_id` IS an FK (ON DELETE CASCADE): the ledger is
+    operational state of that review row, nothing else.
+
+    **Preparation state** (`state`): `PREPARING` (one owner, identified by
+    `generation` + `prep_claim_token`), `PREPARED` (a consistent package is
+    published), `FAILED` (sanitized `last_error` code). Stale ownership is a
+    recovery TRANSITION (`PREPARING -> FAILED`), never a fourth state. Every
+    `PREPARING -> *` UPDATE matches `id`, `state`, `generation` and
+    `prep_claim_token` in SQL, so a stale worker can never publish, fail, or
+    attach a letter to a newer generation. `input_identity` is a digest of
+    the inputs the package was prepared from; `attempt_count` counts
+    genuine attempts for the current `input_identity` (max 5).
+
+    **Preview delivery** (`preview_state`): `NONE -> SENDING -> SENT /
+    FAILED / UNCERTAIN`, fenced exactly like Stage 9A card delivery --
+    `SENDING` (with `preview_claim_token`) is committed BEFORE the Telegram
+    request, and only that token + `generation` can resolve it. A stale
+    `SENDING` becomes `UNCERTAIN` (an external side effect may have
+    happened), and `UNCERTAIN` is never retried automatically.
+
+    `package_token` is the opaque capability embedded in the preview's
+    "Vorschau" buttons; it is replaced on every publication, so an old
+    button can never display a newer package.
+    """
+
+    __tablename__ = "telegram_bewerbung_preparations"
+    __table_args__ = (
+        UniqueConstraint("review_id", name="uq_telegram_bewerbung_preparations_review_id"),
+        UniqueConstraint("package_token", name="uq_telegram_bewerbung_preparations_package_token"),
+        CheckConstraint(
+            "state IN ('PREPARING', 'PREPARED', 'FAILED')",
+            name="ck_telegram_bewerbung_preparations_state_valid",
+        ),
+        CheckConstraint(
+            "generation >= 1", name="ck_telegram_bewerbung_preparations_generation_positive"
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_telegram_bewerbung_preparations_attempt_count_nonnegative",
+        ),
+        CheckConstraint(
+            "(state = 'PREPARING' AND prep_claim_token IS NOT NULL "
+            "AND prep_claim_started_at IS NOT NULL) "
+            "OR (state <> 'PREPARING' AND prep_claim_token IS NULL)",
+            name="ck_telegram_bewerbung_preparations_prep_token_state",
+        ),
+        CheckConstraint(
+            "state <> 'PREPARED' OR (match_id IS NOT NULL AND cv_draft_id IS NOT NULL "
+            "AND bewerbung_draft_id IS NOT NULL AND package_token IS NOT NULL "
+            "AND preview_text IS NOT NULL AND preview_renderer_version IS NOT NULL)",
+            name="ck_telegram_bewerbung_preparations_prepared_artifacts",
+        ),
+        CheckConstraint(
+            "preview_state IN ('NONE', 'SENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
+            name="ck_telegram_bewerbung_preparations_preview_state_valid",
+        ),
+        CheckConstraint(
+            "(preview_state = 'SENDING' AND preview_claim_token IS NOT NULL "
+            "AND preview_claim_started_at IS NOT NULL) "
+            "OR (preview_state <> 'SENDING' AND preview_claim_token IS NULL)",
+            name="ck_telegram_bewerbung_preparations_preview_token_state",
+        ),
+        CheckConstraint(
+            "preview_state <> 'SENDING' OR state = 'PREPARED'",
+            name="ck_telegram_bewerbung_preparations_preview_requires_prepared",
+        ),
+        Index(
+            "ix_telegram_bewerbung_preparations_state_claim",
+            "state",
+            "prep_claim_started_at",
+        ),
+        Index(
+            "ix_telegram_bewerbung_preparations_preview_claim",
+            "preview_state",
+            "preview_claim_started_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("telegram_vacancy_reviews.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    input_identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    prep_claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    prep_claim_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    match_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cv_draft_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bewerbung_draft_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    package_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    preview_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preview_renderer_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    preview_state: Mapped[str] = mapped_column(String(20), nullable=False, default="NONE")
+    preview_claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    preview_claim_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    preview_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    preview_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )

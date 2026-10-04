@@ -300,11 +300,21 @@ _OPENING_TEMPLATES: dict[str, str] = {
         'mit großem Interesse habe ich Ihre Stellenanzeige für die Position "{title}" '
         "bei {company} gelesen."
     ),
+    # Evidence-neutral (Stage 9B truth fix, Codex review section 7): the
+    # deterministic provider picks MATCH_FOCUS exactly when it has NO skill
+    # claim to reference, so this sentence must not assert any knowledge.
     "MATCH_FOCUS": (
-        'Die ausgeschriebene Position "{title}" bei {company} interessiert mich besonders, '
-        "da sie gut zu meinen nachgewiesenen Kenntnissen passt."
+        'Die ausgeschriebene Position "{title}" bei {company} interessiert mich besonders.'
     ),
 }
+
+# MATCH_FOCUS may mention fitting knowledge ONLY when the plan actually
+# references at least one skill claim from the pinned CV draft's trusted
+# evidence -- see render_draft.
+_MATCH_FOCUS_WITH_SKILL_EVIDENCE = (
+    'Die ausgeschriebene Position "{title}" bei {company} interessiert mich besonders, '
+    "da sie gut zu meinen Kenntnissen passt."
+)
 
 _CLOSING_TEMPLATES: dict[str, str] = {
     "INTERVIEW_INTEREST": (
@@ -313,9 +323,9 @@ _CLOSING_TEMPLATES: dict[str, str] = {
     "SHORT_PROFESSIONAL": "Für Rückfragen stehe ich Ihnen gerne zur Verfügung.",
 }
 
-_GENERIC_PARAGRAPH_TEXT = (
-    "Gerne möchte ich Ihnen meine bisherigen Erfahrungen in einem persönlichen Gespräch vorstellen."
-)
+# Used only when there is no candidate evidence to reference at all, so it
+# must make no claim about experience or knowledge (Stage 9B truth fix).
+_GENERIC_PARAGRAPH_TEXT = "Gerne stelle ich mich Ihnen in einem persönlichen Gespräch vor."
 
 
 def _experience_fragment(record: ExperienceEvidenceRecord) -> str:
@@ -338,9 +348,7 @@ def _language_fragment(record: LanguageEvidenceRecord) -> str:
     return f"{record.language}kenntnisse auf {record.level}-Niveau"
 
 
-def _render_evidence_paragraph(
-    records: list[EvidenceRecord], professional_title: str | None
-) -> str:
+def _render_evidence_paragraph(records: list[EvidenceRecord]) -> str:
     skills = [r for r in records if isinstance(r, SkillEvidenceRecord)]
     experiences = [r for r in records if isinstance(r, ExperienceEvidenceRecord)]
     projects = [r for r in records if isinstance(r, ProjectEvidenceRecord)]
@@ -348,11 +356,13 @@ def _render_evidence_paragraph(
 
     sentences: list[str] = []
     if skills:
+        # Skills render as skills only (Stage 9B truth fix): a skill record
+        # carries no employment context -- it may be evidenced by a personal
+        # project alone -- so no role, title or "bisherige Tätigkeit" is
+        # attached to it. Employment is stated only by experience records.
         names = ", ".join(skill.name for skill in skills)
-        role = professional_title or "meiner bisherigen Tätigkeit"
         sentences.append(
-            f"Im Rahmen von {role} bringe ich Kenntnisse in {names} mit, die für diese "
-            "Position relevant sind."
+            f"Ich bringe Kenntnisse in {names} mit, die für diese Position relevant sind."
         )
     for experience in experiences:
         sentences.append(f"Besonders relevant ist {_experience_fragment(experience)}.")
@@ -374,12 +384,26 @@ def render_draft(
     `plan`'s bounded enum/structure choices (already schema- and
     claim-id-validated by `parse_plan`/`resolve_plan`), `resolved_paragraphs`
     (evidence records looked up from the registry, never provider text),
-    and `job_title`/`job_company`/`professional_title` (already-trusted
-    fields from the persisted Job / pinned CV draft header). No parameter
-    here can carry provider-authored prose.
+    and `job_title`/`job_company` (already-trusted fields from the
+    persisted Job). No parameter here can carry provider-authored prose.
+
+    `professional_title` is accepted for call-site compatibility but is
+    deliberately no longer rendered (Stage 9B truth fix): attaching the
+    candidate's title to a skill sentence implied the skill was used in
+    that professional role, which a skill record cannot prove.
     """
+    del professional_title
     subject = f"Bewerbung als {job_title}"
-    opening = _OPENING_TEMPLATES[plan.opening_style].format(title=job_title, company=job_company)
+    has_skill_evidence = any(
+        isinstance(record, SkillEvidenceRecord)
+        for records in resolved_paragraphs
+        for record in records
+    )
+    if plan.opening_style == "MATCH_FOCUS" and has_skill_evidence:
+        opening_template = _MATCH_FOCUS_WITH_SKILL_EVIDENCE
+    else:
+        opening_template = _OPENING_TEMPLATES[plan.opening_style]
+    opening = opening_template.format(title=job_title, company=job_company)
     closing = _CLOSING_TEMPLATES[plan.closing_style]
 
     body_paragraphs: list[BewerbungParagraph] = []
@@ -387,7 +411,7 @@ def render_draft(
         if paragraph.kind == "GENERIC":
             text = _GENERIC_PARAGRAPH_TEXT
         else:
-            text = _render_evidence_paragraph(records, professional_title)
+            text = _render_evidence_paragraph(records)
         body_paragraphs.append(
             BewerbungParagraph(text=text, source_claim_ids=list(paragraph.claim_ids))
         )

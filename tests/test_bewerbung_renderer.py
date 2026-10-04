@@ -450,9 +450,11 @@ def test_candidate_identity_never_inflated_by_job_title():
     rendered = render_draft(
         plan, resolved, "Senior Backend Engineer", "Example GmbH", "Junior Python Developer"
     )
-    text = _full_text(rendered)
-    assert "Senior Backend Engineer" not in "".join(p.text for p in rendered.body_paragraphs)
-    assert "Junior Python Developer" in text
+    body = "".join(p.text for p in rendered.body_paragraphs)
+    assert "Senior Backend Engineer" not in body
+    # Stage 9B truth fix: the candidate's own title is no longer attached to
+    # skill sentences either -- a skill record proves no professional role.
+    assert "Junior Python Developer" not in body
 
 
 def test_experience_renders_only_its_own_technologies_not_global_skills():
@@ -718,3 +720,131 @@ def test_evidence_record_types_carry_no_numeric_field():
     ):
         for field in record_cls.model_fields.values():
             assert field.annotation not in (int, float)
+
+
+# --- Stage 9B truth fixes (Codex architecture review section 7) -----------
+
+_EXPERIENCE_OR_KNOWLEDGE_CLAIMS = (
+    "erfahrung",
+    "bisherige",
+    "tätigkeit",
+    "nachgewiesen",
+    "kenntnisse",
+    "im rahmen von",
+)
+
+
+def _render_with_deterministic_provider(cv_draft, match=None):
+    match = match or _match()
+    evidence, registry = build_evidence(cv_draft, match, "Python Developer", "Example GmbH", "")
+    plan = parse_plan(_run(DeterministicBewerbungProvider().generate_plan(evidence)))
+    resolved = resolve_plan(plan, registry)
+    header_title = cv_draft.header.professional_title
+    return render_draft(
+        plan,
+        resolved,
+        "Python Developer",
+        "Example GmbH",
+        header_title.value if header_title else None,
+    )
+
+
+def test_evidence_empty_candidate_makes_no_experience_or_knowledge_claim():
+    cv_draft = _cv_draft(skills=[], experience=[], projects=[], languages=[])
+
+    rendered = _render_with_deterministic_provider(cv_draft)
+
+    text = _full_text(rendered).lower()
+    for marker in _EXPERIENCE_OR_KNOWLEDGE_CLAIMS:
+        assert marker not in text, marker
+    assert rendered.body_paragraphs[0].source_claim_ids == []
+
+
+def test_match_focus_without_skill_evidence_claims_no_demonstrated_knowledge():
+    """The deterministic provider picks MATCH_FOCUS exactly when there is no
+    skill claim -- the opening must then assert no knowledge at all."""
+    cv_draft = _cv_draft(skills=[], languages=[])
+
+    rendered = _render_with_deterministic_provider(cv_draft)
+
+    assert "nachgewiesen" not in rendered.opening.lower()
+    assert "kenntnisse" not in rendered.opening.lower()
+
+
+def test_match_focus_with_skill_evidence_may_mention_fitting_knowledge():
+    cv_draft = _cv_draft()
+    evidence, registry = build_evidence(cv_draft, _match(), "Python Developer", "Example GmbH", "")
+    skill_id = next(c.id for c in evidence.allowed_claims if c.source_entity == "candidate_skill")
+    plan = parse_plan(
+        {
+            "opening_style": "MATCH_FOCUS",
+            "paragraphs": [{"kind": "EVIDENCE", "claim_ids": [skill_id]}],
+            "closing_style": "INTERVIEW_INTEREST",
+        }
+    )
+    rendered = render_draft(
+        plan, resolve_plan(plan, registry), "Python Developer", "Example GmbH", None
+    )
+
+    assert "Kenntnissen" in rendered.opening
+    assert "nachgewiesen" not in rendered.opening.lower()
+
+
+def test_project_only_skill_evidence_infers_no_employment():
+    """A skill evidenced only by a personal project, for a candidate with no
+    employment history and no professional title, renders as a skill only."""
+    from app.models.cv_draft import CVProjectItem
+
+    cv_draft = _cv_draft(
+        header=CVHeader(
+            first_name=CVTopLevelFact(
+                value="Anna", source_id=1, source_field="first_name", profile_version=1
+            ),
+        ),
+        experience=[],
+        languages=[],
+        projects=[
+            CVProjectItem(
+                source_id=7,
+                name="ChallengeMatch API",
+                description=None,
+                role=None,
+                technologies=["Python"],
+                repository_url=None,
+                demo_url=None,
+                start_date=None,
+                end_date=None,
+                matched_skills=["Python"],
+            )
+        ],
+    )
+
+    rendered = _render_with_deterministic_provider(cv_draft)
+
+    body = " ".join(p.text for p in rendered.body_paragraphs).lower()
+    assert "kenntnisse in python" in body
+    for marker in ("tätigkeit", "im rahmen von", "berufserfahrung", "erfahrung als"):
+        assert marker not in body, marker
+
+
+def test_skill_sentence_never_carries_the_professional_title():
+    cv_draft = _cv_draft(experience=[], languages=[])
+
+    rendered = _render_with_deterministic_provider(cv_draft)
+
+    body = " ".join(p.text for p in rendered.body_paragraphs)
+    assert "Junior Python Developer" not in body
+    assert "Ich bringe Kenntnisse in Python mit" in body
+
+
+def test_all_neutral_templates_make_no_experience_claim():
+    from app.agents.bewerbung_renderer import _MATCH_FOCUS_WITH_SKILL_EVIDENCE
+
+    neutral = [_GENERIC_PARAGRAPH_TEXT, *_OPENING_TEMPLATES.values()]
+    for template in neutral:
+        lowered = template.lower()
+        for marker in _EXPERIENCE_OR_KNOWLEDGE_CLAIMS:
+            assert marker not in lowered, (template, marker)
+    # The evidence-gated variant is still free of number/history claims.
+    assert "nachgewiesen" not in _MATCH_FOCUS_WITH_SKILL_EVIDENCE.lower()
+    assert not any(ch.isdigit() for ch in _MATCH_FOCUS_WITH_SKILL_EVIDENCE)

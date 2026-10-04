@@ -34,6 +34,7 @@ import functools
 import logging
 
 from telegram import Update
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -60,6 +61,13 @@ from app.services.collector_runner import (
     run_xing,
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
+from app.services.telegram import send_telegram_message
+from app.services.telegram_bewerbung import (
+    BewerbungOutcome,
+    handle_apply,
+    handle_preview_page,
+    parse_preview_callback_data,
+)
 from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
 from app.services.telegram_vacancy_feed import (
     ACTION_APPLY,
@@ -447,6 +455,65 @@ _DECISION_REPLIES = {
     "SKIPPED": ("❌ Übersprungen.", "Bereits übersprungen."),
 }
 
+_PRIVATE_CHAT_ONLY = (
+    "Bewerbungsentwürfe werden nur im privaten Chat mit dem Bot erstellt und angezeigt. "
+    "Es wurde nichts erstellt oder gesendet."
+)
+
+
+def _is_private_chat(update: Update) -> bool:
+    """Stage 9B privacy boundary: draft packages contain personal CV data,
+    so they are prepared/shown only when the authorized chat is a PRIVATE
+    chat. A configured group stays fully usable for Stage 9A cards
+    (unchanged), but never receives candidate draft content."""
+    chat = update.effective_chat
+    return chat is not None and getattr(chat, "type", None) == ChatType.PRIVATE
+
+
+async def _send_bewerbung_notice(settings: Settings, outcome: BewerbungOutcome) -> None:
+    """Best-effort short status notice (no candidate data) to the
+    authorized chat; its failure never affects the draft state."""
+    if not outcome.notice:
+        return
+    await send_telegram_message(
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        outcome.notice,
+        reply_markup=outcome.notice_markup,
+        timeout_seconds=settings.telegram_timeout_seconds,
+    )
+
+
+@require_authorized
+async def on_bewerbung_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9B: read-only "👁 Vorschau" and page navigation of a prepared
+    Bewerbung draft. Same authorization gate, plus the 9B flag and the
+    private-chat requirement. `callback_data` carries only an opaque
+    package capability and a bounded page number -- never a database id --
+    and shows the exact pinned package or an expired message. Never
+    generates anything."""
+    query = update.callback_query
+    settings = get_settings()
+    if not settings.telegram_bewerbung_draft_enabled:
+        await query.answer("Bewerbungsentwürfe sind deaktiviert.")
+        return
+    if not _is_private_chat(update):
+        await query.answer(_PRIVATE_CHAT_ONLY, show_alert=True)
+        logger.warning("telegram_bewerbung_preview_rejected reason=not_private_chat")
+        return
+    parsed = parse_preview_callback_data(query.data)
+    if parsed is None:
+        logger.warning("telegram_bewerbung_preview_rejected reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    package_token, page = parsed
+    await query.answer()
+    outcome = await handle_preview_page(
+        SessionLocal, settings, package_token, page, send=send_telegram_message
+    )
+    logger.info("telegram_bewerbung_preview_callback page=%s result=%s", page, outcome.code)
+    await _send_bewerbung_notice(settings, outcome)
+
 
 @require_authorized
 async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -463,8 +530,10 @@ async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     nothing.
 
     Save/Skip only record review state (`record_decision`); they never
-    write `JobRecord.status`. "Bewerbung erstellen" is a placeholder in
-    Stage 9A: it changes nothing and generates/sends nothing.
+    write `JobRecord.status`. "Bewerbung erstellen" stays the Stage 9A
+    placeholder unless `telegram_bewerbung_draft_enabled` is set; then it
+    starts Stage 9B DRAFT preparation (`app.services.telegram_bewerbung`),
+    only in a private chat -- it never sends an application or email.
     """
     query = update.callback_query
     parsed = parse_callback_data(query.data)
@@ -494,14 +563,35 @@ async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if action == ACTION_APPLY:
-            await query.answer(
-                "Bewerbung erstellen ist noch nicht verfügbar - es wurde nichts erstellt "
-                "oder gesendet.",
-                show_alert=True,
+            settings = get_settings()
+            if not settings.telegram_bewerbung_draft_enabled:
+                await query.answer(
+                    "Bewerbung erstellen ist noch nicht verfügbar - es wurde nichts erstellt "
+                    "oder gesendet.",
+                    show_alert=True,
+                )
+                logger.info(
+                    "telegram_vacancy_callback action=apply_placeholder review_id=%s", review.id
+                )
+                return
+            if not _is_private_chat(update):
+                await query.answer(_PRIVATE_CHAT_ONLY, show_alert=True)
+                logger.warning(
+                    "telegram_bewerbung_rejected reason=not_private_chat review_id=%s", review.id
+                )
+                return
+            review_id = review.id
+            db.close()
+            await query.answer("Bewerbungsentwurf wird vorbereitet ... Nichts wird gesendet.")
+            outcome = await handle_apply(
+                SessionLocal, settings, review_id, send=send_telegram_message
             )
             logger.info(
-                "telegram_vacancy_callback action=apply_placeholder review_id=%s", review.id
+                "telegram_vacancy_callback action=apply review_id=%s result=%s",
+                review_id,
+                outcome.code,
             )
+            await _send_bewerbung_notice(settings, outcome)
             return
 
         decision = "SAVED" if action == ACTION_SAVE else "SKIPPED"
@@ -573,6 +663,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("research", cmd_research))
     application.add_handler(CommandHandler("digest", cmd_digest))
     application.add_handler(CallbackQueryHandler(on_vacancy_callback, pattern=r"^vf:"))
+    application.add_handler(CallbackQueryHandler(on_bewerbung_preview_callback, pattern=r"^bp:"))
     application.add_error_handler(_handle_error)
     return application
 

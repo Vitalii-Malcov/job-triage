@@ -105,6 +105,13 @@ class Settings(BaseSettings):
     # stay queued for the next run.
     telegram_vacancy_feed_enabled: bool = False
     telegram_vacancy_feed_max_per_run: int = Field(default=10, ge=1, le=50)
+    # Stage 9B Telegram Bewerbung DRAFT preparation
+    # (app.services.telegram_bewerbung). Off by default: the card's
+    # "Bewerbung erstellen" button stays a harmless placeholder with no DB
+    # writes. When True, it prepares a draft package (existing 6B/6C/6D) and
+    # shows a preview in the authorized PRIVATE chat -- it never sends an
+    # application or email. Independent of telegram_vacancy_feed_enabled.
+    telegram_bewerbung_draft_enabled: bool = False
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.
