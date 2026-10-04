@@ -96,6 +96,15 @@ class Settings(BaseSettings):
     telegram_timeout_seconds: float = 5.0
     telegram_max_retries: int = 3
     min_job_score_to_notify: int = 80
+    # Stage 9A Telegram vacancy feed (app.services.telegram_vacancy_feed).
+    # Off by default: when False, collectors keep the legacy one-line
+    # TelegramNotifier.send_job alert unchanged. When True, collectors
+    # instead persist per-job review state and deliver one vacancy card per
+    # eligible job (same APPLY + min_job_score_to_notify gate), at most
+    # `telegram_vacancy_feed_max_per_run` cards per collector run -- the rest
+    # stay queued for the next run.
+    telegram_vacancy_feed_enabled: bool = False
+    telegram_vacancy_feed_max_per_run: int = Field(default=10, ge=1, le=50)
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.

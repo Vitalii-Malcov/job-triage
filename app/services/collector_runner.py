@@ -75,6 +75,10 @@ from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.telegram import TelegramNotifier
+from app.services.telegram_vacancy_feed import (
+    deliver_queued_vacancy_cards,
+    record_collected_job,
+)
 from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
@@ -485,6 +489,24 @@ async def _maybe_auto_research(
         )
 
 
+async def _deliver_vacancy_feed(
+    db: Session, settings, *, is_lease_lost: Callable[[], bool] | None
+) -> None:
+    """Stage 9A: deliver queued vacancy cards at the end of a collector run
+    (this run's newly queued jobs AND earlier runs' provably failed sends --
+    this sweep is the retry path). Best-effort, exactly like the legacy
+    alert: a delivery failure is logged and rolled back, never raised, so it
+    can never change the run's counts or lose an already-persisted job.
+    No-op when the feed is disabled."""
+    if not settings.telegram_vacancy_feed_enabled:
+        return
+    try:
+        await deliver_queued_vacancy_cards(db, settings, is_lease_lost=is_lease_lost)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("vacancy_feed_delivery_error error_type=%s", type(exc).__name__)
+
+
 async def run_bundesagentur(
     db: Session,
     settings,
@@ -642,7 +664,11 @@ async def run_bundesagentur(
             db, settings, job_record, result, auto_research_budget, is_lease_lost=is_lease_lost
         )
 
-        if result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
+        if settings.telegram_vacancy_feed_enabled:
+            # Stage 9A: persist review state only; cards are delivered by
+            # the sweep after this loop (see _deliver_vacancy_feed).
+            record_collected_job(db, job_record, settings)
+        elif result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
             # Notification delivery is best-effort orchestration on top of
             # already-committed persistence: a failed/slow send must not
             # affect created/updated/failed counts or abort the run.
@@ -676,6 +702,8 @@ async def run_bundesagentur(
                             job.company,
                         )
                 notified_count += 1
+
+    await _deliver_vacancy_feed(db, settings, is_lease_lost=is_lease_lost)
 
     logger.info(
         "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
@@ -836,7 +864,10 @@ async def run_xing(
                 is_lease_lost=is_lease_lost,
             )
 
-            if (
+            if settings.telegram_vacancy_feed_enabled:
+                # Stage 9A: see run_bundesagentur's identical branch.
+                record_collected_job(db, job_record, settings)
+            elif (
                 result.recommendation == "APPLY"
                 and result.score >= settings.min_job_score_to_notify
             ):
@@ -930,6 +961,8 @@ async def run_xing(
             mailbox_scope=mailbox_scope,
             observed_uid_validity=observed_uid_validity,
         )
+
+    await _deliver_vacancy_feed(db, settings, is_lease_lost=is_lease_lost)
 
     logger.info(
         "xing_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s "

@@ -3215,6 +3215,6 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type") -- update this
-    # alongside every new migration's own down_revision chaining.
-    assert heads[0] == "b2c5d8e4f7a1"
+    # Stage 9A (c4e8a1f63b9d, "add telegram_vacancy_reviews.claim_token") --
+    # update this alongside every new migration's own down_revision chaining.
+    assert heads[0] == "c4e8a1f63b9d"

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
@@ -14,6 +15,16 @@ logger = logging.getLogger(__name__)
 # behalf, since what's safe to drop is content-dependent.
 TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 
+# HTTP statuses that are reliable evidence the sendMessage request was
+# REJECTED without creating a message (Codex S9A-CODEX-001): the request was
+# refused for its content/auth/target (400 bad request, 401 bad token, 403
+# bot blocked / not in chat, 404 unknown token path) or throttled before
+# processing (429 Too Many Requests). Every other non-2xx status -- notably
+# 500/502/503/504, which an intermediary can return AFTER forwarding the
+# POST to Telegram, plus statuses Telegram does not document for sendMessage
+# (e.g. 409, 408) -- cannot disprove delivery and is UNCERTAIN.
+DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 429})
+
 
 class TelegramSendOutcome(StrEnum):
     """The three outcomes a single `send_telegram_text` attempt can
@@ -26,6 +37,26 @@ class TelegramSendOutcome(StrEnum):
     SENT = "SENT"
     FAILED = "FAILED"
     UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass(frozen=True)
+class TelegramSendResult:
+    """`send_telegram_message`'s result: the outcome plus, when SENT and
+    Telegram's response carried one, the delivered message's id."""
+
+    outcome: TelegramSendOutcome
+    message_id: int | None = None
+
+
+def _extract_message_id(response: httpx.Response) -> int | None:
+    """Best-effort read of `result.message_id` from a 2xx sendMessage
+    response. A body that can't be parsed never turns a confirmed SENT into
+    anything else -- the message_id is bookkeeping, not proof of delivery."""
+    try:
+        message_id = response.json()["result"]["message_id"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return message_id if isinstance(message_id, int) else None
 
 
 async def send_telegram_text(
@@ -46,9 +77,13 @@ async def send_telegram_text(
     UNCERTAIN, never FAILED.** Only two situations are provably
     "never reached Telegram, safe to retry":
 
-    - `httpx.HTTPStatusError` -- a response WAS received (Telegram
-      itself rejected/errored the request, e.g. bad token or chat not
-      found). The HTTP transaction completed; we know the outcome.
+    - `httpx.HTTPStatusError` with a status in
+      `DEFINITIVE_REJECTION_STATUS_CODES` (400/401/403/404/429) -- the
+      request was rejected (e.g. bad token, chat not found, rate-limited)
+      without a message being created. Any OTHER non-2xx status (5xx
+      gateway/server errors, 409, ...) is UNCERTAIN (Codex S9A-CODEX-001):
+      a gateway can return 502/504 after Telegram already accepted the
+      message, so the error response does not prove non-delivery.
     - `httpx.ConnectError` / `httpx.ConnectTimeout` / `httpx.PoolTimeout`
       -- the connection itself could never be established (DNS failure,
       refused connection, or a timeout while still connecting/queued
@@ -74,23 +109,60 @@ async def send_telegram_text(
     message/traceback -- only the outcome and, on failure,
     `type(exc).__name__`.
     """
+    result = await send_telegram_message(bot_token, chat_id, text, timeout_seconds=timeout_seconds)
+    return result.outcome
+
+
+async def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    reply_markup: dict | None = None,
+    timeout_seconds: float = 5.0,
+) -> TelegramSendResult:
+    """`send_telegram_text`'s implementation, additionally accepting an
+    optional `reply_markup` (e.g. an inline keyboard, Stage 9A vacancy
+    cards) and returning the delivered `message_id`. Same single-attempt,
+    no-retry contract and the SAME outcome classification and logging
+    hardening documented on `send_telegram_text`. Plain text only -- no
+    `parse_mode`, so untrusted job content can never be interpreted as
+    markup.
+    """
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload: dict = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(url, json={"chat_id": chat_id, "text": text})
+            response = await client.post(url, json=payload)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        # A response WAS received -- Telegram itself rejected the
-        # request (e.g. bad token, chat not found). Provably not
-        # delivered.
-        logger.warning("telegram_send_failed error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.FAILED
+        status_code = exc.response.status_code
+        if status_code in DEFINITIVE_REJECTION_STATUS_CODES:
+            # The request was rejected (bad token, chat not found,
+            # rate-limited, ...) -- provably not delivered, safe to retry.
+            logger.warning(
+                "telegram_send_failed error_type=%s status_code=%s",
+                type(exc).__name__,
+                status_code,
+            )
+            return TelegramSendResult(TelegramSendOutcome.FAILED)
+        # 5xx gateway/server errors and undocumented statuses: the POST may
+        # already have been accepted upstream before this error response was
+        # produced -- delivery cannot be disproven (S9A-CODEX-001).
+        logger.warning(
+            "telegram_send_uncertain error_type=%s status_code=%s",
+            type(exc).__name__,
+            status_code,
+        )
+        return TelegramSendResult(TelegramSendOutcome.UNCERTAIN)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         # The connection was never established (or timed out before it
         # was) -- no request bytes were ever transmitted. Provably not
         # delivered, safe to retry.
         logger.warning("telegram_send_failed error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.FAILED
+        return TelegramSendResult(TelegramSendOutcome.FAILED)
     except httpx.HTTPError as exc:
         # Everything else (ReadTimeout/WriteTimeout/ReadError/
         # WriteError/RemoteProtocolError/any other RequestError or
@@ -99,10 +171,10 @@ async def send_telegram_text(
         # be disproven. Never classified FAILED -- see this function's
         # docstring's classification rule.
         logger.warning("telegram_send_uncertain error_type=%s", type(exc).__name__)
-        return TelegramSendOutcome.UNCERTAIN
+        return TelegramSendResult(TelegramSendOutcome.UNCERTAIN)
 
     logger.info("telegram_send_sent")
-    return TelegramSendOutcome.SENT
+    return TelegramSendResult(TelegramSendOutcome.SENT, _extract_message_id(response))
 
 
 class TelegramNotifier:
