@@ -561,3 +561,110 @@ class TestSendTelegramMessage:
         result = await send_telegram_message("t", "1", "hi")
 
         assert result == TelegramSendResult(TelegramSendOutcome.SENT, None)
+
+
+class _AcceptingClient:
+    """Stands in for httpx.AsyncClient inside the REAL
+    `send_telegram_message`: every POST is recorded as externally accepted
+    (the card reached the chat) and then answered with the next scripted
+    HTTP status -- simulating a gateway that forwards the POST to Telegram
+    but returns an error to us (Codex S9A-CODEX-001)."""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.accepted: list[dict] = []
+
+    def __call__(self, **_kwargs):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def post(self, url, json=None):
+        self.accepted.append(json)
+        status = self.statuses.pop(0) if self.statuses else 200
+        body = (
+            {"ok": True, "result": {"message_id": 77}}
+            if status == 200
+            else {"ok": False, "error_code": status, "description": "error"}
+        )
+        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
+
+
+@pytest.fixture()
+def real_sender_client(monkeypatch):
+    """Uses the REAL sender; only the HTTP client is replaced."""
+
+    def install(statuses):
+        client = _AcceptingClient(statuses)
+        monkeypatch.setattr("app.services.telegram.httpx.AsyncClient", client)
+        monkeypatch.setattr(
+            feed, "get_candidate_skills_for_scoring", lambda db: frozenset({"python", "sql"})
+        )
+        return client
+
+    return install
+
+
+class TestRealSenderHttpClassification:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+    async def test_gateway_error_after_acceptance_is_uncertain_and_never_resent(
+        self, db, real_sender_client, status_code
+    ):
+        client = real_sender_client([status_code])
+        job = _persist_job(db)
+        ensure_review(db, job.id, eligible=True)
+
+        first = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+
+        review = get_review_for_job(db, job.id)
+        assert review.state == "DELIVERY_UNCERTAIN"
+        assert first.uncertain == 1 and first.failed == 0
+        assert len(client.accepted) == 1
+
+        second = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+
+        db.refresh(review)
+        assert len(client.accepted) == 1  # zero new sendMessage calls
+        assert second.sent == 0 and second.failed == 0 and second.uncertain == 0
+        assert review.state == "DELIVERY_UNCERTAIN"
+        assert review.attempt_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 429])
+    async def test_definitive_rejection_is_retried_on_next_sweep(
+        self, db, real_sender_client, status_code
+    ):
+        client = real_sender_client([status_code, 200])
+        job = _persist_job(db)
+        ensure_review(db, job.id, eligible=True)
+
+        first = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+        review = get_review_for_job(db, job.id)
+        assert first.failed == 1
+        assert review.state == "QUEUED_FOR_REVIEW"
+
+        second = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+        db.refresh(review)
+        assert second.sent == 1
+        assert review.state == "TELEGRAM_SENT"
+        assert review.telegram_message_id == 77
+        assert len(client.accepted) == 2
+
+    @pytest.mark.asyncio
+    async def test_repeated_definitive_rejection_stops_at_max_attempts(
+        self, db, real_sender_client
+    ):
+        client = real_sender_client([400] * (MAX_DELIVERY_ATTEMPTS + 3))
+        job = _persist_job(db)
+        ensure_review(db, job.id, eligible=True)
+
+        for _ in range(MAX_DELIVERY_ATTEMPTS + 3):
+            await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+
+        assert len(client.accepted) == MAX_DELIVERY_ATTEMPTS
+        assert get_review_for_job(db, job.id).state == "DELIVERY_FAILED"

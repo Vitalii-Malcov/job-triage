@@ -107,6 +107,48 @@ class TestOutcomeClassification:
         assert outcome is TelegramSendOutcome.FAILED
 
 
+def _status_response(status_code: int) -> httpx.Response:
+    return httpx.Response(status_code, request=httpx.Request("POST", "https://api.telegram.org/x"))
+
+
+class TestHttpStatusClassification:
+    """Codex S9A-CODEX-001: only statuses that prove the request was
+    rejected without creating a message are FAILED (retryable). A 5xx
+    gateway/server error can be returned AFTER Telegram accepted the POST,
+    and undocumented statuses cannot be attributed to a Telegram rejection,
+    so both are UNCERTAIN (never automatically retried by duplicate-averse
+    callers)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 429])
+    async def test_definitive_rejection_is_failed(self, monkeypatch, status_code):
+        _patch_client(monkeypatch, _status_response(status_code))
+
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+
+        assert outcome is TelegramSendOutcome.FAILED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [409, 500, 502, 503, 504])
+    async def test_ambiguous_status_is_uncertain_not_failed(self, monkeypatch, status_code):
+        _patch_client(monkeypatch, _status_response(status_code))
+
+        outcome = await send_telegram_text(BOT_TOKEN, CHAT_ID, "hello")
+
+        assert outcome is TelegramSendOutcome.UNCERTAIN
+
+    @pytest.mark.asyncio
+    async def test_status_classification_never_logs_token_or_text(self, monkeypatch, caplog):
+        _patch_client(monkeypatch, _status_response(502))
+
+        with caplog.at_level("DEBUG"):
+            await send_telegram_text(BOT_TOKEN, CHAT_ID, "secret message body")
+
+        assert BOT_TOKEN not in caplog.text
+        assert "secret message body" not in caplog.text
+        assert "status_code=502" in caplog.text
+
+
 class TestAdversarialAmbiguousOutcomesAreUncertain:
     """Codex Stage 8E BLOCKER (OUTBOUND UNCERTAINTY): every network
     failure that occurs AFTER a connection was already established must

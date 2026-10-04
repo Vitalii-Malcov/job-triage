@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 # behalf, since what's safe to drop is content-dependent.
 TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 
+# HTTP statuses that are reliable evidence the sendMessage request was
+# REJECTED without creating a message (Codex S9A-CODEX-001): the request was
+# refused for its content/auth/target (400 bad request, 401 bad token, 403
+# bot blocked / not in chat, 404 unknown token path) or throttled before
+# processing (429 Too Many Requests). Every other non-2xx status -- notably
+# 500/502/503/504, which an intermediary can return AFTER forwarding the
+# POST to Telegram, plus statuses Telegram does not document for sendMessage
+# (e.g. 409, 408) -- cannot disprove delivery and is UNCERTAIN.
+DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 429})
+
 
 class TelegramSendOutcome(StrEnum):
     """The three outcomes a single `send_telegram_text` attempt can
@@ -67,9 +77,13 @@ async def send_telegram_text(
     UNCERTAIN, never FAILED.** Only two situations are provably
     "never reached Telegram, safe to retry":
 
-    - `httpx.HTTPStatusError` -- a response WAS received (Telegram
-      itself rejected/errored the request, e.g. bad token or chat not
-      found). The HTTP transaction completed; we know the outcome.
+    - `httpx.HTTPStatusError` with a status in
+      `DEFINITIVE_REJECTION_STATUS_CODES` (400/401/403/404/429) -- the
+      request was rejected (e.g. bad token, chat not found, rate-limited)
+      without a message being created. Any OTHER non-2xx status (5xx
+      gateway/server errors, 409, ...) is UNCERTAIN (Codex S9A-CODEX-001):
+      a gateway can return 502/504 after Telegram already accepted the
+      message, so the error response does not prove non-delivery.
     - `httpx.ConnectError` / `httpx.ConnectTimeout` / `httpx.PoolTimeout`
       -- the connection itself could never be established (DNS failure,
       refused connection, or a timeout while still connecting/queued
@@ -124,11 +138,25 @@ async def send_telegram_message(
             response = await client.post(url, json=payload)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        # A response WAS received -- Telegram itself rejected the
-        # request (e.g. bad token, chat not found). Provably not
-        # delivered.
-        logger.warning("telegram_send_failed error_type=%s", type(exc).__name__)
-        return TelegramSendResult(TelegramSendOutcome.FAILED)
+        status_code = exc.response.status_code
+        if status_code in DEFINITIVE_REJECTION_STATUS_CODES:
+            # The request was rejected (bad token, chat not found,
+            # rate-limited, ...) -- provably not delivered, safe to retry.
+            logger.warning(
+                "telegram_send_failed error_type=%s status_code=%s",
+                type(exc).__name__,
+                status_code,
+            )
+            return TelegramSendResult(TelegramSendOutcome.FAILED)
+        # 5xx gateway/server errors and undocumented statuses: the POST may
+        # already have been accepted upstream before this error response was
+        # produced -- delivery cannot be disproven (S9A-CODEX-001).
+        logger.warning(
+            "telegram_send_uncertain error_type=%s status_code=%s",
+            type(exc).__name__,
+            status_code,
+        )
+        return TelegramSendResult(TelegramSendOutcome.UNCERTAIN)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
         # The connection was never established (or timed out before it
         # was) -- no request bytes were ever transmitted. Provably not
