@@ -114,6 +114,10 @@ ELIGIBLE_REVIEW_STATES = frozenset({"TELEGRAM_SENT", "DELIVERY_UNCERTAIN", "SAVE
 ELIGIBLE_JOB_STATUSES = frozenset({"NEW", "SAVED"})
 
 PREVIEW_CALLBACK_PREFIX = "bp"
+# Stage 9C "✅ Zur Prüfung" request (handled by app.services.
+# telegram_bewerbung_approval). Defined here so this Stage 9B module never
+# imports Stage 9C/6E code; the button only carries the package capability.
+REVIEW_REQUEST_CALLBACK_PREFIX = "ba"
 _PAGE_DIGITS_MAX = 2
 
 # Preparation failures caused by the inputs themselves: retrying the same
@@ -197,9 +201,24 @@ class BewerbungOutcome:
     notice_markup: dict | None = None
 
 
-def _outcome(code: str, *, package_token: str | None = None) -> BewerbungOutcome:
-    markup = preview_keyboard(package_token) if package_token else None
+def _outcome(
+    code: str, *, package_token: str | None = None, approval_enabled: bool = False
+) -> BewerbungOutcome:
+    markup = (
+        preview_keyboard(package_token, approval_enabled=approval_enabled)
+        if package_token
+        else None
+    )
     return BewerbungOutcome(code, NOTICES.get(code), markup)
+
+
+def approval_flags_enabled(settings) -> bool:
+    """Stage 9C is effective only when BOTH the 9B draft flag and the 9C
+    approval flag are on."""
+    return bool(
+        getattr(settings, "telegram_bewerbung_draft_enabled", False)
+        and getattr(settings, "telegram_bewerbung_approval_enabled", False)
+    )
 
 
 # --- callback data ---------------------------------------------------------
@@ -227,20 +246,31 @@ def parse_preview_callback_data(data: str | None) -> tuple[str, int] | None:
     return parts[1], page
 
 
-def preview_keyboard(package_token: str) -> dict:
+def review_request_button(package_token: str) -> dict:
+    """Stage 9C: request review of exactly this package (no DB ids)."""
     return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "👁 Vorschau",
-                    "callback_data": build_preview_callback_data(package_token, 1),
-                }
-            ]
-        ]
+        "text": "✅ Zur Prüfung",
+        "callback_data": f"{REVIEW_REQUEST_CALLBACK_PREFIX}:{package_token}",
     }
 
 
-def page_keyboard(package_token: str, page: int, total: int) -> dict | None:
+def preview_keyboard(package_token: str, *, approval_enabled: bool = False) -> dict:
+    rows = [
+        [
+            {
+                "text": "👁 Vorschau",
+                "callback_data": build_preview_callback_data(package_token, 1),
+            }
+        ]
+    ]
+    if approval_enabled:
+        rows.append([review_request_button(package_token)])
+    return {"inline_keyboard": rows}
+
+
+def page_keyboard(
+    package_token: str, page: int, total: int, *, approval_enabled: bool = False
+) -> dict | None:
     buttons = []
     if page > 1:
         buttons.append(
@@ -256,7 +286,10 @@ def page_keyboard(package_token: str, page: int, total: int) -> dict | None:
                 "callback_data": build_preview_callback_data(package_token, page + 1),
             }
         )
-    return {"inline_keyboard": [buttons]} if buttons else None
+    rows = [buttons] if buttons else []
+    if approval_enabled:
+        rows.append([review_request_button(package_token)])
+    return {"inline_keyboard": rows} if rows else None
 
 
 # --- inputs ----------------------------------------------------------------
@@ -650,9 +683,17 @@ async def _offer_summary(
     definite FAILED), never automatically again after SENT/UNCERTAIN."""
     package_token = prep.package_token
     if prep.preview_state == "SENT":
-        return _outcome("ALREADY_SHOWN", package_token=package_token)
+        return _outcome(
+            "ALREADY_SHOWN",
+            package_token=package_token,
+            approval_enabled=approval_flags_enabled(settings),
+        )
     if prep.preview_state == "UNCERTAIN":
-        return _outcome("PREVIEW_UNCERTAIN", package_token=package_token)
+        return _outcome(
+            "PREVIEW_UNCERTAIN",
+            package_token=package_token,
+            approval_enabled=approval_flags_enabled(settings),
+        )
     if prep.preview_state == "SENDING":
         return _outcome("PREVIEW_BUSY")
     if _job_still_eligible(db, job_id) is None:
@@ -663,7 +704,9 @@ async def _offer_summary(
         settings,
         prep,
         text=prep.preview_text,
-        reply_markup=preview_keyboard(prep.package_token),
+        reply_markup=preview_keyboard(
+            prep.package_token, approval_enabled=approval_flags_enabled(settings)
+        ),
         allowed_states=_APPLY_PREVIEW_STATES,
         send=send,
     )
@@ -673,7 +716,11 @@ async def _offer_summary(
         return _outcome("PREVIEW_BUSY")
     if state == "FAILED":
         return _outcome("PREVIEW_FAILED")
-    return _outcome("PREVIEW_UNCERTAIN", package_token=package_token)
+    return _outcome(
+        "PREVIEW_UNCERTAIN",
+        package_token=package_token,
+        approval_enabled=approval_flags_enabled(settings),
+    )
 
 
 # --- entry points ----------------------------------------------------------
@@ -797,7 +844,12 @@ async def handle_preview_page(
             settings,
             prep,
             text=pages[page - 1],
-            reply_markup=page_keyboard(expected.package_token, page, len(pages)),
+            reply_markup=page_keyboard(
+                expected.package_token,
+                page,
+                len(pages),
+                approval_enabled=approval_flags_enabled(settings),
+            ),
             allowed_states=_EXPLICIT_PREVIEW_STATES,
             send=send,
             expected=expected,

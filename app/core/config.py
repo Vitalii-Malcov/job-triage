@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     # shows a preview in the authorized PRIVATE chat -- it never sends an
     # application or email. Independent of telegram_vacancy_feed_enabled.
     telegram_bewerbung_draft_enabled: bool = False
+    # Stage 9C: "✅ Zur Prüfung" on a Stage 9B package creates/reuses one
+    # Stage 6E review, shows its COMPLETE content and lets the operator
+    # approve or reject it in the PRIVATE chat. APPROVED != SENT: nothing is
+    # ever sent. Effective only together with telegram_bewerbung_draft_enabled.
+    telegram_bewerbung_approval_enabled: bool = False
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.
