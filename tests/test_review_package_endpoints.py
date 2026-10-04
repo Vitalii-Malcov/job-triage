@@ -1123,3 +1123,37 @@ def test_approve_still_checks_profile_version_after_authority_confirmed_present(
     assert response.status_code == 409
     # The profile itself must still exist and be untouched by Stage 6E.
     assert _count_candidate_profiles(session_factory) == 1
+
+
+def test_service_create_commit_false_composes_into_the_callers_transaction(client):
+    """Stage 9C: commit=False flushes header + revision 1 only; the caller's
+    rollback removes both, and the API default (commit=True) is unchanged."""
+    from app.db.models import ApplicationPackageReviewRevisionRecord
+    from app.services.review_package import ReviewPackageService
+
+    test_client, session_factory = client
+    job_id = _seed_job(session_factory)
+    cv_draft_id, bewerbung_draft_id = _ready_pair(test_client, session_factory, job_id)
+
+    db = session_factory()
+    try:
+        job = db.get(JobRecord, job_id)
+        package = ReviewPackageService().create(
+            db, job, cv_draft_id, bewerbung_draft_id, commit=False
+        )
+        assert package.id is not None and package.review_version == 1
+        assert package.current_revision_id is not None
+        assert _count_reviews(session_factory) == 0
+        db.rollback()
+    finally:
+        db.close()
+    assert _count_reviews(session_factory) == 0
+    db = session_factory()
+    try:
+        assert db.query(ApplicationPackageReviewRevisionRecord).count() == 0
+    finally:
+        db.close()
+
+    created = _create_review(test_client, job_id, cv_draft_id, bewerbung_draft_id)
+    assert created.status_code == 200
+    assert _count_reviews(session_factory) == 1

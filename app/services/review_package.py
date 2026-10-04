@@ -84,8 +84,21 @@ def _resolve_cas_conflict(db: Session, review_id: int, expected_review_version: 
 
 class ReviewPackageService:
     def create(
-        self, db: Session, job: JobRecord, cv_draft_id: int, bewerbung_draft_id: int
+        self,
+        db: Session,
+        job: JobRecord,
+        cv_draft_id: int,
+        bewerbung_draft_id: int,
+        *,
+        commit: bool = True,
     ) -> ReviewPackage:
+        """Create a PENDING_REVIEW package + its MACHINE revision 1.
+
+        `commit=False` composes the creation into the CALLER's transaction
+        (flush only; see `create_review`). Stage 9C uses it to commit the
+        review, its revision and its Telegram link atomically. The default
+        is unchanged, and duplicate creation stays legal for API callers.
+        """
         cv_record = get_draft_by_id(db, cv_draft_id)
         if cv_record is None:
             raise ReviewCVDraftNotFoundError(cv_draft_id)
@@ -135,6 +148,7 @@ class ReviewPackageService:
             bewerbung_generator_version=bewerbung_record.bewerbung_generator_version,
             reviewed_cv=reviewed_cv,
             reviewed_bewerbung=reviewed_bewerbung,
+            commit=commit,
         )
         logger.info(
             "review_package_created review_id=%s job_id=%s cv_draft_id=%s "
