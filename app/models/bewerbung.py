@@ -189,6 +189,18 @@ class BewerbungParagraph(BaseModel):
     source_claim_ids: list[str] = Field(default_factory=list)
 
 
+class BewerbungJobContext(BaseModel):
+    """The exact, case-preserving job display context a letter was rendered
+    with (Stage 9B). `job_snapshot_fingerprint` casefolds the title and
+    excludes the company, so it cannot tell whether a letter's opening still
+    names the job's current title/company -- this snapshot can, and
+    `app.services.bewerbung_reuse` compares it exactly. Never re-derived by
+    parsing rendered prose."""
+
+    title: str
+    company: str
+
+
 class BewerbungDraftData(BaseModel):
     """The computed content of a Bewerbung draft — everything
     `app.services.bewerbung.BewerbungService.generate` produces, before
@@ -230,6 +242,10 @@ class BewerbungDraftData(BaseModel):
 
     claims: list[AllowedClaim] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    # Optional for backward-compatible reading of pre-Stage-9B rows, which
+    # never recorded it; such legacy drafts are never treated as current.
+    job_context: BewerbungJobContext | None = None
 
 
 class BewerbungDraft(BewerbungDraftData):

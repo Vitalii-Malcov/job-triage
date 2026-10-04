@@ -42,10 +42,19 @@ def get_latest_bewerbung_draft(db: Session, job_id: int) -> BewerbungDraftRecord
     return db.scalar(stmt)
 
 
-def create_bewerbung_draft(db: Session, data: BewerbungDraftData) -> BewerbungDraftRecord:
+def create_bewerbung_draft(
+    db: Session, data: BewerbungDraftData, *, commit: bool = True
+) -> BewerbungDraftRecord:
     """Persist a freshly generated Bewerbung draft. Always inserts a new
     row — see module docstring for why there is no cache-identity/race
     handling here, unlike Stage 6B/6C's create_match/create_draft.
+
+    `commit=True` (the default, used by the API and Stage 8C) commits the
+    row immediately, exactly as before. `commit=False` (Stage 9B, caller-
+    owned transaction) only flushes it: the row gets its id but becomes
+    durable only if the CALLER commits -- the Telegram preparation path
+    commits it together with its ownership-fenced publication, and rolls it
+    back if that publication loses, so a stale worker leaves no letter.
     """
     record = BewerbungDraftRecord(
         job_id=data.job_id,
@@ -61,8 +70,11 @@ def create_bewerbung_draft(db: Session, data: BewerbungDraftData) -> BewerbungDr
         draft_json=data.model_dump_json(),
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    if commit:
+        db.commit()
+        db.refresh(record)
+    else:
+        db.flush()
     return record
 
 

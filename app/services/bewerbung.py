@@ -51,7 +51,7 @@ from app.db.candidate_job_match_repository import (
 )
 from app.db.candidate_profile_repository import get_or_create_candidate_profile
 from app.db.models import JobRecord
-from app.models.bewerbung import BewerbungDraft, BewerbungDraftData
+from app.models.bewerbung import BewerbungDraft, BewerbungDraftData, BewerbungJobContext
 from app.providers.bewerbung.base import BewerbungProvider
 from app.providers.bewerbung.deterministic import DeterministicBewerbungProvider
 
@@ -69,7 +69,13 @@ class BewerbungService:
     def _provider_for(self) -> BewerbungProvider:
         return self._injected_provider or DeterministicBewerbungProvider()
 
-    async def generate(self, db: Session, job: JobRecord, cv_draft_id: int) -> BewerbungDraft:
+    async def generate(
+        self, db: Session, job: JobRecord, cv_draft_id: int, *, commit: bool = True
+    ) -> BewerbungDraft:
+        """Generate and persist one new draft. `commit=False` only flushes
+        the new row inside the caller's transaction (Stage 9B caller-owned
+        publication -- see `create_bewerbung_draft`); the default is the
+        unchanged commit-on-generation behavior."""
         cv_draft_record = get_draft_by_id(db, cv_draft_id)
         if cv_draft_record is None:
             raise BewerbungCVDraftNotFoundError(cv_draft_id)
@@ -172,19 +178,21 @@ class BewerbungService:
             plan=plan,
             claims=used_claims,
             warnings=warnings,
+            job_context=BewerbungJobContext(title=job.title, company=job.company),
         )
 
-        record = create_bewerbung_draft(db, data)
+        record = create_bewerbung_draft(db, data, commit=commit)
         # Privacy-safe (spec section 42): technical metadata only, never
         # candidate name/summary/skills/experience/subject/body content.
         logger.info(
             "bewerbung_draft_created job_id=%s cv_draft_id=%s bewerbung_draft_id=%s "
-            "provider=%s generator_version=%s status=%s",
+            "provider=%s generator_version=%s status=%s committed=%s",
             job.id,
             cv_draft_id,
             record.id,
             provider.name,
             BEWERBUNG_GENERATOR_VERSION,
             record.status,
+            commit,
         )
         return to_bewerbung_draft(record)

@@ -232,7 +232,7 @@ def prepare_candidate_cv_draft_with_outcome(
 
 
 async def prepare_bewerbung_draft(
-    db: Session, job_id: int, cv_draft_id: int
+    db: Session, job_id: int, cv_draft_id: int, *, commit: bool = True
 ) -> BewerbungDraft | None:
     """Generate a Bewerbung draft pinned to one specific persisted CV draft
     (Stage 6D). Returns None if the job doesn't exist — callers translate
@@ -253,10 +253,14 @@ async def prepare_bewerbung_draft(
     WHETHER to call this at all) lives in app.services.automation, never
     here, so manual callers (the API endpoint) keep their existing
     always-regenerate behavior unmodified.
+
+    `commit=False` (Stage 9B) flushes the new draft inside the caller's
+    transaction instead of committing it -- see
+    `app.db.bewerbung_repository.create_bewerbung_draft`.
     """
     job = get_job_by_id(db, job_id)
     if job is None:
         return None
 
     service = BewerbungService()
-    return await service.generate(db, job, cv_draft_id)
+    return await service.generate(db, job, cv_draft_id, commit=commit)

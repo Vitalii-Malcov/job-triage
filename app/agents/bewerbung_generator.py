@@ -8,13 +8,16 @@ to this job, is the candidate profile still at the version the draft was
 generated against, has the job's own content fingerprint changed, and is
 the CV draft's pinned match still self-consistent.
 
-**BEWERBUNG_GENERATOR_VERSION.** `"v1"` — bumped whenever evidence-packet
+**BEWERBUNG_GENERATOR_VERSION.** `"v2"` — bumped whenever evidence-packet
 construction or rendering rules in `app.agents.bewerbung_renderer` change
 in a way that would produce a different draft for the same inputs (mirrors
-`app.agents.cv_adapter.CV_ADAPTER_VERSION`'s rationale exactly).
+`app.agents.cv_adapter.CV_ADAPTER_VERSION`'s rationale exactly). v2
+(Stage 9B): evidence-neutral generic/MATCH_FOCUS wording, skills rendered
+without inferred employment context, and the job display context persisted
+in the draft JSON. v1 drafts stay readable but are never reused as current.
 """
 
-BEWERBUNG_GENERATOR_VERSION = "v1"
+BEWERBUNG_GENERATOR_VERSION = "v2"
 
 
 class BewerbungCVDraftNotFoundError(Exception):
