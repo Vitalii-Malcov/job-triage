@@ -2671,3 +2671,68 @@ class TelegramBewerbungPreparationRecord(Base):
         onupdate=lambda: datetime.now(UTC),
         nullable=False,
     )
+
+
+class TelegramBewerbungApprovalRecord(Base):
+    """Stage 9C: the immutable, historical link between ONE Stage 9B
+    package generation and the ONE Stage 6E review created for it from
+    Telegram, plus the opaque decision capability that Telegram buttons
+    carry (see app/services/telegram_bewerbung_approval.py).
+
+    **Linkage only -- never a second approval state machine.** Review
+    status, decision time, the approved revision and the match/CV/letter
+    pins all live in Stage 6E (`ApplicationPackageReviewRecord`); nothing
+    here duplicates them. A row is inserted once, in the same transaction as
+    the review and its revision 1, and is never updated (so there is no
+    `updated_at`).
+
+    **Exact binding.** `(preparation_id, generation, package_token,
+    input_identity)` snapshot the exact Stage 9B package the review was
+    created for; `(review_id, bound_review_version)` pins the exact
+    immutable revision Telegram displays and decides (unique through 6E's
+    UNIQUE(review_id, revision_number)). Stage 9C v1 binds only revision 1;
+    an API PATCH makes the capability permanently non-decidable.
+
+    **Historical retention.** `preparation_id` and `review_id` are
+    deliberately NOT foreign keys (and never cascade): deleting the
+    operational Stage 9B ledger row (or the Stage 9A review it cascades
+    from) must not erase approval lineage that Stage 6E keeps as permanent
+    audit data. Every reader validates the referenced rows and fails closed
+    when a current preparation is required but missing.
+
+    UNIQUE(preparation_id, generation) is the database arbiter of "at most
+    one Telegram-linked review per generation"; `approval_capability` is a
+    96-bit bearer credential (16 base64url characters).
+    """
+
+    __tablename__ = "telegram_bewerbung_approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "preparation_id",
+            "generation",
+            name="uq_telegram_bewerbung_approvals_preparation_generation",
+        ),
+        UniqueConstraint("review_id", name="uq_telegram_bewerbung_approvals_review_id"),
+        UniqueConstraint(
+            "approval_capability", name="uq_telegram_bewerbung_approvals_approval_capability"
+        ),
+        CheckConstraint(
+            "generation >= 1", name="ck_telegram_bewerbung_approvals_generation_positive"
+        ),
+        CheckConstraint(
+            "bound_review_version = 1",
+            name="ck_telegram_bewerbung_approvals_bound_review_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    preparation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    package_token: Mapped[str] = mapped_column(String(32), nullable=False)
+    input_identity: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    bound_review_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    approval_capability: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )

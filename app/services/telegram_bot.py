@@ -64,9 +64,19 @@ from app.services.company_research import AmbiguousCompanyIdentityError, Invalid
 from app.services.telegram import send_telegram_message
 from app.services.telegram_bewerbung import (
     BewerbungOutcome,
+    approval_flags_enabled,
     handle_apply,
     handle_preview_page,
     parse_preview_callback_data,
+)
+from app.services.telegram_bewerbung_approval import (
+    ApprovalOutcome,
+    handle_decision,
+    handle_request_review,
+    handle_review_page,
+    parse_decision_callback_data,
+    parse_page_callback_data,
+    parse_request_callback_data,
 )
 from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
 from app.services.telegram_vacancy_feed import (
@@ -470,7 +480,27 @@ def _is_private_chat(update: Update) -> bool:
     return chat is not None and getattr(chat, "type", None) == ChatType.PRIVATE
 
 
-async def _send_bewerbung_notice(settings: Settings, outcome: BewerbungOutcome) -> None:
+_APPROVAL_DISABLED = "Freigabe ist deaktiviert - es wurde nichts erstellt oder gesendet."
+
+
+async def _approval_gate(update: Update, kind: str) -> bool:
+    """Stage 9C gate, checked BEFORE any DB access or content: both the 9B
+    draft flag and the 9C approval flag, and a PRIVATE chat. (Authorization
+    is the `@require_authorized` decorator around every caller.)"""
+    query = update.callback_query
+    if not approval_flags_enabled(get_settings()):
+        await query.answer(_APPROVAL_DISABLED)
+        return False
+    if not _is_private_chat(update):
+        await query.answer(_PRIVATE_CHAT_ONLY, show_alert=True)
+        logger.warning("telegram_review_rejected kind=%s reason=not_private_chat", kind)
+        return False
+    return True
+
+
+async def _send_bewerbung_notice(
+    settings: Settings, outcome: BewerbungOutcome | ApprovalOutcome
+) -> None:
     """Best-effort short status notice (no candidate data) to the
     authorized chat; its failure never affects the draft state."""
     if not outcome.notice:
@@ -479,7 +509,7 @@ async def _send_bewerbung_notice(settings: Settings, outcome: BewerbungOutcome) 
         settings.telegram_bot_token,
         settings.telegram_chat_id,
         outcome.notice,
-        reply_markup=outcome.notice_markup,
+        reply_markup=getattr(outcome, "notice_markup", None),
         timeout_seconds=settings.telegram_timeout_seconds,
     )
 
@@ -512,6 +542,68 @@ async def on_bewerbung_preview_callback(update: Update, context: ContextTypes.DE
         SessionLocal, settings, package_token, page, send=send_telegram_message
     )
     logger.info("telegram_bewerbung_preview_callback page=%s result=%s", page, outcome.code)
+    await _send_bewerbung_notice(settings, outcome)
+
+
+@require_authorized
+async def on_review_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9C "✅ Zur Prüfung": create or reuse the ONE Stage 6E review of
+    exactly this Stage 9B package and show its complete content. Never sends
+    an application or email. `callback_data` carries only the opaque package
+    capability; it is never logged."""
+    if not await _approval_gate(update, "request"):
+        return
+    query = update.callback_query
+    package_token = parse_request_callback_data(query.data)
+    if package_token is None:
+        logger.warning("telegram_review_rejected kind=request reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    await query.answer("Prüfdokument wird vorbereitet ... Nichts wird gesendet.")
+    settings = get_settings()
+    outcome = await handle_request_review(
+        SessionLocal, settings, package_token, send=send_telegram_message
+    )
+    await _send_bewerbung_notice(settings, outcome)
+
+
+@require_authorized
+async def on_review_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9C: one page of the exact bound revision's review document."""
+    if not await _approval_gate(update, "page"):
+        return
+    query = update.callback_query
+    parsed = parse_page_callback_data(query.data)
+    if parsed is None:
+        logger.warning("telegram_review_rejected kind=page reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    capability, page = parsed
+    await query.answer()
+    settings = get_settings()
+    outcome = await handle_review_page(
+        SessionLocal, settings, capability, page, send=send_telegram_message
+    )
+    logger.info("telegram_review_page page=%s result=%s", page, outcome.code)
+    await _send_bewerbung_notice(settings, outcome)
+
+
+@require_authorized
+async def on_review_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9C "✅ Freigeben" / "❌ Ablehnen" of the exact bound revision.
+    APPROVED != SENT: only the Stage 6E review state changes."""
+    if not await _approval_gate(update, "decision"):
+        return
+    query = update.callback_query
+    parsed = parse_decision_callback_data(query.data)
+    if parsed is None:
+        logger.warning("telegram_review_rejected kind=decision reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    capability, action = parsed
+    await query.answer()
+    settings = get_settings()
+    outcome = await handle_decision(SessionLocal, settings, capability, action)
     await _send_bewerbung_notice(settings, outcome)
 
 
@@ -664,6 +756,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("digest", cmd_digest))
     application.add_handler(CallbackQueryHandler(on_vacancy_callback, pattern=r"^vf:"))
     application.add_handler(CallbackQueryHandler(on_bewerbung_preview_callback, pattern=r"^bp:"))
+    application.add_handler(CallbackQueryHandler(on_review_request_callback, pattern=r"^ba:"))
+    application.add_handler(CallbackQueryHandler(on_review_page_callback, pattern=r"^bv:"))
+    application.add_handler(CallbackQueryHandler(on_review_decision_callback, pattern=r"^bz:"))
     application.add_error_handler(_handle_error)
     return application
 

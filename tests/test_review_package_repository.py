@@ -669,3 +669,74 @@ def test_concurrent_reject_and_patch_only_one_wins_no_orphan_revision(tmp_path):
         assert reloaded.status == "PENDING_REVIEW"
         assert total_revisions == 2
     final.close()
+
+
+# --- commit=False: caller-owned transaction (Stage 9C) ----------------------
+
+
+def _create_flush_only(db):
+    return create_review(
+        db,
+        job_id=1,
+        cv_draft_id=1,
+        bewerbung_draft_id=1,
+        match_id=1,
+        candidate_profile_version=1,
+        job_snapshot_fingerprint="fp-1",
+        match_algorithm_version="v1",
+        cv_adapter_version="v1",
+        bewerbung_generator_version="v1",
+        reviewed_cv=build_initial_reviewed_cv(_cv_draft()),
+        reviewed_bewerbung=build_initial_reviewed_bewerbung(_bewerbung_draft()),
+        commit=False,
+    )
+
+
+def _counts(session_factory) -> tuple[int, int]:
+    other = session_factory()
+    try:
+        return (
+            other.scalar(select(func.count(ApplicationPackageReviewRecord.id))),
+            other.scalar(select(func.count(ApplicationPackageReviewRevisionRecord.id))),
+        )
+    finally:
+        other.close()
+
+
+def test_create_review_flush_only_assigns_ids_without_committing(tmp_path):
+    session_factory = _file_session_factory(tmp_path, "flush_only.db")
+    db = session_factory()
+    try:
+        record, revision = _create_flush_only(db)
+
+        assert record.id is not None and revision.id is not None
+        assert revision.review_id == record.id and revision.revision_number == 1
+        assert to_review_package(record, revision).status == "PENDING_REVIEW"
+        assert _counts(session_factory) == (0, 0)  # nothing committed yet
+
+        db.rollback()  # caller-owned rollback removes header AND revision
+        assert _counts(session_factory) == (0, 0)
+    finally:
+        db.close()
+
+
+def test_create_review_flush_only_commits_with_the_callers_transaction(tmp_path):
+    session_factory = _file_session_factory(tmp_path, "flush_commit.db")
+    db = session_factory()
+    try:
+        _create_flush_only(db)
+        db.commit()
+    finally:
+        db.close()
+    assert _counts(session_factory) == (1, 1)
+
+
+def test_create_review_default_still_commits_on_its_own(tmp_path):
+    session_factory = _file_session_factory(tmp_path, "default_commit.db")
+    db = session_factory()
+    try:
+        _create(db)
+        db.rollback()  # a later rollback cannot undo the default's own commit
+    finally:
+        db.close()
+    assert _counts(session_factory) == (1, 1)
