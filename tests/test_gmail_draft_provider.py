@@ -72,6 +72,27 @@ def _message(**overrides) -> DraftMessage:
     return DraftMessage(**values)
 
 
+# S9D-ASTRA-001 adversarial subject matrix.
+SUBJECT_ACCEPT_EXACT = {
+    "ascii": "Bewerbung als Junior Python Developer",
+    "unicode-german": "Bewerbung als Softwareentwickler (m/w/d) – Müller & Söhne GmbH, Köln",
+    "emoji-supplementary": "Bewerbung 🚀 als 𝔇eveloper ✓",
+    "long": "Bewerbung als " + "Senior Python Backend Entwickler für Datenplattformen " * 6,
+    "q-encoded-word": "Bewerbung als Junior Python Developer =?utf-8?q?Unapproved_Subject_Text?=",
+    "b-encoded-word": "Bewerbung als =?UTF-8?B?VW5hcHByb3ZlZCBTdWJqZWN0?= Developer",
+    "encoded-cr": "Bewerbung =?utf-8?q?=0D?= Developer",
+    "encoded-lf": "Bewerbung =?utf-8?q?=0A?=Bcc: x@example.com",
+    "encoded-nul": "Bewerbung =?utf-8?q?=00?= Developer",
+    "adjacent-encoded-words": "=?utf-8?q?a?= =?utf-8?q?b?=",
+    "long-encoded-word-unicode": "Bewerbung =?utf-8?q?X?= Größe 🚀 " * 8,
+}
+SUBJECT_REJECT = {
+    "raw-cr": "Bewerbung\rBcc: x@example.com",
+    "raw-lf": "Bewerbung\nBcc: x@example.com",
+    "raw-nul": "Bewerbung\x00Developer",
+}
+
+
 class FakeClient:
     """Records every IMAP command; scripted results; imaplib-like untagged
     response cache for APPENDUID / UIDVALIDITY."""
@@ -420,6 +441,43 @@ class TestMime:
     def test_unsafe_messages_are_refused(self, overrides):
         with pytest.raises(DraftMessageInvalidError):
             build_draft_mime(_message(**overrides), date=NOW)
+
+    @pytest.mark.parametrize(
+        "subject", list(SUBJECT_ACCEPT_EXACT.values()), ids=list(SUBJECT_ACCEPT_EXACT)
+    )
+    def test_subject_round_trips_exactly(self, subject):
+        # S9D-ASTRA-001: logical subject -> MIME bytes -> stdlib parse ->
+        # decoded logical subject must be the approved string, literally.
+        data = build_draft_mime(_message(subject=subject), date=NOW)
+        parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
+        (decoded,) = parsed.get_all("Subject")
+        assert str(decoded) == subject
+        assert not any(char in str(decoded) for char in ("\r", "\n", "\x00"))
+        assert {name.lower() for name in parsed.keys()} == draft_base.ALLOWED_HEADERS
+        assert len(parsed.keys()) == len(draft_base.ALLOWED_HEADERS)  # one Subject
+        for name in ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References"):
+            assert parsed[name] is None
+        assert parsed.get_content_type() == "text/plain" and not parsed.is_multipart()
+        assert parsed.get_content_charset() == "utf-8"
+        assert str(parsed["From"]) == ACCOUNT and str(parsed["Message-ID"]) == MARKER
+        assert parsed.get_content().replace("\r\n", "\n") == _message().body_lf
+        assert data.isascii() and all(len(line) <= 998 for line in data.split(b"\r\n"))
+
+    @pytest.mark.parametrize("subject", list(SUBJECT_REJECT.values()), ids=list(SUBJECT_REJECT))
+    def test_raw_control_subjects_are_refused(self, subject):
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject=subject), date=NOW)
+
+    def test_ordinary_subject_wire_form_is_unchanged(self):
+        data = build_draft_mime(_message(), date=NOW)
+        assert b"\r\nSubject: Bewerbung als Junior Python Developer\r\n" in data
+
+    def test_a_subject_that_does_not_round_trip_fails_closed(self, monkeypatch):
+        # Backstop: whatever the encoding step yields, the FINAL decoded
+        # subject must equal the approved one -- else a pre-APPEND failure.
+        monkeypatch.setattr(draft_base, "_subject_header_value", lambda subject: subject)
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject=SUBJECT_ACCEPT_EXACT["q-encoded-word"]), date=NOW)
 
     def test_dto_reprs_leak_nothing(self):
         texts = " ".join(

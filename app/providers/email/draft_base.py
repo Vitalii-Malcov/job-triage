@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from email import policy
+from email.header import Header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import format_datetime
@@ -52,6 +53,17 @@ ALLOWED_HEADERS = frozenset(
 )
 FORBIDDEN_HEADERS = ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References")
 _HEADER_UNSAFE = ("\r", "\n", "\x00")
+
+# S9D-ASTRA-001: the header registry DECODES RFC 2047 encoded-word syntax
+# ("=?charset?q|b?...?=") in an unstructured Subject and the folder re-emits
+# that ASCII text verbatim, so a literal approved "=?utf-8?q?X?=" would
+# arrive as "X" (or as a decoded CR/LF/NUL). Such a subject is therefore
+# encoded WHOLE by the stdlib `email.header` encoder; the resulting
+# encoded-words decode back to exactly the approved string.
+_ENCODED_WORD_START = "=?"
+# Serialize stored header values as-is: refolding a pre-encoded Subject
+# would re-parse (and so re-decode) it. Registry headers still fold normally.
+_SERIALIZE_POLICY = policy.SMTP.clone(refold_source="none")
 
 
 @dataclass(frozen=True, repr=False)
@@ -198,6 +210,30 @@ def build_draft_mime(message: DraftMessage, *, date: datetime) -> bytes:
         raise DraftMessageInvalidError("Draft message could not be built") from exc
 
 
+@dataclass(frozen=True)
+class _EncodedSubject:
+    """A Subject already encoded (folded, pure ASCII) by `email.header`."""
+
+    value: str
+
+
+def _subject_header_value(subject: str) -> "str | _EncodedSubject":
+    """The Subject as given, or -- when it contains encoded-word syntax --
+    wholly encoded so the parser cannot reinterpret any of it."""
+    if _ENCODED_WORD_START not in subject:
+        return subject
+    encoded = Header(subject, "utf-8", header_name="Subject").encode()
+    lines = encoded.split("\n")
+    if (
+        not encoded.isascii()
+        or any(char in encoded for char in ("\r", "\x00"))
+        or any(len(line) > 78 for line in lines)
+        or any(not line.startswith(" ") for line in lines[1:])
+    ):
+        raise DraftMessageInvalidError("Draft header is unsafe")
+    return _EncodedSubject(encoded)
+
+
 def _build(message: DraftMessage, date: datetime) -> bytes:
     if not MESSAGE_ID_PATTERN.fullmatch(message.message_id):
         raise DraftMessageInvalidError("Draft marker is malformed")
@@ -209,11 +245,15 @@ def _build(message: DraftMessage, date: datetime) -> bytes:
 
     mime = EmailMessage(policy=policy.SMTP)
     mime["From"] = message.from_address
-    mime["Subject"] = message.subject
+    subject = _subject_header_value(message.subject)
+    if isinstance(subject, _EncodedSubject):
+        mime.set_raw("Subject", subject.value)
+    else:
+        mime["Subject"] = subject
     mime["Date"] = format_datetime(date)
     mime["Message-ID"] = message.message_id
     mime.set_content(message.body_lf, subtype="plain", charset="utf-8")
-    data = mime.as_bytes()
+    data = mime.as_bytes(policy=_SERIALIZE_POLICY)
 
     parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
     names = {name.lower() for name in parsed.keys()}
@@ -221,6 +261,14 @@ def _build(message: DraftMessage, date: datetime) -> bytes:
         raise DraftMessageInvalidError("Draft carries an unexpected header")
     if any(parsed.get(name) is not None for name in FORBIDDEN_HEADERS):
         raise DraftMessageInvalidError("Draft carries a recipient header")
+    subjects = parsed.get_all("Subject") or []
+    decoded = str(subjects[0]) if len(subjects) == 1 else ""
+    if (
+        decoded != message.subject
+        or not decoded.strip()
+        or any(char in decoded for char in _HEADER_UNSAFE)
+    ):
+        raise DraftMessageInvalidError("Draft subject did not round-trip")
     if parsed.is_multipart() or parsed.get_content_type() != "text/plain":
         raise DraftMessageInvalidError("Draft is not a single text/plain part")
     if (parsed.get_content_charset() or "").lower() != "utf-8":

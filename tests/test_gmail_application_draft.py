@@ -626,6 +626,99 @@ class TestCreate:
         assert len(provider.creates) == 1
 
 
+# --- S9D-ASTRA-001: the approved subject reaches the MIME literally -------------------
+
+
+ENCODED_WORD_TITLE = "Junior Python Developer =?utf-8?q?Unapproved_Subject_Text?="
+
+
+def _approved_revision_subject(session_factory, review_id) -> str:
+    db = session_factory()
+    try:
+        review = db.get(ApplicationPackageReviewRecord, review_id)
+        revision = db.get(ApplicationPackageReviewRevisionRecord, review.approved_revision_id)
+        return json.loads(revision.reviewed_bewerbung_json)["subject"]["value"]
+    finally:
+        db.close()
+
+
+def _transmitted(provider) -> tuple[str, str]:
+    """(decoded Subject, LF body) of the MIME actually handed to APPEND."""
+    (mime,) = provider.mime
+    parsed = _parsed(mime)
+    (subject,) = parsed.get_all("Subject")
+    return str(subject), parsed.get_content().replace("\r\n", "\n")
+
+
+class TestSubjectIntegrity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "Bewerbung als Junior Python Developer =?utf-8?q?Unapproved_Subject_Text?=",
+            "Bewerbung als =?UTF-8?B?VW5hcHByb3ZlZCBTdWJqZWN0?= Developer",
+            "Bewerbung =?utf-8?q?=0D?= Developer",
+            "Bewerbung =?utf-8?q?=0A?=Bcc: x@example.com",
+            "Bewerbung =?utf-8?q?=00?= Developer",
+        ],
+        ids=["q-encoded-word", "b-encoded-word", "encoded-cr", "encoded-lf", "encoded-nul"],
+    )
+    async def test_encoded_word_looking_subject_is_drafted_literally(
+        self, session_factory, approved, provider, subject
+    ):
+        _set_revision_letter(session_factory, approved, subject=subject)
+        outcome = await _create(session_factory, approved["capability"], provider)
+
+        assert outcome.code == "CREATED" and len(provider.creates) == 1
+        decoded, body = _transmitted(provider)
+        assert decoded == subject == provider.creates[0][0].subject
+        assert not any(char in decoded for char in ("\r", "\n", "\x00"))
+        assert _ledger(session_factory).content_sha256 == gd.content_hash(
+            "9d-v1", ACCOUNT, decoded, body
+        )
+
+    @pytest.mark.asyncio
+    async def test_subject_that_would_not_round_trip_is_refused_before_any_claim(
+        self, session_factory, approved, provider, monkeypatch
+    ):
+        # Re-introduce the S9D-ASTRA-001 encoding defect: the final decoded
+        # subject check must refuse it in the pre-claim dry run.
+        monkeypatch.setattr(draft_base, "_subject_header_value", lambda subject: subject)
+        _set_revision_letter(
+            session_factory, approved, subject=f"Bewerbung als {ENCODED_WORD_TITLE}"
+        )
+        outcome = await _create(session_factory, approved["capability"], provider)
+        assert outcome.code == "CONTENT_INVALID"
+        assert _ledgers(session_factory) == [] and provider.creates == []
+
+    @pytest.mark.asyncio
+    async def test_full_9b_9c_9d_flow_keeps_the_approved_subject_exact(
+        self, session_factory, seeded, sender, provider
+    ):
+        _change_job(session_factory, seeded, title=ENCODED_WORD_TITLE)
+        token = await s9c._prepare(session_factory, seeded, sender)  # real Stage 9B
+        shown = await s9c._request(session_factory, token, sender)  # real Stage 9C review
+        assert shown.code == "REVIEW_SHOWN", shown
+        link = s9c._links(session_factory)[0]
+        decided = await _decide(session_factory, link.approval_capability, "f")
+        assert decided.code == "APPROVED", decided
+        approved_subject = _approved_revision_subject(session_factory, link.review_id)
+        assert approved_subject == f"Bewerbung als {ENCODED_WORD_TITLE}"
+
+        outcome = await _create(session_factory, link.approval_capability, provider)
+
+        assert outcome.code == "CREATED" and len(provider.creates) == 1
+        decoded, body = _transmitted(provider)
+        assert decoded == approved_subject
+        parsed = _parsed(provider.mime[0])
+        for name in ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References"):
+            assert parsed[name] is None
+        row = _ledger(session_factory)
+        assert row.content_sha256 == gd.content_hash("9d-v1", ACCOUNT, decoded, body)
+        review = session_factory().get(ApplicationPackageReviewRecord, link.review_id)
+        assert row.approved_revision_id == review.approved_revision_id  # exact revision
+
+
 def _decided_status(session_factory, approved) -> str:
     db = session_factory()
     try:
