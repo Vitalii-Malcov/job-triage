@@ -43,6 +43,20 @@ You are the primary implementation agent for AI Job Search Control Center.
   grants broader access than the collector needs. A dedicated/isolated mailbox for job alerts is a
   future upgrade, not something to implement opportunistically as part of an unrelated change.
 
+## Stage 9D Gmail draft handoff — safety note
+
+- `app/services/gmail_application_draft.py` creates at most ONE Gmail **draft** (single IMAP
+  APPEND into the verified Drafts mailbox) per exact Stage 9C approval, on an explicit operator
+  press. **GMAIL DRAFT CREATED != APPLICATION SENT.** No recipient, no attachment, no SMTP,
+  no Gmail API, no OAuth, no `JobRecord.status` write. Gated by `TELEGRAM_GMAIL_DRAFT_ENABLED`
+  (default false, independent of `OUTBOUND_SENDING_ENABLED`).
+- Accepted risk (same class as the XING note below): the full-access Gmail App Password now
+  performs one write type (APPEND to Drafts). Bounded by the APPEND-only provider Protocol
+  (`app/providers/email/imap_draft.py`), the header allowlist and the verified `\Drafts` target.
+- UNCERTAIN is sticky by design: never convert it to FAILED/retryable on zero matches or time.
+- Real-Gmail validation (separate non-production mailbox) is a production-enable gate before
+  turning the flag on in production.
+
 ## Installed skills
 
 | Skill | Source | When to consult |

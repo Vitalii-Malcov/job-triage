@@ -55,6 +55,7 @@ from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
 from app.providers.base import ProviderNotConfiguredError
+from app.services import gmail_application_draft as gmail_draft
 from app.services.collector_runner import (
     run_bundesagentur,
     run_company_research_for_job,
@@ -68,6 +69,9 @@ from app.services.telegram_bewerbung import (
     handle_apply,
     handle_preview_page,
     parse_preview_callback_data,
+)
+from app.services.telegram_bewerbung_approval import (
+    NOTICES as APPROVAL_NOTICES,
 )
 from app.services.telegram_bewerbung_approval import (
     ApprovalOutcome,
@@ -499,7 +503,10 @@ async def _approval_gate(update: Update, kind: str) -> bool:
 
 
 async def _send_bewerbung_notice(
-    settings: Settings, outcome: BewerbungOutcome | ApprovalOutcome
+    settings: Settings,
+    outcome: BewerbungOutcome | ApprovalOutcome | gmail_draft.GmailDraftOutcome,
+    *,
+    markup: dict | None = None,
 ) -> None:
     """Best-effort short status notice (no candidate data) to the
     authorized chat; its failure never affects the draft state."""
@@ -509,9 +516,24 @@ async def _send_bewerbung_notice(
         settings.telegram_bot_token,
         settings.telegram_chat_id,
         outcome.notice,
-        reply_markup=getattr(outcome, "notice_markup", None),
+        reply_markup=markup if markup is not None else getattr(outcome, "notice_markup", None),
         timeout_seconds=settings.telegram_timeout_seconds,
     )
+
+
+_HANDOFF_CODES = ("APPROVED", "ALREADY_APPROVED")
+
+
+def _gmail_draft_offer(settings: Settings, outcome: ApprovalOutcome, capability: str):
+    """Stage 9D: the explicit "📧 Gmail-Entwurf erstellen" button on a Stage
+    9C approval notice -- only with all three flags on, and never on an
+    approval whose package has since been replaced. Pressing it re-runs the
+    full freshness check; nothing is ever created automatically."""
+    if not gmail_draft.gmail_draft_flags_enabled(settings):
+        return None
+    if outcome.code not in _HANDOFF_CODES or outcome.notice != APPROVAL_NOTICES[outcome.code]:
+        return None
+    return gmail_draft.action_keyboard(capability, gmail_draft.CREATE_ACTION)
 
 
 @require_authorized
@@ -585,7 +607,9 @@ async def on_review_page_callback(update: Update, context: ContextTypes.DEFAULT_
         SessionLocal, settings, capability, page, send=send_telegram_message
     )
     logger.info("telegram_review_page page=%s result=%s", page, outcome.code)
-    await _send_bewerbung_notice(settings, outcome)
+    await _send_bewerbung_notice(
+        settings, outcome, markup=_gmail_draft_offer(settings, outcome, capability)
+    )
 
 
 @require_authorized
@@ -604,7 +628,47 @@ async def on_review_decision_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
     settings = get_settings()
     outcome = await handle_decision(SessionLocal, settings, capability, action)
-    await _send_bewerbung_notice(settings, outcome)
+    await _send_bewerbung_notice(
+        settings, outcome, markup=_gmail_draft_offer(settings, outcome, capability)
+    )
+
+
+_GMAIL_DRAFT_DISABLED = "Gmail-Entwürfe sind deaktiviert - es wurde nichts erstellt oder gesendet."
+
+
+@require_authorized
+async def on_gmail_draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 9D "📧 Gmail-Entwurf erstellen" / "🔄 Gmail-Status prüfen" for
+    the exact Stage 9C approval capability. Checked BEFORE any DB or
+    content access: authorized operator (decorator), the 9B + 9C + 9D
+    flags, a PRIVATE chat, and a strict `bm:<capability>:c|r` parse.
+    GMAIL DRAFT != SENT: nothing is ever sent. `callback_data` is never
+    logged."""
+    query = update.callback_query
+    settings = get_settings()
+    if not gmail_draft.gmail_draft_flags_enabled(settings):
+        await query.answer(_GMAIL_DRAFT_DISABLED)
+        return
+    if not _is_private_chat(update):
+        await query.answer(_PRIVATE_CHAT_ONLY, show_alert=True)
+        logger.warning("telegram_gmail_draft_rejected reason=not_private_chat")
+        return
+    parsed = gmail_draft.parse_callback_data(query.data)
+    if parsed is None:
+        logger.warning("telegram_gmail_draft_rejected reason=malformed")
+        await query.answer("Unbekannte Aktion.")
+        return
+    capability, action = parsed
+    if action == gmail_draft.CREATE_ACTION:
+        await query.answer("Gmail-Entwurf wird erstellt ... Nichts wird gesendet.")
+        outcome = await gmail_draft.handle_create(SessionLocal, settings, capability)
+    else:
+        await query.answer("Gmail-Status wird geprüft ... Nichts wird gesendet.")
+        outcome = await gmail_draft.handle_reconcile(SessionLocal, settings, capability)
+    logger.info("telegram_gmail_draft_callback action=%s result=%s", action, outcome.code)
+    await _send_bewerbung_notice(
+        settings, outcome, markup=gmail_draft.outcome_keyboard(outcome, capability)
+    )
 
 
 @require_authorized
@@ -759,6 +823,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(on_review_request_callback, pattern=r"^ba:"))
     application.add_handler(CallbackQueryHandler(on_review_page_callback, pattern=r"^bv:"))
     application.add_handler(CallbackQueryHandler(on_review_decision_callback, pattern=r"^bz:"))
+    application.add_handler(CallbackQueryHandler(on_gmail_draft_callback, pattern=r"^bm:"))
     application.add_error_handler(_handle_error)
     return application
 
