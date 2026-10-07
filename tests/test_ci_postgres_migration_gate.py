@@ -20,6 +20,9 @@ run -- they skip without `TEST_POSTGRES_URL`. This guard now:
   required module cannot be silently omitted;
 - requires `TEST_POSTGRES_URL` wiring plus the zero-skip enforcement, so
   the job cannot go green on environment-gated skips;
+- (S9D-REREVIEW-001) EXECUTES the workflow's embedded zero-skip checker
+  against pytest-shaped JUnit XML, so weakening its predicate (e.g.
+  dropping `or skipped`) fails here even if every string still matches;
 - keeps the HARD-008 migration-cycle module LAST.
 
 This module does not spin up PostgreSQL itself (that's what the real
@@ -28,7 +31,12 @@ of the workflow text, and the mutation tests below prove each rule would
 actually reject a broken workflow.
 """
 
+import functools
 import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -46,6 +54,11 @@ HARD_008_PG_MODULE = "tests/integration/test_hard008_legacy_pending_migration_po
 MIGRATION_STEP_NAME = "- name: Alembic upgrade head against CI PostgreSQL"
 PYTEST_STEP_NAME = "- name: PostgreSQL integration tests (zero skips)"
 ZERO_SKIP_CHECK = "PostgreSQL integration gate requires zero skipped tests"
+SKIP_PREDICATE = "if tests == 0 or skipped:"
+CHECKER_START = re.compile(r"^[ \t]*python - (\S+) <<'PY'[ \t]*$", re.M)
+CHECKER_END = re.compile(r"^[ \t]*PY[ \t]*$", re.M)
+# (tests, skipped) -> must the checker let the job pass?
+JUNIT_CONTRACT = {(50, 0): True, (21, 21): False, (21, 1): False, (0, 0): False}
 
 
 def _repository_head() -> str:
@@ -87,6 +100,68 @@ def _pytest_targets(step: str) -> list[str]:
     return re.findall(r"tests/integration/[\w./-]+\.py", match.group(1))
 
 
+def _zero_skip_checker(step: str) -> tuple[str, str] | None:
+    """(JUnit path, Python source) of the step's `python - <path> <<'PY'` heredoc."""
+    start = CHECKER_START.search(step)
+    if start is None:
+        return None
+    end = CHECKER_END.search(step, start.end())
+    if end is None:
+        return None
+    # The YAML block scalar strips the step's indentation before bash runs it.
+    return start.group(1), textwrap.dedent(step[start.end() + 1 : end.start()])
+
+
+def _pytest_junit_xml(tests: int, skipped: int) -> str:
+    """JUnit XML in the exact shape pytest emits: testsuites > testsuite > testcase."""
+    cases = "".join(
+        f'<testcase classname="tests.integration.test_pg" name="test_{i}" time="0.001">'
+        + (
+            '<skipped type="pytest.skip" message="TEST_POSTGRES_URL not set">skip</skipped>'
+            if i < skipped
+            else ""
+        )
+        + "</testcase>"
+        for i in range(tests)
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests">'
+        f'<testsuite name="pytest" errors="0" failures="0" skipped="{skipped}" '
+        f'tests="{tests}" time="0.1" timestamp="2026-01-01T00:00:00" hostname="ci">'
+        f"{cases}</testsuite></testsuites>"
+    )
+
+
+@functools.cache
+def _checker_accepts(source: str, tests: int, skipped: int) -> bool:
+    """Run the checker exactly as CI does (`python - <xml>` on stdin); True iff exit 0."""
+    with tempfile.TemporaryDirectory() as tmp:
+        xml_path = Path(tmp) / "postgres-junit.xml"
+        xml_path.write_text(_pytest_junit_xml(tests, skipped), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-", str(xml_path)],
+            input=source,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    return result.returncode == 0
+
+
+def _checker_violations(pytest_step: str) -> list[str]:
+    junit = re.search(r"--junitxml=(\S+)", pytest_step)
+    checker = _zero_skip_checker(pytest_step)
+    if junit is None or checker is None or checker[0] != junit.group(1):
+        return ["pytest step must check its own JUnit XML for skipped tests"]
+    violations = []
+    for (tests, skipped), accept in JUNIT_CONTRACT.items():
+        if _checker_accepts(checker[1], tests, skipped) != accept:
+            verdict = "accept" if accept else "reject"
+            violations.append(f"zero-skip checker must {verdict} {tests} tests / {skipped} skipped")
+    return violations
+
+
 def _gate_violations(workflow: str, head: str, required_modules: list[str]) -> list[str]:
     violations: list[str] = []
     job = _job_text(workflow)
@@ -120,6 +195,7 @@ def _gate_violations(workflow: str, head: str, required_modules: list[str]) -> l
         violations.append("pytest step must refuse to run without TEST_POSTGRES_URL")
     if "--junitxml=" not in pytest_step or ZERO_SKIP_CHECK not in pytest_step:
         violations.append("pytest step must fail on ANY skipped PostgreSQL test")
+    violations.extend(_checker_violations(pytest_step))
     if "pipefail" not in pytest_step or "pipefail" not in migration:
         violations.append("PostgreSQL steps must run with `set -euo pipefail`")
 
@@ -266,3 +342,48 @@ def test_migration_after_tests_is_rejected() -> None:
 def test_dropping_the_migration_step_is_rejected() -> None:
     violations = _mutated(MIGRATION_STEP_NAME, "- name: something else")
     assert "missing Alembic upgrade-head migration step" in violations
+
+
+# --- S9D-REREVIEW-001: the zero-skip checker's real behavior ------------------------
+
+
+def _real_checker() -> str:
+    step = _step(_job_text(_workflow()), PYTEST_STEP_NAME)
+    checker = _zero_skip_checker(step)
+    assert checker is not None
+    assert checker[0] == "/tmp/postgres-junit.xml"
+    return checker[1]
+
+
+@pytest.mark.parametrize(
+    ("tests", "skipped", "accept"),
+    [(tests, skipped, accept) for (tests, skipped), accept in JUNIT_CONTRACT.items()],
+    ids=["50-tests-0-skipped", "all-skipped", "one-skipped", "no-tests"],
+)
+def test_real_zero_skip_checker_behavior(tests: int, skipped: int, accept: bool) -> None:
+    assert _checker_accepts(_real_checker(), tests, skipped) is accept
+
+
+def test_dropping_the_skip_predicate_is_rejected() -> None:
+    # Codex's exact mutation: every string the old guard looked for survives it.
+    weakened = _real_checker().replace(SKIP_PREDICATE, "if tests == 0:")
+    assert ZERO_SKIP_CHECK in weakened and SKIP_PREDICATE not in weakened
+    assert _checker_accepts(weakened, 21, 21)  # why it is invalid: skips go green
+    violations = _mutated(SKIP_PREDICATE, "if tests == 0:")
+    assert "zero-skip checker must reject 21 tests / 21 skipped" in violations
+    assert "zero-skip checker must reject 21 tests / 1 skipped" in violations
+
+
+def test_dropping_the_empty_run_predicate_is_rejected() -> None:
+    violations = _mutated(SKIP_PREDICATE, "if skipped:")
+    assert violations == ["zero-skip checker must reject 0 tests / 0 skipped"]
+
+
+def test_checker_must_read_the_xml_pytest_writes() -> None:
+    violations = _mutated("python - /tmp/postgres-junit.xml", "python - /tmp/other.xml")
+    assert "pytest step must check its own JUnit XML for skipped tests" in violations
+
+
+def test_checker_failure_cannot_be_swallowed() -> None:
+    violations = _mutated("<<'PY'\n", "<<'PY' || true\n")
+    assert "pytest step must check its own JUnit XML for skipped tests" in violations
