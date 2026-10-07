@@ -3,12 +3,37 @@ against a REAL PostgreSQL server -- the acceptance evidence the Stage 9D
 architecture requires (sequential SQLite is not concurrency evidence).
 
 Every scenario runs the REAL Stage 9D/9C/6E/9B code in threads with
-independent sessions/connections. A hook pauses one worker while it HOLDS
-its transaction (`_Hold`); the other worker is started only after that
-point, so both transactions are open at the same time. Each test asserts
-the durable ledger, the exact attempt, one business row, the provider
-invocation count, and (via timestamps) that the blocked worker really
-waited for the holder's commit:
+independent sessions/connections. No Gmail, IMAP or Telegram is ever
+contacted: the draft provider is a thread-safe recording fake.
+
+Two kinds of test live here (S9D-CODEX-001):
+
+A. OUTCOME / IDEMPOTENCY assertions never require one particular
+   transient report where the schedule is left free. They accept an
+   explicitly ENUMERATED set of valid reports (e.g. `ONE_CREATION_REPORTS`)
+   and then assert the durable invariants: one business row, the exact
+   final state and attempt, and the provider invocation count.
+
+B. FORCED-CONCURRENCY tests claim a specific overlap (lock waiting, a
+   stale takeover race, a begin_append race, a classifier/finalizer race,
+   a retry race, a reconcile race, a 9B/9C boundary). They PROVE it --
+   nothing here depends on sleeps, elapsed time or finish timestamps:
+
+   1. the holder runs the real repository/service function inside its
+      open transaction, records its PostgreSQL backend pid and signals
+      `held`, then BLOCKS on an explicit `release` event (`_Hold`/`_Gate`);
+   2. the contender is started and the controller polls
+      `pg_blocking_pids()` until PostgreSQL itself reports a backend
+      waiting on the holder's lock (`_await_blocked_on`) -- the contender
+      has provably reached the conflicting statement while the lock is
+      still held (a contender that finishes without blocking FAILS);
+   3. only then is the holder released, and the durable results are
+      asserted.
+
+   Where a scenario instead requires that a reader does NOT wait for the
+   holder, the reader is joined while the holder is still held.
+
+Scenarios:
 
 1. simultaneous first create (+ UNIQUE(link_id) as the DB arbiter)
 2. begin_append race on the same claim
@@ -21,10 +46,9 @@ waited for the holder's commit:
 9. a ledger-first reader/locker vs the normal full lock order
 10. DB commit-acknowledgment loss after a REAL commit
 
-**Local execution:** skipped unless `TEST_POSTGRES_URL` is set. Run
-`alembic upgrade head` against that DEDICATED test database first (no
-`create_all` fallback). No Gmail, IMAP or Telegram is ever contacted: the
-draft provider is a thread-safe recording fake.
+**Local execution:** skipped unless `TEST_POSTGRES_URL` is set (the CI
+`scheduler-postgres` job always sets it). Run `alembic upgrade head`
+against that DEDICATED test database first (no `create_all` fallback).
 """
 
 import asyncio
@@ -34,13 +58,14 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 import app.services.gmail_application_draft as gd
 import app.services.telegram_bewerbung_approval as ta
 from app.core.config import Settings
 from app.db import gmail_application_draft_repository as repo
-from app.db.models import GmailApplicationDraftRecord
+from app.db.models import GmailApplicationDraftRecord, TelegramBewerbungPreparationRecord
+from app.db.telegram_bewerbung_repository import claim_preparation
 from app.providers.email.draft_base import (
     DraftCreateRejectedError,
     DraftCreateResult,
@@ -48,7 +73,6 @@ from app.providers.email.draft_base import (
 )
 from tests.integration import test_telegram_bewerbung_approval_postgres as s9c_pg
 from tests.integration.test_telegram_bewerbung_approval_postgres import (
-    HOLD_SECONDS,
     JOIN_TIMEOUT,
     _decide,
     _join,
@@ -65,6 +89,13 @@ pytestmark = pytest.mark.skipif(
     not TEST_POSTGRES_URL,
     reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally.",
 )
+
+POLL_SECONDS = 0.01  # lock-wait polling cadence only -- never a correctness bound
+
+# Every valid (creator, observer) report pair for ONE durable creation: the
+# observer either saw the creator's attempt still running (IN_PROGRESS) or
+# reported only after it finalized (ALREADY_CREATED -- a historical report).
+ONE_CREATION_REPORTS = {("CREATED", "IN_PROGRESS"), ("CREATED", "ALREADY_CREATED")}
 
 
 def _settings(**overrides) -> Settings:
@@ -121,29 +152,90 @@ class Provider:
         return self.lookup_result
 
 
-class _Hold:
-    """Wrap `module.name`: when called in a thread named `thread_name`, run
-    the real function, record the time, signal `held`, and keep the
-    caller's open transaction (and its locks) alive for HOLD_SECONDS."""
+def _backend_pid(db) -> int:
+    """The PostgreSQL backend serving `db`'s CURRENT transaction."""
+    return db.connection().exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+
+
+class _Gate:
+    """A holder's open transaction: `held` once its locks are taken (with
+    its backend `pid`), kept open until the controller sets `release`."""
+
+    def __init__(self):
+        self.held = threading.Event()
+        self.release = threading.Event()
+        self.pid = None
+        self.release_timed_out = False
+
+    def hold(self, db):
+        self.pid = _backend_pid(db)
+        self.held.set()
+        if not self.release.wait(JOIN_TIMEOUT):
+            self.release_timed_out = True
+
+    def wait_held(self):
+        assert self.held.wait(JOIN_TIMEOUT), "holder never reached its lock"
+        assert self.pid is not None
+
+
+class _Hold(_Gate):
+    """Wrap `module.name` (first argument: the Session): when called in a
+    thread named `thread_name`, run the real function, then hold that
+    caller's open transaction (and its locks) until released."""
 
     def __init__(self, monkeypatch, module, name, thread_name):
-        self.held = threading.Event()
-        self.acquired_at = None
+        super().__init__()
         real = getattr(module, name)
 
         def wrapper(*args, **kwargs):
             result = real(*args, **kwargs)
             if threading.current_thread().name == thread_name and not self.held.is_set():
-                self.acquired_at = time.monotonic()
-                self.held.set()
-                time.sleep(HOLD_SECONDS)
+                self.hold(args[0])
             return result
 
         monkeypatch.setattr(module, name, wrapper)
 
 
+def _await_blocked_on(factory, holder_pid, *contenders):
+    """Return once PostgreSQL reports a backend WAITING on `holder_pid`'s
+    lock -- proof that a contender reached the conflicting statement while
+    the holder still holds it. A contender that finishes first fails."""
+    deadline = time.monotonic() + JOIN_TIMEOUT
+    probe = factory()
+    try:
+        while True:
+            waiting = probe.execute(
+                text(
+                    "SELECT pid FROM pg_stat_activity "
+                    "WHERE CAST(:holder AS integer) = ANY(pg_blocking_pids(pid))"
+                ),
+                {"holder": holder_pid},
+            ).all()
+            probe.rollback()
+            if waiting:
+                return [row.pid for row in waiting]
+            for thread, box in contenders:
+                assert thread.is_alive(), (
+                    f"contender {thread.name} finished WITHOUT waiting for the holder: {box}"
+                )
+            assert time.monotonic() < deadline, "contender never blocked on the holder"
+            time.sleep(POLL_SECONDS)
+    finally:
+        probe.close()
+
+
+def _overlap(factory, gate, *contenders):
+    """Forced overlap: the contenders provably wait on the holder, THEN the
+    holder is released (always released, even if the proof fails)."""
+    try:
+        _await_blocked_on(factory, gate.pid, *contenders)
+    finally:
+        gate.release.set()
+    assert not gate.release_timed_out
+
+
 def _start(name, target, *args):
-    """Like `_run`, but the thread carries `name` BEFORE it starts."""
+    """Run `target` in a thread that carries `name` BEFORE it starts."""
     box = {}
 
     def runner():
@@ -151,7 +243,6 @@ def _start(name, target, *args):
             box["result"] = target(*args)
         except BaseException as exc:
             box["error"] = exc
-        box["finished_at"] = time.monotonic()
 
     thread = threading.Thread(target=runner, name=name)
     thread.start()
@@ -217,6 +308,16 @@ def _row(factory, link_id) -> GmailApplicationDraftRecord:
     return row
 
 
+def _assert_one_creation(factory, package, provider, *, attempt=1, creates=1):
+    """The durable invariants of exactly one successful authorized APPEND."""
+    rows = _rows(factory, package["link_id"])
+    assert len(rows) == 1, f"expected one business ledger row, got {len(rows)}"
+    (row,) = rows
+    assert (row.state, row.attempt_count) == ("CREATED", attempt)
+    assert row.marker_message_id is not None and row.claim_token is None
+    assert provider.creates == creates
+
+
 def _config():
     return gd._static_config(_settings())
 
@@ -235,28 +336,111 @@ def _arm(factory, claimed):
 
 
 def test_1_simultaneous_first_create_one_row_one_append(env, monkeypatch):
-    factory, _, _, _ = env
+    """FORCED: B provably waits on A's open first-claim transaction. After A
+    is released B may observe A still creating OR already finalized -- both
+    valid; the durable result must be exactly one creation."""
+    factory = env[0]
     package = _approved(env)
     _approve(env, package)
     provider = Provider()
     hold = _Hold(monkeypatch, repo, "insert_claim", "A")
 
     first = _start("A", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     second = _start("B", _create, factory, package["cap"], provider)
+    _overlap(factory, hold, second)
     a, b = _join(*first), _join(*second)
 
-    assert {a["result"].code, b["result"].code} == {"CREATED", "IN_PROGRESS"}
-    assert a["result"].code == "CREATED"
-    row = _row(factory, package["link_id"])
-    assert (row.state, row.attempt_count) == ("CREATED", 1)
-    assert provider.creates == 1
-    assert b["finished_at"] >= hold.acquired_at + HOLD_SECONDS  # B really waited
+    assert (a["result"].code, b["result"].code) in ONE_CREATION_REPORTS
+    _assert_one_creation(factory, package, provider)
+
+
+def test_1_observer_during_the_armed_attempt_reports_in_progress(env, monkeypatch):
+    """FORCED: B runs to completion while A provably still holds its armed,
+    unfinalized attempt -- the only valid report is IN_PROGRESS."""
+    factory = env[0]
+    package = _approved(env)
+    _approve(env, package)
+    provider = Provider()
+    hold = _Hold(monkeypatch, repo, "begin_append", "A")
+
+    first = _start("A", _create, factory, package["cap"], provider)
+    hold.wait_held()
+    try:
+        b = _join(*_start("B", _create, factory, package["cap"], provider))
+        assert provider.creates == 0  # A has not appended yet: still creating
+    finally:
+        hold.release.set()
+    a = _join(*first)
+
+    assert not hold.release_timed_out
+    assert (a["result"].code, b["result"].code) == ("CREATED", "IN_PROGRESS")
+    _assert_one_creation(factory, package, provider)
+
+
+def test_1_observer_after_finalize_reports_already_created(env, monkeypatch):
+    """FORCED (the Codex S9D-CODEX-001 schedule): B starts while A holds its
+    claim, but reaches fresh validation only after A FINALIZED. The valid
+    report is the historical ALREADY_CREATED, never a second APPEND."""
+    factory = env[0]
+    package = _approved(env)
+    _approve(env, package)
+    provider = Provider()
+    hold = _Hold(monkeypatch, repo, "insert_claim", "A")
+    b_reached, a_done = threading.Event(), threading.Event()
+    real_revalidate = gd.revalidate_approved_link_locked
+
+    def revalidate(db, link_id):
+        if threading.current_thread().name == "B":
+            b_reached.set()
+            assert a_done.wait(JOIN_TIMEOUT)
+        return real_revalidate(db, link_id)
+
+    monkeypatch.setattr(gd, "revalidate_approved_link_locked", revalidate)
+
+    first = _start("A", _create, factory, package["cap"], provider)
+    hold.wait_held()
+    second = _start("B", _create, factory, package["cap"], provider)
+    try:
+        assert b_reached.wait(JOIN_TIMEOUT)  # B passed its unlocked read: no row yet
+    finally:
+        hold.release.set()
+    try:
+        a = _join(*first)
+    finally:
+        a_done.set()
+    b = _join(*second)
+
+    assert not hold.release_timed_out
+    assert (a["result"].code, b["result"].code) == ("CREATED", "ALREADY_CREATED")
+    _assert_one_creation(factory, package, provider)
+
+
+def test_1_free_schedule_first_create_is_one_creation(env):
+    """OUTCOME: two creates released together by a barrier, schedule left
+    free. Either thread may be the creator; the other's report must be one
+    of the enumerated valid observations of that single creation."""
+    factory = env[0]
+    package = _approved(env)
+    _approve(env, package)
+    provider = Provider()
+    barrier = threading.Barrier(2)
+
+    def racer():
+        barrier.wait(JOIN_TIMEOUT)
+        return _create(factory, package["cap"], provider)
+
+    first, second = _start("A", racer), _start("B", racer)
+    codes = (_join(*first)["result"].code, _join(*second)["result"].code)
+
+    assert codes in ONE_CREATION_REPORTS or codes[::-1] in ONE_CREATION_REPORTS, codes
+    _assert_one_creation(factory, package, provider)
 
 
 def test_1_unique_link_is_the_database_arbiter(env):
     """Two INSERTs of the same link in overlapping transactions: the
-    second blocks on the unique index and loses with the KNOWN conflict."""
+    second provably blocks on the unique index and loses with the KNOWN
+    conflict."""
     factory, _, clock, _ = env
     package = _approved(env)
     handoff = repo.FrozenHandoff(1, 1, 1, 1, 1, 1, 1, "P" * 16, "i" * 64)
@@ -264,6 +448,7 @@ def test_1_unique_link_is_the_database_arbiter(env):
     repo.insert_claim(
         holder, link_id=package["link_id"], account_key="a", handoff=handoff, now=clock()
     )
+    holder_pid = _backend_pid(holder)
 
     def contender():
         db = factory()
@@ -279,14 +464,14 @@ def test_1_unique_link_is_the_database_arbiter(env):
         finally:
             db.close()
 
-    started = time.monotonic()
     thread, box = _start("B", contender)
-    time.sleep(HOLD_SECONDS)
-    holder.commit()
-    holder.close()
+    try:
+        _await_blocked_on(factory, holder_pid, (thread, box))
+    finally:
+        holder.commit()
+        holder.close()
     result = _join(thread, box)
     assert repo.classify_ledger_conflict(result["result"]) == repo.LINK_CONFLICT
-    assert result["finished_at"] - started >= HOLD_SECONDS
     assert len(_rows(factory, package["link_id"])) == 1
 
 
@@ -301,8 +486,9 @@ def test_2_begin_append_race_grants_exactly_one_permit(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "begin_append", "A")
 
     first = _start("A", _arm, factory, claimed)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     second = _start("B", _arm, factory, claimed)
+    _overlap(factory, hold, second)
     a, b = _join(*first), _join(*second)
 
     permits = [r["result"] for r in (a, b) if isinstance(r["result"], gd._Permit)]
@@ -310,7 +496,6 @@ def test_2_begin_append_race_grants_exactly_one_permit(env, monkeypatch):
     assert b["result"].code == "IN_PROGRESS"
     row = _row(factory, package["link_id"])
     assert row.marker_message_id == permits[0].marker and row.attempt_count == 1
-    assert b["finished_at"] >= hold.acquired_at + HOLD_SECONDS
 
 
 # --- 3 ------------------------------------------------------------------------------
@@ -326,16 +511,14 @@ def test_3_takeover_first_then_old_begin_append_is_fenced(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "takeover_pre_fence", "B")
 
     taker = _start("B", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     stale = _start("A", _arm, factory, old)
+    _overlap(factory, hold, stale)
     b, a = _join(*taker), _join(*stale)
 
     assert b["result"].code == "CREATED"
     assert not isinstance(a["result"], gd._Permit)  # the old token can never arm
-    row = _row(factory, package["link_id"])
-    assert (row.state, row.attempt_count) == ("CREATED", 2)
-    assert provider.creates == 1
-    assert a["finished_at"] >= hold.acquired_at + HOLD_SECONDS
+    _assert_one_creation(factory, package, provider, attempt=2)
 
 
 def test_3_old_begin_append_first_then_takeover_is_refused(env, monkeypatch):
@@ -348,8 +531,9 @@ def test_3_old_begin_append_first_then_takeover_is_refused(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "begin_append", "A")
 
     stale = _start("A", _arm, factory, old)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     taker = _start("B", _create, factory, package["cap"], provider)
+    _overlap(factory, hold, taker)
     a, b = _join(*stale), _join(*taker)
 
     assert isinstance(a["result"], gd._Permit)
@@ -357,7 +541,6 @@ def test_3_old_begin_append_first_then_takeover_is_refused(env, monkeypatch):
     row = _row(factory, package["link_id"])
     assert (row.state, row.attempt_count) == ("CREATING", 1)
     assert row.marker_message_id == a["result"].marker
-    assert b["finished_at"] >= hold.acquired_at + HOLD_SECONDS
 
 
 # --- 4 ------------------------------------------------------------------------------
@@ -381,8 +564,9 @@ def test_4_stale_classifier_first_then_retained_ok_creates(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "classify_stale_armed", "C")
 
     classifier = _start("C", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     finalizer = _start("F", gd._finalize, factory, permit, evidence)
+    _overlap(factory, hold, finalizer)
     c, f = _join(*classifier), _join(*finalizer)
 
     assert c["result"].code == "UNCERTAIN" and f["result"].code == "CREATED"
@@ -395,10 +579,11 @@ def test_4_stale_classifier_first_then_retained_ok_creates(env, monkeypatch):
     )
     assert row.claim_token is None and row.attempt_count == 1
     assert provider.creates == 0  # the classifier never gained APPEND authority
-    assert f["finished_at"] >= hold.acquired_at + HOLD_SECONDS
 
 
 def test_4_late_finalize_first_then_classifier_is_a_no_op(env, monkeypatch):
+    """FORCED: the classifier provably waits on the CREATED finalize; once
+    it commits, the classifier's CAS misses and it reports history."""
     factory = env[0]
     package = _approved(env)
     _approve(env, package)
@@ -408,13 +593,15 @@ def test_4_late_finalize_first_then_classifier_is_a_no_op(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "finalize_created", "F")
 
     finalizer = _start("F", gd._finalize, factory, permit, evidence)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     classifier = _start("C", _create, factory, package["cap"], provider)
+    _overlap(factory, hold, classifier)
     f, c = _join(*finalizer), _join(*classifier)
 
     assert f["result"].code == "CREATED"
-    assert c["result"].code in ("ALREADY_CREATED", "IN_PROGRESS")
-    assert _row(factory, package["link_id"]).state == "CREATED"
+    assert c["result"].code == "ALREADY_CREATED"
+    row = _row(factory, package["link_id"])
+    assert (row.state, row.attempt_count) == ("CREATED", 1)
     assert provider.creates == 0
 
 
@@ -432,16 +619,14 @@ def test_5_failed_retry_race_is_one_new_attempt(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "retry_failed", "A")
 
     first = _start("A", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     second = _start("B", _create, factory, package["cap"], provider)
+    _overlap(factory, hold, second)
     a, b = _join(*first), _join(*second)
 
-    assert a["result"].code == "CREATED"
-    assert b["result"].code in ("IN_PROGRESS", "ALREADY_CREATED")
-    row = _row(factory, package["link_id"])
-    assert (row.state, row.attempt_count) == ("CREATED", 2)
-    assert provider.creates == 2  # the definite failure + exactly one retry
-    assert b["finished_at"] >= hold.acquired_at + HOLD_SECONDS
+    assert (a["result"].code, b["result"].code) in ONE_CREATION_REPORTS
+    # the definite failure + exactly one retry
+    _assert_one_creation(factory, package, provider, attempt=2, creates=2)
 
 
 # --- 6 ------------------------------------------------------------------------------
@@ -456,6 +641,8 @@ def _uncertain(env, package, provider):
 
 
 def test_6_concurrent_positive_reconciliations_have_one_winner(env, monkeypatch):
+    """FORCED: B's positive CAS provably waits on A's; B's CAS then misses
+    and it reports A's identical reconciliation."""
     factory = env[0]
     package = _approved(env)
     _approve(env, package)
@@ -464,12 +651,12 @@ def test_6_concurrent_positive_reconciliations_have_one_winner(env, monkeypatch)
     hold = _Hold(monkeypatch, repo, "reconcile_created", "A")
 
     first = _start("A", _reconcile, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     second = _start("B", _reconcile, factory, package["cap"], provider)
+    _overlap(factory, hold, second)
     a, b = _join(*first), _join(*second)
 
-    assert a["result"].code == "RECONCILED"
-    assert b["result"].code in ("RECONCILED", "ALREADY_CREATED")
+    assert (a["result"].code, b["result"].code) == ("RECONCILED", "RECONCILED")
     row = _row(factory, package["link_id"])
     assert (row.state, row.reconciled, row.draft_uid) == ("CREATED", True, 42)
     assert provider.creates == 1 and provider.lookups == 2
@@ -502,16 +689,35 @@ def test_6_retained_ok_never_overwrites_a_concurrent_reconciliation(env, monkeyp
             db.close()
 
     first = _start("A", _reconcile, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     second = _start("B", retained)
+    _overlap(factory, hold, second)
     a, b = _join(*first), _join(*second)
 
     assert a["result"].code == "RECONCILED" and b["result"] is False
     final = _row(factory, package["link_id"])
     assert (final.reconciled, final.uid_validity, final.draft_uid) == (True, 7, 42)
+    assert provider.creates == 1
 
 
 # --- 7 ------------------------------------------------------------------------------
+
+
+def _replace_preparation_holding(factory, prep_id, gate: _Gate):
+    """Stage 9B's real reclaim CAS, but its transaction first locks the
+    preparation row and holds it until `gate.release`."""
+    db = factory()
+    try:
+        record = db.get(TelegramBewerbungPreparationRecord, prep_id)
+        db.execute(
+            select(TelegramBewerbungPreparationRecord)
+            .where(TelegramBewerbungPreparationRecord.id == prep_id)
+            .with_for_update()
+        )
+        gate.hold(db)
+        return claim_preparation(db, record, input_identity="e" * 64)
+    finally:
+        db.close()
 
 
 def test_7_replacement_waits_for_an_armed_create(env, monkeypatch):
@@ -522,13 +728,14 @@ def test_7_replacement_waits_for_an_armed_create(env, monkeypatch):
     hold = _Hold(monkeypatch, repo, "begin_append", "A")
 
     creator = _start("A", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     replacer = _start("B", _replace_preparation, factory, package["prep_id"])
+    _overlap(factory, hold, replacer)
     a, b = _join(*creator), _join(*replacer)
 
-    assert a["result"].code == "CREATED" and provider.creates == 1
+    assert a["result"].code == "CREATED"
     assert b["result"] is not None  # 9B reclaimed only after the arm committed
-    assert b["finished_at"] >= hold.acquired_at + HOLD_SECONDS
+    _assert_one_creation(factory, package, provider)
 
 
 def test_7_create_waits_for_a_replacement_and_refuses(env):
@@ -536,23 +743,17 @@ def test_7_create_waits_for_a_replacement_and_refuses(env):
     package = _approved(env)
     _approve(env, package)
     provider = Provider()
-    held = threading.Event()
+    gate = _Gate()
 
-    replacer = _start(
-        "B",
-        lambda: _replace_preparation(
-            factory, package["prep_id"], hold_seconds=HOLD_SECONDS, held=held
-        ),
-    )
-    assert held.wait(JOIN_TIMEOUT)
-    started = time.monotonic()
+    replacer = _start("B", _replace_preparation_holding, factory, package["prep_id"], gate)
+    gate.wait_held()
     creator = _start("A", _create, factory, package["cap"], provider)
-    _join(*replacer)
-    a = _join(*creator)
+    _overlap(factory, gate, creator)
+    b, a = _join(*replacer), _join(*creator)
 
+    assert b["result"] is not None
     assert a["result"].code == "PACKAGE_REPLACED"
     assert _rows(factory, package["link_id"]) == [] and provider.creates == 0
-    assert a["finished_at"] - started >= HOLD_SECONDS * 0.5
 
 
 def test_7_replacement_between_claim_and_arm_releases_without_append(env, monkeypatch):
@@ -563,8 +764,9 @@ def test_7_replacement_between_claim_and_arm_releases_without_append(env, monkey
     hold = _Hold(monkeypatch, repo, "insert_claim", "A")
 
     creator = _start("A", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     replacer = _start("B", _replace_preparation, factory, package["prep_id"])
+    _overlap(factory, hold, replacer)
     b, a = _join(*replacer), _join(*creator)
 
     assert b["result"] is not None
@@ -584,15 +786,15 @@ def test_8_create_waits_for_an_overlapping_9c_decision(env, monkeypatch, action,
     hold = _Hold(monkeypatch, ta, "lock_review_header_fresh", "D")
 
     decider = _start("D", _decide, factory, package["cap"], action)
-    assert hold.held.wait(JOIN_TIMEOUT)
+    hold.wait_held()
     creator = _start("A", _create, factory, package["cap"], provider)
+    _overlap(factory, hold, creator)
     d, a = _join(*decider), _join(*creator)
 
     assert d["result"].code == ("APPROVED" if action == "f" else "REJECTED")
     assert a["result"].code == expected
     assert provider.creates == (1 if action == "f" else 0)
     assert len(_rows(factory, package["link_id"])) == (1 if action == "f" else 0)
-    assert a["finished_at"] >= hold.acquired_at + HOLD_SECONDS
 
 
 # --- 9 ------------------------------------------------------------------------------
@@ -622,18 +824,22 @@ def test_9_ledger_first_reader_and_locker_never_deadlock_or_gain_authority(env, 
             db.close()
 
     retrier = _start("A", _create, factory, package["cap"], provider)
-    assert hold.held.wait(JOIN_TIMEOUT)
-    reader = _start("R", _reconcile, factory, package["cap"], provider)
-    locker = _start("L", ledger_first_locker)
-    a, r, lock = _join(*retrier), _join(*reader), _join(*locker)
+    hold.wait_held()
+    try:
+        # The unlocked status read completes while A still HOLDS the ledger
+        # lock: it never waited for, nor raced, the holder.
+        r = _join(*_start("R", _reconcile, factory, package["cap"], provider))
+        assert r["result"].code == "FAILED" and provider.lookups == 0
+        locker = _start("L", ledger_first_locker)
+        _await_blocked_on(factory, hold.pid, locker)  # the ledger locker DOES wait
+    finally:
+        hold.release.set()
+    a, lock = _join(*retrier), _join(*locker)
 
+    assert not hold.release_timed_out
     assert a["result"].code == "CREATED"
-    # The unlocked status read never waited for, nor raced, the holder.
-    assert r["result"].code == "FAILED" and r["finished_at"] < hold.acquired_at + HOLD_SECONDS
-    assert provider.lookups == 0
-    assert lock["result"] is True and lock["finished_at"] >= hold.acquired_at + HOLD_SECONDS
-    row = _row(factory, package["link_id"])
-    assert (row.state, row.attempt_count) == ("CREATED", 2) and provider.creates == 2
+    assert lock["result"] is True
+    _assert_one_creation(factory, package, provider, attempt=2, creates=2)
 
 
 # --- 10 -----------------------------------------------------------------------------
