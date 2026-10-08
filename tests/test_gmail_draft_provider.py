@@ -4,6 +4,7 @@ read-only lookup parsing, and the allowed-command trace. No network: a
 fake client records every IMAP command."""
 
 import ast
+import binascii
 import imaplib
 import re
 import ssl
@@ -60,6 +61,72 @@ ALLOWED_COMMANDS = {"LOGIN", "LIST", "RESPONSE", "APPEND", "EXAMINE", "UID", "LO
 
 # RFC 2047 section 2: encoded-text excludes "?" and space.
 ENCODED_WORD = re.compile(r"=\?[^?\s]+\?[QqBb]\?[!->@-~]*\?=")
+HEX_UPPER = "0123456789ABCDEF"
+
+
+def _strict_decode_word(word: str) -> str:
+    """Independent strict decode of one UTF-8 encoded word (S9D-CODEX-FINAL-001):
+    nonempty payload; B is strict, canonical base64; Q is literal printable
+    ASCII except "=", "?" and space, "_" for space, "=" + two uppercase hex
+    digits; the bytes must be valid UTF-8. Raises ValueError otherwise."""
+    charset, encoding, payload = word[2:-2].split("?")
+    if charset.lower() != "utf-8" or not payload:
+        raise ValueError(word)
+    if encoding.lower() == "b":
+        raw = binascii.a2b_base64(payload, strict_mode=True)
+        if binascii.b2a_base64(raw, newline=False).decode("ascii") != payload:
+            raise ValueError(word)
+    else:
+        out, i = bytearray(), 0
+        while i < len(payload):
+            char = payload[i]
+            if char == "=":
+                pair = payload[i + 1 : i + 3]
+                if len(pair) != 2 or any(c not in HEX_UPPER for c in pair):
+                    raise ValueError(word)
+                out.append(int(pair, 16))
+                i += 3
+                continue
+            if char in "? " or not "!" <= char <= "~":
+                raise ValueError(word)
+            out.append(0x20 if char == "_" else ord(char))
+            i += 1
+        raw = bytes(out)
+    return raw.decode("utf-8")
+
+
+# S9D-CODEX-FINAL-001: synthetic malformed encoder output, each refused.
+MALFORMED_ENCODED = {
+    "empty-q": "=?utf-8?q??=",
+    "empty-b": "=?utf-8?b??=",
+    "truncated-q": "=?utf-8?q?=0?=",
+    "truncated-q-end": "=?utf-8?q?A=?=",
+    "invalid-q-hex": "=?utf-8?q?=GG?=",
+    "lowercase-q-hex": "=?utf-8?q?=c3=a9?=",
+    "codex-invalid-q": "=?utf-8?q?=3D=3Futf-8=3Fq=3FX=3F=3D_=GG?=",
+    "invalid-b-alphabet": "=?utf-8?b?!!!!?=",
+    "codex-invalid-b": "=?utf-8?b?PT91!dGYtOD9xP1g/PQ==?=",
+    "invalid-b-length": "=?utf-8?b?A?=",
+    "invalid-b-length-5": "=?utf-8?b?QUJDR?=",
+    "invalid-b-padding": "=?utf-8?b?QQ=?=",
+    "discontinuous-b-padding": "=?utf-8?b?QQ=A?=",
+    "excess-b-after-padding": "=?utf-8?b?QQ==QQ==?=",
+    "noncanonical-b-bits": "=?utf-8?b?QR==?=",
+    "invalid-utf8-q": "=?utf-8?q?=FF?=",
+    "invalid-utf8-q-truncated-seq": "=?utf-8?q?=C3?=",
+    "invalid-utf8-b": "=?utf-8?b?/w==?=",
+    "invalid-utf8-b-overlong": "=?utf-8?b?wK8=?=",
+    "valid-then-invalid": "=?utf-8?q?ok?= =?utf-8?q?=GG?=",
+}
+# Hand-written strictly valid output, accepted by the validator.
+VALID_ENCODED = {
+    "q-ascii": "=?utf-8?q?Bewerbung_als_Developer?=",
+    "q-unicode": "=?utf-8?q?Gr=C3=B6=C3=9Fe_=F0=9F=9A=80?=",
+    "b-unicode": "=?utf-8?b?R3LDtsOfZSDwn5qA?=",
+    "q-multi-word": "=?utf-8?q?Bewerbung_?= =?utf-8?q?als_Developer?=",
+    "b-multi-word": "=?utf-8?b?QmV3ZXJidW5n?=\n =?utf-8?b?IGFscyBEZXZlbG9wZXI=?=",
+    "q-literal-safe-chars": "=?utf-8?q?a!*+-/b?=",
+}
 
 
 def _subject_wire_lines(data: bytes) -> list[str]:
@@ -82,6 +149,8 @@ def _assert_rfc2047_subject(data: bytes) -> tuple[int, int]:
         token for line in lines[1:] for token in line.split()
     ]
     assert tokens and all(ENCODED_WORD.fullmatch(token) for token in tokens), lines
+    for token in tokens:
+        _strict_decode_word(token)  # raises on a malformed payload
     assert all(len(token) <= 75 for token in tokens), lines
     assert all(len(line) <= 76 for line in lines), lines
     assert all(line[:1] in (" ", "\t") for line in lines[1:]), lines
@@ -589,6 +658,72 @@ class TestMime:
         monkeypatch.setattr(draft_base, "Header", FakeHeader)
         with pytest.raises(DraftMessageInvalidError):
             build_draft_mime(_message(subject="=?utf-8?q?A?="), date=NOW)
+
+    @pytest.mark.parametrize(
+        "encoded", list(MALFORMED_ENCODED.values()), ids=list(MALFORMED_ENCODED)
+    )
+    def test_malformed_payload_is_not_compliant(self, encoded):
+        # S9D-CODEX-FINAL-001: structure and length are not enough; the
+        # payload must be strictly valid Q/B and decode to UTF-8.
+        with pytest.raises(ValueError):
+            for word in encoded.split():
+                _strict_decode_word(word)
+        assert draft_base._is_rfc2047_compliant(encoded) is False
+
+    @pytest.mark.parametrize(
+        "encoded", list(MALFORMED_ENCODED.values()), ids=list(MALFORMED_ENCODED)
+    )
+    def test_malformed_encoder_output_fails_closed(self, monkeypatch, encoded):
+        # The subject is what a permissive parser makes of the malformed
+        # output (prefixed by a valid "=?" word), so the final round-trip
+        # alone could not catch it: only payload validation refuses it.
+        fake = "=?utf-8?q?=3D=3F?= " + encoded
+        raw = f"Subject: {fake}\r\n\r\n".encode("ascii")
+        subject = str(BytesParser(policy=policy.SMTP).parsebytes(raw)["Subject"])
+
+        class FakeHeader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self):
+                return fake
+
+        monkeypatch.setattr(draft_base, "Header", FakeHeader)
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject=subject), date=NOW)
+
+    def test_codex_malformed_base64_round_trips_permissively_but_is_refused(self, monkeypatch):
+        # The exact Codex demonstration: Python's parser decodes the invalid
+        # Base64 word to the approved subject, yet it must never be sent.
+        encoded = MALFORMED_ENCODED["codex-invalid-b"]
+        raw = f"Subject: {encoded}\r\n\r\n".encode("ascii")
+        assert str(BytesParser(policy=policy.SMTP).parsebytes(raw)["Subject"]) == "=?utf-8?q?X?="
+
+        class FakeHeader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self):
+                return encoded
+
+        monkeypatch.setattr(draft_base, "Header", FakeHeader)
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject="=?utf-8?q?X?="), date=NOW)
+
+    @pytest.mark.parametrize("encoded", list(VALID_ENCODED.values()), ids=list(VALID_ENCODED))
+    def test_strictly_valid_payload_is_compliant(self, encoded):
+        for word in encoded.split():
+            _strict_decode_word(word)
+        assert draft_base._is_rfc2047_compliant(encoded) is True
+
+    @pytest.mark.parametrize(
+        "subject", list(SUBJECT_ENCODED_PATH.values()), ids=list(SUBJECT_ENCODED_PATH)
+    )
+    def test_generated_output_passes_strict_payload_validation(self, subject):
+        encoded = draft_base.Header(subject, "utf-8", maxlinelen=76, header_name="Subject").encode()
+        assert draft_base._is_rfc2047_compliant(encoded) is True
+        decoded = "".join(_strict_decode_word(word) for word in encoded.split())
+        assert decoded == subject
 
     @pytest.mark.parametrize("subject", list(SUBJECT_REJECT.values()), ids=list(SUBJECT_REJECT))
     def test_raw_control_subjects_are_refused(self, subject):

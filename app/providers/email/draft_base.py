@@ -18,6 +18,8 @@ no HTML, a single text/plain UTF-8 part.
 address, subject, body, Message-ID marker, mailbox, UID or UIDVALIDITY.
 """
 
+import base64
+import binascii
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,8 +72,13 @@ _SERIALIZE_POLICY = policy.SMTP.clone(refold_source="none")
 # output is checked word by word; anything else is refused pre-APPEND.
 _ENCODED_WORD_MAX = 75
 _ENCODED_LINE_MAX = 76
-# Encoded-text is printable ASCII without "?" or space.
-_ENCODED_WORD = re.compile(r"=\?utf-8\?[qb]\?[!->@-~]*\?=")
+# Encoded-text is nonempty printable ASCII without "?" or space.
+_ENCODED_WORD = re.compile(r"=\?utf-8\?([qb])\?([!->@-~]+)\?=")
+# S9D-CODEX-FINAL-001: the payload itself is validated strictly. Q text is
+# literal printable ASCII except "=", "?" (and space; "_" is a space) or
+# "=" plus two uppercase hex digits (RFC 2045 6.7).
+_Q_ENCODED_TEXT = re.compile(r"(?:[!-<>@-~]|=[0-9A-F]{2})+")
+_Q_ESCAPE = re.compile(rb"=([0-9A-F]{2})")
 
 
 @dataclass(frozen=True, repr=False)
@@ -252,8 +259,37 @@ def _is_rfc2047_compliant(encoded: str) -> bool:
         if any(token and len(token) > _ENCODED_WORD_MAX for token in tokens):
             return False
         words = [token for token in tokens if token]
-        if not words or not all(_ENCODED_WORD.fullmatch(word) for word in words):
+        if not words or not all(_is_valid_encoded_word(word) for word in words):
             return False
+    return True
+
+
+def _is_valid_encoded_word(word: str) -> bool:
+    """True when `word` is one UTF-8 Q/B encoded word whose payload is
+    strictly valid for its encoding (B: canonical base64, never repaired)
+    and decodes to valid UTF-8. Each encoded word must stand alone, so a
+    character split across words is refused too."""
+    match = _ENCODED_WORD.fullmatch(word)
+    if match is None:
+        return False
+    encoding, text = match.groups()
+    if encoding == "b":
+        try:
+            raw = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        if base64.b64encode(raw).decode("ascii") != text:
+            return False
+    else:
+        if not _Q_ENCODED_TEXT.fullmatch(text):
+            return False
+        raw = _Q_ESCAPE.sub(
+            lambda escape: bytes([int(escape[1], 16)]), text.replace("_", " ").encode("ascii")
+        )
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
     return True
 
 

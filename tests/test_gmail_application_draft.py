@@ -53,7 +53,7 @@ from app.providers.email.draft_base import (
     build_draft_mime,
 )
 from tests import test_telegram_bewerbung_approval as s9c
-from tests.test_gmail_draft_provider import _assert_rfc2047_subject
+from tests.test_gmail_draft_provider import MALFORMED_ENCODED, _assert_rfc2047_subject
 from tests.test_telegram_bewerbung_approval import (
     _api,
     _bump_profile,
@@ -718,6 +718,34 @@ class TestSubjectIntegrity:
         _set_revision_letter(
             session_factory, approved, subject="Bewerbung =?utf-8?q?X?= " + "A" * 85
         )
+        outcome = await _create(session_factory, approved["capability"], provider)
+        assert outcome.code == "CONTENT_INVALID"
+        assert _ledgers(session_factory) == [] and provider.creates == []
+        assert provider.mime == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "encoded", list(MALFORMED_ENCODED.values()), ids=list(MALFORMED_ENCODED)
+    )
+    async def test_malformed_encoded_payload_is_refused_before_any_claim(
+        self, session_factory, approved, provider, monkeypatch, encoded
+    ):
+        # S9D-CODEX-FINAL-001: malformed encoder output must be refused in
+        # the pre-claim render, even where a permissive parse would decode
+        # it to the approved subject.
+        fake = "=?utf-8?q?=3D=3F?= " + encoded
+        raw = f"Subject: {fake}\r\n\r\n".encode("ascii")
+        subject = str(_parsed(raw)["Subject"])
+
+        class FakeHeader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self):
+                return fake
+
+        monkeypatch.setattr(draft_base, "Header", FakeHeader)
+        _set_revision_letter(session_factory, approved, subject=subject)
         outcome = await _create(session_factory, approved["capability"], provider)
         assert outcome.code == "CONTENT_INVALID"
         assert _ledgers(session_factory) == [] and provider.creates == []
