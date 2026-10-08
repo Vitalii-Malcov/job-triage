@@ -64,6 +64,14 @@ _ENCODED_WORD_START = "=?"
 # Serialize stored header values as-is: refolding a pre-encoded Subject
 # would re-parse (and so re-decode) it. Registry headers still fold normally.
 _SERIALIZE_POLICY = policy.SMTP.clone(refold_source="none")
+# S9D-CODEX-ASTRAFIX-001 -- RFC 2047 section 2: an encoded word is at most
+# 75 characters and a line containing one at most 76. The stdlib default
+# (78) can emit a 76-character word, so the encoder is asked for 76 and its
+# output is checked word by word; anything else is refused pre-APPEND.
+_ENCODED_WORD_MAX = 75
+_ENCODED_LINE_MAX = 76
+# Encoded-text is printable ASCII without "?" or space.
+_ENCODED_WORD = re.compile(r"=\?utf-8\?[qb]\?[!->@-~]*\?=")
 
 
 @dataclass(frozen=True, repr=False)
@@ -222,16 +230,31 @@ def _subject_header_value(subject: str) -> "str | _EncodedSubject":
     wholly encoded so the parser cannot reinterpret any of it."""
     if _ENCODED_WORD_START not in subject:
         return subject
-    encoded = Header(subject, "utf-8", header_name="Subject").encode()
-    lines = encoded.split("\n")
-    if (
-        not encoded.isascii()
-        or any(char in encoded for char in ("\r", "\x00"))
-        or any(len(line) > 78 for line in lines)
-        or any(not line.startswith(" ") for line in lines[1:])
-    ):
+    encoded = Header(subject, "utf-8", maxlinelen=_ENCODED_LINE_MAX, header_name="Subject").encode()
+    if not _is_rfc2047_compliant(encoded):
         raise DraftMessageInvalidError("Draft header is unsafe")
     return _EncodedSubject(encoded)
+
+
+def _is_rfc2047_compliant(encoded: str) -> bool:
+    """True when the folded value is ASCII, every token on every line is
+    one encoded word of at most 75 characters, every line (the first with
+    its "Subject: " prefix) is at most 76 characters, and every
+    continuation line starts with one space."""
+    if not encoded.isascii() or any(char in encoded for char in ("\r", "\x00")):
+        return False
+    for index, line in enumerate(encoded.split("\n")):
+        if index and not line.startswith(" "):
+            return False
+        if len(line if index else f"Subject: {line}") > _ENCODED_LINE_MAX:
+            return False
+        tokens = line.split(" ")
+        if any(token and len(token) > _ENCODED_WORD_MAX for token in tokens):
+            return False
+        words = [token for token in tokens if token]
+        if not words or not all(_ENCODED_WORD.fullmatch(word) for word in words):
+            return False
+    return True
 
 
 def _build(message: DraftMessage, date: datetime) -> bytes:
@@ -254,6 +277,10 @@ def _build(message: DraftMessage, date: datetime) -> bytes:
     mime["Message-ID"] = message.message_id
     mime.set_content(message.body_lf, subtype="plain", charset="utf-8")
     data = mime.as_bytes(policy=_SERIALIZE_POLICY)
+    if isinstance(subject, _EncodedSubject):
+        wire = "\r\nSubject: " + subject.value.replace("\n", "\r\n") + "\r\n"
+        if wire.encode("ascii") not in data:
+            raise DraftMessageInvalidError("Draft subject was not serialized as validated")
 
     parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
     names = {name.lower() for name in parsed.keys()}

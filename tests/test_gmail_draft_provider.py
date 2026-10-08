@@ -5,6 +5,7 @@ fake client records every IMAP command."""
 
 import ast
 import imaplib
+import re
 import ssl
 from datetime import UTC, datetime, timedelta
 from email import policy
@@ -57,6 +58,36 @@ LIST_DATA = [
 ALLOWED_COMMANDS = {"LOGIN", "LIST", "RESPONSE", "APPEND", "EXAMINE", "UID", "LOGOUT"}
 
 
+# RFC 2047 section 2: encoded-text excludes "?" and space.
+ENCODED_WORD = re.compile(r"=\?[^?\s]+\?[QqBb]\?[!->@-~]*\?=")
+
+
+def _subject_wire_lines(data: bytes) -> list[str]:
+    """The raw (folded, undecoded) Subject header lines of serialized MIME."""
+    head = data.split(b"\r\n\r\n", 1)[0].decode("ascii").split("\r\n")
+    (start,) = [i for i, line in enumerate(head) if line.lower().startswith("subject:")]
+    end = start + 1
+    while end < len(head) and head[end][:1] in (" ", "\t"):
+        end += 1
+    return head[start:end]
+
+
+def _assert_rfc2047_subject(data: bytes) -> tuple[int, int]:
+    """Independent RFC 2047 check of an encoded-path Subject: every token is
+    one encoded word of at most 75 characters, every line is at most 76
+    characters and every continuation line starts with whitespace. Returns
+    (max encoded-word length, max line length)."""
+    lines = _subject_wire_lines(data)
+    tokens = lines[0][len("Subject:") :].split() + [
+        token for line in lines[1:] for token in line.split()
+    ]
+    assert tokens and all(ENCODED_WORD.fullmatch(token) for token in tokens), lines
+    assert all(len(token) <= 75 for token in tokens), lines
+    assert all(len(line) <= 76 for line in lines), lines
+    assert all(line[:1] in (" ", "\t") for line in lines[1:]), lines
+    return max(map(len, tokens)), max(map(len, lines))
+
+
 def _target(mailbox="[Gmail]/Drafts", account=ACCOUNT) -> DraftTarget:
     return DraftTarget(account, mailbox, encode_mailbox_wire(mailbox))
 
@@ -85,6 +116,31 @@ SUBJECT_ACCEPT_EXACT = {
     "encoded-nul": "Bewerbung =?utf-8?q?=00?= Developer",
     "adjacent-encoded-words": "=?utf-8?q?a?= =?utf-8?q?b?=",
     "long-encoded-word-unicode": "Bewerbung =?utf-8?q?X?= Größe 🚀 " * 8,
+    # S9D-CODEX-ASTRAFIX-001: long encoded-path subjects. With the stdlib
+    # default line length these produced 76/77-character encoded words.
+    "rfc2047-codex-repro": "Bewerbung =?utf-8?q?X?= " + "A" * 85,
+    "rfc2047-threshold-75": "Bewerbung =?utf-8?q?X?= " + "A" * 84,
+    "rfc2047-threshold-77": "Bewerbung =?utf-8?q?X?= " + "A" * 86,
+    "rfc2047-long-mixed": "Bewerbung =?utf-8?q?X?= Größe 🚀 =?UTF-8?B?VW5h?= Müller " * 6,
+    "rfc2047-long-q": "=?utf-8?q?" + "Unapproved_Subject_Text_=3D=0A" * 10 + "?=",
+    "rfc2047-long-b": "=?UTF-8?B?" + "VW5hcHByb3ZlZCBTdWJqZWN0" * 10 + "?=",
+    "rfc2047-adjacent-spaced": " ".join(f"=?utf-8?q?seg{i}_Text?=" for i in range(12)),
+    "rfc2047-adjacent-unspaced": "".join(f"=?utf-8?b?U2VnbWVudA{i}?=" for i in range(12)),
+}
+# Header-injection vectors: accepted only as the literal approved text.
+SUBJECT_INJECTION = {
+    "q-lf-bcc": "=?utf-8?q?=0A?=Bcc: attacker@example.com",
+    "q-crlf-bcc": "=?utf-8?q?=0D=0ABcc=3A_attacker@example.com?=",
+    **{
+        f"then-{name.lower()}": f"Bewerbung =?utf-8?q?X?= {name}: attacker@example.com"
+        for name in ("Bcc", "Cc", "To", "Reply-To", "Content-Type", "Subject")
+    },
+    "folding-boundary": "A" * 60 + " =?utf-8?q?=0A?=Bcc: attacker@example.com " + "B" * 70,
+}
+SUBJECT_ENCODED_PATH = {
+    name: subject
+    for name, subject in {**SUBJECT_ACCEPT_EXACT, **SUBJECT_INJECTION}.items()
+    if "=?" in subject
 }
 SUBJECT_REJECT = {
     "raw-cr": "Bewerbung\rBcc: x@example.com",
@@ -462,6 +518,77 @@ class TestMime:
         assert str(parsed["From"]) == ACCOUNT and str(parsed["Message-ID"]) == MARKER
         assert parsed.get_content().replace("\r\n", "\n") == _message().body_lf
         assert data.isascii() and all(len(line) <= 998 for line in data.split(b"\r\n"))
+        if "=?" in subject:
+            _assert_rfc2047_subject(data)
+
+    @pytest.mark.parametrize(
+        "subject", list(SUBJECT_INJECTION.values()), ids=list(SUBJECT_INJECTION)
+    )
+    def test_header_injection_vectors_stay_one_literal_subject(self, subject):
+        data = build_draft_mime(_message(subject=subject), date=NOW)
+        parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
+        (decoded,) = parsed.get_all("Subject")
+        assert str(decoded) == subject
+        assert len(parsed.keys()) == len(draft_base.ALLOWED_HEADERS)
+        for name in ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References"):
+            assert parsed[name] is None
+        assert parsed.get_content_type() == "text/plain"
+        _assert_rfc2047_subject(data)
+
+    @pytest.mark.parametrize(
+        "subject", list(SUBJECT_ENCODED_PATH.values()), ids=list(SUBJECT_ENCODED_PATH)
+    )
+    def test_encoded_subject_meets_rfc2047_limits(self, subject):
+        # S9D-CODEX-ASTRAFIX-001: a permissive parser decodes oversized
+        # encoded words, so decoded equality alone cannot prove compliance.
+        data = build_draft_mime(_message(subject=subject), date=NOW)
+        max_word, max_line = _assert_rfc2047_subject(data)
+        assert max_word <= 75 and max_line <= 76
+
+    @pytest.mark.parametrize("pad", range(70, 100))
+    def test_encoded_word_length_threshold_sweep(self, pad):
+        subject = "Bewerbung =?utf-8?q?X?= " + "A" * pad
+        data = build_draft_mime(_message(subject=subject), date=NOW)
+        _assert_rfc2047_subject(data)
+        parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
+        assert str(parsed["Subject"]) == subject
+
+    def test_oversized_encoder_output_fails_closed(self, monkeypatch):
+        # The stdlib default line length (78) emits a 76-character encoded
+        # word for this subject; it must be refused, never transmitted.
+        default_header = draft_base.Header
+
+        def header_with_default_line_length(*args, maxlinelen=None, **kwargs):
+            return default_header(*args, **kwargs)
+
+        monkeypatch.setattr(draft_base, "Header", header_with_default_line_length)
+        subject = SUBJECT_ACCEPT_EXACT["rfc2047-codex-repro"]
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject=subject), date=NOW)
+
+    @pytest.mark.parametrize(
+        "encoded",
+        [
+            "=?utf-8?q?" + "A" * 64 + "?=",  # 76-character encoded word
+            "=?utf-8?q?A?= =?utf-8?q?" + "B" * 52 + "?=",  # line over 76 characters
+            "=?utf-8?q?A?=\n=?utf-8?q?B?=",  # continuation without whitespace
+            "=?utf-8?q?A?= plain",  # bare text the parser would not decode
+            "=?utf-8?q?A B?=",  # space inside encoded-text
+            "=?utf-8?q?A?=\n ",  # empty continuation line
+        ],
+        ids=["word-76", "line-77", "no-fold-space", "bare-text", "inner-space", "empty-line"],
+    )
+    def test_noncompliant_encoder_output_fails_closed(self, monkeypatch, encoded):
+        class FakeHeader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self):
+                return encoded
+
+        monkeypatch.setattr(draft_base, "Header", FakeHeader)
+        with pytest.raises(DraftMessageInvalidError):
+            build_draft_mime(_message(subject="=?utf-8?q?A?="), date=NOW)
 
     @pytest.mark.parametrize("subject", list(SUBJECT_REJECT.values()), ids=list(SUBJECT_REJECT))
     def test_raw_control_subjects_are_refused(self, subject):

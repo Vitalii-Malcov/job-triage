@@ -53,6 +53,7 @@ from app.providers.email.draft_base import (
     build_draft_mime,
 )
 from tests import test_telegram_bewerbung_approval as s9c
+from tests.test_gmail_draft_provider import _assert_rfc2047_subject
 from tests.test_telegram_bewerbung_approval import (
     _api,
     _bump_profile,
@@ -660,8 +661,18 @@ class TestSubjectIntegrity:
             "Bewerbung =?utf-8?q?=0D?= Developer",
             "Bewerbung =?utf-8?q?=0A?=Bcc: x@example.com",
             "Bewerbung =?utf-8?q?=00?= Developer",
+            "Bewerbung =?utf-8?q?X?= " + "A" * 85,
+            ("Bewerbung =?utf-8?q?X?= Größe 🚀 =?UTF-8?B?VW5h?= Müller " * 6).strip(),
         ],
-        ids=["q-encoded-word", "b-encoded-word", "encoded-cr", "encoded-lf", "encoded-nul"],
+        ids=[
+            "q-encoded-word",
+            "b-encoded-word",
+            "encoded-cr",
+            "encoded-lf",
+            "encoded-nul",
+            "rfc2047-codex-repro",
+            "rfc2047-long-mixed",
+        ],
     )
     async def test_encoded_word_looking_subject_is_drafted_literally(
         self, session_factory, approved, provider, subject
@@ -673,6 +684,7 @@ class TestSubjectIntegrity:
         decoded, body = _transmitted(provider)
         assert decoded == subject == provider.creates[0][0].subject
         assert not any(char in decoded for char in ("\r", "\n", "\x00"))
+        _assert_rfc2047_subject(provider.mime[0])
         assert _ledger(session_factory).content_sha256 == gd.content_hash(
             "9d-v1", ACCOUNT, decoded, body
         )
@@ -692,10 +704,35 @@ class TestSubjectIntegrity:
         assert _ledgers(session_factory) == [] and provider.creates == []
 
     @pytest.mark.asyncio
-    async def test_full_9b_9c_9d_flow_keeps_the_approved_subject_exact(
-        self, session_factory, seeded, sender, provider
+    async def test_oversized_encoded_word_is_refused_before_any_claim(
+        self, session_factory, approved, provider, monkeypatch
     ):
-        _change_job(session_factory, seeded, title=ENCODED_WORD_TITLE)
+        # S9D-CODEX-ASTRAFIX-001: the stdlib default line length yields a
+        # 76-character encoded word here; it must never reach APPEND.
+        default_header = draft_base.Header
+
+        def header_with_default_line_length(*args, maxlinelen=None, **kwargs):
+            return default_header(*args, **kwargs)
+
+        monkeypatch.setattr(draft_base, "Header", header_with_default_line_length)
+        _set_revision_letter(
+            session_factory, approved, subject="Bewerbung =?utf-8?q?X?= " + "A" * 85
+        )
+        outcome = await _create(session_factory, approved["capability"], provider)
+        assert outcome.code == "CONTENT_INVALID"
+        assert _ledgers(session_factory) == [] and provider.creates == []
+        assert provider.mime == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "title",
+        [ENCODED_WORD_TITLE, ENCODED_WORD_TITLE + " " + "A" * 85],
+        ids=["encoded-word-title", "long-encoded-word-title"],
+    )
+    async def test_full_9b_9c_9d_flow_keeps_the_approved_subject_exact(
+        self, session_factory, seeded, sender, provider, title
+    ):
+        _change_job(session_factory, seeded, title=title)
         token = await s9c._prepare(session_factory, seeded, sender)  # real Stage 9B
         shown = await s9c._request(session_factory, token, sender)  # real Stage 9C review
         assert shown.code == "REVIEW_SHOWN", shown
@@ -703,7 +740,7 @@ class TestSubjectIntegrity:
         decided = await _decide(session_factory, link.approval_capability, "f")
         assert decided.code == "APPROVED", decided
         approved_subject = _approved_revision_subject(session_factory, link.review_id)
-        assert approved_subject == f"Bewerbung als {ENCODED_WORD_TITLE}"
+        assert approved_subject == f"Bewerbung als {title}"
 
         outcome = await _create(session_factory, link.approval_capability, provider)
 
@@ -713,6 +750,7 @@ class TestSubjectIntegrity:
         parsed = _parsed(provider.mime[0])
         for name in ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References"):
             assert parsed[name] is None
+        _assert_rfc2047_subject(provider.mime[0])
         row = _ledger(session_factory)
         assert row.content_sha256 == gd.content_hash("9d-v1", ACCOUNT, decoded, body)
         review = session_factory().get(ApplicationPackageReviewRecord, link.review_id)
