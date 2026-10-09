@@ -30,6 +30,9 @@ implicitly set the `\\Seen` flag as a side effect of transferring the
 body; `.PEEK` is the documented way to fetch the same content without
 that mutation. See app/providers/email/imap.py's
 `test_module_never_calls_mailbox_write_commands`-style regression tests.
+This guarantee is scoped to this reader and its `ImapClient` Protocol; the
+Stage 9D APPEND-only Drafts provider is a separate code path
+(draft_base.py / imap_draft.py) that never reuses this client for writing.
 
 Attachment content note (see ParsedAttachment's docstring for the full,
 honest contract): a bounded `BODY.PEEK[]` fetch transfers the complete

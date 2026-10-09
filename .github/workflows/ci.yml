@@ -69,11 +69,22 @@ jobs:
       # no longer call create_all themselves and rely entirely on this
       # step for schema creation, so a broken migration fails loudly
       # here instead of being silently papered over.
+      #
+      # S9D-CODEX-002: the expected revision below MUST equal the
+      # repository's single migration-script head --
+      # tests/test_ci_postgres_migration_gate.py compares it against
+      # alembic's ScriptDirectory, so adding a migration fails that test
+      # until this literal is updated. `alembic heads` additionally proves
+      # the script tree still has exactly one head.
       - name: Alembic upgrade head against CI PostgreSQL
+        shell: bash
         run: |
+          set -euo pipefail
           python -m alembic upgrade head
+          python -m alembic heads | tee /tmp/alembic_heads.txt
+          test "$(grep -c '(head)' /tmp/alembic_heads.txt)" -eq 1
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "a1b2c3d4e5f6 (head)" /tmp/alembic_current.txt
+          grep -q "f3b8d2a6c9e1 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       # HARD-010 (adversarial hardening r1): claim_send_attempt's
@@ -92,20 +103,49 @@ jobs:
       # correctly discriminates uq_jobs_fingerprint from an unrelated
       # real constraint violation using psycopg's own `.diag`.
       #
+      # S9D-CODEX-002: the Stage 9C approval and Stage 9D Gmail-draft
+      # concurrency modules are REQUIRED PostgreSQL gates (their
+      # architectures reject sequential SQLite as concurrency evidence),
+      # so they run here too -- before HARD-008, at head.
+      #
       # HARD-008-RR1 (Codex targeted re-review): runs LAST, after the
-      # other four PostgreSQL integration tests below -- it drives its
+      # other PostgreSQL integration tests below -- it drives its
       # own Alembic downgrade/upgrade cycle against this same database
       # (down to c7d3f9a1e5b8 and back to head) to prove the legacy-
       # PENDING backfill fail-closes to UNCERTAIN, and always restores
       # head in a `finally` block (including on failure). Running it
-      # last means the four tests before it -- which all assume the
+      # last means the tests before it -- which all assume the
       # schema is already at head (see the "Alembic upgrade head" step
       # above) -- are never affected by its own temporary downgrade.
-      - run: pytest -q tests/integration/test_scheduler_postgres_concurrency.py
-          tests/integration/test_gmail_watermark_postgres_concurrency.py
-          tests/integration/test_response_draft_send_postgres_concurrency.py
-          tests/integration/test_upsert_job_postgres_concurrency.py
-          tests/integration/test_hard008_legacy_pending_migration_postgres.py
+      #
+      # Every module here skips when TEST_POSTGRES_URL is unset, so the
+      # step refuses to run without it and then fails on ANY skipped test:
+      # a green job must mean every PostgreSQL test actually executed.
+      - name: PostgreSQL integration tests (zero skips)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${TEST_POSTGRES_URL:-}"
+          pytest -q -rs --junitxml=/tmp/postgres-junit.xml \
+            tests/integration/test_scheduler_postgres_concurrency.py \
+            tests/integration/test_gmail_watermark_postgres_concurrency.py \
+            tests/integration/test_response_draft_send_postgres_concurrency.py \
+            tests/integration/test_upsert_job_postgres_concurrency.py \
+            tests/integration/test_telegram_bewerbung_approval_postgres.py \
+            tests/integration/test_gmail_application_draft_postgres.py \
+            tests/integration/test_hard008_legacy_pending_migration_postgres.py
+          python - /tmp/postgres-junit.xml <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"PostgreSQL integration: {tests} tests, {skipped} skipped")
+          if tests == 0 or skipped:
+              sys.exit("PostgreSQL integration gate requires zero skipped tests")
+          PY
         env:
           TEST_POSTGRES_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
 

@@ -117,6 +117,25 @@ class Settings(BaseSettings):
     # approve or reject it in the PRIVATE chat. APPROVED != SENT: nothing is
     # ever sent. Effective only together with telegram_bewerbung_draft_enabled.
     telegram_bewerbung_approval_enabled: bool = False
+    # Stage 9D (app.services.gmail_application_draft): "📧 Gmail-Entwurf
+    # erstellen" on a Stage 9C approval puts ONE recipient-less,
+    # attachment-less plain-text draft into the Gmail Drafts mailbox via a
+    # single IMAP APPEND. A Gmail DRAFT is never SENT: no SMTP, no Gmail API,
+    # no OAuth. Effective only together with BOTH flags above; deliberately
+    # independent of outbound_sending_enabled. Keep False in production
+    # until the real-Gmail production-enable gate has passed.
+    telegram_gmail_draft_enabled: bool = False
+    # The DECODED name of the Gmail Drafts mailbox (localized accounts use
+    # e.g. "[Gmail]/Entwürfe"). Configured, never auto-discovered; validated
+    # (and modified-UTF-7 encoded) before any claim -- see
+    # app.providers.email.imap_draft.encode_mailbox_wire.
+    gmail_drafts_mailbox: str = "[Gmail]/Drafts"
+    # Absolute wall-clock budget of ONE draft attempt, frozen into the ledger
+    # when the attempt is armed (a later change never extends an old one).
+    gmail_draft_attempt_budget_seconds: int = Field(default=60, ge=15, le=300)
+    # UX/load pacing for "🔄 Gmail-Status prüfen" -- NOT evidence that no
+    # draft exists; an unclear status stays unclear without a positive match.
+    gmail_draft_reconcile_min_age_seconds: int = Field(default=120, ge=0, le=86400)
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.

@@ -1340,3 +1340,89 @@ def get_approved_handoff(db: Session, link_id: int) -> ApprovedPackageHandoff | 
         cv_draft_id=review.cv_draft_id,
         bewerbung_draft_id=review.bewerbung_draft_id,
     )
+
+
+@dataclass(frozen=True)
+class ApprovedLinkSnapshot:
+    """Detached, immutable result of `revalidate_approved_link_locked`: the
+    exact approved package identity plus the approved revision's reviewed
+    letter, captured under the locks. Never a "latest" anything."""
+
+    link_id: int
+    review_id: int
+    approved_revision_id: int
+    preparation_id: int
+    generation: int
+    match_id: int
+    cv_draft_id: int
+    bewerbung_draft_id: int
+    package_token: str = field(repr=False)
+    input_identity: str = field(repr=False)
+    reviewed_bewerbung_json: str = field(repr=False)
+
+    def reviewed_bewerbung(self) -> ReviewedBewerbungContent:
+        return ReviewedBewerbungContent.model_validate_json(self.reviewed_bewerbung_json)
+
+
+def revalidate_approved_link_locked(db: Session, link_id: int) -> ApprovedLinkSnapshot | str:
+    """Stage 9D's read-only entry: re-verify, under fresh row locks, that
+    link `link_id` is STILL exactly the current, eligible, Telegram-bound
+    APPROVED package -- the same rules Stage 9C itself applies -- and
+    return its detached snapshot, or the refusing outcome code.
+
+    Lock order: profile -> job -> preparation -> review header, then the
+    exact immutable approved revision is read. The caller owns the
+    transaction: this never commits, rolls back, approves, rejects or
+    writes anything, and the caller may lock later rows (Stage 9D's ledger
+    LAST) inside the same transaction."""
+    db.expire_all()
+    link = db.get(TelegramBewerbungApprovalRecord, link_id)
+    if link is None:
+        return "UNKNOWN_CAPABILITY"
+    header = _review_header(db, link.review_id)
+    if header is None:
+        return "PACKAGE_UNAVAILABLE"
+    profile = lock_profile_fresh(db)
+    job = lock_job_fresh(db, header.job_id)
+    prep = lock_preparation_fresh(db, link.preparation_id)
+    review = lock_review_header_fresh(db, link.review_id)
+    if review is None or review.id != link.review_id or review.job_id != header.job_id:
+        return "PACKAGE_UNAVAILABLE"
+    if review.status != "APPROVED":
+        return "ALREADY_REJECTED" if review.status == "REJECTED" else "NOT_APPROVED"
+    if not _approved_revision_is_bound(db, review, link):
+        return "APPROVED_ELSEWHERE"
+    problem = _package_problem(
+        db,
+        prep=prep,
+        job=job,
+        profile=profile,
+        generation=link.generation,
+        package_token=link.package_token,
+        pins=(review.match_id, review.cv_draft_id, review.bewerbung_draft_id),
+        link_identity=link.input_identity,
+        replaced_code="PACKAGE_REPLACED",
+    )
+    if problem is not None:
+        return problem
+    revision = get_revision_by_id(db, review.approved_revision_id)
+    if (
+        revision is None
+        or revision.id != review.approved_revision_id
+        or revision.review_id != review.id
+        or revision.revision_number != link.bound_review_version
+    ):
+        return "PACKAGE_UNAVAILABLE"
+    return ApprovedLinkSnapshot(
+        link_id=link.id,
+        review_id=review.id,
+        approved_revision_id=revision.id,
+        preparation_id=link.preparation_id,
+        generation=link.generation,
+        match_id=review.match_id,
+        cv_draft_id=review.cv_draft_id,
+        bewerbung_draft_id=review.bewerbung_draft_id,
+        package_token=link.package_token,
+        input_identity=link.input_identity,
+        reviewed_bewerbung_json=revision.reviewed_bewerbung_json,
+    )
