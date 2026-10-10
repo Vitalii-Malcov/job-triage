@@ -38,6 +38,7 @@ import json
 import time
 import uuid
 from collections.abc import Collection
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, or_, select, update
@@ -58,6 +59,11 @@ from app.models.gmail import (
     GmailThreadDetail,
 )
 from app.providers.email.base import ParsedGmailMessage
+from app.providers.email.imap_mailbox import (
+    canonical_mailbox_identity,
+    mailbox_identity_aliases,
+    same_mailbox,
+)
 
 # GMAIL-013 (thread detail readiness): a bounded default/maximum for how
 # many of a thread's messages GET /gmail/threads/{id} returns inline —
@@ -326,13 +332,16 @@ def get_known_uids(
     query per UID, regardless of how many UIDs IMAP SEARCH returns.
     """
     candidates = list(dict.fromkeys(candidate_uids))  # de-dup, preserve order
+    # ASTRA-GMAIL-001: every spelling of the same server mailbox (readable
+    # vs modified UTF-7), so a configuration spelling change never re-fetches.
+    aliases = mailbox_identity_aliases(mailbox)
     known: set[int] = set()
     for start in range(0, len(candidates), KNOWN_UIDS_QUERY_CHUNK_SIZE):
         chunk = candidates[start : start + KNOWN_UIDS_QUERY_CHUNK_SIZE]
         rows = db.scalars(
             select(GmailMessageRecord.uid).where(
                 GmailMessageRecord.account_key == account_key,
-                GmailMessageRecord.mailbox == mailbox,
+                GmailMessageRecord.mailbox.in_(aliases),
                 GmailMessageRecord.uid_validity == uid_validity,
                 GmailMessageRecord.uid.in_(chunk),
             )
@@ -341,7 +350,7 @@ def get_known_uids(
         skip_rows = db.scalars(
             select(GmailPermanentSkipRecord.uid).where(
                 GmailPermanentSkipRecord.account_key == account_key,
-                GmailPermanentSkipRecord.mailbox == mailbox,
+                GmailPermanentSkipRecord.mailbox.in_(aliases),
                 GmailPermanentSkipRecord.uid_validity == uid_validity,
                 GmailPermanentSkipRecord.uid.in_(chunk),
             )
@@ -375,7 +384,11 @@ def record_permanent_skips(
     it can never turn an otherwise-successful sync into a failure, only
     mean this same UID is (harmlessly, just wastefully) reconsidered on
     the next run.
+
+    `mailbox` is persisted in its canonical spelling (ASTRA-GMAIL-001-R1,
+    see `upsert_message`), so the UNIQUE key also dedups across aliases.
     """
+    mailbox = canonical_mailbox_identity(mailbox)
     for uid, reason in skips:
         record = GmailPermanentSkipRecord(
             account_key=account_key,
@@ -396,14 +409,19 @@ def record_permanent_skips(
 def get_message_by_identity(
     db: Session, account_key: str, mailbox: str, uid_validity: int, uid: int
 ) -> GmailMessageRecord | None:
-    """Pure read by the DB-enforced dedup identity — never mutates."""
+    """Pure read by the DB-enforced dedup identity — never mutates.
+    `mailbox` matches any spelling of the same server mailbox
+    (ASTRA-GMAIL-001, see `mailbox_identity_aliases`)."""
     return db.scalar(
-        select(GmailMessageRecord).where(
+        select(GmailMessageRecord)
+        .where(
             GmailMessageRecord.account_key == account_key,
-            GmailMessageRecord.mailbox == mailbox,
+            GmailMessageRecord.mailbox.in_(mailbox_identity_aliases(mailbox)),
             GmailMessageRecord.uid_validity == uid_validity,
             GmailMessageRecord.uid == uid,
         )
+        .order_by(GmailMessageRecord.id)
+        .limit(1)
     )
 
 
@@ -481,9 +499,10 @@ def _same_claimant_identity(claim: GmailMessageIdClaimRecord, parsed: ParsedGmai
     """True if `claim`'s recorded owner IS `parsed`'s own provider
     identity — i.e. this is a concurrent/later retry of the exact same
     message, not a different message that happens to share a Message-ID.
+    The mailbox compares by server identity, not spelling (ASTRA-GMAIL-001).
     """
     return (
-        claim.claimant_mailbox == parsed.mailbox
+        same_mailbox(claim.claimant_mailbox, parsed.mailbox)
         and claim.claimant_uid_validity == parsed.uid_validity
         and claim.claimant_uid == parsed.uid
     )
@@ -665,7 +684,21 @@ def upsert_message(
     the run — see its own docstring — so a lock timeout here is retried
     on the NEXT sync run exactly like any other one-message failure, not
     a fatal error for the whole sync).
+
+    **ASTRA-GMAIL-001-R1 (atomic alias dedup).** `parsed.mailbox` is
+    rewritten to `canonical_mailbox_identity` before anything else, so
+    every spelling of one server mailbox (`[Gmail]/Отправленные` vs
+    `[Gmail]/&BB4E...-`) inserts the SAME `mailbox` string, derives the
+    same synthetic thread key and claimant identity, and two concurrent
+    imports collide on the UNIQUE constraint above -- a database
+    guarantee across threads, processes and workers, unlike the thread
+    lock (keyed per thread, and alias spellings of a header-less message
+    used to resolve to different synthetic threads). Rows written before
+    this rule in another spelling are still found by the alias-aware
+    `get_message_by_identity` reads; they are already committed, so they
+    cannot race a new insert.
     """
+    parsed = replace(parsed, mailbox=canonical_mailbox_identity(parsed.mailbox))
     existing = get_message_by_identity(
         db, parsed.account_key, parsed.mailbox, parsed.uid_validity, parsed.uid
     )

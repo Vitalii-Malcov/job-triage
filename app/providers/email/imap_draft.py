@@ -46,7 +46,6 @@ Logs carry only fixed event names, fixed codes and exception TYPES --
 never the address, mailbox, marker, UID/UIDVALIDITY, raw IMAP or `str(exc)`.
 """
 
-import base64
 import contextlib
 import logging
 import re
@@ -78,6 +77,14 @@ from app.providers.email.draft_base import (
     build_draft_mime,
 )
 from app.providers.email.imap_deadline import DeadlineIMAP4SSL, ImapSessionDeadline
+from app.providers.email.imap_mailbox import (
+    MAILBOX_INVALID,
+    MAILBOX_UNENCODABLE,
+    MailboxNameError,
+    decode_modified_utf7,
+    encode_modified_utf7,
+    quote_imap_string,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +92,6 @@ IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 # Never START an APPEND with less remaining absolute budget than this.
 APPEND_SAFETY_MARGIN_SECONDS = 5.0
 DRAFT_FLAGS = r"(\Draft)"
-
-MAILBOX_INVALID = "DRAFTS_MAILBOX_INVALID"
-MAILBOX_UNENCODABLE = "DRAFTS_MAILBOX_UNENCODABLE"
 
 _FORBIDDEN_FLAGS = frozenset(
     {
@@ -105,93 +109,7 @@ _FORBIDDEN_FLAGS = frozenset(
 _DRAFTS_FLAG = "\\drafts"
 
 
-# --- modified UTF-7 + quoting ----------------------------------------------------
-
-
-class MailboxNameError(ValueError):
-    """A mailbox name that cannot be used exactly. `code` is a fixed
-    outcome code; the name itself is never part of the message."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__("Mailbox name is not usable")
-        self.code = code
-
-
-def encode_modified_utf7(name: str) -> str:
-    """RFC 3501 §5.1.3: printable US-ASCII except `&` stands for itself,
-    `&` is `&-`, every other run is `&` + modified base64 (`,` for `/`, no
-    padding) of its UTF-16BE encoding + `-`. Deterministic."""
-    out: list[str] = []
-    run: list[str] = []
-
-    def flush() -> None:
-        if run:
-            raw = "".join(run).encode("utf-16-be")
-            encoded = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
-            out.append(f"&{encoded}-")
-            run.clear()
-
-    for char in name:
-        if 0x20 <= ord(char) <= 0x7E:
-            flush()
-            out.append("&-" if char == "&" else char)
-        else:
-            run.append(char)
-    flush()
-    return "".join(out)
-
-
-_MUTF7_SEGMENT = re.compile(r"[A-Za-z0-9+,]+")
-
-
-def decode_modified_utf7(raw: str) -> str:
-    """Strict decode: printable ASCII only, well-formed segments, even
-    UTF-16 length, valid surrogates, and CANONICAL (re-encoding must give
-    back exactly `raw`), so two different wire names never decode to the
-    same mailbox."""
-    if any(not 0x20 <= ord(char) <= 0x7E for char in raw):
-        raise MailboxNameError(MAILBOX_UNENCODABLE)
-    out: list[str] = []
-    index = 0
-    while index < len(raw):
-        char = raw[index]
-        if char != "&":
-            out.append(char)
-            index += 1
-            continue
-        end = raw.find("-", index + 1)
-        if end < 0:
-            raise MailboxNameError(MAILBOX_UNENCODABLE)
-        segment = raw[index + 1 : end]
-        if not segment:
-            out.append("&")
-        else:
-            if not _MUTF7_SEGMENT.fullmatch(segment):
-                raise MailboxNameError(MAILBOX_UNENCODABLE)
-            b64 = segment.replace(",", "/")
-            try:
-                data = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=True)
-                if len(data) % 2:
-                    raise ValueError("odd UTF-16 length")
-                out.append(data.decode("utf-16-be"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise MailboxNameError(MAILBOX_UNENCODABLE) from exc
-        index = end + 1
-    decoded = "".join(out)
-    try:
-        canonical = encode_modified_utf7(decoded)
-    except UnicodeEncodeError as exc:
-        raise MailboxNameError(MAILBOX_UNENCODABLE) from exc
-    if canonical != raw:
-        raise MailboxNameError(MAILBOX_UNENCODABLE)
-    return decoded
-
-
-def quote_imap_string(value: str) -> str:
-    """An IMAP quoted string with `\\` and `"` escaped."""
-    if any(char in value for char in ("\r", "\n", "\x00")):
-        raise MailboxNameError(MAILBOX_INVALID)
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+# --- Drafts mailbox name (codec: app.providers.email.imap_mailbox) ---------------
 
 
 def validate_drafts_mailbox_name(name: str) -> None:

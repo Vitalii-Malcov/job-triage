@@ -9,6 +9,7 @@ test asserting this package has no means to make an HTTP request at all.
 import email.errors
 import imaplib
 import inspect
+import io
 import socket
 import ssl
 import threading
@@ -25,9 +26,20 @@ import pytest
 
 import app.providers.email.base as email_base_module
 import app.providers.email.imap as gmail_imap_module
+import app.providers.email.imap_draft as imap_draft_module
+import app.providers.email.imap_mailbox as imap_mailbox_module
 from app.providers.email.base import GmailAuthError, GmailConnectionError
 from app.providers.email.imap import IMAP_OPERATION_TIMEOUT_SECONDS, GmailImapProvider
 from app.providers.email.imap_deadline import ImapSessionDeadline
+from app.providers.email.imap_mailbox import (
+    MailboxNameError,
+    decode_modified_utf7,
+    encode_modified_utf7,
+    mailbox_command_arg,
+    mailbox_identity_aliases,
+    quote_imap_string,
+    same_mailbox,
+)
 
 ACCOUNT = "me@example.com"
 
@@ -83,7 +95,9 @@ class FakeImapClient:
     def status(self, mailbox: str, names: str) -> tuple[str, list[bytes]]:
         if self._status_data is not None:
             return ("OK", self._status_data)
-        return ("OK", [f'"{mailbox}" (UIDVALIDITY {self._uid_validity})'.encode()])
+        # Echo the argument as the server would: already-quoted stays as-is.
+        echoed = mailbox if mailbox.startswith('"') else f'"{mailbox}"'
+        return ("OK", [f"{echoed} (UIDVALIDITY {self._uid_validity})".encode()])
 
     def uid(self, command: str, *args) -> tuple[str, list]:
         self.uid_calls.append((command, args))
@@ -1698,3 +1712,591 @@ class TestSessionDeadlineWiring:
 
         assert fake_client.closed is True
         assert fake_client.logged_out is True
+
+
+# ---------------------------------------------------------------------------
+# Mailbox command arguments -- modified UTF-7 + IMAP quoting for SELECT/STATUS
+# ---------------------------------------------------------------------------
+
+SENT_RU = "[Gmail]/Отправленные"
+# The modified-UTF-7 name a real Russian-localized Gmail account returns
+# in LIST (Gmail quotes it there; bare and quoted are equivalent astrings).
+SENT_RU_ENCODED = "[Gmail]/&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"
+
+# (configured name, exact argument SELECT/EXAMINE and STATUS must receive)
+MAILBOX_WIRE_CASES = [
+    ("INBOX", "INBOX"),
+    ("Projects", "Projects"),
+    ("[Gmail]/Sent Mail", '"[Gmail]/Sent Mail"'),
+    (SENT_RU, SENT_RU_ENCODED),
+    ("Jobs & Co", '"Jobs &- Co"'),  # readable literal & becomes &-
+    ("Jobs &- Co", '"Jobs &- Co"'),  # already canonical: never encoded twice
+    (SENT_RU_ENCODED, SENT_RU_ENCODED),  # already encoded: never encoded twice
+]
+
+
+class AsciiOnlyImapClient(FakeImapClient):
+    """Encodes mailbox arguments exactly like imaplib's `_command`
+    (`bytes(arg, "ascii")`), so a raw non-ASCII name fails here the same
+    way it fails against real Gmail. Records STATUS calls too."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.status_calls: list[str] = []
+
+    def select(self, mailbox: str, readonly: bool) -> tuple[str, list[bytes]]:
+        bytes(mailbox, "ascii")
+        return super().select(mailbox, readonly)
+
+    def status(self, mailbox: str, names: str) -> tuple[str, list[bytes]]:
+        bytes(mailbox, "ascii")
+        self.status_calls.append(mailbox)
+        return super().status(mailbox, names)
+
+
+@pytest.mark.parametrize(("name", "expected"), MAILBOX_WIRE_CASES)
+def test_mailbox_command_arg_wire_form(name, expected):
+    assert mailbox_command_arg(name) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("My Folder", '"My Folder"'),
+        ("a(b)", '"a(b)"'),
+        ("a{1}", '"a{1}"'),
+        ("50%", '"50%"'),
+        ("star*", '"star*"'),
+        ('say "hi"', '"say \\"hi\\""'),
+        ("back\\slash", '"back\\\\slash"'),
+        ("", '""'),
+        ("[Gmail]/Вся почта", '"[Gmail]/&BBIEQQRP- &BD8EPgRHBEIEMA-"'),
+        ('A & "B"', '"A &- \\"B\\""'),
+    ],
+)
+def test_mailbox_command_arg_quotes_and_escapes_when_required(name, expected):
+    assert mailbox_command_arg(name) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("AT&T", "AT&-T"),
+        ("R&D-Team", "R&-D-Team"),
+        ("&-", "&-"),
+        ("Jobs &-", '"Jobs &-"'),
+    ],
+)
+def test_mailbox_command_arg_literal_and_encoded_ampersands(name, expected):
+    assert mailbox_command_arg(name) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("[Gmail]/&BB4E", "[Gmail]/&-BB4E"),  # unterminated shift
+        ("&Zm9v-", "&-Zm9v-"),  # odd UTF-16 byte length
+        ("&AGE-", "&-AGE-"),  # non-canonical ("a" must stay literal)
+        ("&!!-", "&-!!-"),  # not modified base64
+    ],
+)
+def test_malformed_encoded_looking_names_are_treated_as_readable(name, expected):
+    """Anything that is not canonical modified UTF-7 is a readable name:
+    it is encoded, so the server sees exactly the configured characters."""
+    wire = mailbox_command_arg(name)
+
+    assert wire == expected
+    assert decode_modified_utf7(wire) == name
+
+
+def test_mailbox_command_arg_encodes_ascii_control_characters():
+    assert mailbox_command_arg("Sent\tMail") == "Sent&AAk-Mail"
+
+
+def test_cyrillic_wire_form_decodes_back_to_the_configured_name():
+    assert decode_modified_utf7(mailbox_command_arg(SENT_RU)) == SENT_RU
+
+
+def test_mailbox_command_arg_shares_the_stage_9d_drafts_codec():
+    """One codec for both providers: for the same decoded name the inbox
+    argument and the Drafts wire identity carry the same encoding."""
+    assert imap_draft_module.encode_modified_utf7 is encode_modified_utf7
+    assert imap_draft_module.MailboxNameError is MailboxNameError
+    assert quote_imap_string(
+        mailbox_command_arg("[Gmail]/Черновики")
+    ) == imap_draft_module.encode_mailbox_wire("[Gmail]/Черновики")
+
+
+def test_mailbox_command_arg_rejects_an_unencodable_name():
+    with pytest.raises(MailboxNameError):
+        mailbox_command_arg("Sent\ud800")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("name", "expected"), MAILBOX_WIRE_CASES)
+async def test_provider_examines_readonly_with_wire_arg_and_persists_configured_name(
+    name, expected
+):
+    client = AsciiOnlyImapClient(messages={1: _build_email(sender="anyone@example.com")})
+    provider = _provider(client, mailbox=name, trusted_outbound=True)
+
+    result = await provider.fetch()
+
+    assert client.select_calls == [(expected, True)]
+    assert client.status_calls == [expected]
+    message = result.messages[0]
+    assert message.mailbox == name  # persisted identity is the configured name
+    assert message.uid_validity == 100
+    assert message.direction == "OUTBOUND"
+    assert [command for command, _ in client.uid_calls] == ["search", "fetch", "fetch"]
+
+
+@pytest.mark.asyncio
+async def test_unencodable_mailbox_fails_closed_before_connecting(monkeypatch):
+    def must_not_connect(*args, **kwargs):
+        raise AssertionError("must not open an IMAP session")
+
+    monkeypatch.setattr(gmail_imap_module, "DeadlineIMAP4SSL", must_not_connect)
+    provider = _provider(None, mailbox="Sent\ud800")
+
+    with pytest.raises(GmailConnectionError):
+        await provider.fetch()
+
+
+def test_mailbox_encoding_module_has_no_io_or_mailbox_write_capability():
+    source = inspect.getsource(imap_mailbox_module)
+    for forbidden in ("import imaplib", "import smtplib", "import socket", "import ssl"):
+        assert forbidden not in source
+    for forbidden in (".store(", ".expunge(", ".copy(", ".move(", "client.append("):
+        assert forbidden not in source
+
+
+# ---------------------------------------------------------------------------
+# ASTRA-GMAIL-001: mailbox identity aliases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "aliases"),
+    [
+        (SENT_RU, (SENT_RU, SENT_RU_ENCODED)),
+        (SENT_RU_ENCODED, (SENT_RU_ENCODED, SENT_RU)),
+        ("Jobs & Co", ("Jobs & Co", "Jobs &- Co")),
+        ("Jobs &- Co", ("Jobs &- Co", "Jobs & Co")),
+        ("INBOX", ("INBOX",)),
+        ("[Gmail]/Sent Mail", ("[Gmail]/Sent Mail",)),
+        ("&--", ("&--",)),  # decodes to "&-", which itself selects "&": different
+        ("Sent\ud800", ("Sent\ud800",)),
+    ],
+)
+def test_mailbox_identity_aliases(name, aliases):
+    assert mailbox_identity_aliases(name) == aliases
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "expected"),
+    [
+        (SENT_RU, SENT_RU_ENCODED, True),
+        (SENT_RU_ENCODED, SENT_RU, True),
+        ("Jobs & Co", "Jobs &- Co", True),
+        ("INBOX", "INBOX", True),
+        ("INBOX", "[Gmail]/Sent Mail", False),
+        (SENT_RU, "[Gmail]/Черновики", False),
+        ("&-", "&--", False),
+    ],
+)
+def test_same_mailbox(a, b, expected):
+    assert same_mailbox(a, b) is expected
+    assert same_mailbox(b, a) is expected
+
+
+# ---------------------------------------------------------------------------
+# ASTRA-GMAIL-002: UIDVALIDITY comes from the STATUS attribute list only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation", [100, 200])
+async def test_uidvalidity_ignores_a_spoofing_mailbox_name(generation):
+    """A mailbox literally named `Projects UIDVALIDITY 7` must yield the
+    real generation, so a later generation change is never hidden."""
+    status = f'"Projects UIDVALIDITY 7" (UIDVALIDITY {generation})'.encode()
+    seen: list[int] = []
+
+    def known(uid_validity, candidate_uids):
+        seen.append(uid_validity)
+        return {1} if uid_validity == 100 else set()
+
+    client = FakeImapClient(messages={1: _build_email()}, status_data=[status])
+    provider = _provider(client, mailbox="Projects UIDVALIDITY 7", get_known_uids=known)
+
+    result = await provider.fetch()
+
+    assert client.select_calls == [('"Projects UIDVALIDITY 7"', True)]
+    assert result.uid_validity == generation
+    assert seen == [generation]
+    # Generation 200 re-fetches the reused UID instead of trusting gen 100.
+    assert [m.uid for m in result.messages] == ([] if generation == 100 else [1])
+
+
+LITERAL_STATUS = [(b"{22}", b"Projects UIDVALIDITY 7"), b" (UIDVALIDITY 100)"]
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ([b'"INBOX" (UIDVALIDITY 100)'], 100),  # 1
+        ([b'"Projects UIDVALIDITY 7" (UIDVALIDITY 100)'], 100),  # 2
+        ([b'"INBOX" (UIDVALIDITY 200)'], 200),  # 3: generation change
+        ([b"INBOX (UIDVALIDITY 100)"], 100),
+        ([b'"[Gmail]/Sent Mail" (MESSAGES 3 UIDVALIDITY 42 UIDNEXT 9)'], 42),
+        ([b"[Gmail]/&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1- (UIDVALIDITY 5)"], 5),
+        ([b'"a (UIDVALIDITY 7) b" (UIDVALIDITY 8)'], 8),
+        ([b'"say \\"hi\\" \\\\ (UIDVALIDITY 7)" (UIDVALIDITY 9)'], 9),
+        ([b'"x" (uidvalidity 11)'], 11),
+        ([b'"INBOX" (UIDVALIDITY 4294967295)'], 4294967295),
+        (LITERAL_STATUS, 100),  # 11: Python 3.14 imaplib literal shape
+        ([(b"{5}", b"INBOX"), b" (UIDVALIDITY 200)"], 200),
+        ([(b"{0}", b""), b" (UIDVALIDITY 3)"], 3),
+        ([(b"{7}", b'a"(b) c'), b" (UIDVALIDITY 4)"], 4),
+        ([b'"INBOX" (UIDVALIDITY 0)'], 0),  # returned; the caller rejects it
+    ],
+)
+def test_parse_status_uid_validity_accepts_complete_valid_responses(data, expected):
+    assert gmail_imap_module._parse_status_uid_validity(data) == expected
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # 4/5: extra or unbalanced attribute groups
+        [b'"INBOX" (UIDVALIDITY 100) (UIDVALIDITY 7)'],
+        [b'"INBOX" (UIDVALIDITY 100 (UIDVALIDITY 7)'],
+        [b'"INBOX" (UIDVALIDITY 100))'],
+        [b'"INBOX" ((UIDVALIDITY 100)'],
+        [b'"INBOX" (UIDVALIDITY 100'],
+        [b'"INBOX" UIDVALIDITY 100)'],
+        [b'"INBOX" ()'],
+        # 6: unterminated quoted mailbox / bad quoting
+        [b'"INBOX (UIDVALIDITY 7)'],
+        [b'"Projects UIDVALIDITY 7 (UIDVALIDITY 100)'],
+        [b'"INBOX\\" (UIDVALIDITY 100)'],
+        [b'"IN\\BOX" (UIDVALIDITY 100)'],
+        [b'"IN\rBOX" (UIDVALIDITY 100)'],
+        [b'"INBOX (UIDVALIDITY 100)"'],  # only inside the quoted name
+        # trailing / leading garbage
+        [b'"INBOX" (UIDVALIDITY 100) x'],
+        [b'"INBOX" (UIDVALIDITY 100) '],
+        [b'"INBOX" (UIDVALIDITY 100)\r\n'],
+        [b'"INBOX"x (UIDVALIDITY 100)'],
+        [b'"INBOX"  (UIDVALIDITY 100)'],
+        [b'"INBOX" ( UIDVALIDITY 100)'],
+        [b'"INBOX" (UIDVALIDITY  100)'],
+        [b'"INBOX" (UIDVALIDITY 100 )'],
+        [b"IN(BOX (UIDVALIDITY 100)"],
+        [b"IN*BOX (UIDVALIDITY 100)"],
+        [b"(UIDVALIDITY 100)"],  # no mailbox before the list
+        [b" (UIDVALIDITY 100)"],
+        [b"{5} (UIDVALIDITY 100)"],  # literal marker not split by imaplib
+        # 7: duplicate attributes
+        [b'"INBOX" (UIDVALIDITY 1 UIDVALIDITY 2)'],
+        [b'"INBOX" (UIDVALIDITY 1 uidvalidity 1)'],
+        [b'"INBOX" (MESSAGES 1 UIDVALIDITY 2 MESSAGES 3)'],
+        # 8: missing
+        [b'"INBOX" (MESSAGES 0)'],
+        [b'"INBOX" UIDVALIDITY 100'],
+        [b'"INBOX"'],
+        [b"INBOX"],
+        # malformed attributes
+        [b'"INBOX" (UIDVALIDITY)'],
+        [b'"INBOX" (UIDVALIDITY 100 MESSAGES)'],
+        [b'"INBOX" (UIDVALIDITY 100 5 6)'],
+        [b'"INBOX" (UID-VALIDITY 100 "X" 1)'],
+        [b'"INBOX" (MAILBOXID (abc) UIDVALIDITY 100)'],
+        # 9: non-numeric
+        [b'"INBOX" (UIDVALIDITY abc)'],
+        [b'"INBOX" (UIDVALIDITY 1e3)'],
+        [b'"INBOX" (UIDVALIDITY +5)'],
+        [b'"INBOX" (UIDVALIDITY \xd9\xa1)'],
+        # 10: negative / out of 32-bit range
+        [b'"INBOX" (UIDVALIDITY -5)'],
+        [b'"INBOX" (UIDVALIDITY 4294967296)'],
+        # several responses / unexpected shapes
+        [b'"INBOX" (UIDVALIDITY 1)', b'"INBOX" (UIDVALIDITY 2)'],
+        [None],
+        [],
+        ["INBOX (UIDVALIDITY 100)"],
+    ],
+)
+def test_parse_status_uid_validity_rejects_malformed_responses(data):
+    assert gmail_imap_module._parse_status_uid_validity(data) is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [("{5}", b"INBOX"), b" (UIDVALIDITY 1)"],  # str prefix
+        [(b"{5}", "INBOX"), b" (UIDVALIDITY 1)"],  # str literal
+        [(b"{6}", b"INBOX"), b" (UIDVALIDITY 1)"],  # size mismatch
+        [(b"{4}", b"INBOX"), b" (UIDVALIDITY 1)"],
+        [(b"x {5}", b"INBOX"), b" (UIDVALIDITY 1)"],  # stray prefix text
+        [(b"{5+}", b"INBOX"), b" (UIDVALIDITY 1)"],
+        [(b"{-5}", b"INBOX"), b" (UIDVALIDITY 1)"],
+        [(b"{5}", b"INBOX", b"x"), b" (UIDVALIDITY 1)"],
+        [(b"{5}",), b" (UIDVALIDITY 1)"],
+        [(b"{5}", b"INBOX")],  # no attribute tail
+        [(b"{5}", b"INBOX"), b""],
+        [(b"{5}", b"INBOX"), b"(UIDVALIDITY 1)"],  # no SP after the literal
+        [(b"{5}", b"INBOX"), b" (UIDVALIDITY 1) (UIDVALIDITY 7)"],
+        [(b"{5}", b"INBOX"), b" (UIDVALIDITY 1 (UIDVALIDITY 7)"],
+        [(b"{5}", b"INBOX"), b" (UIDVALIDITY 1 UIDVALIDITY 7)"],
+        [(b"{5}", b"INBOX"), (b"{5}", b"INBOX")],
+        [(b"{5}", b"INBOX"), b" (UIDVALIDITY 1)", b""],
+        [(b"{5}", b"INBOX"), b" (UIDVALIDITY 1)", (b"{5}", b"INBOX"), b" (UIDVALIDITY 2)"],
+        [b" (UIDVALIDITY 100)", (b"{5}", b"INBOX")],  # reversed
+        [[b"{5}", b"INBOX"], b" (UIDVALIDITY 1)"],  # list, not imaplib's tuple
+    ],
+)
+def test_parse_status_uid_validity_rejects_malformed_literal_sequences(data):
+    assert gmail_imap_module._parse_status_uid_validity(data) is None
+
+
+# ASTRA-GMAIL-002-R1: only imaplib's own outer container (a list) is read.
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {},
+        {b"INBOX (UIDVALIDITY 100)": None},  # a dict's keys must not be read as lines
+        {b"INBOX (UIDVALIDITY 100)"},  # singleton set
+        b"INBOX (UIDVALIDITY 100)",
+        "INBOX (UIDVALIDITY 100)",
+        (),
+        (b"INBOX (UIDVALIDITY 100)",),  # tuple, not imaplib's list
+        (line for line in [b"INBOX (UIDVALIDITY 100)"]),  # generator
+        iter([b"INBOX (UIDVALIDITY 100)"]),
+        [[b"INBOX (UIDVALIDITY 100)"]],  # nested list
+        [(b"INBOX (UIDVALIDITY 100)",)],
+        [{b"INBOX (UIDVALIDITY 100)"}],
+        42,
+    ],
+    ids=lambda value: type(value).__name__,
+)
+def test_parse_status_uid_validity_rejects_non_imaplib_outer_containers(data):
+    assert gmail_imap_module._parse_status_uid_validity(data) is None
+
+
+def test_parse_status_uid_validity_accepts_the_normal_list_container():
+    assert gmail_imap_module._parse_status_uid_validity([b"INBOX (UIDVALIDITY 100)"]) == 100
+
+
+def test_read_uid_validity_with_none_status_data_raises_connection_error():
+    class _NoneStatusClient(FakeImapClient):
+        def status(self, mailbox, names):
+            return ("OK", None)
+
+    client = _NoneStatusClient(messages={})
+    provider = _provider(client)
+
+    with pytest.raises(GmailConnectionError):
+        provider._read_uid_validity(client, "INBOX")
+
+
+# ASTRA-GMAIL-002-R2: mailbox payload content is validated for every shape.
+@pytest.mark.parametrize(
+    "data",
+    [
+        [(b"{1}", b"\x00"), b" (UIDVALIDITY 100)"],  # literal NUL
+        [(b"{5}", b"IN\x00OX"), b" (UIDVALIDITY 100)"],
+        [(b"{1}", b"\r"), b" (UIDVALIDITY 100)"],  # literal CR
+        [(b"{5}", b"IN\rOX"), b" (UIDVALIDITY 100)"],
+        [(b"{1}", b"\n"), b" (UIDVALIDITY 100)"],  # literal LF
+        [(b"{6}", b"IN\r\nOX"), b" (UIDVALIDITY 100)"],
+        [(b"{2}", b"\x00"), b" (UIDVALIDITY 100)"],  # literal size mismatch
+        [(b"{0}", b"\x00"), b" (UIDVALIDITY 100)"],
+        [b'"IN\x00BOX" (UIDVALIDITY 100)'],  # quoted NUL
+        [b'"IN\rBOX" (UIDVALIDITY 100)'],  # quoted CR
+        [b'"IN\nBOX" (UIDVALIDITY 100)'],  # quoted LF
+        [b"IN\x00BOX (UIDVALIDITY 100)"],  # atom control bytes
+        [b"IN\x01BOX (UIDVALIDITY 100)"],
+        [b"IN\x1fBOX (UIDVALIDITY 100)"],
+        [b"IN\x7fBOX (UIDVALIDITY 100)"],
+        [b"IN\tBOX (UIDVALIDITY 100)"],
+        [b"IN\rBOX (UIDVALIDITY 100)"],
+        [b"IN\nBOX (UIDVALIDITY 100)"],
+    ],
+)
+def test_parse_status_uid_validity_rejects_control_bytes_in_mailbox(data):
+    assert gmail_imap_module._parse_status_uid_validity(data) is None
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ([(b"{5}", b"INBOX"), b" (UIDVALIDITY 100)"], 100),  # valid literal mailbox
+        # RFC 3501 literal = *CHAR8 (%x01-ff): high-bit bytes are protocol-valid
+        ([(b"{8}", "Jöbs ä".encode()), b" (UIDVALIDITY 7)"], 7),
+        ([(b"{3}", b"\x80\xfe\xff"), b" (UIDVALIDITY 9)"], 9),
+        ([(b"{3}", b"a\tb"), b" (UIDVALIDITY 11)"], 11),  # other CHAR8 bytes
+    ],
+)
+def test_parse_status_uid_validity_accepts_valid_literal_payloads(data, expected):
+    assert gmail_imap_module._parse_status_uid_validity(data) == expected
+
+
+class _ScriptedImap4(imaplib.IMAP4):
+    """The REAL imaplib response reader over an in-memory server script
+    (no socket), so tests see exactly the STATUS data shapes imaplib
+    itself builds -- including literal mailboxes."""
+
+    def __init__(self, status_lines: bytes) -> None:
+        self._status_lines = status_lines
+        self._script = None
+        super().__init__()
+
+    def open(self, host="", port=0, timeout=None):
+        self.sock = None
+
+    def send(self, data):
+        pass
+
+    def _buffer(self):
+        if self._script is None:
+            tag = self.tagpre
+            self._script = io.BytesIO(
+                b"* OK ready\r\n* CAPABILITY IMAP4rev1\r\n"
+                + tag
+                + b"0 OK done\r\n"
+                + self._status_lines
+                + tag
+                + b"1 OK done\r\n"
+            )
+        return self._script
+
+    def readline(self):
+        return self._buffer().readline()
+
+    def read(self, size):
+        return self._buffer().read(size)
+
+
+@pytest.mark.parametrize(
+    ("status_lines", "expected"),
+    [
+        (b'* STATUS "INBOX" (UIDVALIDITY 100)\r\n', 100),
+        (b'* STATUS "Projects UIDVALIDITY 7" (UIDVALIDITY 100)\r\n', 100),
+        (b"* STATUS {22}\r\nProjects UIDVALIDITY 7 (UIDVALIDITY 100)\r\n", 100),
+        (b"* STATUS {22}\r\nProjects UIDVALIDITY 7 (UIDVALIDITY 200)\r\n", 200),
+        (b"* STATUS {5}\r\nINBOX (UIDVALIDITY 1) (UIDVALIDITY 7)\r\n", None),
+        (b"* STATUS {5}\r\nINBOX (UIDVALIDITY 1 (UIDVALIDITY 7)\r\n", None),
+        (b"* STATUS {5}\r\nINBOX\r\n", None),
+        (
+            b"* STATUS {5}\r\nINBOX (UIDVALIDITY 1)\r\n* STATUS {5}\r\nINBOX (UIDVALIDITY 2)\r\n",
+            None,
+        ),
+        (b'* STATUS "INBOX" (UIDVALIDITY 100) (UIDVALIDITY 7)\r\n', None),
+        (b'* STATUS "INBOX (UIDVALIDITY 7)\r\n', None),
+        ("* STATUS {8}\r\nJöbs ä (UIDVALIDITY 7)\r\n".encode(), 7),
+        (b"* STATUS {1}\r\n\x00 (UIDVALIDITY 100)\r\n", None),
+        (b"* STATUS {3}\r\nI\rX (UIDVALIDITY 100)\r\n", None),
+    ],
+)
+def test_parse_status_uid_validity_with_real_imaplib_responses(status_lines, expected):
+    client = _ScriptedImap4(status_lines)
+    client.state = "AUTH"
+
+    typ, data = client.status("X", "(UIDVALIDITY)")
+
+    assert typ == "OK"
+    assert gmail_imap_module._parse_status_uid_validity(data) == expected
+
+
+def test_real_imaplib_literal_status_has_the_documented_shape():
+    client = _ScriptedImap4(b"* STATUS {22}\r\nProjects UIDVALIDITY 7 (UIDVALIDITY 100)\r\n")
+    client.state = "AUTH"
+
+    assert client.status("X", "(UIDVALIDITY)") == ("OK", LITERAL_STATUS)
+
+
+@pytest.mark.asyncio
+async def test_literal_mailbox_status_drives_the_sync_generation():
+    client = FakeImapClient(messages={1: _build_email()}, status_data=LITERAL_STATUS)
+    provider = _provider(client, mailbox="Projects UIDVALIDITY 7")
+
+    result = await provider.fetch()
+
+    assert result.uid_validity == 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_data",
+    [
+        [b'"INBOX" (UIDVALIDITY 100) (UIDVALIDITY 7)'],
+        [b'"INBOX" (UIDVALIDITY 0)'],
+        [(b"{6}", b"INBOX"), b" (UIDVALIDITY 1)"],
+        [(b"{1}", b"\x00"), b" (UIDVALIDITY 100)"],
+        {b"INBOX (UIDVALIDITY 100)": None},
+        {b"INBOX (UIDVALIDITY 100)"},
+        b"INBOX (UIDVALIDITY 100)",
+    ],
+)
+async def test_invalid_status_generation_fails_the_sync(status_data):
+    client = FakeImapClient(messages={1: _build_email()}, status_data=status_data)
+    provider = _provider(client)
+
+    with pytest.raises(GmailConnectionError):
+        await provider.fetch()
+
+    assert client.uid_calls == []  # never searched/fetched under a bad generation
+
+
+@pytest.mark.parametrize(
+    ("name", "canonical"),
+    [
+        (SENT_RU, SENT_RU_ENCODED),
+        (SENT_RU_ENCODED, SENT_RU_ENCODED),
+        ("Jobs & Co", "Jobs &- Co"),
+        ("Jobs &- Co", "Jobs &- Co"),
+        ("INBOX", "INBOX"),
+        ("[Gmail]/Sent Mail", "[Gmail]/Sent Mail"),
+        ("&--", "&--"),
+        ("Sent\ud800", "Sent\ud800"),
+    ],
+)
+def test_canonical_mailbox_identity(name, canonical):
+    assert imap_mailbox_module.canonical_mailbox_identity(name) == canonical
+
+
+def test_canonical_mailbox_identity_is_shared_by_aliases_and_injective():
+    names = [
+        SENT_RU,
+        SENT_RU_ENCODED,
+        "[Gmail]/Черновики",
+        "INBOX",
+        "Jobs & Co",
+        "Jobs &- Co",
+        "&-",
+        "&--",
+        "&BB4-",
+        "&-BB4-",
+        "Ш",
+        "AT&T",
+    ]
+    canonical = imap_mailbox_module.canonical_mailbox_identity
+    for a in names:
+        for b in names:
+            assert (canonical(a) == canonical(b)) is same_mailbox(a, b), (a, b)
+        for alias in mailbox_identity_aliases(a):
+            assert canonical(alias) == canonical(a)
+
+
+@pytest.mark.asyncio
+async def test_malformed_status_fails_the_sync_explicitly():
+    client = FakeImapClient(
+        messages={1: _build_email()}, status_data=[b'"INBOX" (UIDVALIDITY 1 UIDVALIDITY 2)']
+    )
+    provider = _provider(client)
+
+    with pytest.raises(GmailConnectionError):
+        await provider.fetch()

@@ -133,6 +133,7 @@ jobs:
             tests/integration/test_upsert_job_postgres_concurrency.py \
             tests/integration/test_telegram_bewerbung_approval_postgres.py \
             tests/integration/test_gmail_application_draft_postgres.py \
+            tests/integration/test_gmail_alias_dedup_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'
           import sys

@@ -10,7 +10,7 @@ import time
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
@@ -1188,3 +1188,262 @@ def test_deliberately_slow_provider_still_completes_and_lease_recovers(tmp_path)
     finally:
         db.close()
         other_session.close()
+
+
+# ---------------------------------------------------------------------------
+# ASTRA-GMAIL-001: equivalent mailbox spellings share one identity
+# ---------------------------------------------------------------------------
+
+SENT_RU = "[Gmail]/Отправленные"
+SENT_RU_ENCODED = "[Gmail]/&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"
+SPELLING_TRANSITIONS = [(SENT_RU_ENCODED, SENT_RU), (SENT_RU, SENT_RU_ENCODED)]
+
+
+def _store_legacy_spelling(db, record, mailbox):
+    """Rewrite a row (and its Message-ID claim) to `mailbox` exactly as a
+    pre-ASTRA-GMAIL-001-R1 build, which stored the configured spelling
+    verbatim, would have left it."""
+    from app.db.models import GmailMessageIdClaimRecord
+
+    db.execute(
+        update(GmailMessageRecord).where(GmailMessageRecord.id == record.id).values(mailbox=mailbox)
+    )
+    db.execute(
+        update(GmailMessageIdClaimRecord)
+        .where(GmailMessageIdClaimRecord.claimant_uid == record.uid)
+        .values(claimant_mailbox=mailbox)
+    )
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@pytest.mark.parametrize("configured", [SENT_RU, SENT_RU_ENCODED])
+def test_upsert_persists_the_canonical_mailbox_spelling(db, configured):
+    from app.db.models import GmailThreadRecord
+
+    record, created = upsert_message(db, _parsed(mailbox=configured, uid=7, message_id=None))
+    record_permanent_skips(db, ACCOUNT_A, configured, 100, [(9, "OVERSIZED")])
+
+    assert created is True
+    assert record.mailbox == SENT_RU_ENCODED
+    thread = db.get(GmailThreadRecord, record.thread_id)
+    assert thread.thread_key == f"synthetic:{SENT_RU_ENCODED}:100:7"
+    assert db.scalars(select(GmailPermanentSkipRecord.mailbox)).all() == [SENT_RU_ENCODED]
+
+
+@pytest.mark.parametrize(("stored", "configured"), SPELLING_TRANSITIONS)
+def test_mailbox_spelling_change_never_reimports_a_known_message(db, stored, configured):
+    first, created = upsert_message(db, _parsed(mailbox=stored, uid=7))
+    assert created is True
+    _store_legacy_spelling(db, first, stored)
+
+    assert get_known_uids(db, ACCOUNT_A, configured, 100, [7, 8]) == {7}
+    again, created_again = upsert_message(db, _parsed(mailbox=configured, uid=7))
+
+    assert created_again is False
+    assert again.id == first.id
+    assert again.mailbox == stored  # existing rows are never rewritten
+    assert len(list_messages(db, ACCOUNT_A, limit=10, offset=0)) == 1
+
+
+@pytest.mark.parametrize(("stored", "configured"), SPELLING_TRANSITIONS)
+def test_mailbox_spelling_change_never_contests_the_message_id_claim(db, stored, configured):
+    from app.db.gmail_repository import (
+        _claim_message_id_or_get_collision_thread,
+        _get_message_id_claim,
+        _same_claimant_identity,
+    )
+    from app.db.models import GmailThreadRecord
+
+    record, _ = upsert_message(db, _parsed(mailbox=stored, uid=7, message_id="<root@example.com>"))
+    _store_legacy_spelling(db, record, stored)
+    respelled = _parsed(mailbox=configured, uid=7, message_id="<root@example.com>")
+    upsert_message(db, respelled)
+    claim = _get_message_id_claim(db, ACCOUNT_A, "<root@example.com>")
+    assert claim.claimant_mailbox == stored
+    assert _same_claimant_identity(claim, respelled) is True
+
+    # The claim path itself (reached e.g. by a concurrent retry that got
+    # past the dedup read) must treat the respelled message as the owner.
+    thread = _claim_message_id_or_get_collision_thread(db, respelled, "<root@example.com>")
+
+    assert thread.id == record.thread_id
+    db.refresh(claim)
+    assert claim.contested is False
+    thread_keys = db.scalars(select(GmailThreadRecord.thread_key)).all()
+    assert thread_keys == ["<root@example.com>"]
+    assert not any(key.startswith("synthetic-collision:") for key in thread_keys)
+
+
+@pytest.mark.parametrize(("stored", "configured"), SPELLING_TRANSITIONS)
+def test_mailbox_spelling_change_keeps_permanent_skips(db, stored, configured):
+    db.add(
+        GmailPermanentSkipRecord(
+            account_key=ACCOUNT_A, mailbox=stored, uid_validity=100, uid=9, reason="OVERSIZED"
+        )
+    )
+    db.commit()
+
+    assert get_known_uids(db, ACCOUNT_A, configured, 100, [9, 10]) == {9}
+
+
+def test_truly_different_mailboxes_keep_separate_identities(db):
+    from app.db.gmail_repository import _get_message_id_claim
+
+    upsert_message(db, _parsed(mailbox=SENT_RU, uid=7, message_id="<x@example.com>"))
+    record_permanent_skips(db, ACCOUNT_A, SENT_RU, 100, [(9, "OVERSIZED")])
+
+    for other in ("INBOX", "[Gmail]/Sent Mail", "[Gmail]/Черновики"):
+        assert get_known_uids(db, ACCOUNT_A, other, 100, [7, 9]) == set()
+        assert get_message_by_identity(db, ACCOUNT_A, other, 100, 7) is None
+
+    # Same UID + Message-ID in a genuinely different mailbox is a
+    # different message: persisted separately, and the claim is contested.
+    _, created = upsert_message(db, _parsed(mailbox="INBOX", uid=7, message_id="<x@example.com>"))
+    assert created is True
+    assert _get_message_id_claim(db, ACCOUNT_A, "<x@example.com>").contested is True
+
+
+# ---------------------------------------------------------------------------
+# ASTRA-GMAIL-001-R1: alias dedup is atomic under concurrent imports
+# ---------------------------------------------------------------------------
+
+# Threading-header variants: a self-anchored root (Message-ID claim path),
+# a reply (In-Reply-To/References path), and a header-less message
+# (synthetic-thread path, whose key embeds the mailbox spelling).
+HEADER_VARIANTS = {
+    "message-id": {"message_id": "<race@example.com>"},
+    "reply": {
+        "message_id": "<race-reply@example.com>",
+        "in_reply_to": "<race-root@example.com>",
+        "references": ("<race-root@example.com>",),
+    },
+    "no-threading-headers": {"message_id": None},
+}
+
+
+@pytest.fixture()
+def two_sessions(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'gmail_alias_race.db'}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    session_a, session_b = factory(), factory()
+    try:
+        yield session_a, session_b
+    finally:
+        session_a.close()
+        session_b.close()
+        engine.dispose()
+
+
+def race_alias_imports(monkeypatch, session_a, session_b, parsed_a, parsed_b):
+    """Astra's interleaving, made deterministic: import A runs its
+    pre-insert duplicate lookup (finds nothing), then -- before A resolves
+    its thread, takes the thread lock or inserts -- import B runs to
+    completion on an independent session/connection; then A continues.
+    Returns (result_a, result_b)."""
+    import app.db.gmail_repository as repository
+
+    original_resolve = repository._resolve_thread_for_message
+    results = {}
+
+    def resolve_after_b_commits(db, parsed):
+        if db is session_a and "b" not in results:
+            results["b"] = upsert_message(session_b, parsed_b)
+        return original_resolve(db, parsed)
+
+    monkeypatch.setattr(repository, "_resolve_thread_for_message", resolve_after_b_commits)
+    results["a"] = upsert_message(session_a, parsed_a)
+    return results["a"], results["b"]
+
+
+@pytest.mark.parametrize("headers", HEADER_VARIANTS.values(), ids=HEADER_VARIANTS.keys())
+@pytest.mark.parametrize(
+    ("spelling_a", "spelling_b"),
+    [(SENT_RU_ENCODED, SENT_RU), (SENT_RU, SENT_RU_ENCODED), (SENT_RU, SENT_RU)],
+    ids=["encoded-vs-readable", "readable-vs-encoded", "identical-control"],
+)
+def test_concurrent_alias_imports_create_exactly_one_message(
+    monkeypatch, two_sessions, spelling_a, spelling_b, headers
+):
+    session_a, session_b = two_sessions
+
+    (record_a, created_a), (record_b, created_b) = race_alias_imports(
+        monkeypatch,
+        session_a,
+        session_b,
+        _parsed(mailbox=spelling_a, uid=7, **headers),
+        _parsed(mailbox=spelling_b, uid=7, **headers),
+    )
+
+    assert created_b is True
+    assert created_a is False  # resolved as the existing row, never a second insert
+    assert record_a.id == record_b.id
+    session_a.expire_all()
+    rows = session_a.scalars(select(GmailMessageRecord)).all()
+    assert [(row.mailbox, row.uid_validity, row.uid) for row in rows] == [(SENT_RU_ENCODED, 100, 7)]
+
+
+@pytest.mark.parametrize("headers", HEADER_VARIANTS.values(), ids=HEADER_VARIANTS.keys())
+def test_alias_race_reproduces_without_canonical_persistence(monkeypatch, two_sessions, headers):
+    """Control: with the canonical-spelling rule disabled (the pre-fix
+    behavior) the same interleaving inserts TWO rows -- proof that the
+    test above exercises Astra's race rather than passing vacuously."""
+    import app.db.gmail_repository as repository
+
+    monkeypatch.setattr(repository, "canonical_mailbox_identity", lambda name: name)
+    session_a, session_b = two_sessions
+
+    (_, created_a), (_, created_b) = race_alias_imports(
+        monkeypatch,
+        session_a,
+        session_b,
+        _parsed(mailbox=SENT_RU_ENCODED, uid=7, **headers),
+        _parsed(mailbox=SENT_RU, uid=7, **headers),
+    )
+
+    assert (created_a, created_b) == (True, True)
+    assert len(session_a.scalars(select(GmailMessageRecord)).all()) == 2
+
+
+@pytest.mark.parametrize("headers", HEADER_VARIANTS.values(), ids=HEADER_VARIANTS.keys())
+@pytest.mark.parametrize(
+    "difference",
+    [
+        {"account_key": ACCOUNT_B},
+        {"uid_validity": 200},
+        {"uid": 8},
+        {"mailbox": "[Gmail]/Черновики"},
+        {"mailbox": "INBOX"},
+    ],
+    ids=["account", "generation", "uid", "other-cyrillic-mailbox", "inbox"],
+)
+def test_concurrent_imports_of_different_identities_stay_independent(
+    monkeypatch, two_sessions, difference, headers
+):
+    session_a, session_b = two_sessions
+
+    (record_a, created_a), (record_b, created_b) = race_alias_imports(
+        monkeypatch,
+        session_a,
+        session_b,
+        _parsed(mailbox=SENT_RU_ENCODED, uid=7, **headers),
+        _parsed(**{"mailbox": SENT_RU, "uid": 7, **headers, **difference}),
+    )
+
+    assert (created_a, created_b) == (True, True)
+    assert record_a.id != record_b.id
+    assert len(session_a.scalars(select(GmailMessageRecord)).all()) == 2
+
+
+def test_alias_permanent_skips_record_one_row(two_sessions):
+    session_a, session_b = two_sessions
+
+    record_permanent_skips(session_b, ACCOUNT_A, SENT_RU, 100, [(9, "OVERSIZED")])
+    record_permanent_skips(session_a, ACCOUNT_A, SENT_RU_ENCODED, 100, [(9, "OVERSIZED")])
+
+    rows = session_a.scalars(select(GmailPermanentSkipRecord)).all()
+    assert [(row.mailbox, row.uid) for row in rows] == [(SENT_RU_ENCODED, 9)]
