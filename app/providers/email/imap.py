@@ -78,6 +78,7 @@ from app.providers.email.imap_deadline import (
     DeadlineIMAP4SSL,
     ImapSessionDeadline,
 )
+from app.providers.email.imap_mailbox import MailboxNameError, mailbox_command_arg
 from app.providers.email.mime_utils import decode_mime_part
 from app.utils.config_flags import is_configured
 
@@ -95,7 +96,6 @@ logger = logging.getLogger(__name__)
 # while still bounding a truly unresponsive server.
 IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 
-_UIDVALIDITY_RE = re.compile(rb"UIDVALIDITY\s+(\d+)")
 _RFC822_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
 _INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 
@@ -205,6 +205,118 @@ def _parse_internal_date(fetch_header: bytes) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(UTC)
+
+
+_STATUS_LITERAL_PREFIX_RE = re.compile(rb"\{([0-9]{1,10})\}")
+_STATUS_ATTRIBUTE_NAME_RE = re.compile(rb"[A-Za-z][A-Za-z0-9.-]*")
+_STATUS_NUMBER_RE = re.compile(rb"[0-9]{1,20}")
+# RFC 3501 §9: atom-specials an unquoted mailbox may not contain, besides
+# SP and CTL (`]` is allowed in an astring).
+_STATUS_ATOM_SPECIALS = frozenset(b'(){%*"\\')
+# RFC 3501 §9: UIDVALIDITY is an nz-number, a 32-bit unsigned value.
+_UIDVALIDITY_MAX = 2**32 - 1
+
+
+def _normalize_status_response(data: object) -> tuple[bytes, bytes] | None:
+    """ASTRA-GMAIL-002-R2: imaplib's STATUS data -> `(mailbox, rest)` of
+    exactly ONE response, `rest` being everything after the mailbox
+    (` (UIDVALIDITY 100)`), or None. Two shapes exist:
+
+    - quoted/atom mailbox: `[b'"INBOX" (UIDVALIDITY 100)']`;
+    - literal mailbox (RFC 3501 `{n}`):
+      `[(b'{22}', b'Projects UIDVALIDITY 7'), b' (UIDVALIDITY 100)']` --
+      the declared size must equal the literal's length.
+
+    Anything else (several responses, a stray prefix, a size mismatch,
+    non-bytes parts) is rejected, never guessed at.
+
+    ASTRA-GMAIL-002-R1: the outer container must be exactly the `list`
+    imaplib returns -- a dict/set/bytes/str/tuple/generator/None is
+    rejected up front rather than iterated, so e.g. a dict's keys are
+    never read as response lines and no TypeError escapes.
+    ASTRA-GMAIL-002-R2: a literal mailbox must not contain NUL/CR/LF
+    (RFC 3501 CHAR8 excludes NUL; CR/LF are never mailbox data);
+    high-bit bytes are legal CHAR8 and pass through."""
+    if type(data) is not list:
+        return None
+    parts = [part for part in data if part is not None]
+    if len(parts) == 1 and isinstance(parts[0], bytes):
+        return _split_status_mailbox(parts[0])
+    if len(parts) != 2 or not isinstance(parts[0], tuple) or not isinstance(parts[1], bytes):
+        return None
+    literal = parts[0]
+    if len(literal) != 2 or not all(isinstance(item, bytes) for item in literal):
+        return None
+    prefix, mailbox = literal
+    match = _STATUS_LITERAL_PREFIX_RE.fullmatch(prefix)
+    if match is None or int(match.group(1)) != len(mailbox):
+        return None
+    if any(char in mailbox for char in b"\r\n\x00"):
+        return None
+    return mailbox, parts[1]
+
+
+def _split_status_mailbox(line: bytes) -> tuple[bytes, bytes] | None:
+    """`(mailbox, rest)` of one STATUS line whose mailbox is a quoted
+    string or an atom, scanned left to right -- so a quoted name's own
+    `(`/`)`/`UIDVALIDITY` text never leaks into `rest`. None for an
+    unterminated quote, a bad escape, CR/LF/NUL, or an invalid atom."""
+    if line.startswith(b'"'):
+        index = 1
+        while index < len(line):
+            char = line[index : index + 1]
+            if char == b"\\":
+                if line[index + 1 : index + 2] not in (b'"', b"\\"):
+                    return None
+                index += 2
+            elif char == b'"':
+                return line[1:index], line[index + 1 :]
+            elif char in (b"\r", b"\n", b"\x00"):
+                return None
+            else:
+                index += 1
+        return None  # unterminated quoted string
+    end = line.find(b" ")
+    atom = line if end < 0 else line[:end]
+    if not atom or any(
+        char <= 0x20 or char >= 0x7F or char in _STATUS_ATOM_SPECIALS for char in atom
+    ):
+        return None
+    return atom, line[len(atom) :]
+
+
+def _parse_status_uid_validity(data: object) -> int | None:
+    """ASTRA-GMAIL-002: UIDVALIDITY from a STATUS response, validated as a
+    WHOLE: `mailbox SP "(" name SP number *(SP name SP number) ")"` and
+    nothing else -- one attribute group, balanced, no trailing bytes, each
+    attribute name at most once, exactly one UIDVALIDITY of at most 32
+    bits. The echoed mailbox (quoted, atom or literal) is consumed first,
+    so text inside it (e.g. `"Projects UIDVALIDITY 7"`) is never read as
+    an attribute. None unless the full response is valid; a `0` is
+    returned as-is for the caller's GMAIL-009 check."""
+    normalized = _normalize_status_response(data)
+    if normalized is None:
+        return None
+    _, rest = normalized
+    if not rest.startswith(b" (") or not rest.endswith(b")"):
+        return None
+    tokens = rest[2:-1].split(b" ")
+    if len(tokens) % 2:
+        return None
+    attributes: dict[bytes, bytes] = {}
+    for name, value in zip(tokens[::2], tokens[1::2], strict=True):
+        key = name.upper()
+        if (
+            not _STATUS_ATTRIBUTE_NAME_RE.fullmatch(name)
+            or not _STATUS_NUMBER_RE.fullmatch(value)
+            or key in attributes
+        ):
+            return None
+        attributes[key] = value
+    value = attributes.get(b"UIDVALIDITY")
+    if value is None or int(value) > _UIDVALIDITY_MAX:
+        return None
+    return int(value)
 
 
 def _attachment_metadata(part: Message, filename: str | None) -> ParsedAttachment:
@@ -395,6 +507,14 @@ class GmailImapProvider:
         # peer needs this. Only applied when this call owns the
         # connection: a test-injected client has no real socket to bound.
         deadline = ImapSessionDeadline(IMAP_SESSION_DEADLINE_SECONDS) if owns_connection else None
+        # Resolved before connecting: an unusable configured name never
+        # opens a session. Parsed messages carry `self.mailbox` as
+        # configured; the repository persists its canonical spelling
+        # (`canonical_mailbox_identity`, ASTRA-GMAIL-001-R1).
+        try:
+            mailbox_arg = mailbox_command_arg(self.mailbox)
+        except MailboxNameError:
+            raise GmailConnectionError("Configured mailbox name is not usable") from None
 
         with contextlib.ExitStack() as stack:
             if deadline is not None:
@@ -402,7 +522,7 @@ class GmailImapProvider:
             if client is None:
                 client = self._connect(deadline)
             try:
-                return self._fetch_sync_body(client, since, deadline)
+                return self._fetch_sync_body(client, since, deadline, mailbox_arg)
             except OSError as exc:
                 if deadline is not None and deadline.exceeded:
                     logger.warning("gmail_imap_session_deadline_exceeded")
@@ -418,12 +538,13 @@ class GmailImapProvider:
         client: ImapClient,
         since: datetime,
         deadline: ImapSessionDeadline | None,
+        mailbox_arg: str,
     ) -> GmailFetchResult:
-        typ, _ = client.select(self.mailbox, readonly=True)
+        typ, _ = client.select(mailbox_arg, readonly=True)
         if typ != "OK":
             raise GmailConnectionError("IMAP SELECT failed")
 
-        uid_validity = self._read_uid_validity(client)
+        uid_validity = self._read_uid_validity(client, mailbox_arg)
 
         criteria = f'(SINCE "{since.strftime("%d-%b-%Y")}")'
         typ, data = client.uid("search", None, criteria)
@@ -567,22 +688,18 @@ class GmailImapProvider:
             permanently_skipped=tuple(permanently_skipped),
         )
 
-    def _read_uid_validity(self, client: ImapClient) -> int:
-        typ, data = client.status(self.mailbox, "(UIDVALIDITY)")
+    def _read_uid_validity(self, client: ImapClient, mailbox_arg: str) -> int:
+        typ, data = client.status(mailbox_arg, "(UIDVALIDITY)")
         if typ != "OK":
             raise GmailConnectionError("IMAP STATUS failed")
-        for line in data:
-            if not isinstance(line, bytes):
-                continue
-            match = _UIDVALIDITY_RE.search(line)
-            if match:
-                value = int(match.group(1))
-                # GMAIL-009: UIDVALIDITY 0 is a reserved/invalid value per
-                # RFC 3501 — never trust it as a real mailbox generation.
-                if value <= 0:
-                    raise GmailConnectionError("IMAP reported an invalid UIDVALIDITY")
-                return value
-        raise GmailConnectionError("Could not determine mailbox UIDVALIDITY")
+        value = _parse_status_uid_validity(data)
+        if value is None:
+            raise GmailConnectionError("Could not determine mailbox UIDVALIDITY")
+        # GMAIL-009: UIDVALIDITY 0 is a reserved/invalid value per
+        # RFC 3501 — never trust it as a real mailbox generation.
+        if value <= 0:
+            raise GmailConnectionError("IMAP reported an invalid UIDVALIDITY")
+        return value
 
     def _read_message_size(self, client: ImapClient, uid_bytes: bytes) -> int | None:
         """GMAIL-005: a lightweight `RFC822.SIZE` FETCH, used to decide

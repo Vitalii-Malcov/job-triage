@@ -70,9 +70,10 @@ MAX_ATTACHMENTS = 20
 #
 # GMAIL_USERNAME is effectively a mailbox account address — reuses
 # MAX_ADDRESS_LENGTH (RFC 5321) rather than a separate constant.
-# GMAIL_MAILBOX mirrors app.db.models.GmailMessageRecord.mailbox's column
-# width (String(100)). GMAIL_IMAP_HOST uses RFC 1035/1123's 253-character
-# maximum total hostname length.
+# GMAIL_MAILBOX is a decoded-character limit; what is persisted is its
+# canonical modified-UTF-7 form, which can be longer -- see
+# app.db.models.GMAIL_MAILBOX_IDENTITY_MAX_LENGTH. GMAIL_IMAP_HOST uses
+# RFC 1035/1123's 253-character maximum total hostname length.
 MAX_MAILBOX_NAME_LENGTH = 100
 MAX_IMAP_HOST_LENGTH = 253
 
