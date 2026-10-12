@@ -3215,6 +3215,7 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    # Stage 9D (f3b8d2a6c9e1, "add gmail_application_drafts table") --
-    # update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "f3b8d2a6c9e1"
+    # Codex mailbox-width finding (d2f5a8c1b7e4, "widen Gmail canonical
+    # mailbox identity columns") -- update this alongside every new
+    # migration's own down_revision chaining.
+    assert heads[0] == "d2f5a8c1b7e4"

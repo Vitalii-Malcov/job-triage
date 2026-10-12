@@ -346,6 +346,25 @@ class XingScanProgressRecord(Base):
     )
 
 
+# Codex mailbox-width finding: the persisted Gmail mailbox identity is
+# `app.providers.email.imap_mailbox.canonical_mailbox_identity(name)`
+# (modified UTF-7), not the decoded name the config limits to
+# MAX_MAILBOX_NAME_LENGTH (100) code points. Worst case: one run of 100
+# supplementary code points = 400 UTF-16 bytes -> "&" + ceil(1600 / 3) =
+# 534 base64 characters + "-" = 536 ASCII characters (a literal "&" is
+# only 2, a BMP character in a run at most 8/3, and run boundaries cost
+# more input than they add). 600 leaves headroom; a test re-derives the
+# bound from MAX_MAILBOX_NAME_LENGTH so raising that limit fails loudly.
+# Shared by every column storing that identity: gmail_messages.mailbox,
+# gmail_message_id_claims.claimant_mailbox, gmail_permanent_skips.mailbox.
+GMAIL_MAILBOX_IDENTITY_MAX_LENGTH = 600
+# gmail_threads.lock_holder embeds the identity too:
+# `app.db.gmail_repository.upsert_message` holds
+# "gmail_sync:<identity>:<uid_validity>:<uid>:<32 hex>" -- at most
+# 11 + 600 + 1 + 10 + 1 + 10 + 1 + 32 = 666 characters (a test re-derives it).
+GMAIL_THREAD_LOCK_HOLDER_MAX_LENGTH = 700
+
+
 class GmailThreadRecord(Base):
     """A neutral (non-Gmail-native) correspondence thread grouping (Stage
     7A) — see app/db/gmail_repository.py's `resolve_thread_anchor` for how
@@ -421,7 +440,9 @@ class GmailThreadRecord(Base):
     # constraint). `lock_expires_at` bounds how long a crashed holder can
     # block everyone else — a lock past its expiry is treated as free by
     # `acquire_thread_lock`, never held forever.
-    lock_holder: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lock_holder: Mapped[str | None] = mapped_column(
+        String(GMAIL_THREAD_LOCK_HOLDER_MAX_LENGTH), nullable=True
+    )
     lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     messages: Mapped[list["GmailMessageRecord"]] = relationship(back_populates="thread")
@@ -516,7 +537,7 @@ class GmailMessageRecord(Base):
     account_key: Mapped[str] = mapped_column(
         String(320), nullable=False, server_default="", index=True
     )
-    mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    mailbox: Mapped[str] = mapped_column(String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False)
     uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
     uid: Mapped[int] = mapped_column(Integer, nullable=False)
 
@@ -679,7 +700,9 @@ class GmailMessageIdClaimRecord(Base):
     # The provider identity that WON this claim — traceability only, not
     # itself part of any uniqueness (mirrors CandidateJobMatchRecord's own
     # "traceability, not identity" columns elsewhere in this file).
-    claimant_mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    claimant_mailbox: Mapped[str] = mapped_column(
+        String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False
+    )
     claimant_uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
     claimant_uid: Mapped[int] = mapped_column(Integer, nullable=False)
     thread_id: Mapped[int] = mapped_column(
@@ -753,7 +776,7 @@ class GmailPermanentSkipRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(320), nullable=False)
-    mailbox: Mapped[str] = mapped_column(String(100), nullable=False)
+    mailbox: Mapped[str] = mapped_column(String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False)
     uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
     uid: Mapped[int] = mapped_column(Integer, nullable=False)
     reason: Mapped[str] = mapped_column(String(32), nullable=False)

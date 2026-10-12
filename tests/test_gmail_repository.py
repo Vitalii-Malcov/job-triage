@@ -30,8 +30,13 @@ from app.db.gmail_repository import (
     to_gmail_thread,
     upsert_message,
 )
-from app.db.models import GmailMessageRecord, GmailPermanentSkipRecord
+from app.db.models import (
+    GmailMessageIdClaimRecord,
+    GmailMessageRecord,
+    GmailPermanentSkipRecord,
+)
 from app.providers.email.base import ParsedGmailMessage
+from app.providers.email.imap_mailbox import canonical_mailbox_identity
 
 ACCOUNT_A = "a@example.com"
 ACCOUNT_B = "b@example.com"
@@ -1447,3 +1452,61 @@ def test_alias_permanent_skips_record_one_row(two_sessions):
 
     rows = session_a.scalars(select(GmailPermanentSkipRecord)).all()
     assert [(row.mailbox, row.uid) for row in rows] == [(SENT_RU_ENCODED, 9)]
+
+
+# Codex mailbox-width finding: long canonical identities (> the old
+# String(100)) keep every alias/dedup guarantee. SQLite does not enforce
+# VARCHAR length -- tests/integration/test_gmail_mailbox_width_postgres.py
+# proves the same against real PostgreSQL.
+LONG_RU = "Я" * 40
+LONG_RU_ENCODED = canonical_mailbox_identity(LONG_RU)
+WORST_CASE_MAILBOX = "\U0001f600" * 100
+LONG_SPELLINGS = [
+    (LONG_RU, LONG_RU_ENCODED),
+    (LONG_RU_ENCODED, LONG_RU),
+    (WORST_CASE_MAILBOX, canonical_mailbox_identity(WORST_CASE_MAILBOX)),
+]
+
+
+@pytest.mark.parametrize(
+    ("spelling_a", "spelling_b"), LONG_SPELLINGS, ids=["rd-enc", "enc-rd", "worst"]
+)
+def test_long_alias_imports_create_exactly_one_message_and_claim(
+    monkeypatch, two_sessions, spelling_a, spelling_b
+):
+    session_a, session_b = two_sessions
+    canonical = canonical_mailbox_identity(spelling_a)
+    assert len(canonical) > 100
+
+    (record_a, created_a), (record_b, created_b) = race_alias_imports(
+        monkeypatch,
+        session_a,
+        session_b,
+        _parsed(mailbox=spelling_a, uid=7, message_id="<long@example.com>"),
+        _parsed(mailbox=spelling_b, uid=7, message_id="<long@example.com>"),
+    )
+
+    assert (created_a, created_b) == (False, True)
+    assert record_a.id == record_b.id
+    session_a.expire_all()
+    rows = session_a.scalars(select(GmailMessageRecord)).all()
+    assert [(row.mailbox, row.uid_validity, row.uid) for row in rows] == [(canonical, 100, 7)]
+    claims = session_a.scalars(select(GmailMessageIdClaimRecord)).all()
+    assert [(c.claimant_mailbox, c.contested) for c in claims] == [(canonical, False)]
+    for spelling in (spelling_a, spelling_b):
+        assert get_message_by_identity(session_a, ACCOUNT_A, spelling, 100, 7).id == record_a.id
+
+
+@pytest.mark.parametrize(
+    ("spelling_a", "spelling_b"), LONG_SPELLINGS, ids=["rd-enc", "enc-rd", "worst"]
+)
+def test_long_alias_permanent_skips_record_one_row(two_sessions, spelling_a, spelling_b):
+    session_a, session_b = two_sessions
+
+    record_permanent_skips(session_b, ACCOUNT_A, spelling_a, 100, [(9, "OVERSIZED")])
+    record_permanent_skips(session_a, ACCOUNT_A, spelling_b, 100, [(9, "OVERSIZED")])
+
+    rows = session_a.scalars(select(GmailPermanentSkipRecord)).all()
+    assert [(row.mailbox, row.uid) for row in rows] == [(canonical_mailbox_identity(spelling_a), 9)]
+    for spelling in (spelling_a, spelling_b):
+        assert get_known_uids(session_a, ACCOUNT_A, spelling, 100, [9, 10]) == {9}

@@ -576,4 +576,3 @@ def test_migration_parent_is_the_stage_9c_head():
     script = ScriptDirectory.from_config(_alembic_config(Path("unused.db")))
     revision = script.get_revision("f3b8d2a6c9e1")
     assert revision.down_revision == "e5a17c3b9d42"
-    assert script.get_heads() == ["f3b8d2a6c9e1"]
