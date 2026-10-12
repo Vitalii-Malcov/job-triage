@@ -226,10 +226,10 @@ def test_required_modules_include_stage_9c_9d_and_hard008() -> None:
         assert (PROJECT_ROOT / module).exists()
 
 
-def test_repository_head_is_the_uidvalidity_bigint_head() -> None:
+def test_repository_head_is_the_live_send_uniqueness_head() -> None:
     # Moves with the next migration on purpose: that migration must also
     # update the CI literal (see test_real_workflow_satisfies_the_gate).
-    assert _repository_head() == "e8b1c4f7a2d9"
+    assert _repository_head() == "a7c3e9f1b2d4"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

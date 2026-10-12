@@ -1129,6 +1129,15 @@ class ResponseDraftApprovalRecord(Base):
     )
 
 
+# Stage 12: the send statuses that mean "a transmission is in flight, happened,
+# or may have happened" -- i.e. every status except a DEFINITE
+# pre-transmission FAILED. Shared by `ResponseDraftSendRecord`'s and
+# `FollowUpSendRecord`'s per-target partial unique indexes below (and by the
+# migration that creates them), so both tables use the identical predicate.
+LIVE_SEND_STATUSES: tuple[str, ...] = ("PENDING", "SENT", "UNCERTAIN")
+LIVE_SEND_STATUS_PREDICATE = "status IN ('PENDING', 'SENT', 'UNCERTAIN')"
+
+
 class ResponseDraftSendRecord(Base):
     """The DB-enforced atomic arbiter of "has this approved response
     draft already been sent, or is a send currently in flight" (Stage
@@ -1149,6 +1158,22 @@ class ResponseDraftSendRecord(Base):
     other concurrent (or later) request instead reads the existing row
     and acts on ITS state (see `app.db.response_draft_approval_repository`'s
     `claim_send_attempt`/`retry_send_attempt`).
+
+    **At most one live reply per inbound message, across ALL revisions
+    (Stage 12).** `UNIQUE(response_draft_id)` alone only serializes sends
+    of ONE revision: two different revisions of a draft for the same
+    inbound message (e.g. regenerated after a candidate-profile edit) could
+    each be approved and each sent, so the recruiter would receive two
+    replies. `uq_response_draft_sends_live_per_message` -- a PARTIAL unique
+    index `UNIQUE(account_key, gmail_message_id) WHERE status IN ('PENDING',
+    'SENT', 'UNCERTAIN')` -- makes that impossible at the database level: at
+    most one row per inbound message may ever be in flight, sent, or
+    possibly sent. `FAILED` rows are excluded because a FAILED attempt is, by
+    construction, a DEFINITE pre-transmission failure (see below), so it
+    never blocks a later attempt (of the same or another revision). A claim
+    INSERT or FAILED -> PENDING retry UPDATE that would violate the index is
+    translated into `ResponseDraftMessageAlreadyRepliedError` by the
+    repository -- never a silent second send.
 
     **`status` is a real, CAS-guarded state machine — mirrors
     `ApplicationPackageReviewRecord`'s own "deliberately mutable" precedent
@@ -1223,6 +1248,14 @@ class ResponseDraftSendRecord(Base):
     __tablename__ = "response_draft_sends"
     __table_args__ = (
         UniqueConstraint("response_draft_id", name="uq_response_draft_sends_response_draft"),
+        Index(
+            "uq_response_draft_sends_live_per_message",
+            "account_key",
+            "gmail_message_id",
+            unique=True,
+            sqlite_where=text(LIVE_SEND_STATUS_PREDICATE),
+            postgresql_where=text(LIVE_SEND_STATUS_PREDICATE),
+        ),
         CheckConstraint(
             "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
             name="ck_response_draft_sends_status_valid",
@@ -1479,11 +1512,32 @@ class FollowUpSendRecord(Base):
     outcome — see that model's docstring for the full rationale, which
     applies here unchanged. See app/services/follow_up_send.py for the
     orchestration that drives these transitions.
+
+    **At most one live follow-up per correspondence anchor, across ALL
+    proposal revisions (Stage 12).** `gmail_message_id` here is the
+    proposal's `anchor_gmail_message_id` (the thread's latest OUTBOUND
+    message). Proposals are unique per `(anchor, input_fingerprint)`, so a
+    fingerprint change (candidate-profile edit, job title edit, generator
+    version) yields a second proposal for the SAME anchor; send-time
+    revalidation checks the anchor is still current, which it still is
+    until the first follow-up has been synced back from the Sent mailbox.
+    `uq_follow_up_sends_live_per_anchor` (`UNIQUE(account_key,
+    gmail_message_id) WHERE status IN ('PENDING', 'SENT', 'UNCERTAIN')`)
+    closes that window at the database level -- the same predicate and
+    rationale as `ResponseDraftSendRecord`'s per-message index.
     """
 
     __tablename__ = "follow_up_sends"
     __table_args__ = (
         UniqueConstraint("follow_up_proposal_id", name="uq_follow_up_sends_follow_up_proposal"),
+        Index(
+            "uq_follow_up_sends_live_per_anchor",
+            "account_key",
+            "gmail_message_id",
+            unique=True,
+            sqlite_where=text(LIVE_SEND_STATUS_PREDICATE),
+            postgresql_where=text(LIVE_SEND_STATUS_PREDICATE),
+        ),
         CheckConstraint(
             "status IN ('PENDING', 'SENT', 'FAILED', 'UNCERTAIN')",
             name="ck_follow_up_sends_status_valid",

@@ -31,7 +31,7 @@ outcome of an attempted send:
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 ApprovalDecision = Literal["APPROVED", "REJECTED"]
 SendStatus = Literal["PENDING", "SENT", "FAILED", "UNCERTAIN"]
@@ -54,7 +54,13 @@ class ResponseDraftApproval(BaseModel):
 
 
 class ResponseDraftApprovalRequest(BaseModel):
-    """POST /response-drafts/{draft_id}/decision body."""
+    """POST /response-drafts/{draft_id}/decision body. Stage 12:
+    `extra="forbid"` -- an unknown field (e.g. a client believing it can
+    pin a "version") is rejected with 422 rather than silently ignored;
+    the draft id in the path is the only revision identity.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     decision: ApprovalDecision
     note: str | None = Field(default=None, max_length=2000)
@@ -92,5 +98,36 @@ class ResponseDraftState(BaseModel):
     response_draft_id: int
     gmail_message_id: int
     draft_status: str
+    # Stage 12: False when a newer analysis, a candidate-profile edit or a
+    # generator upgrade has superseded this revision -- it can then no
+    # longer be APPROVED (an approval recorded while it was current still
+    # authorizes its pinned content; see app.services.response_draft_send).
+    is_current_revision: bool
     approval: ResponseDraftApproval | None
     send: ResponseDraftSendStatus | None
+
+
+class PendingResponseDraft(BaseModel):
+    """Stage 12: one entry of GET /response-drafts/pending -- the newest
+    PROPOSED draft revision of an inbound message that has no human
+    decision yet and whose message has no live (PENDING/SENT/UNCERTAIN)
+    reply. Carries the Stage 7B association evidence a reviewer needs to
+    judge it (`match_type` is APPLICATION/JOB_ONLY/AMBIGUOUS/UNMATCHED --
+    an AMBIGUOUS or UNMATCHED draft never carries a `matched_job_id`).
+    Never includes the draft's subject/body or any message content: read
+    GET /gmail/messages/{id}/response-draft for that. Listing performs no
+    generation, decision or send.
+    """
+
+    response_draft_id: int
+    gmail_message_id: int
+    analysis_id: int
+    matched_job_id: int | None
+    match_type: str | None
+    match_confidence: str | None
+    classification: str
+    candidate_profile_version: int
+    generator_version: str
+    provider: str
+    is_current_revision: bool
+    created_at: datetime

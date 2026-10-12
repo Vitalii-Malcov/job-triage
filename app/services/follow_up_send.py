@@ -182,6 +182,19 @@ automatically.
 fetches a URL. The ONLY external action anywhere in this module is the
 one explicitly-approved `OutboundEmailProvider.send` call in
 `send_follow_up`.
+
+**One live follow-up per correspondence anchor (Stage 12).** Proposals are
+unique per `(anchor, input_fingerprint)`, so several proposals can target
+the SAME anchor (e.g. after a candidate-profile edit). Send-time
+revalidation proves the anchor is still current, which it remains until
+the first follow-up is synced back from the Sent mailbox -- so before
+Stage 12 two proposals for one anchor could both be approved and sent. An
+APPROVED decision or a send is now refused
+(`FollowUpAnchorAlreadyFollowedUpError`, 409) when ANOTHER proposal for
+the same anchor already has a PENDING/SENT/UNCERTAIN send; the guarantee
+itself is the database's `uq_follow_up_sends_live_per_anchor` partial
+unique index, whose violation the repository translates into the same
+error. REJECTED decisions are always accepted.
 """
 
 import json
@@ -194,11 +207,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.db.follow_up_approval_repository import (
+    FollowUpLiveSendExistsError,
     begin_transmission,
     claim_send_attempt,
     create_approval,
     get_approval_for_proposal,
     get_follow_up_proposal_by_id,
+    get_live_send_for_anchor,
     get_send_for_proposal,
     mark_send_failed,
     mark_send_sent,
@@ -237,6 +252,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FollowUpAlreadyDecidedError",
+    "FollowUpAnchorAlreadyFollowedUpError",
     "FollowUpAlreadySentError",
     "FollowUpMissingRecipientError",
     "FollowUpNotApprovedError",
@@ -290,6 +306,20 @@ class FollowUpProposalStaleAtSendTimeError(Exception):
     """
 
 
+class FollowUpAnchorAlreadyFollowedUpError(Exception):
+    """Stage 12: ANOTHER proposal for the same correspondence anchor already
+    has a PENDING/SENT/UNCERTAIN send -- a second follow-up for that anchor
+    is refused. Mapped to 409. Nothing was written.
+    """
+
+
+def _other_proposal_has_live_send(
+    db: Session, account_key: str, proposal: FollowUpProposalRecord
+) -> bool:
+    live = get_live_send_for_anchor(db, account_key, proposal.anchor_gmail_message_id)
+    return live is not None and live.follow_up_proposal_id != proposal.id
+
+
 class FollowUpAlreadySentError(Exception):
     """This proposal's approval has already been successfully consumed by
     a prior send — mapped to 409.
@@ -332,6 +362,21 @@ def approve_or_reject_follow_up(
             f"No follow_up_proposals row for account_key={account_key!r} "
             f"id={follow_up_proposal_id!r}"
         )
+
+    if decision == "APPROVED":
+        # Precedence: an already-decided proposal keeps reporting exactly
+        # that (create_approval below would too).
+        existing = get_approval_for_proposal(db, account_key, proposal.id)
+        if existing is not None:
+            raise FollowUpAlreadyDecidedError(
+                f"follow_up_proposal_id={follow_up_proposal_id!r} already has a recorded "
+                f"decision ({existing.decision!r}); decisions are permanent."
+            )
+        if _other_proposal_has_live_send(db, account_key, proposal):
+            raise FollowUpAnchorAlreadyFollowedUpError(
+                f"follow_up_proposal_id={follow_up_proposal_id!r}: another proposal for the "
+                "same anchor already has a live send"
+            )
 
     record, created = create_approval(
         db,
@@ -447,18 +492,34 @@ def _claim_or_retry_send(
     real exclusivity gate) before revalidating or calling the provider —
     see module docstring's "Race safety" section.
     """
-    record, claimed = claim_send_attempt(
-        db,
-        account_key=account_key,
-        follow_up_proposal_id=proposal.id,
-        gmail_message_id=proposal.anchor_gmail_message_id,
-        approval_id=approval.id,
-    )
-    if claimed:
-        return record
-    return _resolve_existing_send_record(
-        db, account_key=account_key, proposal=proposal, record=record
-    )
+    own = get_send_for_proposal(db, account_key, proposal.id)
+    if (own is None or own.status == "FAILED") and _other_proposal_has_live_send(
+        db, account_key, proposal
+    ):
+        raise FollowUpAnchorAlreadyFollowedUpError(
+            f"follow_up_proposal_id={proposal.id!r}: another proposal for the same anchor "
+            "already has a live send"
+        )
+    try:
+        record, claimed = claim_send_attempt(
+            db,
+            account_key=account_key,
+            follow_up_proposal_id=proposal.id,
+            gmail_message_id=proposal.anchor_gmail_message_id,
+            approval_id=approval.id,
+        )
+        if claimed:
+            return record
+        return _resolve_existing_send_record(
+            db, account_key=account_key, proposal=proposal, record=record
+        )
+    except FollowUpLiveSendExistsError as exc:
+        # Stage 12: the per-anchor live-send index refused this proposal's
+        # claim/retry -- another proposal won the anchor's only live send.
+        raise FollowUpAnchorAlreadyFollowedUpError(
+            f"follow_up_proposal_id={proposal.id!r}: another proposal for the same anchor "
+            "already has a live send"
+        ) from exc
 
 
 def _revalidate_or_fail_closed(

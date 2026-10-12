@@ -179,6 +179,28 @@ def _derive_candidate_profile_facts(
     return record.profile_version, candidate_name
 
 
+def is_current_response_draft_revision(
+    db: Session, account_key: str, draft: ResponseDraftRecord
+) -> bool:
+    """Stage 12: whether `draft` is the revision
+    `generate_response_draft_for_message` would resolve to RIGHT NOW --
+    the same identity it keys on: the message's latest analysis, the
+    current candidate profile version, and this module's generator
+    version. A False result means the draft is SUPERSEDED (a newer analysis
+    of the message, a candidate-profile edit, or a generator upgrade has
+    happened since it was built) and must not be approved or sent; the
+    human regenerates and reviews the current revision instead. Pure reads
+    only -- never generates anything.
+    """
+    if draft.generator_version != RESPONSE_DRAFT_GENERATOR_VERSION:
+        return False
+    latest_analysis = get_latest_analysis_for_message(db, account_key, draft.gmail_message_id)
+    if latest_analysis is None or latest_analysis.id != draft.analysis_id:
+        return False
+    current_profile_version, _name = _derive_candidate_profile_facts(get_candidate_profile(db))
+    return draft.candidate_profile_version == current_profile_version
+
+
 def generate_response_draft_for_message(
     db: Session, account_key: str, gmail_message_id: int
 ) -> tuple[ResponseDraftRecord, bool]:

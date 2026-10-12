@@ -14,7 +14,7 @@ see that model's docstring for what each value means).
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 FollowUpLanguage = Literal["de", "en"]
 FollowUpEligibility = Literal["ELIGIBLE", "NOT_ELIGIBLE"]
@@ -120,7 +120,11 @@ class FollowUpApproval(BaseModel):
 
 
 class FollowUpApprovalRequest(BaseModel):
-    """POST /follow-ups/{id}/decision body."""
+    """POST /follow-ups/{id}/decision body. Stage 12: `extra="forbid"`,
+    same rationale as `ResponseDraftApprovalRequest`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     decision: FollowUpApprovalDecision
     note: str | None = Field(default=None, max_length=2000)

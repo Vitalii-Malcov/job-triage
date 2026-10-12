@@ -15,7 +15,12 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import FollowUpApprovalRecord, FollowUpProposalRecord, FollowUpSendRecord
+from app.db.models import (
+    LIVE_SEND_STATUSES,
+    FollowUpApprovalRecord,
+    FollowUpProposalRecord,
+    FollowUpSendRecord,
+)
 from app.models.follow_up import FollowUpApproval, FollowUpSendStatus
 
 
@@ -23,6 +28,15 @@ class FollowUpApprovalRepositoryConsistencyError(Exception):
     """Raised when a persistence invariant that must always hold is
     violated anyway — mirrors
     app.db.response_draft_approval_repository.ResponseDraftApprovalRepositoryConsistencyError.
+    """
+
+
+class FollowUpLiveSendExistsError(Exception):
+    """Stage 12: a claim INSERT or FAILED -> PENDING retry UPDATE for one
+    proposal was refused by `uq_follow_up_sends_live_per_anchor` because
+    ANOTHER proposal for the same correspondence anchor already has a
+    PENDING/SENT/UNCERTAIN send row. Nothing was written. Mirrors
+    app.db.response_draft_approval_repository.ResponseDraftLiveSendExistsError.
     """
 
 
@@ -107,6 +121,22 @@ def get_send_for_proposal(
     )
 
 
+def get_live_send_for_anchor(
+    db: Session, account_key: str, anchor_gmail_message_id: int
+) -> FollowUpSendRecord | None:
+    """Stage 12: the PENDING/SENT/UNCERTAIN send row -- from ANY proposal --
+    for one correspondence anchor, if one exists. At most one can exist
+    (`uq_follow_up_sends_live_per_anchor`). Pure, account-scoped read.
+    """
+    return db.scalar(
+        select(FollowUpSendRecord).where(
+            FollowUpSendRecord.account_key == account_key,
+            FollowUpSendRecord.gmail_message_id == anchor_gmail_message_id,
+            FollowUpSendRecord.status.in_(LIVE_SEND_STATUSES),
+        )
+    )
+
+
 def claim_send_attempt(
     db: Session,
     *,
@@ -136,13 +166,18 @@ def claim_send_attempt(
     except IntegrityError:
         db.rollback()
         existing = get_send_for_proposal(db, account_key, follow_up_proposal_id)
-        if existing is None:
-            raise FollowUpApprovalRepositoryConsistencyError(
-                f"Expected a follow_up_sends row for "
-                f"follow_up_proposal_id={follow_up_proposal_id!r} after a UNIQUE "
-                "constraint collision, but none was found."
+        if existing is not None:
+            return existing, False
+        # Stage 12: refused by the per-anchor live-send index.
+        if get_live_send_for_anchor(db, account_key, gmail_message_id) is not None:
+            raise FollowUpLiveSendExistsError(
+                "another follow-up proposal already has a live send for this anchor"
             ) from None
-        return existing, False
+        raise FollowUpApprovalRepositoryConsistencyError(
+            f"Expected a follow_up_sends row for "
+            f"follow_up_proposal_id={follow_up_proposal_id!r} after a UNIQUE "
+            "constraint collision, but none was found."
+        ) from None
 
     db.refresh(record)
     return record, True
@@ -155,21 +190,31 @@ def retry_send_attempt(db: Session, record: FollowUpSendRecord) -> bool:
     is, by construction, always a DEFINITE pre-transmission failure (see
     `mark_send_failed`'s docstring), so a fresh retry legitimately starts
     the pre-transmission window over.
+
+    Stage 12: raises `FollowUpLiveSendExistsError` (nothing written) if
+    moving this row back to PENDING would violate
+    `uq_follow_up_sends_live_per_anchor`.
     """
-    result = db.execute(
-        update(FollowUpSendRecord)
-        .where(
-            FollowUpSendRecord.id == record.id,
-            FollowUpSendRecord.status == "FAILED",
+    try:
+        result = db.execute(
+            update(FollowUpSendRecord)
+            .where(
+                FollowUpSendRecord.id == record.id,
+                FollowUpSendRecord.status == "FAILED",
+            )
+            .values(
+                status="PENDING",
+                send_attempted=False,
+                attempt_count=FollowUpSendRecord.attempt_count + 1,
+                updated_at=datetime.now(UTC),
+            )
         )
-        .values(
-            status="PENDING",
-            send_attempted=False,
-            attempt_count=FollowUpSendRecord.attempt_count + 1,
-            updated_at=datetime.now(UTC),
-        )
-    )
-    db.commit()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise FollowUpLiveSendExistsError(
+            "another follow-up proposal already has a live send for this anchor"
+        ) from None
     won = result.rowcount == 1
     if won:
         db.refresh(record)
