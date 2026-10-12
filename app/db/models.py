@@ -538,8 +538,12 @@ class GmailMessageRecord(Base):
         String(320), nullable=False, server_default="", index=True
     )
     mailbox: Mapped[str] = mapped_column(String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False)
-    uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
-    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    # IMAP UID and UIDVALIDITY are 32-bit unsigned values (up to
+    # app.providers.email.base.IMAP_NZ_NUMBER_MAX = 4294967295), past signed
+    # INTEGER's 2147483647 -- BigInteger, like XingScanProgressRecord and
+    # GmailApplicationDraftRecord (migration e8b1c4f7a2d9).
+    uid_validity: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    uid: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     # RFC 5322 Message-ID / In-Reply-To / References headers. Indexed
     # (not unique) — see the class docstring for why this is never the
@@ -703,8 +707,8 @@ class GmailMessageIdClaimRecord(Base):
     claimant_mailbox: Mapped[str] = mapped_column(
         String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False
     )
-    claimant_uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
-    claimant_uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    claimant_uid_validity: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    claimant_uid: Mapped[int] = mapped_column(BigInteger, nullable=False)
     thread_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("gmail_threads.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -751,8 +755,8 @@ class GmailPermanentSkipRecord(Base):
     `GmailMessageRecord`'s own dedup identity, no separate cleanup logic
     needed.
 
-    `reason` is diagnostic only (e.g. "OVERSIZED", "PARSE_FAILED",
-    "INVALID_UID") — never itself part of the uniqueness/lookup identity.
+    `reason` is diagnostic only (e.g. "OVERSIZED", "PARSE_FAILED") — never
+    itself part of the uniqueness/lookup identity.
     """
 
     __tablename__ = "gmail_permanent_skips"
@@ -777,8 +781,8 @@ class GmailPermanentSkipRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(320), nullable=False)
     mailbox: Mapped[str] = mapped_column(String(GMAIL_MAILBOX_IDENTITY_MAX_LENGTH), nullable=False)
-    uid_validity: Mapped[int] = mapped_column(Integer, nullable=False)
-    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    uid_validity: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    uid: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False

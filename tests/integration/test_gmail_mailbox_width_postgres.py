@@ -25,6 +25,7 @@ import pytest
 import sqlalchemy.exc
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.orm import sessionmaker
 
@@ -245,7 +246,9 @@ def test_downgrade_refuses_while_a_long_identity_is_stored(engine):
     with pytest.raises(RuntimeError, match="Refusing to narrow"):
         downgrade(_alembic_config(), PRE_FIX_REVISION)
 
-    assert _revision(engine) == "d2f5a8c1b7e4"
+    # PostgreSQL runs the whole multi-step downgrade in one transaction, so
+    # the refusal rolls back every step: the schema stays at head.
+    assert _revision(engine) == ScriptDirectory.from_config(_alembic_config()).get_current_head()
     assert _widths(engine) == MIGRATED_WIDTHS
     with engine.connect() as conn:
         stored = conn.execute(

@@ -52,6 +52,7 @@ from email.message import Message
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from app.providers.email.base import (
+    IMAP_NZ_NUMBER_MAX,
     MAX_ADDRESS_LENGTH,
     MAX_ADDRESSES_PER_HEADER,
     MAX_ATTACHMENTS,
@@ -108,7 +109,6 @@ _INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 # distinction is what makes durable forward progress possible.
 PERMANENT_SKIP_REASON_OVERSIZED = "OVERSIZED"
 PERMANENT_SKIP_REASON_PARSE_FAILED = "PARSE_FAILED"
-PERMANENT_SKIP_REASON_INVALID_UID = "INVALID_UID"
 
 
 def _decode_mime_words(raw: str) -> str:
@@ -209,12 +209,12 @@ def _parse_internal_date(fetch_header: bytes) -> datetime | None:
 
 _STATUS_LITERAL_PREFIX_RE = re.compile(rb"\{([0-9]{1,10})\}")
 _STATUS_ATTRIBUTE_NAME_RE = re.compile(rb"[A-Za-z][A-Za-z0-9.-]*")
-_STATUS_NUMBER_RE = re.compile(rb"[0-9]{1,20}")
+_IMAP_NUMBER_RE = re.compile(rb"[0-9]{1,20}")
+# RFC 3501 §9 nz-number = digit-nz *DIGIT, at most 10 digits for 32 bits.
+_IMAP_NZ_NUMBER_RE = re.compile(rb"[1-9][0-9]{0,9}")
 # RFC 3501 §9: atom-specials an unquoted mailbox may not contain, besides
 # SP and CTL (`]` is allowed in an astring).
 _STATUS_ATOM_SPECIALS = frozenset(b'(){%*"\\')
-# RFC 3501 §9: UIDVALIDITY is an nz-number, a 32-bit unsigned value.
-_UIDVALIDITY_MAX = 2**32 - 1
 
 
 def _normalize_status_response(data: object) -> tuple[bytes, bytes] | None:
@@ -308,15 +308,28 @@ def _parse_status_uid_validity(data: object) -> int | None:
         key = name.upper()
         if (
             not _STATUS_ATTRIBUTE_NAME_RE.fullmatch(name)
-            or not _STATUS_NUMBER_RE.fullmatch(value)
+            or not _IMAP_NUMBER_RE.fullmatch(value)
             or key in attributes
         ):
             return None
         attributes[key] = value
     value = attributes.get(b"UIDVALIDITY")
-    if value is None or int(value) > _UIDVALIDITY_MAX:
+    if value is None or int(value) > IMAP_NZ_NUMBER_MAX:
         return None
     return int(value)
+
+
+def _parse_imap_uid(token: bytes) -> int | None:
+    """A UID token from UID SEARCH as its integer, or None unless it is
+    an RFC 3501 nz-number -- `digit-nz *DIGIT`: ASCII only, no leading
+    zero, sign, whitespace or `_` (all of which `int()` would accept) --
+    at most IMAP_NZ_NUMBER_MAX, the only values the persisted BIGINT
+    identity can hold. The regex caps the length at 10 digits; the value
+    check rejects 10-digit numbers above the maximum (e.g. 9999999999)."""
+    if not _IMAP_NZ_NUMBER_RE.fullmatch(token):
+        return None
+    uid = int(token)
+    return uid if uid <= IMAP_NZ_NUMBER_MAX else None
 
 
 def _attachment_metadata(part: Message, filename: str | None) -> ParsedAttachment:
@@ -551,8 +564,20 @@ class GmailImapProvider:
         if typ != "OK":
             raise GmailConnectionError("IMAP UID SEARCH failed")
 
-        uids = data[0].split() if data and data[0] else []
-        skipped_count = 0
+        tokens = data[0].split() if data and data[0] else []
+        # UID32-001: parse every SEARCH token HERE, before the known-UID
+        # lookup, the cap and any FETCH, so an invalid token (see
+        # `_parse_imap_uid`) can never take a valid message's place in
+        # the per-sync cap. Each one is counted as skipped (the same
+        # accounting it always got), never fetched and never a permanent
+        # skip -- no persisted identity can hold it. A repeated token
+        # names the same message, so it is processed once.
+        parsed_uids = [_parse_imap_uid(token) for token in tokens]
+        invalid_count = parsed_uids.count(None)
+        if invalid_count:
+            logger.warning("gmail_message_invalid_uid count=%s", invalid_count)
+        skipped_count = invalid_count
+        uids = list(dict.fromkeys(uid for uid in parsed_uids if uid is not None))
 
         # GMAIL-005 starvation fix (GMAIL-012: one bulk lookup, not
         # one query per UID): filter out UIDs already known to be
@@ -561,31 +586,8 @@ class GmailImapProvider:
         # spend its entire budget re-fetching bodies for the same
         # already-known messages and never reach anything new,
         # regardless of which end (oldest/newest) is prioritized.
-        # Malformed (non-integer) UID tokens are left in the
-        # candidate list unfiltered — downstream per-message handling
-        # in _fetch_one treats them as malformed the same way it
-        # always has.
-        candidate_uid_ints: list[int] = []
-        for uid_bytes in uids:
-            try:
-                candidate_uid_ints.append(int(uid_bytes))
-            except ValueError:
-                continue
-
-        known_uids = (
-            self._get_known_uids(uid_validity, candidate_uid_ints) if candidate_uid_ints else set()
-        )
-
-        not_yet_known = []
-        for uid_bytes in uids:
-            try:
-                uid_int = int(uid_bytes)
-            except ValueError:
-                not_yet_known.append(uid_bytes)
-                continue
-            if uid_int not in known_uids:
-                not_yet_known.append(uid_bytes)
-        uids = not_yet_known
+        known_uids = self._get_known_uids(uid_validity, uids) if uids else set()
+        uids = [uid for uid in uids if uid not in known_uids]
 
         # GMAIL-005: bound how many message bodies one sync run will
         # fetch at all. The OLDEST UIDs (Gmail UIDs are monotonically
@@ -610,10 +612,7 @@ class GmailImapProvider:
         # guarantee this cap actually provides.
         if len(uids) > MAX_MESSAGES_PER_SYNC:
             overflow = len(uids) - MAX_MESSAGES_PER_SYNC
-            try:
-                uids = sorted(uids, key=int)[:MAX_MESSAGES_PER_SYNC]
-            except ValueError:
-                uids = uids[:MAX_MESSAGES_PER_SYNC]
+            uids = sorted(uids)[:MAX_MESSAGES_PER_SYNC]
             skipped_count += overflow
             logger.warning("gmail_sync_message_cap_exceeded cap=%s", MAX_MESSAGES_PER_SYNC)
 
@@ -626,7 +625,8 @@ class GmailImapProvider:
         # closing the starvation bug a never-recorded permanent skip
         # would otherwise cause.
         permanently_skipped: list[tuple[int, str]] = []
-        for uid_bytes in uids:
+        for uid in uids:
+            uid_bytes = str(uid).encode("ascii")
             # AUD-005: once the total session deadline has fired, the
             # connection's socket is already forcibly closed (see
             # ImapSessionDeadline) -- stop issuing further FETCHes on it
@@ -656,7 +656,7 @@ class GmailImapProvider:
             if parsed is None:
                 skipped_count += 1
                 if permanent_skip_reason is not None:
-                    permanently_skipped.append((int(uid_bytes), permanent_skip_reason))
+                    permanently_skipped.append((uid, permanent_skip_reason))
             else:
                 messages.append(parsed)
 
@@ -814,7 +814,7 @@ class GmailImapProvider:
         `permanent_skip_reason` is non-None (FINAL-004, Astra R5A) ONLY
         for a narrow set of cases that are a pure, deterministic
         function of this message's own immutable CONTENT: an oversized
-        raw size, an invalid UID value, or `email.message_from_bytes`
+        raw size, or `email.message_from_bytes`
         itself failing to parse the raw bytes into a Message object at
         all (confirmed empirically: this is notoriously lenient and
         essentially never raises in practice, but when it does, it is a
@@ -837,7 +837,17 @@ class GmailImapProvider:
         app.providers.email.base.GmailFetchResult.permanently_skipped
         and app.db.models.GmailPermanentSkipRecord for how the caller
         uses this distinction.
+
+        A UID token outside RFC 3501's nz-number range (see
+        `_parse_imap_uid`) is skipped BEFORE any FETCH and is never a
+        permanent skip: no persisted identity can hold it (the
+        `uid > 0` CHECK, the 32-bit range, or not a number at all).
         """
+        uid = _parse_imap_uid(uid_bytes)
+        if uid is None:
+            logger.warning("gmail_message_invalid_uid")
+            return None, None
+
         # GMAIL-005: check the server-reported size BEFORE transferring
         # the body at all. An unknown size (None) proceeds rather than
         # failing closed — see _read_message_size's docstring.
@@ -885,11 +895,6 @@ class GmailImapProvider:
         # shape can never propagate out of _fetch_one and abort the rest
         # of the sync.
         try:
-            uid = int(uid_bytes)
-            if uid <= 0:
-                logger.warning("gmail_message_invalid_uid")
-                return None, PERMANENT_SKIP_REASON_INVALID_UID
-
             item = msg_data[0]
             if not isinstance(item, tuple) or len(item) < 2:
                 logger.warning("gmail_message_fetch_response_malformed")
