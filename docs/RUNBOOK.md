@@ -63,6 +63,7 @@ If `alembic upgrade head` fails:
 3. Check `alembic/versions/<revision>.py` for what it attempts; check the actual DB state (`docker compose exec db psql -U <user> -d <db> -c '\d'`) to see how far it got.
 4. Postgres runs each migration inside a transaction by default (`alembic/env.py`: "Will assume transactional DDL") — a failed migration should already be rolled back, not left half-applied. Confirm via `alembic current` before retrying.
 5. Fix the underlying issue (schema conflict, bad data) and re-run `alembic upgrade head` — do not skip revisions.
+   - `a7c3e9f1b2d4` (Stage 12) refuses to run if a message/follow-up anchor already has more than one PENDING/SENT/UNCERTAIN send row (counts only in the error). That data means duplicate emails may already have gone out — reconcile manually; see docs/GMAIL_RESPONSE_WORKFLOW.md.
 
 ## Database unavailable
 
