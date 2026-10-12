@@ -3215,7 +3215,7 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    # Codex mailbox-width finding (d2f5a8c1b7e4, "widen Gmail canonical
-    # mailbox identity columns") -- update this alongside every new
+    # Gmail UIDVALIDITY BIGINT (e8b1c4f7a2d9, "widen persisted Gmail
+    # UIDVALIDITY columns to BIGINT") -- update this alongside every new
     # migration's own down_revision chaining.
-    assert heads[0] == "d2f5a8c1b7e4"
+    assert heads[0] == "e8b1c4f7a2d9"

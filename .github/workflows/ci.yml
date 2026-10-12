@@ -84,7 +84,7 @@ jobs:
           python -m alembic heads | tee /tmp/alembic_heads.txt
           test "$(grep -c '(head)' /tmp/alembic_heads.txt)" -eq 1
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "d2f5a8c1b7e4 (head)" /tmp/alembic_current.txt
+          grep -q "e8b1c4f7a2d9 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       # HARD-010 (adversarial hardening r1): claim_send_attempt's
@@ -111,6 +111,8 @@ jobs:
       # Codex mailbox-width finding: test_gmail_mailbox_width_postgres.py
       # also cycles Alembic (down to f3b8d2a6c9e1 and back) and restores
       # head in a `finally` block, so it runs after the at-head modules.
+      # test_gmail_imap_32bit_identifiers_postgres.py does the same (down to
+      # d2f5a8c1b7e4 and back).
       #
       # HARD-008-RR1 (Codex targeted re-review): runs LAST, after the
       # other PostgreSQL integration tests below -- it drives its
@@ -139,6 +141,7 @@ jobs:
             tests/integration/test_gmail_application_draft_postgres.py \
             tests/integration/test_gmail_alias_dedup_postgres.py \
             tests/integration/test_gmail_mailbox_width_postgres.py \
+            tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'
           import sys

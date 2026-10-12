@@ -75,6 +75,11 @@ MAX_ATTACHMENTS = 20
 # app.db.models.GMAIL_MAILBOX_IDENTITY_MAX_LENGTH. GMAIL_IMAP_HOST uses
 # RFC 1035/1123's 253-character maximum total hostname length.
 MAX_MAILBOX_NAME_LENGTH = 100
+# RFC 3501 §9: both a message UID (`uniqueid`) and a mailbox UIDVALIDITY are
+# nz-numbers, i.e. 32-bit unsigned values 1..4294967295 -- past PostgreSQL
+# signed INTEGER's 2147483647, so every column persisting either is BIGINT
+# (alembic/versions/e8b1c4f7a2d9). The inbox parser enforces this range.
+IMAP_NZ_NUMBER_MAX = 2**32 - 1
 MAX_IMAP_HOST_LENGTH = 253
 
 # GMAIL-005: bounds applied BEFORE the expensive part of a fetch, not just
