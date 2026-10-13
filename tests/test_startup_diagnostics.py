@@ -64,3 +64,45 @@ def test_log_line_never_contains_secrets_or_identifiers(caplog):
         assert leaked not in message
     assert PROXY not in message
     assert "sentinel" not in message
+
+
+def _safety_lines(stderr: str) -> list[str]:
+    import json
+
+    lines = []
+    for raw in stderr.splitlines():
+        try:
+            message = json.loads(raw)["message"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if message.startswith("startup_safety_state "):
+            lines.append(message)
+    return lines
+
+
+def test_web_startup_emits_the_safety_line(monkeypatch, capsys):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setattr("app.main.get_settings", lambda: Settings(_env_file=None))
+    with TestClient(app):
+        pass
+    (line,) = _safety_lines(capsys.readouterr().err)
+    assert line.startswith("startup_safety_state process=web ")
+    assert "outbound_sending_enabled=false" in line
+
+
+def test_scheduler_startup_emits_the_safety_line(monkeypatch, capsys):
+    from app import scheduler
+
+    def _no_loop(coro):
+        coro.close()
+        return 0
+
+    monkeypatch.setattr(scheduler, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(scheduler, "_run_until_shutdown", _no_loop)
+    assert scheduler.main() == 0
+    (line,) = _safety_lines(capsys.readouterr().err)
+    assert line.startswith("startup_safety_state process=scheduler ")
+    assert "telegram_gmail_draft_enabled=false" in line
