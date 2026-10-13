@@ -51,7 +51,7 @@ No reverse proxy container is included in `compose.yaml` by default — see "Rev
 
 ## Ports
 
-- `web`: exposes `8000` internally (uvicorn default); published to the host only if a reverse proxy isn't already handling external exposure, otherwise kept on the internal compose network.
+- `web`: listens on `8000` in the container and is published on **loopback only**: `127.0.0.1:${WEB_PORT:-8000}:8000` (Stage 13A). Nothing on the network can reach the API directly; external access goes through a host reverse proxy. If the proxy is ever moved inside Docker, the preferred shape is an internal compose network with **no** host-published `web` port at all.
 - `db`: `5432`, not published to the host by default (only reachable by `web`/`scheduler` on the compose network) — reduces the accidental-exposure surface.
 - `scheduler`: no listening port; outbound-only (DB, IMAP, SMTP, Bundesagentur, Telegram).
 
@@ -83,7 +83,11 @@ Single default `compose` bridge network. `web` and `scheduler` both reach `db` b
 ## Health checks
 
 - `db`: PostgreSQL's own `pg_isready` (already the pattern used in `.github/workflows/ci.yml`'s `scheduler-postgres` job) — reused verbatim in `compose.yaml`.
-- `web`: a Docker `HEALTHCHECK`/compose healthcheck against the existing `GET /health` endpoint. **Caveat (AUD-002):** this endpoint currently does not check DB connectivity — a healthy HTTP response does not guarantee the app can actually reach the database. This is documented, not silently assumed; see `docs/TECHNICAL_DEBT.md` for the deferred fix (adding a dependency-aware health check is a public-API-shape change and is out of scope for this branch).
+- `web` (Stage 13A, AUD-002 resolved): two endpoints with different jobs.
+  - `GET /api/v1/health` — **liveness** only: the process is up. Never touches the database.
+  - `GET /api/v1/ready` — **readiness**, and the compose healthcheck target: `200 {"status":"ready"}` only when the database answers a read-only query **and** its Alembic revision is exactly the image's single head; otherwise `503 {"status":"not_ready"}` (no reason, revision or error text in the body; the reason category is logged). It never migrates or writes — with `ALEMBIC_AUTO_UPGRADE=false`, a schema behind the code stays "not ready" until the explicit migration step runs.
+  - Bounded inside the 5 s healthcheck timeout at the driver level (`app/services/readiness.py`): its own `NullPool` engine (no pool wait), PostgreSQL `connect_timeout=2`, `statement_timeout=1500ms`, `tcp_user_timeout` + keepalives. A host name resolving to several addresses multiplies the connect bound per address; compose's `db` resolves to one.
+  - Docker does not restart an unhealthy container by itself: an unhealthy `web` is a signal in `docker compose ps`, not a restart loop.
 - `scheduler`: no HTTP surface to health-check; operational health is inferred from container "running" state plus log inspection (see `docs/RUNBOOK.md`) — a process-level `docker compose ps` check plus log-tailing is the practical signal here.
 
 ## Restart behavior
@@ -102,16 +106,23 @@ Single default `compose` bridge network. `web` and `scheduler` both reach `db` b
 
 ## Reverse proxy / TLS
 
-- Not bundled in `compose.yaml` — TLS termination and the reverse proxy are treated as an environment-specific decision (a host-level Caddy/Nginx/Traefik instance, a cloud load balancer, or a VPN tunnel for fully private single-user use) rather than another moving part in this project's own compose file.
-- **Important, and already flagged in the audit (AUD-003):** the in-memory rate limiter trusts `request.client.host` directly with no `X-Forwarded-For` awareness. Until that is fixed (deferred, security-relevant, reserved for Codex review), a reverse proxy in front of this app makes the rate limiter effectively see one client (the proxy) for all real users. Acceptable for a private, low-traffic, single-user/small-team deployment; **not** acceptable for public exposure.
+- Not bundled in `compose.yaml` — TLS termination and the reverse proxy are an environment-specific decision. The approved initial topology is `Internet -> host nginx -> 127.0.0.1:WEB_PORT -> FastAPI`.
+- **Client identity (Stage 13A, AUD-003 resolved):** the container runs Uvicorn with `--no-proxy-headers`, so Uvicorn never rewrites the client address (its own default would trust `127.0.0.1` and any `FORWARDED_ALLOW_IPS` from the environment). The application alone decides proxy trust (`app/security/client_identity.py`):
+  - `TRUSTED_PROXY_IPS` (comma-separated **literal** IPs, no CIDR, no host names) is **empty by default** — then every forwarding header is ignored and rate limiting keys on the TCP peer.
+  - Only when the immediate peer is a listed address is exactly one header read: `X-Real-IP`, holding exactly one bare IP literal. Missing, repeated, list/comma, padded, port, IPv6-zone or malformed values fall back to the peer (one shared bucket — degraded, never spoofable). `X-Forwarded-For` and `Forwarded` are never interpreted.
+- **nginx contract:** nginx must **overwrite** the header with the real remote address, never pass through client-supplied content:
+  ```nginx
+  proxy_set_header X-Real-IP $remote_addr;
+  ```
+- **Configuring the trusted peer (do not guess it):** with Docker's port publishing, FastAPI may see a Docker gateway/NAT address rather than `127.0.0.1` for host-nginx traffic. Do **not** guess that address and do **not** list a Docker subnet. First observe the actual immediate peer of proxied requests in the intended deployment (for example from a temporary debug log of `request.client.host` on one test request), confirm it is inside the local-host trust boundary (only host nginx can originate from it), then set `TRUSTED_PROXY_IPS` to exactly that one address. An invalid entry makes the app refuse to start.
 
 ## Rate-limit implications
 
-See AUD-003/AUD-004/AUD-005 in the audit. Practical guidance for this deployment: keep the app behind a VPN or IP-allowlist rather than the open internet until the proxy-aware rate limiting fix lands, and run exactly one `web` replica (`--workers 1`, one container) so the configured rate limits mean what their numbers say.
+Limits are per process (AUD-004, accepted for the initial topology): run exactly one `web` replica (`--workers 1`, one container; the fixed host-port mapping also makes `--scale web=2` fail) so the configured limits mean what their numbers say. Behind a proxy, buckets are per real client only once `TRUSTED_PROXY_IPS` names that proxy (see above); until then all proxied clients share the proxy's bucket. Rate limiting still runs after API-key auth (HARD-015) and the key comparison is not constant-time (AUD-006) — acceptable only because the API has no direct network exposure (loopback bind); keep it that way.
 
 ## Scaling limitations (explicit, honest)
 
 - **Not multi-worker safe today** (AUD-004): stay at `--workers 1` / one `web` container.
-- **Not designed for public internet exposure today** (AUD-002, AUD-003, AUD-006): keep it behind a private network / VPN / allowlist.
+- **Not designed for direct public internet exposure** (HARD-015, AUD-006): the API is loopback-only by default; expose it only through the reverse proxy described above.
 - **PostgreSQL production use is not yet field-tested by the author** (AUD-011) — CI proves migrations and concurrency correctness, but this compose target has not yet run as a long-lived production workload; treat an initial rollout as monitored, not "fire and forget."
 - The `scheduler` service must never be scaled beyond 1 replica — DB-level lease/CAS makes extra instances merely redundant rather than harmful, but there's no reason to run more than one.

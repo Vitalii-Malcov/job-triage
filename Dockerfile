@@ -26,4 +26,10 @@ USER appuser
 EXPOSE 8000
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Stage 13A: --no-proxy-headers -- Uvicorn must never rewrite the client
+# address from X-Forwarded-For (its default trusts 127.0.0.1 and whatever
+# FORWARDED_ALLOW_IPS says, and compose passes the whole .env through). The
+# application alone decides proxy trust: app/security/client_identity.py.
+# --workers 1: the in-process rate limiter and the Telegram poller assume
+# exactly one web worker (docs/DEPLOYMENT.md).
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]

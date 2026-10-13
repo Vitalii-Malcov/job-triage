@@ -1,3 +1,4 @@
+import ipaddress
 from functools import lru_cache
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -90,6 +91,13 @@ class Settings(BaseSettings):
     # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-006.
     rate_limit_requests: int = Field(default=60, ge=1)
     rate_limit_window_seconds: int = Field(default=60, ge=1)
+    # Stage 13A: comma-separated LITERAL IP addresses of reverse proxies whose
+    # `X-Real-IP` header may name the client for rate limiting (see
+    # app/security/client_identity.py). Empty by default -- no forwarding
+    # header is ever trusted. No CIDR ranges and no hostnames: the operator
+    # observes the actual immediate peer of the proxied traffic first and
+    # lists exactly that address (docs/DEPLOYMENT.md "Reverse proxy").
+    trusted_proxy_ips: str = ""
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -375,6 +383,31 @@ class Settings(BaseSettings):
     # disagree about what the "real" value is — Settings never applies
     # casefold itself, since gmail_username is also the literal IMAP LOGIN
     # credential, not just an identity key.
+    @field_validator("trusted_proxy_ips")
+    @classmethod
+    def _validate_trusted_proxy_ips(cls, value: str) -> str:
+        # Normalized, de-duplicated, order-preserving. An invalid entry fails
+        # Settings() construction -- never silently dropped (a typo must not
+        # quietly mean "trust nothing" or "trust something else").
+        normalized: list[str] = []
+        for raw in value.split(","):
+            entry = raw.strip()
+            if not entry:
+                continue
+            try:
+                address = ipaddress.ip_address(entry)
+            except ValueError:
+                raise ValueError("must be literal IP addresses separated by commas") from None
+            if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+                raise ValueError("must not contain IPv6 zone identifiers")
+            if str(address) not in normalized:
+                normalized.append(str(address))
+        return ",".join(normalized)
+
+    @property
+    def trusted_proxy_ip_set(self) -> frozenset[str]:
+        return frozenset(entry for entry in self.trusted_proxy_ips.split(",") if entry)
+
     @field_validator("gmail_username")
     @classmethod
     def _validate_gmail_username(cls, value: str) -> str:

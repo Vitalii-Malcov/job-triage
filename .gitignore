@@ -3,6 +3,11 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .env
+# Stage 13A: every local env variant (e.g. .env.before-stage11 credential
+# backups) stays untracked; only the committed templates are trackable.
+.env.*
+!.env.example
+!.env.stage10.example
 .idea/
 .vscode/
 coverage.xml

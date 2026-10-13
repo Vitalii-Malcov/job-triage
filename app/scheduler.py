@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+from app.core.startup_diagnostics import log_startup_safety_state
 from app.services.scheduler import (
     SchedulerConfigurationError,
     run_due_cycle_if_claimed,
@@ -250,6 +251,7 @@ def main() -> int:
         # container. Still logs the same informative message; an operator
         # inspecting `docker compose logs scheduler` sees the same signal
         # as before, the container just stays "Up" instead of "Exited (0)".
+        log_startup_safety_state(settings, process="scheduler")
         logger.info("automation_scheduler_disabled")
         print(
             "Automation scheduler and Telegram daily digest are both disabled "
@@ -271,6 +273,9 @@ def main() -> int:
         print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
 
+    # Stage 13A: logged only once the settings are known-valid, so a
+    # configuration-error exit stays a single sanitized error line.
+    log_startup_safety_state(settings, process="scheduler")
     return _run_until_shutdown(_poll_loop(settings))
 
 
