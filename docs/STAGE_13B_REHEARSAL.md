@@ -86,15 +86,22 @@ curl -fsS -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/api/v1/candidate-profil
 
 ## 7. PostgreSQL backup and restore
 
+The exact commands (bash and PowerShell) live in **one** place, `docs/RUNBOOK.md` → *Backup* and
+*Restore*, so the rehearsal and the operational procedure cannot drift apart. Their invariants:
+
+- `pg_dump -F c` runs inside the `db` container via a single-quoted `sh -c`, so `POSTGRES_USER` /
+  `POSTGRES_DB` are expanded by the **container** (Compose sets them there from `.env`; it does not
+  export them into the host shell). No password is passed or printed.
+- The dump is written to the container's `/tmp`, copied by `docker compose cp` **directly** into
+  the private `BACKUP_DIR` outside the repository (the commands refuse a `BACKUP_DIR` that resolves
+  inside it), then the container's `/tmp` copy is removed. Record size + SHA-256.
+- Restore copies the dump from that same external `BACKUP_DIR` into the container and runs
+  `createdb` + `pg_restore --no-owner --exit-on-error` there, into a brand-new, empty
+  `restore_check` database — never over a live one.
+
+Then verify `restore_check`: `alembic current` == `alembic heads`, `/ready`, and
+
 ```bash
-# backup (custom format), stored OUTSIDE the repository; record size + SHA-256
-docker compose exec db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F c -f /tmp/jobtriage.dump
-docker compose cp db:/tmp/jobtriage.dump "$BACKUP_DIR/jobtriage-$(date +%Y%m%d%H%M%S).dump"
-sha256sum "$BACKUP_DIR"/jobtriage-*.dump
-# restore ONLY into a brand-new, empty database (never over a live one)
-createdb ... restore_check
-pg_restore --no-owner --exit-on-error -d restore_check "$BACKUP_DIR/jobtriage-<stamp>.dump"
-# verify: alembic current == alembic heads, /ready, and
 TRANSFER_SOURCE_DATABASE_URL=<archive sqlite> TRANSFER_TARGET_DATABASE_URL=<restore_check> \
     python -m scripts.candidate_profile_transfer_stage13b compare
 ```

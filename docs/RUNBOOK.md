@@ -114,27 +114,96 @@ docker compose logs web | grep -o '{.*}' | jq 'select(.level=="ERROR")'
 
 ## Backup
 
+A dump contains the candidate's personal data **unencrypted**. It is written to a private
+directory **outside the repository** and never anywhere under the working tree (`.gitignore` is
+not the protection — the file must not exist in the repository filesystem at all). The commands
+below refuse to run if `BACKUP_DIR` resolves inside the repository.
+
+`POSTGRES_USER` / `POSTGRES_DB` are expanded **inside the `db` container** (single-quoted
+`sh -c`), where Compose has set them from `.env`. Compose does *not* export `.env` into your host
+shell, so a host-side `$POSTGRES_USER` would be empty or wrong. No password is involved: `pg_dump`
+connects over the container's local socket.
+
+Linux / macOS (bash):
+
 ```bash
-docker compose exec db pg_dump -U ${POSTGRES_USER:-jobtriage} -d ${POSTGRES_DB:-jobtriage} -F c -f /tmp/backup.dump
-docker compose cp db:/tmp/backup.dump ./backup-$(date +%Y%m%d).dump
+BACKUP_DIR="$HOME/job-triage-backups"          # private, OUTSIDE the repository
+mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+REPO_REAL="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
+BACKUP_REAL="$(cd "$BACKUP_DIR" && pwd -P)"
+case "$BACKUP_REAL/" in
+  "$REPO_REAL/"*) echo "refusing: BACKUP_DIR is inside the repository" >&2 ;;
+  *)
+    STAMP="$(date +%Y%m%d%H%M%S)"
+    docker compose exec -T db sh -c \
+        'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F c -f /tmp/jobtriage.dump' &&
+    docker compose cp db:/tmp/jobtriage.dump "$BACKUP_REAL/jobtriage-$STAMP.dump" &&
+    docker compose exec -T db rm -f /tmp/jobtriage.dump &&
+    ls -l "$BACKUP_REAL/jobtriage-$STAMP.dump" &&
+    sha256sum "$BACKUP_REAL/jobtriage-$STAMP.dump"
+    ;;
+esac
 ```
 
-Schedule this externally (cron, orchestrator-native backup) — no in-app backup mechanism exists or is planned.
+Windows (PowerShell 5.1 — run from the repository root so `git rev-parse` resolves it; the inner
+command has no embedded double quotes because PowerShell 5.1 mangles them when calling `docker`):
 
-Keep dumps **outside the repository** (they contain the candidate's personal data) and record each dump's size and SHA-256.
+```powershell
+$BackupDir = Join-Path $env:LOCALAPPDATA 'job-triage-backups'   # private, OUTSIDE the repository
+New-Item -ItemType Directory -Force $BackupDir | Out-Null
+$RepoReal = (Resolve-Path (git rev-parse --show-toplevel)).Path.TrimEnd('\') + '\'
+$BackupReal = (Resolve-Path $BackupDir).Path.TrimEnd('\')
+if (($BackupReal + '\').StartsWith($RepoReal, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'refusing: BACKUP_DIR is inside the repository'
+}
+$Dump = Join-Path $BackupReal ("jobtriage-{0}.dump" -f (Get-Date -Format yyyyMMddHHmmss))
+docker compose exec -T db sh -c 'pg_dump -U $POSTGRES_USER -d $POSTGRES_DB -F c -f /tmp/jobtriage.dump'
+if ($LASTEXITCODE -ne 0) { throw 'pg_dump failed' }
+docker compose cp db:/tmp/jobtriage.dump $Dump
+if ($LASTEXITCODE -ne 0) { throw 'copy out of the container failed' }
+docker compose exec -T db rm -f /tmp/jobtriage.dump
+Get-Item $Dump | Select-Object FullName, Length
+Get-FileHash -Algorithm SHA256 $Dump
+```
+
+Schedule this externally (cron, Task Scheduler, orchestrator-native backup) — no in-app backup
+mechanism exists or is planned. Record each dump's size and SHA-256.
 
 ## Restore
 
-Rehearsed end to end in Stage 13B (`docs/STAGE_13B_REHEARSAL.md` section 7):
+Rehearsed end to end in Stage 13B (`docs/STAGE_13B_REHEARSAL.md` section 7). Always into a
+**brand-new, empty** database — never over the live one, never `pg_restore --clean` against a live
+database. The dump is read from the same private `BACKUP_DIR` outside the repository; the user is
+again expanded inside the container.
+
+Linux / macOS (bash):
 
 ```bash
-# into a BRAND-NEW, empty database -- never over the live one:
-docker compose cp ./backup-YYYYMMDD.dump db:/tmp/restore.dump
-docker compose exec db createdb -U ${POSTGRES_USER:-jobtriage} restore_check
-docker compose exec db pg_restore -U ${POSTGRES_USER:-jobtriage} -d restore_check --no-owner --exit-on-error /tmp/restore.dump
+DUMP="$HOME/job-triage-backups/jobtriage-<stamp>.dump"   # from BACKUP_DIR, OUTSIDE the repository
+docker compose cp "$DUMP" db:/tmp/restore.dump &&
+docker compose exec -T db sh -c 'createdb -U "$POSTGRES_USER" restore_check' &&
+docker compose exec -T db sh -c \
+    'pg_restore -U "$POSTGRES_USER" -d restore_check --no-owner --exit-on-error /tmp/restore.dump'
+docker compose exec -T db rm -f /tmp/restore.dump
 ```
 
-Then verify before switching anything to it: `alembic current` equals `alembic heads` against `restore_check`, `/api/v1/ready` is 200 when pointed at it, and `python -m scripts.candidate_profile_transfer_stage13b compare` (source = the archived SQLite pilot or the previous database, target = `restore_check`) reports PASS. Never use `pg_restore --clean` against a live database.
+Windows (PowerShell 5.1):
+
+```powershell
+$Dump = Join-Path $env:LOCALAPPDATA 'job-triage-backups\jobtriage-<stamp>.dump'   # OUTSIDE the repository
+docker compose cp $Dump db:/tmp/restore.dump
+if ($LASTEXITCODE -ne 0) { throw 'copy into the container failed' }
+docker compose exec -T db sh -c 'createdb -U $POSTGRES_USER restore_check'
+if ($LASTEXITCODE -ne 0) { throw 'createdb failed (restore_check must not already exist)' }
+docker compose exec -T db sh -c 'pg_restore -U $POSTGRES_USER -d restore_check --no-owner --exit-on-error /tmp/restore.dump'
+if ($LASTEXITCODE -ne 0) { throw 'pg_restore failed' }
+docker compose exec -T db rm -f /tmp/restore.dump
+```
+
+Then verify before switching anything to it: `alembic current` equals `alembic heads` against
+`restore_check`, `/api/v1/ready` is 200 when pointed at it, and
+`python -m scripts.candidate_profile_transfer_stage13b compare` (source = the archived SQLite pilot
+or the previous database, target = `restore_check`) reports PASS.
 
 ## SQLite pilot → PostgreSQL cutover (Stage 13B)
 
