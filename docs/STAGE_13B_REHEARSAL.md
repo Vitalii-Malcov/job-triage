@@ -1,6 +1,6 @@
 # Stage 13B — SQLite pilot archive, CandidateProfile transfer, PostgreSQL rehearsal
 
-Stage 13B moves JobTriage from the SQLite pilot database to the production PostgreSQL topology (`docs/DEPLOYMENT.md`) **without importing historical runtime or outbound state**. It performs no employer-facing action and contacts no external provider (Gmail, SMTP, XING, Bundesagentur, Telegram). `OUTBOUND_SENDING_ENABLED` and `TELEGRAM_GMAIL_DRAFT_ENABLED` stay `false` throughout. Stage 13C (controlled live pilot) is separate and not started here.
+Stage 13B moves JobTriage from the SQLite pilot database to the production PostgreSQL topology (`docs/DEPLOYMENT.md`) **without importing historical runtime or outbound state**. It performs no employer-facing action and contacts no external provider (Gmail, SMTP, XING, Bundesagentur, Telegram). `OUTBOUND_SENDING_ENABLED` and `TELEGRAM_GMAIL_DRAFT_ENABLED` stay `false` throughout. The remaining stages are separate and not started here: Stage 13C (real Gmail draft validation, using a separate non-production Gmail mailbox first) and Stage 13D (controlled live pilot).
 
 Tooling: `scripts/candidate_profile_transfer_stage13b.py` (operator CLI) on top of `app/services/candidate_profile_transfer.py` (snapshot format, validation, import, comparison).
 
@@ -108,7 +108,7 @@ Sending email, creating Gmail drafts, reading/writing real Gmail, running the XI
 ## 9. Rollback
 
 - Before PostgreSQL goes live: discard the PostgreSQL database and re-run the procedure; the SQLite pilot and its archive are untouched.
-- After go-live: restore the latest `pg_dump` into a fresh database (section 7). Returning to SQLite means pointing `DATABASE_URL` back at a **copy** of the archive (never the archive itself) — any PostgreSQL-era state is then lost by construction, which is why the cutover happens before Stage 13C produces any new operational state.
+- After go-live: restore the latest `pg_dump` into a fresh database (section 7). Returning to SQLite means pointing `DATABASE_URL` back at a **copy** of the archive (never the archive itself) — any PostgreSQL-era state is then lost by construction, which is why the cutover happens before Stage 13C (real Gmail draft validation) or Stage 13D (controlled live pilot) produces any new operational state.
 
 ## 10. Rehearsal evidence (2026-10-13, local, real pilot)
 
