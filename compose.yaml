@@ -66,8 +66,17 @@ services:
       # .env.example's own OUTBOUND_SENDING_ENABLED comment for the
       # "must stay false outside a deliberate, reviewed send path" rule.
       OUTBOUND_SENDING_ENABLED: "false"
+      # Stage 13A (Codex P2-03): the Stage 9D Gmail-draft APPEND stays off in
+      # this deployment regardless of .env until the real-Gmail validation
+      # gate (Stage 13C) has passed -- same explicit fail-closed pin as above.
+      TELEGRAM_GMAIL_DRAFT_ENABLED: "false"
+    # Stage 13A: loopback only. The approved topology is
+    # Internet -> host nginx -> 127.0.0.1:WEB_PORT -> FastAPI; nothing else on
+    # the network can reach the API directly. If nginx ever moves inside
+    # Docker, use an internal network and drop this published port instead.
+    # PostgreSQL is never published.
     ports:
-      - "${WEB_PORT:-8000}:8000"
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
     # Stage 13A: readiness, not liveness -- /api/v1/ready returns 503 (so
     # urlopen raises) unless the database answers and its Alembic revision
     # is exactly the image's head; the check itself is bounded well inside
@@ -127,6 +136,9 @@ services:
       # too so it can never silently default differently from `web` if
       # that ever changes.
       OUTBOUND_SENDING_ENABLED: "false"
+      # Stage 13A: see the `web` service's TELEGRAM_GMAIL_DRAFT_ENABLED
+      # comment -- pinned here too so the two services can never diverge.
+      TELEGRAM_GMAIL_DRAFT_ENABLED: "false"
 
 volumes:
   pgdata:

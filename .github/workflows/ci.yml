@@ -141,6 +141,7 @@ jobs:
             tests/integration/test_gmail_application_draft_postgres.py \
             tests/integration/test_gmail_alias_dedup_postgres.py \
             tests/integration/test_live_send_uniqueness_postgres.py \
+            tests/integration/test_readiness_postgres.py \
             tests/integration/test_gmail_mailbox_width_postgres.py \
             tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py

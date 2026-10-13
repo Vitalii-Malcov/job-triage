@@ -17,7 +17,7 @@ docker compose up -d web
 docker compose --profile scheduler up -d scheduler
 ```
 
-Verify: `curl http://localhost:8000/api/v1/health` → `{"status": "ok"}`. Note this does **not** confirm DB connectivity (AUD-002) — also check `docker compose logs web` for a clean startup with no `OperationalError`.
+Verify: `curl http://127.0.0.1:8000/api/v1/ready` → `{"status":"ready"}` (database reachable and schema exactly at head; `503 {"status":"not_ready"}` otherwise, with the reason category in `docker compose logs web` as `readiness_not_ready reason=...`). `/api/v1/health` only proves the process is up. Also check the `startup_safety_state` log line shows `outbound_sending_enabled=false telegram_gmail_draft_enabled=false alembic_auto_upgrade=false`.
 
 ## Database migration (after pulling new code)
 
@@ -67,7 +67,7 @@ If `alembic upgrade head` fails:
 
 ## Database unavailable
 
-- `web` will fail its healthcheck (once AUD-002's dependency-aware health check is implemented — until then, the app returns 500s on any DB-touching route while `/health` still reports "ok").
+- `web` turns unhealthy: `/api/v1/ready` returns 503 (`readiness_not_ready reason=database_unavailable` in the logs) while `/api/v1/health` still reports "ok" — the process is alive, its dependency is not.
 - Check: `docker compose ps db`, `docker compose logs db`.
 - If `db` container is unhealthy: check disk space (`docker system df`), check the `pgdata` volume isn't corrupted, check Postgres logs for the actual startup error.
 - `web`/`scheduler` do not currently retry DB connection failures beyond SQLAlchemy's pool behavior — restart them (`docker compose restart web`) once `db` is confirmed healthy again.

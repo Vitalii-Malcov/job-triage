@@ -17,3 +17,4 @@ docs
 *.db
 *.db-journal
 .env
+.env.*

@@ -4,7 +4,7 @@ This document explains what the application actually enforces in code, what it a
 
 ## API authentication
 
-**Implemented:** every protected route requires `X-API-Key` matching the configured `API_KEY` (`app/security/auth.py::require_api_key`). An unset `API_KEY` fails **closed** — every request is rejected, never defaults to "no auth" (`app/core/config.py`). `/health` is intentionally unauthenticated (it reveals nothing sensitive).
+**Implemented:** every protected route requires `X-API-Key` matching the configured `API_KEY` (`app/security/auth.py::require_api_key`). An unset `API_KEY` fails **closed** — every request is rejected, never defaults to "no auth" (`app/core/config.py`). `/health` (liveness) and `/ready` (readiness) are intentionally unauthenticated — they return only a fixed status word, never a revision, reason or error text.
 
 **Deployment responsibility:** TLS termination (the API key travels in a header — must not be sent over plaintext HTTP in any real deployment); rotating the key (see `docs/RUNBOOK.md`).
 
@@ -16,10 +16,12 @@ This document explains what the application actually enforces in code, what it a
 
 **Deployment responsibility:** this in-memory design is only meaningful under a **single FastAPI worker process** (`--workers 1`) — see `docs/DEPLOYMENT.md`. It is the deployment's job to not scale `web` horizontally until a shared store replaces it.
 
-**Known limitations (not fixed in this session, security-relevant, reserved for Codex review):**
-- No `X-Forwarded-For` awareness — behind a reverse proxy, all clients collapse to one bucket (AUD-003).
-- Not multi-worker safe — effective limit multiplies by worker count if ever scaled (AUD-004).
-- Per-host bucket dictionaries grow unbounded for the life of the process (AUD-005) — low priority for a private, low-traffic deployment.
+**Client identity (Stage 13A):** buckets key on `app.security.client_identity.resolve_client_identity` — the TCP peer, unless that peer is listed in `TRUSTED_PROXY_IPS` (literal IPs, empty by default), in which case exactly one `X-Real-IP` header holding one bare IP names the client. Anything else falls back to the peer; forwarding headers from an untrusted peer are ignored entirely. Uvicorn runs with `--no-proxy-headers`, so it never rewrites the peer itself. Contract and operator steps: `docs/DEPLOYMENT.md` "Reverse proxy / TLS".
+
+**Known limitations:**
+- Not multi-worker safe — effective limit multiplies by worker count if ever scaled (AUD-004); accepted for the single-worker topology.
+- Rate limiting runs after auth, so invalid-key attempts are not rate-limited (HARD-015); acceptable only while the API is loopback-only.
+- Per-host bucket dictionaries are swept once they exceed a threshold (HARD-001; AUD-005 resolved).
 
 ## Trusted vs. untrusted job data
 

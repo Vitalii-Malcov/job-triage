@@ -8,10 +8,10 @@ Complexity: **S** (< 1 hour), **M** (< 1 day), **L** (multi-day), **XL** (needs 
 |---|---|---|---|---|---|
 | TD-001 | `app/api/routes.py` centralized exception→HTTP translation (≥12 confirmed duplicate blocks of 85) | P2 | Maintainability/consistency drift risk, no current runtime bug | L | Codex (explicitly reserved) |
 | TD-002 | Individually-reviewed decomposition of `run_xing` (259 LOC), `run_bundesagentur` (206), `prepare_shortlist_drafts` (213), `send_follow_up` (205) | P3 | Maintenance/review cost; `send_follow_up` touches the send-safety boundary | XL | Codex, and likely Astra for `send_follow_up` |
-| TD-003 | In-memory rate limiter: no `X-Forwarded-For` trust behind reverse proxy | P1 | Rate limiting becomes ineffective once proxied (AUD-003) | M | Codex (security-relevant) |
+| TD-003 | In-memory rate limiter: no `X-Forwarded-For` trust behind reverse proxy | P1 | Rate limiting becomes ineffective once proxied (AUD-003) | M | **RESOLVED Stage 13A** — explicit one-hop `X-Real-IP` trust via `TRUSTED_PROXY_IPS` (default empty), Uvicorn `--no-proxy-headers` (`app/security/client_identity.py`) |
 | TD-004 | In-memory rate limiter: not multi-worker safe | P1 | Effective limit multiplies by worker count if scaled (AUD-004) | L (needs shared store, e.g. Redis) | Codex |
-| TD-005 | Rate limiter host-key dict growth is unbounded | P2 | Slow memory growth on long-lived, publicly-hit processes (AUD-005) | S | Codex |
-| TD-006 | `/health` does not check DB connectivity | P1 | False-positive health signal (AUD-002) | M (public API shape change) | Codex |
+| TD-005 | Rate limiter host-key dict growth is unbounded | P2 | Slow memory growth on long-lived, publicly-hit processes (AUD-005) | S | **RESOLVED** (HARD-001 sweep eviction) |
+| TD-006 | `/health` does not check DB connectivity | P1 | False-positive health signal (AUD-002) | M (public API shape change) | **RESOLVED Stage 13A** — `/health` stays liveness; new bounded read-only `/api/v1/ready` is the compose healthcheck (`app/services/readiness.py`) |
 | TD-007 | API key comparison uses `!=` not `hmac.compare_digest` | P2 | Theoretical timing side-channel (AUD-006) | S | Codex (touches auth boundary) |
 | TD-008 | No correlation/request ID in logs | P2 | Harder multi-line request tracing at scale (AUD-010) | M | Manual/Claude (low risk) |
 | TD-009 | No startup diagnostics log line | P3 | Minor operational friction (AUD-009) | S | Manual/Claude |
@@ -30,7 +30,7 @@ Complexity: **S** (< 1 hour), **M** (< 1 day), **L** (multi-day), **XL** (needs 
 | TD-022 | Bundesagentur collector: `url` fallback has same fingerprint-instability structure as the (already-fixed) `title` bug | P2 | Possible duplicate `JobRecord` inserts if `externeURL` intermittently present/absent | M | Codex (needs live-data-driven audit, per existing note) |
 | TD-023 | XING mailbox uses full-access IMAP App Password, not an isolated mailbox | P2 | Broader blast radius than needed if credential leaks | L (needs dedicated mailbox + migration) | Manual/operational — explicitly NOT to be fixed opportunistically |
 | TD-024 | PostgreSQL not yet field-tested in a real long-running production deployment | P2 | Unknown-unknowns from sustained real-world load (AUD-011) | — (operational, not code) | Manual operational verification |
-| TD-025 | No health-check/readiness depth beyond a static `/health` | P1 | Same root cause as TD-006 | M | Codex |
+| TD-025 | No health-check/readiness depth beyond a static `/health` | P1 | Same root cause as TD-006 | M | **RESOLVED Stage 13A** — see TD-006 |
 | TD-026 | No backup/restore automation (procedure documented, not automated) | P2 | Manual step, human-error-prone | M | Manual/Claude (could script `docs/RUNBOOK.md`'s procedure later) |
 | TD-027 | Dependency reproducibility: no upper Python version bound, ranged (not pinned) dependencies | P3 | Low risk given CI pins 3.13 and Docker image pins `python:3.13-slim` | S | Manual (deliberately not touching `pyproject.toml`) |
 | TD-028 | `app/scheduler.py` had no SIGTERM handler | P2 | Ungraceful container shutdown (log noise only, correctness preserved by lease design) | S | **FIXED this branch** (AUD-008) |

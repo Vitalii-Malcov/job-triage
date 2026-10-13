@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+from app.core.startup_diagnostics import log_startup_safety_state
 from app.services.scheduler import (
     SchedulerConfigurationError,
     run_due_cycle_if_claimed,
@@ -236,6 +237,8 @@ def main() -> int:
         logger.error("automation_scheduler_configuration_error error_type=%s", type(exc).__name__)
         print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
         return 1
+
+    log_startup_safety_state(settings, process="scheduler")
 
     # S8E: the worker starts its poll loop if EITHER the automation
     # cycle OR the daily Telegram digest is enabled -- neither implies
