@@ -192,13 +192,24 @@ def is_current_response_draft_revision(
     human regenerates and reviews the current revision instead. Pure reads
     only -- never generates anything.
     """
-    if draft.generator_version != RESPONSE_DRAFT_GENERATOR_VERSION:
+    current_profile_version, current_generator_version = current_response_draft_identity(db)
+    if draft.generator_version != current_generator_version:
         return False
     latest_analysis = get_latest_analysis_for_message(db, account_key, draft.gmail_message_id)
     if latest_analysis is None or latest_analysis.id != draft.analysis_id:
         return False
-    current_profile_version, _name = _derive_candidate_profile_facts(get_candidate_profile(db))
     return draft.candidate_profile_version == current_profile_version
+
+
+def current_response_draft_identity(db: Session) -> tuple[int, str]:
+    """Stage 12: `(candidate_profile_version, generator_version)` a draft
+    generated RIGHT NOW would carry -- the message-independent half of
+    `is_current_response_draft_revision`'s identity (the other half is the
+    message's latest analysis). Shared with the pending queue so both use
+    one definition of "current". Pure read.
+    """
+    current_profile_version, _name = _derive_candidate_profile_facts(get_candidate_profile(db))
+    return current_profile_version, RESPONSE_DRAFT_GENERATOR_VERSION
 
 
 def generate_response_draft_for_message(

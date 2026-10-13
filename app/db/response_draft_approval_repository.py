@@ -33,9 +33,9 @@ for the full rationale.
 
 from datetime import UTC, datetime
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import and_, case, exists, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.db.models import (
     LIVE_SEND_STATUSES,
@@ -393,23 +393,63 @@ PENDING_RESPONSE_DRAFTS_MAX_LIMIT = 100
 
 
 def list_pending_response_drafts(
-    db: Session, account_key: str, *, limit: int, offset: int
+    db: Session,
+    account_key: str,
+    *,
+    current_candidate_profile_version: int,
+    current_generator_version: str,
+    limit: int,
+    offset: int,
 ) -> list[tuple[ResponseDraftRecord, str | None, str | None]]:
     """Stage 12: the human-decision queue -- for each inbound message, its
-    NEWEST draft revision (highest id) when that revision is PROPOSED, has
-    no decision yet, and the message has no live (PENDING/SENT/UNCERTAIN)
-    send from any revision. Returns `(draft, match_type, match_confidence)`
+    REPRESENTATIVE draft revision when that revision is PROPOSED, has no
+    decision yet, and the message has no live (PENDING/SENT/UNCERTAIN) send
+    from any revision. Returns `(draft, match_type, match_confidence)`
     newest first, bounded by `limit`/`offset`. Pure, account-scoped SELECT
-    -- never generates, decides or sends anything. The newest revision is
-    not necessarily the CURRENT one (see
-    `app.services.response_draft.is_current_response_draft_revision`); the
-    service layer reports that per item rather than hiding the message.
+    -- never generates, decides or sends anything.
+
+    S12-001 (Codex review): the representative is the message's CURRENT
+    revision whenever one exists -- the same identity
+    `app.services.response_draft.is_current_response_draft_revision` uses
+    (latest analysis by (`analysis_version`, `id`), plus the caller-supplied
+    `current_candidate_profile_version` / `current_generator_version`), so
+    a stale revision inserted LATER (higher id, e.g. by a worker that read
+    an older candidate profile) can never hide it. The draft identity
+    UNIQUE constraint makes the current revision unique per message. Only
+    when NO current revision exists does it fall back to the highest-id
+    revision, which the service reports with `is_current_revision=False`
+    so the human knows to regenerate.
     """
-    newest_per_message = (
-        select(func.max(ResponseDraftRecord.id))
-        .where(ResponseDraftRecord.account_key == account_key)
-        .group_by(ResponseDraftRecord.gmail_message_id)
+    draft = aliased(ResponseDraftRecord)
+    analysis = aliased(GmailMessageAnalysisRecord)
+    latest_analysis_id = (
+        select(analysis.id)
+        .where(
+            analysis.account_key == account_key,
+            analysis.gmail_message_id == draft.gmail_message_id,
+        )
+        .order_by(analysis.analysis_version.desc(), analysis.id.desc())
+        .limit(1)
+        .correlate(draft)
+        .scalar_subquery()
     )
+    is_current = and_(
+        draft.generator_version == current_generator_version,
+        draft.candidate_profile_version == current_candidate_profile_version,
+        draft.analysis_id == latest_analysis_id,
+    )
+    per_draft = (
+        select(
+            draft.id.label("id"),
+            draft.gmail_message_id.label("gmail_message_id"),
+            case((is_current, draft.id)).label("current_id"),
+        )
+        .where(draft.account_key == account_key)
+        .subquery()
+    )
+    representative_per_message = select(
+        func.coalesce(func.max(per_draft.c.current_id), func.max(per_draft.c.id))
+    ).group_by(per_draft.c.gmail_message_id)
     has_decision = exists().where(
         ResponseDraftApprovalRecord.response_draft_id == ResponseDraftRecord.id,
         ResponseDraftApprovalRecord.account_key == account_key,
@@ -433,7 +473,7 @@ def list_pending_response_drafts(
         .where(
             ResponseDraftRecord.account_key == account_key,
             ResponseDraftRecord.status == "PROPOSED",
-            ResponseDraftRecord.id.in_(newest_per_message),
+            ResponseDraftRecord.id.in_(representative_per_message),
             ~has_decision,
             ~message_has_live_send,
         )

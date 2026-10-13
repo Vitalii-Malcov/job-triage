@@ -202,6 +202,35 @@ def _two_revisions(db, msg_id: int) -> tuple[ResponseDraftRecord, ResponseDraftR
     return old, new
 
 
+def _current_then_delayed_stale_draft(
+    db, msg_id: int, monkeypatch
+) -> tuple[ResponseDraftRecord, ResponseDraftRecord]:
+    """S12-001 race through the real generator: worker A snapshots the
+    candidate profile, the profile is edited, worker B generates the CURRENT
+    draft, then A resumes with its stale snapshot and inserts LATER."""
+    _bump_candidate_profile(db)
+    analyze_gmail_message(db, ACCOUNT, msg_id)
+    worker_a_snapshot = db.get(CandidateProfileRecord, 1)
+    db.refresh(worker_a_snapshot)
+    db.expunge(worker_a_snapshot)
+
+    _bump_candidate_profile(db)
+    current, created = generate_response_draft_for_message(db, ACCOUNT, msg_id)  # worker B
+    assert created
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            "app.services.response_draft.get_candidate_profile", lambda _db: worker_a_snapshot
+        )
+        stale, created = generate_response_draft_for_message(db, ACCOUNT, msg_id)  # worker A
+    assert created
+    assert stale.candidate_profile_version < current.candidate_profile_version
+    assert stale.analysis_id == current.analysis_id
+    assert is_current_response_draft_revision(db, ACCOUNT, current)
+    assert not is_current_response_draft_revision(db, ACCOUNT, stale)
+    return current, stale
+
+
 # --------------------------------------------------------------------------- currency
 
 
@@ -581,6 +610,59 @@ class TestPendingResponseDrafts:
         if pending:  # only PROPOSED drafts are listed
             assert pending[0].match_type == "AMBIGUOUS"
             assert pending[0].matched_job_id is None
+
+    def test_current_draft_wins_over_a_later_inserted_stale_draft(self, db, monkeypatch):
+        """S12-001 (Codex review): worker A reads the candidate profile,
+        pauses; the profile is edited and worker B creates the CURRENT
+        draft; A resumes and inserts its stale draft with a HIGHER id. The
+        queue must still list B, never A."""
+        _seed_job(db)
+        msg_id = _seed_inbound(db)
+        current, stale = _current_then_delayed_stale_draft(db, msg_id, monkeypatch)
+        assert stale.id > current.id  # insertion order is reversed vs. freshness
+
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError("listing must not generate")
+
+        monkeypatch.setattr("app.services.response_draft.generate_response_draft", _forbidden)
+        pending = get_pending_response_drafts(db, ACCOUNT, limit=20, offset=0)
+
+        assert [(p.response_draft_id, p.is_current_revision) for p in pending] == [
+            (current.id, True)
+        ]
+        # Regeneration resolves to the same current draft: the queue is not
+        # relying on a repair that can never happen.
+        monkeypatch.undo()
+        again, created = generate_response_draft_for_message(db, ACCOUNT, msg_id)
+        assert (again.id, created) == (current.id, False)
+
+    def test_decided_current_draft_is_not_replaced_by_a_later_stale_draft(self, db, monkeypatch):
+        _seed_job(db)
+        msg_id = _seed_inbound(db)
+        current, _stale = _current_then_delayed_stale_draft(db, msg_id, monkeypatch)
+        approve_or_reject_response_draft(db, ACCOUNT, current.id, "REJECTED", None)
+        assert get_pending_response_drafts(db, ACCOUNT, limit=20, offset=0) == []
+
+    def test_stale_only_message_falls_back_to_its_highest_id_revision(self, db):
+        _seed_job(db)
+        _old, newer = _two_revisions(db, _seed_inbound(db))
+        _bump_candidate_profile(db)  # neither revision is current any more
+        pending = get_pending_response_drafts(db, ACCOUNT, limit=20, offset=0)
+        assert [(p.response_draft_id, p.is_current_revision) for p in pending] == [
+            (newer.id, False)
+        ]
+
+    def test_race_message_pages_deterministically_by_listed_draft_id(self, db, monkeypatch):
+        _seed_job(db)
+        race_msg = _seed_inbound(db, uid=1)
+        current, _stale = _current_then_delayed_stale_draft(db, race_msg, monkeypatch)
+        later = _draft(db, _seed_inbound(db, uid=2))
+        _draft(db, _seed_inbound(db, uid=3, account_key=OTHER_ACCOUNT), account_key=OTHER_ACCOUNT)
+        first_page = get_pending_response_drafts(db, ACCOUNT, limit=1, offset=0)
+        second_page = get_pending_response_drafts(db, ACCOUNT, limit=1, offset=1)
+        assert [p.response_draft_id for p in first_page] == [later.id]
+        assert [p.response_draft_id for p in second_page] == [current.id]
+        assert get_pending_response_drafts(db, ACCOUNT, limit=1, offset=2) == []
 
     def test_listing_never_generates_decides_or_sends(self, db, monkeypatch):
         _seed_job(db)

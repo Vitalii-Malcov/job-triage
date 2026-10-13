@@ -158,7 +158,10 @@ from app.providers.email.outbound_base import (
     OutboundEmailProvider,
     OutboundMessage,
 )
-from app.services.response_draft import is_current_response_draft_revision
+from app.services.response_draft import (
+    current_response_draft_identity,
+    is_current_response_draft_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -604,7 +607,15 @@ def get_pending_response_drafts(
     `app.db.response_draft_approval_repository.list_pending_response_drafts`.
     Pure reads; `is_current_revision` is computed per returned item.
     """
-    rows = list_pending_response_drafts(db, account_key, limit=limit, offset=offset)
+    current_profile_version, current_generator_version = current_response_draft_identity(db)
+    rows = list_pending_response_drafts(
+        db,
+        account_key,
+        current_candidate_profile_version=current_profile_version,
+        current_generator_version=current_generator_version,
+        limit=limit,
+        offset=offset,
+    )
     return [
         PendingResponseDraft(
             response_draft_id=draft.id,
