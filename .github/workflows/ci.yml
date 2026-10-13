@@ -124,6 +124,10 @@ jobs:
       # schema is already at head (see the "Alembic upgrade head" step
       # above) -- are never affected by its own temporary downgrade.
       #
+      # Stage 13B: test_candidate_profile_transfer_postgres.py creates and
+      # drops its OWN databases on this server (fresh `alembic upgrade head`
+      # per test), so its position only has to precede HARD-008.
+      #
       # Every module here skips when TEST_POSTGRES_URL is unset, so the
       # step refuses to run without it and then fails on ANY skipped test:
       # a green job must mean every PostgreSQL test actually executed.
@@ -142,6 +146,7 @@ jobs:
             tests/integration/test_gmail_alias_dedup_postgres.py \
             tests/integration/test_live_send_uniqueness_postgres.py \
             tests/integration/test_readiness_postgres.py \
+            tests/integration/test_candidate_profile_transfer_postgres.py \
             tests/integration/test_gmail_mailbox_width_postgres.py \
             tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py

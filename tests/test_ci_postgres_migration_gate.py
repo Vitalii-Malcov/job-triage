@@ -92,12 +92,19 @@ def _step(job: str, name: str) -> str | None:
 
 
 def _pytest_targets(step: str) -> list[str]:
-    """The test module paths actually passed to `pytest` (comments ignored)."""
+    """The test module paths actually passed to `pytest`, read the way bash
+    reads them (Stage 13B): comments are stripped, then only a trailing `\\`
+    joins a line to the next one, and only the ONE logical line that starts
+    with `pytest` counts. A module listed after a line whose continuation
+    backslash is missing (or after a commented-out line, which also ends the
+    command in bash) is a separate shell command, not a pytest argument --
+    it is reported as not invoked instead of being picked up from the step
+    text as the previous, looser regex did."""
     code = "\n".join(line.split("#", 1)[0] for line in step.splitlines())
-    match = re.search(r"\bpytest\b(.*?)(?:\n\s*\n|\n\s*python\b|$)", code, re.S)
-    if match is None:
-        return []
-    return re.findall(r"tests/integration/[\w./-]+\.py", match.group(1))
+    for logical_line in re.sub(r"\\\n", " ", code).splitlines():
+        if re.match(r"\s*pytest\b", logical_line):
+            return re.findall(r"tests/integration/[\w./-]+\.py", logical_line)
+    return []
 
 
 def _zero_skip_checker(step: str) -> tuple[str, str] | None:
@@ -288,6 +295,40 @@ def test_deleting_a_required_module_invocation_fails(module: str) -> None:
 def test_commenting_out_a_required_module_fails(module: str) -> None:
     violations = _mutated(f"            {module} \\\n", f"            # {module} \\\n")
     assert f"required PostgreSQL module not invoked: {module}" in violations
+
+
+STAGE_13B_PG_MODULE = "tests/integration/test_candidate_profile_transfer_postgres.py"
+
+
+def test_stage_13b_transfer_module_is_wired_before_hard008() -> None:
+    targets = _pytest_targets(_step(_job_text(_workflow()), PYTEST_STEP_NAME))
+    assert STAGE_13B_PG_MODULE in _required()
+    assert targets.index(STAGE_13B_PG_MODULE) < targets.index(HARD_008_PG_MODULE)
+
+
+@pytest.mark.parametrize(
+    "module", [STAGE_9D_PG_MODULE, STAGE_13B_PG_MODULE], ids=["stage-9d", "stage-13b"]
+)
+def test_missing_line_continuation_backslash_is_rejected(module: str) -> None:
+    """Stage 13B: the previously observed weakness -- the old regex found every
+    module path anywhere in the step, so dropping one `\\` (which makes bash
+    end the pytest command there and run the next path as its own command)
+    still passed the guard. Every module after the break must now be
+    reported as not invoked."""
+    workflow = _workflow()
+    targets = _pytest_targets(_step(_job_text(workflow), PYTEST_STEP_NAME))
+    broken_line = f"            {module} \\\n"
+    violations = _mutated(broken_line, f"            {module}\n")
+    following = targets[targets.index(module) + 1 :]
+    assert following, "the mutation must cut modules off the pytest command"
+    for cut_off in following:
+        assert f"required PostgreSQL module not invoked: {cut_off}" in violations
+    assert f"required PostgreSQL module not invoked: {module}" not in violations
+
+
+def test_backslash_followed_by_a_space_is_not_a_continuation() -> None:
+    step = "run: |\n  pytest -q \\ \n    tests/integration/a_postgres.py\n"
+    assert _pytest_targets(step) == []
 
 
 def test_a_new_postgres_module_must_be_wired_into_ci() -> None:
