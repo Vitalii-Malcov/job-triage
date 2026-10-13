@@ -121,15 +121,24 @@ docker compose cp db:/tmp/backup.dump ./backup-$(date +%Y%m%d).dump
 
 Schedule this externally (cron, orchestrator-native backup) — no in-app backup mechanism exists or is planned.
 
-## Restore (concept)
+Keep dumps **outside the repository** (they contain the candidate's personal data) and record each dump's size and SHA-256.
+
+## Restore
+
+Rehearsed end to end in Stage 13B (`docs/STAGE_13B_REHEARSAL.md` section 7):
 
 ```bash
-# against a fresh/empty db container:
+# into a BRAND-NEW, empty database -- never over the live one:
 docker compose cp ./backup-YYYYMMDD.dump db:/tmp/restore.dump
-docker compose exec db pg_restore -U ${POSTGRES_USER:-jobtriage} -d ${POSTGRES_DB:-jobtriage} --clean --if-exists /tmp/restore.dump
+docker compose exec db createdb -U ${POSTGRES_USER:-jobtriage} restore_check
+docker compose exec db pg_restore -U ${POSTGRES_USER:-jobtriage} -d restore_check --no-owner --exit-on-error /tmp/restore.dump
 ```
 
-Always restore into a fresh/empty database, not over a live one with divergent state, unless you specifically intend to overwrite it (`--clean` drops existing objects first).
+Then verify before switching anything to it: `alembic current` equals `alembic heads` against `restore_check`, `/api/v1/ready` is 200 when pointed at it, and `python -m scripts.candidate_profile_transfer_stage13b compare` (source = the archived SQLite pilot or the previous database, target = `restore_check`) reports PASS. Never use `pg_restore --clean` against a live database.
+
+## SQLite pilot → PostgreSQL cutover (Stage 13B)
+
+CandidateProfile facts + provenance are the ONLY data carried over; the SQLite pilot is archived read-only and every other table starts empty in PostgreSQL. Never transfer the profile with `GET` → `PATCH` (it would upgrade absent trust to MANUAL_ENTRY/CONFIRMED). Full procedure, rationale and rehearsal evidence: `docs/STAGE_13B_REHEARSAL.md`.
 
 ## Credential rotation (IMAP/SMTP App Passwords, Bundesagentur key, Telegram token)
 

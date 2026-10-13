@@ -31,13 +31,16 @@ Complexity: **S** (< 1 hour), **M** (< 1 day), **L** (multi-day), **XL** (needs 
 | TD-023 | XING mailbox uses full-access IMAP App Password, not an isolated mailbox | P2 | Broader blast radius than needed if credential leaks | L (needs dedicated mailbox + migration) | Manual/operational — explicitly NOT to be fixed opportunistically |
 | TD-024 | PostgreSQL not yet field-tested in a real long-running production deployment | P2 | Unknown-unknowns from sustained real-world load (AUD-011) | — (operational, not code) | Manual operational verification |
 | TD-025 | No health-check/readiness depth beyond a static `/health` | P1 | Same root cause as TD-006 | M | **RESOLVED Stage 13A** — see TD-006 |
-| TD-026 | No backup/restore automation (procedure documented, not automated) | P2 | Manual step, human-error-prone | M | Manual/Claude (could script `docs/RUNBOOK.md`'s procedure later) |
+| TD-026 | No backup/restore automation (procedure documented, not automated) | P2 | Manual step, human-error-prone | M | Manual/Claude. **Stage 13B:** `pg_dump` -> restore into a fresh database rehearsed and semantically verified (`docs/STAGE_13B_REHEARSAL.md`); scheduling/retention is still manual |
 | TD-027 | Dependency reproducibility: no upper Python version bound, ranged (not pinned) dependencies | P3 | Low risk given CI pins 3.13 and Docker image pins `python:3.13-slim` | S | Manual (deliberately not touching `pyproject.toml`) |
 | TD-028 | `app/scheduler.py` had no SIGTERM handler | P2 | Ungraceful container shutdown (log noise only, correctness preserved by lease design) | S | **FIXED this branch** (AUD-008) |
 | TD-029 | No `pool_pre_ping`/pool sizing on the DB engine | P1 | Stale-connection errors after DB restarts under PostgreSQL | S | **FIXED this branch** (AUD-007) |
 | TD-030 | No Docker/deployment artifacts existed | P1 | No repeatable deployment path | L | **FIXED this branch** (AUD-001) |
 | TD-031 | No CI Docker build/config gate | P2 | Dockerfile could silently bit-rot | M | **FIXED this branch** (AUD-019) |
 | TD-032 | `compose.yaml` scheduler `restart: unless-stopped` restart-loops when both automation flags are disabled | P2 | Log noise, wasted restarts, confusing operator signal | S | **FIXED this branch** (found during local Docker smoke test, changed to `restart: on-failure`) |
+| TD-033 | Transfer snapshots / pg_dump files are unencrypted personal data at rest | P2 | Candidate PII on disk outside the repo; protected only by file location and (POSIX) 0600 mode | S | Manual/operational: delete snapshots after cutover, keep dumps in a private backup location (Stage 13B) |
+| TD-034 | SQLite pilot archive keeps all historical operational state (jobs, approvals, send states, legacy `user_profiles`) | P3 | Historical data retained indefinitely, read-only, not migrated | — | Manual/operational retention decision; deliberately not migrated (Stage 13B) |
+| TD-035 | Transfer CLI's `source != target` check compares backend/host/port/database only | P3 | Two different host aliases for one server would not be detected | S | Mitigated by the import preflight: a non-empty or already-profiled target is always refused (Stage 13B) |
 
 ## Notes
 
