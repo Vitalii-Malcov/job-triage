@@ -68,8 +68,13 @@ services:
       OUTBOUND_SENDING_ENABLED: "false"
     ports:
       - "${WEB_PORT:-8000}:8000"
+    # Stage 13A: readiness, not liveness -- /api/v1/ready returns 503 (so
+    # urlopen raises) unless the database answers and its Alembic revision
+    # is exactly the image's head; the check itself is bounded well inside
+    # this 5 s timeout (see app/services/readiness.py). /api/v1/health stays
+    # the cheap, DB-free liveness endpoint.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/ready', timeout=4)"]
       interval: 30s
       timeout: 5s
       retries: 3
