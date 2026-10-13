@@ -2,7 +2,9 @@
 
 Architecture:
 - Each endpoint (or group sharing a cost profile) gets its own independent
-  `_RateLimiter` instance: own bucket dict (keyed by `request.client.host`),
+  `_RateLimiter` instance: own bucket dict (keyed by the client identity
+  from `app.security.client_identity.resolve_client_identity` -- the TCP
+  peer unless that peer is an explicitly trusted proxy),
   own lock, own fixed 429 detail message. Never shared across limiters --
   see each bucket's own comment below for why it's separate.
 - Same-limiter read/expire/count/append is atomic: `check()` does the
@@ -25,13 +27,14 @@ from collections import defaultdict, deque
 from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
+from app.security.client_identity import resolve_client_identity
 
 
 class _RateLimiter:
     """One independent sliding-window rate-limit bucket set, keyed by
-    `request.client.host`, plus the lock that guards it. A class is used
-    here -- rather than a bare function + module dict -- because this
-    object owns mutable, concurrently-accessed state; rate/window
+    the resolved client identity (see module docstring), plus the lock
+    that guards it. A class is used here -- rather than a bare function +
+    module dict -- because this object owns mutable, concurrently-accessed state; rate/window
     configuration itself stays plain module-level constants (see module
     docstring), not attributes of this class.
     """
@@ -53,7 +56,9 @@ class _RateLimiter:
         self._detail = detail
 
     def check(self, request: Request, *, max_requests: int, window_seconds: float) -> None:
-        key = request.client.host if request.client else "unknown"
+        # Stage 13A: the trusted-proxy-aware identity, never a raw
+        # forwarding header -- see app/security/client_identity.py.
+        key = resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
         now = time.monotonic()
         cutoff = now - window_seconds
 
