@@ -26,12 +26,15 @@ is). **CI:** part of the `scheduler-postgres` job's zero-skip gate.
 import json
 import os
 import shutil
+import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -104,36 +107,89 @@ def _drop(admin, name: str) -> None:
         conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
 
 
+@contextmanager
+def _disposable_database(prefix: str, template: str | None = None) -> Iterator[str]:
+    """CREATE a uniquely named database and DROP it afterwards. The CREATE is
+    INSIDE the try: once the name is allocated, a failure at any later point
+    -- including CREATE raising client-side after the server already created
+    the database -- still reaches the `DROP ... IF EXISTS ... WITH (FORCE)`.
+    (A `created = True` flag set after CREATE would miss exactly that case.)"""
+    admin = _admin_engine()
+    name = f"{prefix}_{uuid.uuid4().hex[:12]}"
+    template_clause = f' TEMPLATE "{template}"' if template else ""
+    try:
+        with admin.connect() as conn:
+            conn.execute(text(f'CREATE DATABASE "{name}"{template_clause}'))
+        yield name
+    finally:
+        try:
+            _drop(admin, name)
+        finally:
+            admin.dispose()
+
+
+def _database_exists(name: str) -> bool:
+    admin = _admin_engine()
+    try:
+        with admin.connect() as conn:
+            return (
+                conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": name}
+                ).first()
+                is not None
+            )
+    finally:
+        admin.dispose()
+
+
 @pytest.fixture(scope="module")
 def migrated_template():
     """ONE brand-new database per module, built only by `alembic upgrade head`
     (the full chain, never create_all). Each test then gets an identical,
     independent copy via CREATE DATABASE ... TEMPLATE -- the full chain per
     test is needlessly slow on fsync-heavy hosts."""
-    admin = _admin_engine()
-    name = f"stage13b_tmpl_{uuid.uuid4().hex[:12]}"
-    with admin.connect() as conn:
-        conn.execute(text(f'CREATE DATABASE "{name}"'))
-    try:
+    with _disposable_database("stage13b_tmpl") as name:
         _upgrade_head(_db_url(name))
         yield name
-    finally:
-        _drop(admin, name)
-        admin.dispose()
 
 
 @pytest.fixture()
 def fresh_pg_url(migrated_template):
     """A brand-new database on the test server, at head, holding no rows."""
-    admin = _admin_engine()
-    name = f"stage13b_{uuid.uuid4().hex[:12]}"
-    with admin.connect() as conn:
-        conn.execute(text(f'CREATE DATABASE "{name}" TEMPLATE "{migrated_template}"'))
-    try:
+    with _disposable_database("stage13b", template=migrated_template) as name:
         yield _db_url(name)
-    finally:
-        _drop(admin, name)
-        admin.dispose()
+
+
+class TestDisposableDatabaseCleanup:
+    def test_database_is_dropped_when_setup_fails_after_create(self):
+        with pytest.raises(RuntimeError, match="setup failed"):
+            with _disposable_database("stage13b_cleanup") as name:
+                assert _database_exists(name)
+                raise RuntimeError("setup failed")
+        assert not _database_exists(name)
+
+    def test_database_is_dropped_when_create_raises_after_server_side_creation(self, monkeypatch):
+        created: list[str] = []
+        real_admin_engine = _admin_engine
+
+        def failing_admin_engine():
+            engine = real_admin_engine()
+
+            @event.listens_for(engine, "after_cursor_execute")
+            def fail_after_create(conn, cursor, statement, parameters, context, executemany):
+                if statement.startswith("CREATE DATABASE"):
+                    created.append(statement.split('"')[1])
+                    raise RuntimeError("client-side failure after CREATE")
+
+            return engine
+
+        monkeypatch.setattr(sys.modules[__name__], "_admin_engine", failing_admin_engine)
+        with pytest.raises(RuntimeError, match="after CREATE"):
+            with _disposable_database("stage13b_cleanup"):
+                pytest.fail("body must not run when CREATE raised")
+        monkeypatch.undo()
+        assert len(created) == 1
+        assert not _database_exists(created[0])
 
 
 def _pg_session(url: str) -> Session:
