@@ -95,6 +95,8 @@ from app.db.repositories import (
     update_job_status,
 )
 from app.db.response_draft_approval_repository import (
+    PENDING_RESPONSE_DRAFTS_DEFAULT_LIMIT,
+    PENDING_RESPONSE_DRAFTS_MAX_LIMIT,
     to_response_draft_approval,
     to_response_draft_send_status,
 )
@@ -144,6 +146,7 @@ from app.models.gmail_analysis import GmailMessageAnalysis
 from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
 from app.models.response_draft import ResponseDraft
 from app.models.response_draft_approval import (
+    PendingResponseDraft,
     ResponseDraftApproval,
     ResponseDraftApprovalRequest,
     ResponseDraftSendStatus,
@@ -215,6 +218,7 @@ from app.services.follow_up import (
 from app.services.follow_up_send import (
     FollowUpAlreadyDecidedError,
     FollowUpAlreadySentError,
+    FollowUpAnchorAlreadyFollowedUpError,
     FollowUpMissingRecipientError,
     FollowUpNotApprovedError,
     FollowUpProposalNotFoundError,
@@ -236,6 +240,7 @@ from app.services.response_draft import (
 from app.services.response_draft_send import (
     ResponseDraftAlreadyDecidedError,
     ResponseDraftAlreadySentError,
+    ResponseDraftMessageAlreadyRepliedError,
     ResponseDraftMissingRecipientError,
     ResponseDraftNotApprovableError,
     ResponseDraftNotApprovedError,
@@ -243,7 +248,9 @@ from app.services.response_draft_send import (
     ResponseDraftSendFailedError,
     ResponseDraftSendInProgressError,
     ResponseDraftSendOutcomeUncertainError,
+    ResponseDraftSupersededError,
     approve_or_reject_response_draft,
+    get_pending_response_drafts,
     get_response_draft_state,
     send_response_draft,
 )
@@ -1527,6 +1534,29 @@ def get_gmail_message_response_draft_history(
     return [to_response_draft(record) for record in records]
 
 
+@router.get(
+    "/response-drafts/pending",
+    response_model=list[PendingResponseDraft],
+    dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
+)
+def list_pending_response_drafts_endpoint(
+    limit: int = Query(
+        default=PENDING_RESPONSE_DRAFTS_DEFAULT_LIMIT, ge=1, le=PENDING_RESPONSE_DRAFTS_MAX_LIMIT
+    ),
+    offset: int = Query(default=0, ge=0, le=MAX_OFFSET),
+    db: Session = Depends(get_db),
+) -> list[PendingResponseDraft]:
+    """Stage 12: the human-decision queue -- each inbound message's
+    newest PROPOSED response-draft revision that has no decision yet and
+    whose message has no live reply. Pure read: never generates a draft,
+    never records a decision, never sends. `is_current_revision=False`
+    means the revision is superseded and must be regenerated before it can
+    be approved.
+    """
+    account_key = _current_gmail_account_key(get_settings())
+    return get_pending_response_drafts(db, account_key, limit=limit, offset=offset)
+
+
 @router.post(
     "/response-drafts/{draft_id}/decision",
     response_model=ResponseDraftApproval,
@@ -1543,6 +1573,10 @@ def decide_response_draft(
     reconsider. This endpoint NEVER sends anything — see
     POST /response-drafts/{draft_id}/send for the only endpoint that
     does, and only once this decision is APPROVED.
+
+    Stage 12: APPROVED is refused (409) for a superseded revision or when
+    another revision of the same message already has a live reply;
+    REJECTED is always accepted for a PROPOSED revision.
     """
     account_key = _current_gmail_account_key(get_settings())
     try:
@@ -1562,6 +1596,16 @@ def decide_response_draft(
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="Response draft already has a recorded decision",
+        ) from exc
+    except ResponseDraftSupersededError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Response draft is superseded by a newer revision",
+        ) from exc
+    except ResponseDraftMessageAlreadyRepliedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Another revision for this message already has a reply in progress or sent",
         ) from exc
     except Exception as exc:
         db.rollback()
@@ -1648,6 +1692,11 @@ def send_response_draft_endpoint(
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="A send attempt for this response draft is already in progress",
+        ) from exc
+    except ResponseDraftMessageAlreadyRepliedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Another revision for this message already has a reply in progress or sent",
         ) from exc
     except ResponseDraftSendFailedError as exc:
         # ResponseDraftSendFailedError already carries no upstream
@@ -1818,6 +1867,11 @@ def decide_follow_up(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="Follow-up proposal already has a recorded decision",
         ) from exc
+    except FollowUpAnchorAlreadyFollowedUpError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Another follow-up for this correspondence is already in progress or sent",
+        ) from exc
     except Exception as exc:
         db.rollback()
         logger.warning("follow_up_decision_failed error_type=%s", type(exc).__name__)
@@ -1886,6 +1940,11 @@ def send_follow_up_endpoint(follow_up_id: int, db: Session = Depends(get_db)) ->
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="A send attempt for this follow-up proposal is already in progress",
+        ) from exc
+    except FollowUpAnchorAlreadyFollowedUpError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Another follow-up for this correspondence is already in progress or sent",
         ) from exc
     except FollowUpProposalStaleAtSendTimeError as exc:
         logger.warning("follow_up_send_endpoint_failed error_type=%s", type(exc).__name__)

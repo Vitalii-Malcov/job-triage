@@ -99,6 +99,32 @@ result is also checked directly (not merely called and ignored) — see
 (defense-in-depth; `begin_transmission`'s exclusivity should already
 make this unreachable in practice) is treated the same fail-closed way
 rather than silently assumed to have succeeded.
+
+**One reply per inbound message, current revision only (Stage 12).**
+Approvals and sends are pinned to one exact draft REVISION, but several
+revisions can exist for the same inbound message (re-analysis,
+candidate-profile edit, generator upgrade). Two rules close the gaps that
+leaves:
+
+- **A superseded revision cannot be APPROVED.** An APPROVED decision
+  requires the draft to still be the CURRENT revision
+  (`app.services.response_draft.is_current_response_draft_revision`) --
+  otherwise `ResponseDraftSupersededError` (409): a human must never
+  authorize text built from an outdated analysis/profile. A REJECTED
+  decision is accepted for any revision (rejecting authorizes nothing).
+  An approval that was valid when recorded keeps authorizing exactly its
+  pinned subject/body afterwards -- deliberately unchanged from Stage 7D
+  (see tests/test_response_draft_send_service.py::TestStaleDraftRevisionMismatch):
+  the human reviewed precisely that text.
+- **At most one live reply per inbound message.** If ANOTHER revision of a
+  draft for the same message already has a PENDING/SENT/UNCERTAIN send,
+  both approval and send are refused (`ResponseDraftMessageAlreadyRepliedError`,
+  409). The pre-check is a convenience; the guarantee is the database's
+  `uq_response_draft_sends_live_per_message` partial unique index, whose
+  violation the repository translates into the same error -- so two
+  sends of two different revisions (sequential or concurrent) can never
+  both reach the provider. A FAILED send (definite pre-transmission
+  failure) never blocks another revision.
 """
 
 import json
@@ -109,12 +135,15 @@ from sqlalchemy.orm import Session
 from app.db.gmail_repository import get_message_by_id
 from app.db.models import ResponseDraftApprovalRecord, ResponseDraftSendRecord
 from app.db.response_draft_approval_repository import (
+    ResponseDraftLiveSendExistsError,
     begin_transmission,
     claim_send_attempt,
     create_approval,
     get_approval_for_draft,
+    get_live_send_for_message,
     get_response_draft_by_id,
     get_send_for_draft,
+    list_pending_response_drafts,
     mark_send_failed,
     mark_send_sent,
     mark_send_uncertain,
@@ -122,12 +151,16 @@ from app.db.response_draft_approval_repository import (
     to_response_draft_approval,
     to_response_draft_send_status,
 )
-from app.models.response_draft_approval import ResponseDraftState
+from app.models.response_draft_approval import PendingResponseDraft, ResponseDraftState
 from app.providers.email.outbound_base import (
     EmailSendError,
     EmailSendOutcomeUnknownError,
     OutboundEmailProvider,
     OutboundMessage,
+)
+from app.services.response_draft import (
+    current_response_draft_identity,
+    is_current_response_draft_revision,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,6 +248,25 @@ class ResponseDraftSendOutcomeUncertainError(Exception):
     """
 
 
+class ResponseDraftSupersededError(Exception):
+    """Stage 12: the draft is no longer the CURRENT revision for its
+    message (see `app.services.response_draft.is_current_response_draft_revision`)
+    -- it cannot be APPROVED. Mapped to 409. Nothing was written.
+    """
+
+
+class ResponseDraftMessageAlreadyRepliedError(Exception):
+    """Stage 12: ANOTHER revision of a draft for the same inbound message
+    already has a PENDING/SENT/UNCERTAIN send -- a second reply is refused.
+    Mapped to 409. Nothing was written.
+    """
+
+
+def _other_revision_has_live_send(db: Session, account_key: str, draft) -> bool:
+    live = get_live_send_for_message(db, account_key, draft.gmail_message_id)
+    return live is not None and live.response_draft_id != draft.id
+
+
 def approve_or_reject_response_draft(
     db: Session,
     account_key: str,
@@ -238,6 +290,26 @@ def approve_or_reject_response_draft(
             f"response_draft_id={draft_id!r} has status={draft.status!r}; only a "
             "PROPOSED draft with content can be approved or rejected."
         )
+
+    if decision == "APPROVED":
+        # Precedence: an already-decided revision keeps reporting exactly
+        # that (create_approval below would too) rather than a Stage 12
+        # refusal that could mask it.
+        existing = get_approval_for_draft(db, account_key, draft.id)
+        if existing is not None:
+            raise ResponseDraftAlreadyDecidedError(
+                f"response_draft_id={draft_id!r} already has a recorded decision "
+                f"({existing.decision!r}); decisions are permanent."
+            )
+        if _other_revision_has_live_send(db, account_key, draft):
+            raise ResponseDraftMessageAlreadyRepliedError(
+                f"response_draft_id={draft_id!r}: another revision for the same message "
+                "already has a live send"
+            )
+        if not is_current_response_draft_revision(db, account_key, draft):
+            raise ResponseDraftSupersededError(
+                f"response_draft_id={draft_id!r} is superseded by a newer revision"
+            )
 
     record, created = create_approval(
         db,
@@ -347,16 +419,46 @@ def _claim_or_retry_send(
     real exclusivity gate) before calling the provider — see module
     docstring's "Transmission boundary / crash recovery" section.
     """
-    record, claimed = claim_send_attempt(
-        db,
-        account_key=account_key,
-        response_draft_id=draft.id,
-        gmail_message_id=draft.gmail_message_id,
-        approval_id=approval.id,
-    )
-    if claimed:
-        return record
-    return _resolve_existing_send_record(db, account_key=account_key, draft=draft, record=record)
+    try:
+        record, claimed = claim_send_attempt(
+            db,
+            account_key=account_key,
+            response_draft_id=draft.id,
+            gmail_message_id=draft.gmail_message_id,
+            approval_id=approval.id,
+        )
+        if claimed:
+            return record
+        return _resolve_existing_send_record(
+            db, account_key=account_key, draft=draft, record=record
+        )
+    except ResponseDraftLiveSendExistsError as exc:
+        # Stage 12: the per-message live-send index refused this
+        # revision's claim/retry -- another revision won the message's
+        # only live send (possibly concurrently).
+        raise ResponseDraftMessageAlreadyRepliedError(
+            f"response_draft_id={draft.id!r}: another revision for the same message "
+            "already has a live send"
+        ) from exc
+
+
+def _refuse_if_other_revision_replied(db: Session, *, account_key: str, draft) -> None:
+    """Stage 12 send-time pre-check, run BEFORE any send row is claimed:
+    refuse when ANOTHER revision of a draft for the same message already
+    has a live send. Skipped when this revision has its own non-FAILED row,
+    so an already sent / uncertain / in-flight attempt keeps its existing,
+    more specific outcome from `_resolve_existing_send_record`. Race-free
+    enforcement is the per-message partial unique index (see
+    `_claim_or_retry_send`), not this read.
+    """
+    own = get_send_for_draft(db, account_key, draft.id)
+    if own is not None and own.status != "FAILED":
+        return
+    if _other_revision_has_live_send(db, account_key, draft):
+        raise ResponseDraftMessageAlreadyRepliedError(
+            f"response_draft_id={draft.id!r}: another revision for the same message "
+            "already has a live send"
+        )
 
 
 def send_response_draft(
@@ -397,6 +499,8 @@ def send_response_draft(
             f"gmail_message_id={draft.gmail_message_id!r} could not be resolved"
         )
     outbound_message = _build_outbound_message(message, approval)
+
+    _refuse_if_other_revision_replied(db, account_key=account_key, draft=draft)
 
     send_record = _claim_or_retry_send(db, account_key=account_key, draft=draft, approval=approval)
 
@@ -490,6 +594,42 @@ def get_response_draft_state(db: Session, account_key: str, draft_id: int) -> Re
         response_draft_id=draft.id,
         gmail_message_id=draft.gmail_message_id,
         draft_status=draft.status,
+        is_current_revision=is_current_response_draft_revision(db, account_key, draft),
         approval=to_response_draft_approval(approval) if approval is not None else None,
         send=to_response_draft_send_status(send) if send is not None else None,
     )
+
+
+def get_pending_response_drafts(
+    db: Session, account_key: str, *, limit: int, offset: int
+) -> list[PendingResponseDraft]:
+    """Stage 12: GET /response-drafts/pending -- see
+    `app.db.response_draft_approval_repository.list_pending_response_drafts`.
+    Pure reads; `is_current_revision` is computed per returned item.
+    """
+    current_profile_version, current_generator_version = current_response_draft_identity(db)
+    rows = list_pending_response_drafts(
+        db,
+        account_key,
+        current_candidate_profile_version=current_profile_version,
+        current_generator_version=current_generator_version,
+        limit=limit,
+        offset=offset,
+    )
+    return [
+        PendingResponseDraft(
+            response_draft_id=draft.id,
+            gmail_message_id=draft.gmail_message_id,
+            analysis_id=draft.analysis_id,
+            matched_job_id=draft.matched_job_id,
+            match_type=match_type,
+            match_confidence=match_confidence,
+            classification=draft.classification,
+            candidate_profile_version=draft.candidate_profile_version,
+            generator_version=draft.generator_version,
+            provider=draft.provider,
+            is_current_revision=is_current_response_draft_revision(db, account_key, draft),
+            created_at=draft.created_at,
+        )
+        for draft, match_type, match_confidence in rows
+    ]

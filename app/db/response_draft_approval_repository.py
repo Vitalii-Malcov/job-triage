@@ -33,11 +33,17 @@ for the full rationale.
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, exists, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from app.db.models import ResponseDraftApprovalRecord, ResponseDraftRecord, ResponseDraftSendRecord
+from app.db.models import (
+    LIVE_SEND_STATUSES,
+    GmailMessageAnalysisRecord,
+    ResponseDraftApprovalRecord,
+    ResponseDraftRecord,
+    ResponseDraftSendRecord,
+)
 from app.models.response_draft_approval import ResponseDraftApproval, ResponseDraftSendStatus
 
 
@@ -45,6 +51,15 @@ class ResponseDraftApprovalRepositoryConsistencyError(Exception):
     """Raised when a persistence invariant that must always hold is
     violated anyway — mirrors
     app.db.gmail_analysis_repository.GmailAnalysisRepositoryConsistencyError.
+    """
+
+
+class ResponseDraftLiveSendExistsError(Exception):
+    """Stage 12: a claim INSERT or FAILED -> PENDING retry UPDATE for one
+    draft revision was refused by `uq_response_draft_sends_live_per_message`
+    because ANOTHER revision of a draft for the same inbound message already
+    has a PENDING/SENT/UNCERTAIN send row. Nothing was written. Carries no
+    account key or message identity in its message.
     """
 
 
@@ -138,6 +153,23 @@ def get_send_for_draft(
     )
 
 
+def get_live_send_for_message(
+    db: Session, account_key: str, gmail_message_id: int
+) -> ResponseDraftSendRecord | None:
+    """Stage 12: the PENDING/SENT/UNCERTAIN send row -- from ANY draft
+    revision -- for one inbound message, if one exists. At most one can
+    exist (`uq_response_draft_sends_live_per_message`). Pure, account-scoped
+    read.
+    """
+    return db.scalar(
+        select(ResponseDraftSendRecord).where(
+            ResponseDraftSendRecord.account_key == account_key,
+            ResponseDraftSendRecord.gmail_message_id == gmail_message_id,
+            ResponseDraftSendRecord.status.in_(LIVE_SEND_STATUSES),
+        )
+    )
+
+
 def claim_send_attempt(
     db: Session,
     *,
@@ -172,13 +204,20 @@ def claim_send_attempt(
     except IntegrityError:
         db.rollback()
         existing = get_send_for_draft(db, account_key, response_draft_id)
-        if existing is None:
-            raise ResponseDraftApprovalRepositoryConsistencyError(
-                f"Expected a response_draft_sends row for "
-                f"response_draft_id={response_draft_id!r} after a UNIQUE constraint "
-                "collision, but none was found."
+        if existing is not None:
+            return existing, False
+        # Stage 12: not this revision's own row -- the per-message
+        # live-send index refused it because another revision already
+        # holds the message's only live send.
+        if get_live_send_for_message(db, account_key, gmail_message_id) is not None:
+            raise ResponseDraftLiveSendExistsError(
+                "another response-draft revision already has a live send for this message"
             ) from None
-        return existing, False
+        raise ResponseDraftApprovalRepositoryConsistencyError(
+            f"Expected a response_draft_sends row for "
+            f"response_draft_id={response_draft_id!r} after a UNIQUE constraint "
+            "collision, but none was found."
+        ) from None
 
     db.refresh(record)
     return record, True
@@ -196,21 +235,33 @@ def retry_send_attempt(db: Session, record: ResponseDraftSendRecord) -> bool:
     rationale): a FAILED row is, by construction, always a DEFINITE
     pre-transmission failure (see `mark_send_failed`'s docstring), so a
     fresh retry legitimately starts the pre-transmission window over.
+
+    Stage 12: raises `ResponseDraftLiveSendExistsError` (nothing written)
+    if moving this row back to PENDING would violate
+    `uq_response_draft_sends_live_per_message` -- another revision of a
+    draft for the same message took the live send while this one was
+    FAILED.
     """
-    result = db.execute(
-        update(ResponseDraftSendRecord)
-        .where(
-            ResponseDraftSendRecord.id == record.id,
-            ResponseDraftSendRecord.status == "FAILED",
+    try:
+        result = db.execute(
+            update(ResponseDraftSendRecord)
+            .where(
+                ResponseDraftSendRecord.id == record.id,
+                ResponseDraftSendRecord.status == "FAILED",
+            )
+            .values(
+                status="PENDING",
+                send_attempted=False,
+                attempt_count=ResponseDraftSendRecord.attempt_count + 1,
+                updated_at=datetime.now(UTC),
+            )
         )
-        .values(
-            status="PENDING",
-            send_attempted=False,
-            attempt_count=ResponseDraftSendRecord.attempt_count + 1,
-            updated_at=datetime.now(UTC),
-        )
-    )
-    db.commit()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ResponseDraftLiveSendExistsError(
+            "another response-draft revision already has a live send for this message"
+        ) from None
     won = result.rowcount == 1
     if won:
         db.refresh(record)
@@ -335,6 +386,102 @@ def mark_send_uncertain(db: Session, record: ResponseDraftSendRecord, *, last_er
     if won:
         db.refresh(record)
     return won
+
+
+PENDING_RESPONSE_DRAFTS_DEFAULT_LIMIT = 20
+PENDING_RESPONSE_DRAFTS_MAX_LIMIT = 100
+
+
+def list_pending_response_drafts(
+    db: Session,
+    account_key: str,
+    *,
+    current_candidate_profile_version: int,
+    current_generator_version: str,
+    limit: int,
+    offset: int,
+) -> list[tuple[ResponseDraftRecord, str | None, str | None]]:
+    """Stage 12: the human-decision queue -- for each inbound message, its
+    REPRESENTATIVE draft revision when that revision is PROPOSED, has no
+    decision yet, and the message has no live (PENDING/SENT/UNCERTAIN) send
+    from any revision. Returns `(draft, match_type, match_confidence)`
+    newest first, bounded by `limit`/`offset`. Pure, account-scoped SELECT
+    -- never generates, decides or sends anything.
+
+    S12-001 (Codex review): the representative is the message's CURRENT
+    revision whenever one exists -- the same identity
+    `app.services.response_draft.is_current_response_draft_revision` uses
+    (latest analysis by (`analysis_version`, `id`), plus the caller-supplied
+    `current_candidate_profile_version` / `current_generator_version`), so
+    a stale revision inserted LATER (higher id, e.g. by a worker that read
+    an older candidate profile) can never hide it. The draft identity
+    UNIQUE constraint makes the current revision unique per message. Only
+    when NO current revision exists does it fall back to the highest-id
+    revision, which the service reports with `is_current_revision=False`
+    so the human knows to regenerate.
+    """
+    draft = aliased(ResponseDraftRecord)
+    analysis = aliased(GmailMessageAnalysisRecord)
+    latest_analysis_id = (
+        select(analysis.id)
+        .where(
+            analysis.account_key == account_key,
+            analysis.gmail_message_id == draft.gmail_message_id,
+        )
+        .order_by(analysis.analysis_version.desc(), analysis.id.desc())
+        .limit(1)
+        .correlate(draft)
+        .scalar_subquery()
+    )
+    is_current = and_(
+        draft.generator_version == current_generator_version,
+        draft.candidate_profile_version == current_candidate_profile_version,
+        draft.analysis_id == latest_analysis_id,
+    )
+    per_draft = (
+        select(
+            draft.id.label("id"),
+            draft.gmail_message_id.label("gmail_message_id"),
+            case((is_current, draft.id)).label("current_id"),
+        )
+        .where(draft.account_key == account_key)
+        .subquery()
+    )
+    representative_per_message = select(
+        func.coalesce(func.max(per_draft.c.current_id), func.max(per_draft.c.id))
+    ).group_by(per_draft.c.gmail_message_id)
+    has_decision = exists().where(
+        ResponseDraftApprovalRecord.response_draft_id == ResponseDraftRecord.id,
+        ResponseDraftApprovalRecord.account_key == account_key,
+    )
+    message_has_live_send = exists().where(
+        ResponseDraftSendRecord.account_key == account_key,
+        ResponseDraftSendRecord.gmail_message_id == ResponseDraftRecord.gmail_message_id,
+        ResponseDraftSendRecord.status.in_(LIVE_SEND_STATUSES),
+    )
+    stmt = (
+        select(
+            ResponseDraftRecord,
+            GmailMessageAnalysisRecord.match_type,
+            GmailMessageAnalysisRecord.match_confidence,
+        )
+        .outerjoin(
+            GmailMessageAnalysisRecord,
+            (GmailMessageAnalysisRecord.id == ResponseDraftRecord.analysis_id)
+            & (GmailMessageAnalysisRecord.account_key == account_key),
+        )
+        .where(
+            ResponseDraftRecord.account_key == account_key,
+            ResponseDraftRecord.status == "PROPOSED",
+            ResponseDraftRecord.id.in_(representative_per_message),
+            ~has_decision,
+            ~message_has_live_send,
+        )
+        .order_by(ResponseDraftRecord.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return [(row[0], row[1], row[2]) for row in db.execute(stmt).all()]
 
 
 def to_response_draft_approval(record: ResponseDraftApprovalRecord) -> ResponseDraftApproval:

@@ -141,6 +141,8 @@ Solid arrows: normal call dependency. Dashed arrows: process boundary or externa
 | Response draft / follow-up **generation** (content only) | `app/agents/response_draft_generator.py`, `app/agents/follow_up_generator.py` | None | Pure — sending is a separate, later-gated module |
 | Human approval | `app/services/response_draft.py`, `app/services/follow_up.py`, `app/services/review_package.py` | None | DB state transition only — "never auto-approve" by design |
 
+See [GMAIL_RESPONSE_WORKFLOW.md](GMAIL_RESPONSE_WORKFLOW.md) for the end-to-end message → analysis → draft → approval → send/follow-up lifecycle and its invariants (current-revision-only approval, at most one live reply per inbound message / follow-up per anchor).
+
 ## Trust boundaries
 
 - **Job-fact trust**: `TRUSTED_JOB_SOURCES = frozenset({"bundesagentur"})` (`app/services/response_draft.py`). Only structured-API-sourced job facts (`title`/`company`) may be interpolated into generated text; XING-sourced facts (parsed from unauthenticated inbound email) are treated as untrusted and never reach generated drafts.
