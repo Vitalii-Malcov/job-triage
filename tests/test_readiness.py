@@ -132,6 +132,51 @@ class TestReadyEndpoint:
         assert client.get("/api/v1/ready").status_code == 503
 
 
+class TestSetupFailuresFailClosed:
+    """Stage 13B (Stage 13A P3): failures while resolving the application head
+    or building the default readiness engine used to escape check_readiness
+    and surface as a generic HTTP 500. They must be the fixed, sanitized 503."""
+
+    def _client(self) -> TestClient:
+        # raise_server_exceptions=False: a regression must show up as the 500
+        # a real client would see, not as an exception inside the test.
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_application_head_resolution_failure_is_sanitized_503(self, monkeypatch, caplog):
+        def _broken_heads():
+            raise RuntimeError(f"cannot read alembic.ini near {SECRET_SENTINEL}")
+
+        monkeypatch.setattr(readiness, "expected_alembic_heads", _broken_heads)
+        response = self._client().get("/api/v1/ready")
+        assert response.status_code == 503
+        assert response.text == '{"status":"not_ready"}'
+        assert SECRET_SENTINEL not in caplog.text
+        assert "reason=application_head_unavailable" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_default_engine_construction_failure_is_sanitized_503(self, monkeypatch, caplog):
+        def _broken_engine():
+            raise ValueError(f"bad url postgresql://u:{SECRET_SENTINEL}@db/app")
+
+        monkeypatch.setattr(readiness, "_default_readiness_engine", _broken_engine)
+        response = self._client().get("/api/v1/ready")
+        assert response.status_code == 503
+        assert response.text == '{"status":"not_ready"}'
+        assert SECRET_SENTINEL not in caplog.text
+        assert "reason=engine_unavailable" in caplog.text
+        assert "error_type=ValueError" in caplog.text
+
+    def test_check_readiness_itself_never_raises_on_setup_failure(self, monkeypatch):
+        def _boom():
+            raise OSError("migration scripts unreadable")
+
+        monkeypatch.setattr(readiness, "expected_alembic_heads", _boom)
+        assert check_readiness() is False
+        monkeypatch.undo()
+        monkeypatch.setattr(readiness, "_default_readiness_engine", _boom)
+        assert check_readiness() is False
+
+
 class TestReadOnlyAndBounded:
     def test_readiness_never_mutates_the_database(self, tmp_path):
         db_path = _sqlite_db(tmp_path / "db.db", [HEAD])

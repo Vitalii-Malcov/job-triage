@@ -73,7 +73,12 @@ Single default `compose` bridge network. `web` and `scheduler` both reach `db` b
 
 - `ALEMBIC_AUTO_UPGRADE` **must stay `false`** in this deployment (the app already defaults to this and documents it as a hard production rule — `app/db/session.py`).
 - Migrations run as an **explicit, separate step**, before the `web`/`scheduler` containers start serving traffic: `docker compose run --rm web alembic upgrade head` (or an init container / CI/CD pipeline step). This makes migration failure loud and blocking rather than silently skipped or racily run once-per-worker.
-- The Alembic head this project expects is `a1b2c3d4e5f6` — the same value the CI `scheduler-postgres` job asserts via `alembic current`.
+- The expected schema revision is whatever the deployed code's migration scripts declare as their single head — it moves with every new migration, so this document deliberately does not pin a literal (an earlier version named `a1b2c3d4e5f6`, long since stale). Verify it after every upgrade, against the same image:
+  ```bash
+  docker compose run --rm web alembic heads     # must print exactly ONE line ending in "(head)"
+  docker compose run --rm web alembic current   # must print that same revision followed by "(head)"
+  ```
+  Exactly one head, and `alembic current` equal to it, is the deployment invariant; `GET /api/v1/ready` enforces the same equality at runtime. The CI `scheduler-postgres` job asserts it too, against a literal that `tests/test_ci_postgres_migration_gate.py` keeps equal to the scripts' head.
 
 ## Secrets
 

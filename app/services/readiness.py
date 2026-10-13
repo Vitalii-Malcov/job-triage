@@ -109,13 +109,32 @@ def check_readiness(engine: Engine | None = None) -> bool:
     """True only if the database answers a read-only query and holds exactly
     one Alembic revision equal to the application's single head. Never raises:
     every failure is logged by category (never the exception text, which can
-    carry connection details) and reported as not ready."""
-    heads = expected_alembic_heads()
+    carry connection details) and reported as not ready.
+
+    Stage 13B (Stage 13A P3): resolving the application's heads and building
+    the default readiness engine are inside the same fail-closed contract --
+    an unexpected setup failure (unreadable migration scripts, a malformed
+    DATABASE_URL, a missing driver) is a sanitized "not ready", never an
+    unhandled exception that would surface as a generic HTTP 500."""
+    try:
+        heads = expected_alembic_heads()
+    except Exception as exc:  # noqa: BLE001 -- any failure means "not ready"
+        logger.error(
+            "readiness_not_ready reason=application_head_unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return False
     if len(heads) != 1:
         logger.error("readiness_not_ready reason=application_head_count heads=%d", len(heads))
         return False
 
-    engine = engine if engine is not None else _default_readiness_engine()
+    try:
+        engine = engine if engine is not None else _default_readiness_engine()
+    except Exception as exc:  # noqa: BLE001 -- any failure means "not ready"
+        logger.error(
+            "readiness_not_ready reason=engine_unavailable error_type=%s", type(exc).__name__
+        )
+        return False
     try:
         with engine.connect() as conn:
             revisions = [
