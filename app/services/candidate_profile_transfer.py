@@ -426,9 +426,15 @@ def _strict_field_trust(raw: str) -> dict[str, dict[str, str]]:
     """field_trust_json exactly as stored: every entry must carry BOTH source
     and confidence. A partial entry is refused rather than defaulted (the
     repository's lenient loader would fill a missing confidence in as
-    CONFIRMED -- a trust upgrade)."""
+    CONFIRMED -- a trust upgrade). A duplicate object key at any depth is
+    ambiguous provenance (plain json.loads would keep the LAST value) and is
+    refused too."""
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except SnapshotInvalidError:
+        raise SourceProfileInvalidError(
+            "field_trust_json contains a duplicate object key"
+        ) from None
     except (TypeError, ValueError):
         raise SourceProfileInvalidError("field_trust_json is not valid JSON") from None
     if not isinstance(data, dict):

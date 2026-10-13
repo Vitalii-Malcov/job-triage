@@ -476,6 +476,71 @@ class TestExport:
         with pytest.raises(transfer.SourceProfileInvalidError):
             _export(source_db)
 
+    @staticmethod
+    def _set_raw_field_trust(source_db: Path, raw: str) -> None:
+        conn = sqlite3.connect(source_db)
+        conn.execute("UPDATE candidate_profiles SET field_trust_json = ?", (raw,))
+        conn.commit()
+        conn.close()
+
+    # Hand-written JSON: json.dumps can never emit a duplicate key.
+    _DUPLICATE_TOP_LEVEL = (
+        '{"professional_title": {"source": "MANUAL_ENTRY", "confidence": "CONFIRMED"},'
+        ' "professional_title": {"source": "INFERRED", "confidence": "INFERRED"}}'
+    )
+
+    def test_duplicate_top_level_field_trust_key_is_refused(self, source_db):
+        self._set_raw_field_trust(source_db, self._DUPLICATE_TOP_LEVEL)
+        # Plain json.loads would silently keep only the LAST entry:
+        assert json.loads(self._DUPLICATE_TOP_LEVEL)["professional_title"]["source"] == "INFERRED"
+        with pytest.raises(transfer.SourceProfileInvalidError, match="duplicate object key"):
+            _export(source_db)
+
+    def test_duplicate_key_inside_a_trust_entry_is_refused(self, source_db):
+        self._set_raw_field_trust(
+            source_db,
+            '{"first_name": {"source": "MANUAL_ENTRY", "source": "INFERRED",'
+            ' "confidence": "CONFIRMED"}}',
+        )
+        with pytest.raises(transfer.SourceProfileInvalidError, match="duplicate object key"):
+            _export(source_db)
+
+    def test_valid_unique_field_trust_map_is_accepted_unchanged(self, source_db):
+        trust = {
+            "professional_title": {"source": "MANUAL_ENTRY", "confidence": "CONFIRMED"},
+            "location_city": {"source": "IMPORTED", "confidence": "UNCONFIRMED"},
+        }
+        self._set_raw_field_trust(source_db, json.dumps(trust))
+        profile = _export(source_db)
+        assert {k: v.model_dump() for k, v in profile.field_trust.items()} == trust
+
+    def test_partial_entry_alongside_unique_keys_is_still_refused(self, source_db):
+        self._set_raw_field_trust(
+            source_db,
+            json.dumps(
+                {
+                    "first_name": {"source": "MANUAL_ENTRY", "confidence": "CONFIRMED"},
+                    "last_name": {"confidence": "CONFIRMED"},
+                }
+            ),
+        )
+        with pytest.raises(transfer.SourceProfileInvalidError):
+            _export(source_db)
+
+    def test_duplicate_key_error_leaks_no_candidate_value(self, source_db, caplog, capsys):
+        caplog.set_level(logging.DEBUG)
+        self._set_raw_field_trust(
+            source_db,
+            '{"first_name": {"source": "MANUAL_ENTRY", "confidence": "CONFIRMED"},'
+            f' "first_name": {{"source": "{SENTINEL}-dup", "confidence": "{SENTINEL}-dup"}}}}',
+        )
+        with pytest.raises(transfer.SourceProfileInvalidError) as excinfo:
+            _export(source_db)
+        assert SENTINEL not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+        captured = capsys.readouterr()
+        assert SENTINEL not in caplog.text + captured.out + captured.err
+
     def test_source_not_at_head_is_refused(self, source_db):
         conn = sqlite3.connect(source_db)
         conn.execute("UPDATE alembic_version SET version_num = 'e8b1c4f7a2d9'")
