@@ -72,6 +72,39 @@ class FakeProvider:
         return GmailFetchResult(messages=self._messages, skipped_count=0)
 
 
+SENT_MAILBOX = "[Gmail]/Sent Mail"
+
+
+def _isolated_settings() -> Settings:
+    # `_env_file=None` keeps the developer's local .env (e.g. a localized
+    # GMAIL_SENT_MAILBOX) out of these tests; the mailboxes are passed
+    # explicitly so a process-level GMAIL_* variable cannot override them
+    # either (init kwargs take precedence over environment sources).
+    return Settings(
+        _env_file=None,
+        api_key=API_KEY,
+        rate_limit_requests=1000,
+        rate_limit_window_seconds=60,
+        gmail_username=ACCOUNT,
+        gmail_app_password="app-password",
+        gmail_mailbox="INBOX",
+        gmail_sent_mailbox=SENT_MAILBOX,
+    )
+
+
+def test_isolated_settings_ignore_local_env_file_and_process_env(tmp_path, monkeypatch):
+    localized = "[Gmail]/Отправленные"
+    (tmp_path / ".env").write_text(f"GMAIL_SENT_MAILBOX={localized}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GMAIL_SENT_MAILBOX", localized)
+    monkeypatch.setenv("GMAIL_MAILBOX", localized)
+
+    settings = _isolated_settings()
+
+    assert settings.gmail_mailbox == "INBOX"
+    assert settings.gmail_sent_mailbox == SENT_MAILBOX
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     db_path = tmp_path / "test_gmail_endpoints.db"
@@ -88,13 +121,7 @@ def client(tmp_path, monkeypatch):
 
     app.dependency_overrides[get_db] = override_get_db
 
-    fake_settings = Settings(
-        api_key=API_KEY,
-        rate_limit_requests=1000,
-        rate_limit_window_seconds=60,
-        gmail_username=ACCOUNT,
-        gmail_app_password="app-password",
-    )
+    fake_settings = _isolated_settings()
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
@@ -223,7 +250,7 @@ class TestRunGmailSync:
         assert response.status_code == 200
         assert response.json()["fetched"] == 2
         assert response.json()["created"] == 2
-        assert set(seen_mailboxes) == {"INBOX", "[Gmail]/Sent Mail"}
+        assert set(seen_mailboxes) == {"INBOX", SENT_MAILBOX}
 
     def test_auth_error_returns_502(self, client, monkeypatch):
         test_client, _ = client
