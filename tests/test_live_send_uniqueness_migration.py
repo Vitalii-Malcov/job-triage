@@ -13,6 +13,7 @@ import pytest
 import sqlalchemy.exc
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
+from alembic.ddl.impl import DefaultImpl
 from sqlalchemy import create_engine, inspect, text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -176,6 +177,91 @@ def test_downgrade_drops_indexes_and_keeps_rows_then_upgrade_restores(tmp_path: 
     upgrade(cfg, "head")
     for table, (index_name, _owner) in TABLES.items():
         assert index_name in _index_names(engine, table)
+
+
+FIRST_INDEX, SECOND_INDEX = (
+    "uq_response_draft_sends_live_per_message",
+    "uq_follow_up_sends_live_per_anchor",
+)
+
+
+def _fail_creating(monkeypatch, index_name: str) -> None:
+    """Make Alembic's DDL layer fail when (and only when) it creates
+    `index_name` -- after any index created before it really exists."""
+    original = DefaultImpl.create_index
+
+    def create_index(self, index, **kw):
+        if index.name == index_name:
+            raise sqlalchemy.exc.OperationalError("CREATE INDEX", {}, Exception("injected"))
+        return original(self, index, **kw)
+
+    monkeypatch.setattr(DefaultImpl, "create_index", create_index)
+
+
+def _revision(engine) -> str:
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+
+
+def test_second_index_failure_leaves_no_partial_state_and_retry_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S12-002 (Codex review): SQLite DDL is not transactional, so the first
+    index would otherwise survive the failed upgrade and block every retry."""
+    db_path = tmp_path / "live_send.db"
+    cfg = _cfg(db_path)
+    upgrade(cfg, PREVIOUS)
+    engine = create_engine(f"sqlite:///{db_path}")
+
+    with monkeypatch.context() as patched:
+        _fail_creating(patched, SECOND_INDEX)
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            upgrade(cfg, "head")
+
+    assert _revision(engine) == PREVIOUS
+    for table, (index_name, _owner) in TABLES.items():
+        assert index_name not in _index_names(engine, table)
+
+    upgrade(cfg, "head")  # injected failure removed
+    assert _revision(engine) == REVISION
+    for table, (index_name, _owner) in TABLES.items():
+        assert index_name in _index_names(engine, table)
+
+
+def test_failed_upgrade_never_drops_an_index_that_existed_before_it(tmp_path: Path) -> None:
+    db_path = tmp_path / "live_send.db"
+    cfg = _cfg(db_path)
+    upgrade(cfg, PREVIOUS)
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"CREATE INDEX {SECOND_INDEX} ON follow_up_sends (account_key, gmail_message_id)")
+        )
+
+    with pytest.raises(sqlalchemy.exc.OperationalError):
+        upgrade(cfg, "head")  # second CREATE hits "already exists"
+
+    assert _revision(engine) == PREVIOUS
+    assert FIRST_INDEX not in _index_names(engine, "response_draft_sends")
+    assert SECOND_INDEX in _index_names(engine, "follow_up_sends")  # pre-existing, kept
+
+
+def test_cleanup_failure_is_reported_never_swallowed(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "live_send.db"
+    cfg = _cfg(db_path)
+    upgrade(cfg, PREVIOUS)
+    engine = create_engine(f"sqlite:///{db_path}")
+
+    def drop_index(self, index, **kw):
+        raise sqlalchemy.exc.OperationalError("DROP INDEX", {}, Exception("injected"))
+
+    with monkeypatch.context() as patched:
+        _fail_creating(patched, SECOND_INDEX)
+        patched.setattr(DefaultImpl, "drop_index", drop_index)
+        with pytest.raises(RuntimeError, match=FIRST_INDEX):
+            upgrade(cfg, "head")
+
+    assert _revision(engine) == PREVIOUS
 
 
 def test_models_declare_the_same_partial_indexes_as_the_migration() -> None:

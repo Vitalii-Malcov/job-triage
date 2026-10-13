@@ -10,6 +10,10 @@ indexes (migration a7c3e9f1b2d4):
   proposals sharing one correspondence anchor.
 - A FAILED -> PENDING retry racing a sibling's fresh claim: at most one of
   them ends up live.
+- S12-001: the pending queue's current-revision selection SQL, with the
+  current draft inserted BEFORE a stale one (stale.id > current.id).
+- S12-002: a failure creating the SECOND index rolls the whole migration
+  back (transactional DDL) and a plain retry succeeds.
 
 SQLite's single-writer lock serializes these trivially; PostgreSQL's MVCC is
 where a check-then-act would genuinely race, so this is the real evidence.
@@ -24,11 +28,17 @@ The calls are the REAL repository functions, synchronized with a
 import os
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, delete, select
+import sqlalchemy.exc
+from alembic.command import downgrade, upgrade
+from alembic.config import Config
+from alembic.ddl.postgresql import PostgresqlImpl
+from sqlalchemy import create_engine, delete, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
+from app.agents.response_draft_generator import RESPONSE_DRAFT_GENERATOR_VERSION
 from app.db.follow_up_approval_repository import (
     FollowUpLiveSendExistsError,
 )
@@ -45,6 +55,7 @@ from app.db.models import (
     FollowUpApprovalRecord,
     FollowUpProposalRecord,
     FollowUpSendRecord,
+    GmailMessageAnalysisRecord,
     GmailMessageIdClaimRecord,
     GmailMessageRecord,
     GmailThreadRecord,
@@ -57,10 +68,12 @@ from app.db.response_draft_approval_repository import (
     ResponseDraftLiveSendExistsError,
     claim_send_attempt,
     create_approval,
+    list_pending_response_drafts,
     retry_send_attempt,
 )
 from app.db.response_draft_repository import get_or_create_response_draft
 from app.providers.email.base import ParsedGmailMessage
+from app.services.gmail_message_analysis import analyze_gmail_message
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 
@@ -86,6 +99,7 @@ def pg_session_factory():
                 ResponseDraftSendRecord,
                 ResponseDraftApprovalRecord,
                 ResponseDraftRecord,
+                GmailMessageAnalysisRecord,
                 FollowUpSendRecord,
                 FollowUpApprovalRecord,
                 FollowUpProposalRecord,
@@ -371,3 +385,103 @@ class TestFollowUpLiveSendPerAnchor:
                 )
             ).all()
             assert [row.follow_up_proposal_id for row in live] == [winners[0][0]]
+
+
+def _draft_revision(db, message_id: int, analysis_id: int, profile_version: int) -> int:
+    draft, _created = get_or_create_response_draft(
+        db,
+        account_key=ACCOUNT,
+        gmail_message_id=message_id,
+        analysis_id=analysis_id,
+        analysis_version=1,
+        candidate_profile_version=profile_version,
+        matched_job_id=None,
+        classification="OFFER",
+        status="PROPOSED",
+        reason=None,
+        subject="Re: Offer",
+        body=f"Revision {profile_version}",
+        language="en",
+        missing_fields=(),
+        provider="deterministic_template",
+        generator_version=RESPONSE_DRAFT_GENERATOR_VERSION,
+    )
+    return draft.id
+
+
+class TestPendingQueueCurrentRevisionOnPostgres:
+    def test_current_draft_wins_over_a_later_inserted_stale_draft(self, pg_session_factory):
+        """S12-001: the same SQL the SQLite suites prove, on PostgreSQL."""
+        with pg_session_factory() as db:
+            message = _seed_message(db)
+            analysis, _created = analyze_gmail_message(db, ACCOUNT, message.id)
+            current_id = _draft_revision(db, message.id, analysis.id, profile_version=2)
+            stale_id = _draft_revision(db, message.id, analysis.id, profile_version=1)
+            assert stale_id > current_id
+
+            def listed(profile_version: int) -> list[int]:
+                rows = list_pending_response_drafts(
+                    db,
+                    ACCOUNT,
+                    current_candidate_profile_version=profile_version,
+                    current_generator_version=RESPONSE_DRAFT_GENERATOR_VERSION,
+                    limit=20,
+                    offset=0,
+                )
+                return [draft.id for draft, _type, _confidence in rows]
+
+            assert listed(2) == [current_id]
+            assert listed(1) == [stale_id]
+            assert listed(99) == [stale_id]  # no current revision: highest-id fallback
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PREVIOUS_REVISION = "e8b1c4f7a2d9"
+LIVE_SEND_INDEXES = {
+    "uq_response_draft_sends_live_per_message": "response_draft_sends",
+    "uq_follow_up_sends_live_per_anchor": "follow_up_sends",
+}
+
+
+class TestMigrationSecondIndexFailureOnPostgres:
+    def test_second_index_failure_rolls_back_and_retry_succeeds(self, monkeypatch):
+        """S12-002: PostgreSQL DDL is transactional, so the migration's
+        SQLite-only cleanup is skipped and the failed upgrade leaves nothing
+        behind. Always restores head for the other tests in this job."""
+        cfg = Config(str(PROJECT_ROOT / "alembic.ini"))
+        cfg.set_main_option("sqlalchemy.url", TEST_POSTGRES_URL)
+        engine = create_engine(TEST_POSTGRES_URL, pool_pre_ping=True)
+
+        def state() -> tuple[str, set[str]]:
+            with engine.connect() as conn:
+                revision = conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+            inspector = inspect(engine)
+            names = {
+                index["name"]
+                for table in LIVE_SEND_INDEXES.values()
+                for index in inspector.get_indexes(table)
+            }
+            return revision, names & set(LIVE_SEND_INDEXES)
+
+        original = PostgresqlImpl.create_index
+
+        def create_index(self, index, **kw):
+            if index.name == "uq_follow_up_sends_live_per_anchor":
+                raise sqlalchemy.exc.OperationalError("CREATE INDEX", {}, Exception("injected"))
+            return original(self, index, **kw)
+
+        try:
+            downgrade(cfg, PREVIOUS_REVISION)
+            with monkeypatch.context() as patched:
+                patched.setattr(PostgresqlImpl, "create_index", create_index)
+                with pytest.raises(sqlalchemy.exc.OperationalError):
+                    upgrade(cfg, "head")
+            assert state() == (PREVIOUS_REVISION, set())
+
+            upgrade(cfg, "head")
+            assert state() == ("a7c3e9f1b2d4", set(LIVE_SEND_INDEXES))
+        finally:
+            upgrade(cfg, "head")
+            engine.dispose()

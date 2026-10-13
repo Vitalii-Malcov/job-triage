@@ -23,6 +23,12 @@ creating anything, instead of failing midway on the second index. No row is
 modified or deleted: resolving a pre-existing duplicate live send is a
 human decision. Downgrade drops both indexes; no data is touched.
 
+If creating an index fails on SQLite (non-transactional DDL), the indexes
+this invocation already created are dropped before the error is re-raised,
+so the database stays at e8b1c4f7a2d9 with no partial state and the upgrade
+can simply be retried. Indexes that existed before the invocation are never
+dropped.
+
 Revision ID: a7c3e9f1b2d4
 Revises: e8b1c4f7a2d9
 Create Date: 2026-10-13
@@ -74,15 +80,40 @@ def upgrade() -> None:
             "Refusing to add live-send uniqueness: targets already have more than one "
             f"PENDING/SENT/UNCERTAIN send row: {conflicts}. Resolve them manually first."
         )
-    for name, table in _INDEXES.items():
-        op.create_index(
-            name,
-            table,
-            ["account_key", "gmail_message_id"],
-            unique=True,
-            sqlite_where=sa.text(_LIVE_PREDICATE),
-            postgresql_where=sa.text(_LIVE_PREDICATE),
-        )
+    created: list[tuple[str, str]] = []
+    try:
+        for name, table in _INDEXES.items():
+            op.create_index(
+                name,
+                table,
+                ["account_key", "gmail_message_id"],
+                unique=True,
+                sqlite_where=sa.text(_LIVE_PREDICATE),
+                postgresql_where=sa.text(_LIVE_PREDICATE),
+            )
+            created.append((name, table))
+    except Exception:
+        # S12-002 (Codex review): SQLite DDL is not transactional here, so an
+        # index created before the failure would survive while the revision
+        # stays e8b1c4f7a2d9, and every retry would then fail on "already
+        # exists". Undo only what THIS invocation created, then re-raise.
+        # PostgreSQL rolls the whole migration back itself (and its aborted
+        # transaction would refuse the DROP anyway).
+        if not op.get_context().impl.transactional_ddl:
+            _drop_indexes_created_by_this_upgrade(created)
+        raise
+
+
+def _drop_indexes_created_by_this_upgrade(created: list[tuple[str, str]]) -> None:
+    try:
+        for name, table in reversed(created):
+            op.drop_index(name, table_name=table)
+    except Exception as cleanup_error:
+        names = [name for name, _table in created]
+        raise RuntimeError(
+            f"live-send uniqueness upgrade failed and could not remove the index(es) it "
+            f"had just created: {names}. Drop them manually before retrying."
+        ) from cleanup_error
 
 
 def downgrade() -> None:
