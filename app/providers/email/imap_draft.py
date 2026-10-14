@@ -14,8 +14,9 @@ consults `OUTBOUND_SENDING_ENABLED`.
 
 Account pin (Stage 13C): `allowed_account` empty (the default) or different
 from `username` refuses both `create_draft` and `find_by_message_id` before
-any connection. A successful LOGIN as that exact username is the mailbox
-identity proof; nothing else about the account is trusted.
+any connection. A successful LOGIN only authenticates that configured
+account; it does not prove the mailbox is non-production or dedicated --
+the operator verifies that independently.
 
 Session discipline (installed CPython 3.14 imaplib, verified in source):
 `append()` returns the TAGGED response `(typ, [data])`, e.g.
