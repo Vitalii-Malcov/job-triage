@@ -117,7 +117,10 @@ docker compose logs web | grep -o '{.*}' | jq 'select(.level=="ERROR")'
 A dump contains the candidate's personal data **unencrypted**. It is written to a private
 directory **outside the repository** and never anywhere under the working tree (`.gitignore` is
 not the protection — the file must not exist in the repository filesystem at all). The commands
-below refuse to run if `BACKUP_DIR` resolves inside the repository.
+below refuse to run if `BACKUP_DIR` resolves inside the repository, and the refusal exits
+**nonzero** so a scheduler never records a refused run as a successful backup. Save the bash
+block as a script (e.g. `job-triage-backup.sh`, kept outside the repository) and run it from the
+repository root; pasted into an interactive shell, the refusal's `exit 1` closes that shell.
 
 `POSTGRES_USER` / `POSTGRES_DB` are expanded **inside the `db` container** (single-quoted
 `sh -c`), where Compose has set them from `.env`. Compose does *not* export `.env` into your host
@@ -132,7 +135,10 @@ mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
 REPO_REAL="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
 BACKUP_REAL="$(cd "$BACKUP_DIR" && pwd -P)"
 case "$BACKUP_REAL/" in
-  "$REPO_REAL/"*) echo "refusing: BACKUP_DIR is inside the repository" >&2 ;;
+  "$REPO_REAL/"*)
+    echo "refusing: BACKUP_DIR is inside the repository" >&2
+    exit 1
+    ;;
   *)
     STAMP="$(date +%Y%m%d%H%M%S)"
     docker compose exec -T db sh -c \
