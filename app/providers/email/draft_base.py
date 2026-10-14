@@ -180,6 +180,13 @@ class DraftsMailboxInvalidError(DraftCreateDefiniteError):
     code = "DRAFTS_MAILBOX_INVALID"
 
 
+class DraftAccountNotAllowedError(DraftCreateDefiniteError):
+    """Stage 13C: the login account is not the operator-pinned draft
+    account. Raised before any connection."""
+
+    code = "ACCOUNT_NOT_ALLOWED"
+
+
 class DraftBudgetExhaustedError(DraftCreateDefiniteError):
     code = "BUDGET_EXHAUSTED"
 

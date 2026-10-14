@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     # UX/load pacing for "🔄 Gmail-Status prüfen" -- NOT evidence that no
     # draft exists; an unclear status stays unclear without a positive match.
     gmail_draft_reconcile_min_age_seconds: int = Field(default=120, ge=0, le=86400)
+    # Stage 13C: the ONE mailbox the draft path may log in to, pinned
+    # explicitly by the operator (for validation: a dedicated NON-production
+    # Gmail account). Empty (the default) refuses every draft create and
+    # every reconcile lookup before any ledger claim or IMAP connection; a
+    # GMAIL_USERNAME that differs from it refuses the same way. Identity, not
+    # a secret -- the App Password stays in gmail_app_password.
+    gmail_draft_allowed_account: str = ""
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.

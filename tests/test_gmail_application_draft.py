@@ -81,6 +81,7 @@ def _settings(**overrides):
     data = dict(
         telegram_gmail_draft_enabled=True,
         gmail_username=ACCOUNT,
+        gmail_draft_allowed_account=ACCOUNT,
         gmail_app_password=PASSWORD,
         gmail_drafts_mailbox="[Gmail]/Drafts",
         gmail_draft_attempt_budget_seconds=60,
@@ -608,7 +609,11 @@ class TestCreate:
         await _create(session_factory, approved["capability"], provider)
         await _regenerate(session_factory, approved)
         outcome = await _create(
-            session_factory, approved["capability"], provider, gmail_username="new@example.com"
+            session_factory,
+            approved["capability"],
+            provider,
+            gmail_username="new@example.com",
+            gmail_draft_allowed_account="new@example.com",
         )
         assert outcome.code == "ALREADY_CREATED" and len(provider.creates) == 1
 
@@ -1227,11 +1232,19 @@ class TestStickyUncertain:
     ):
         clock.advance(200)
         outcome = await _recheck(
-            session_factory, uncertain["capability"], provider, gmail_username="new@example.com"
+            session_factory,
+            uncertain["capability"],
+            provider,
+            gmail_username="new@example.com",
+            gmail_draft_allowed_account="new@example.com",
         )
         assert outcome.code == "ACCOUNT_CHANGED" and provider.lookups == []
         create = await _create(
-            session_factory, uncertain["capability"], provider, gmail_username="new@example.com"
+            session_factory,
+            uncertain["capability"],
+            provider,
+            gmail_username="new@example.com",
+            gmail_draft_allowed_account="new@example.com",
         )
         assert create.code == "UNCERTAIN" and len(provider.creates) == 1
 

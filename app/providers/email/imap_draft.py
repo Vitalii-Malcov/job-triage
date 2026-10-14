@@ -12,6 +12,12 @@ Kill switch: `drafts_enabled=False` (the default) refuses before any
 connection. It is wired only from `TELEGRAM_GMAIL_DRAFT_ENABLED` and never
 consults `OUTBOUND_SENDING_ENABLED`.
 
+Account pin (Stage 13C): `allowed_account` empty (the default) or different
+from `username` refuses both `create_draft` and `find_by_message_id` before
+any connection. A successful LOGIN only authenticates that configured
+account; it does not prove the mailbox is non-production or dedicated --
+the operator verifies that independently.
+
 Session discipline (installed CPython 3.14 imaplib, verified in source):
 `append()` returns the TAGGED response `(typ, [data])`, e.g.
 `('OK', [b'[APPENDUID 7 42] (Success)'])`; a tagged BAD raises
@@ -60,6 +66,7 @@ from app.providers.email.base import normalize_account_key
 from app.providers.email.draft_base import (
     MESSAGE_ID_PATTERN,
     UID_MAX,
+    DraftAccountNotAllowedError,
     DraftAuthError,
     DraftBudgetExhaustedError,
     DraftConnectError,
@@ -367,6 +374,7 @@ class GmailImapDraftProvider:
         app_password: str,
         *,
         drafts_enabled: bool = False,
+        allowed_account: str = "",
         client_factory: ClientFactory | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -375,6 +383,7 @@ class GmailImapDraftProvider:
         self.username = username
         self._app_password = app_password
         self.drafts_enabled = bool(drafts_enabled)
+        self.allowed_account = allowed_account
         self._client_factory = client_factory or self._connect
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -428,6 +437,11 @@ class GmailImapDraftProvider:
             raise DraftsMailboxInvalidError("LIST response is not verifiable") from None
         verify_drafts_target(entries, target)
 
+    def _check_account(self) -> None:
+        pinned = normalize_account_key(self.allowed_account or "")
+        if not pinned or normalize_account_key(self.username) != pinned:
+            raise DraftAccountNotAllowedError("Login account is not the pinned draft account")
+
     def _check_target(self, target: DraftTarget) -> None:
         if normalize_account_key(self.username) != target.account_key:
             raise DraftsMailboxInvalidError("Frozen target belongs to another account")
@@ -448,6 +462,7 @@ class GmailImapDraftProvider:
         classification."""
         if not self.drafts_enabled:
             raise DraftsDisabledError("Gmail draft creation is disabled")
+        self._check_account()
         mime = build_draft_mime(message, date=self._clock())
         self._check_target(target)
         remaining = self._remaining(deadline_at)
@@ -511,8 +526,9 @@ class GmailImapDraftProvider:
         if not MESSAGE_ID_PATTERN.fullmatch(marker):
             raise DraftLookupError("Marker is malformed")
         try:
+            self._check_account()
             self._check_target(target)
-        except DraftsMailboxInvalidError:
+        except (DraftAccountNotAllowedError, DraftsMailboxInvalidError):
             raise DraftLookupError("Frozen target is unusable") from None
         remaining = self._remaining(deadline_at)
         if remaining <= 0:
