@@ -34,21 +34,37 @@ nearly every invariant Stage 13C needs:
 | Logging | Ids, attempt counts, states, fixed codes, exception types, durations only |
 | Feature flag | `TELEGRAM_GMAIL_DRAFT_ENABLED` (default `false`, also pinned `false` in `compose.yaml`), plus both Stage 9B/9C flags; never consults `OUTBOUND_SENDING_ENABLED` |
 
-**Gap closed by Stage 13C — mailbox identity.** Before Stage 13C the draft path wrote to whatever
-`GMAIL_USERNAME` was configured — the same account the inbox sync uses, i.e. typically the
-operator's personal mailbox. Stage 13C adds an explicit, fail-closed pin:
+**Gap narrowed by Stage 13C — an explicit mailbox pin.** Before Stage 13C the draft path wrote to
+whatever `GMAIL_USERNAME` was configured — the same account the inbox sync uses, i.e. typically the
+operator's personal mailbox. Stage 13C adds an explicit, fail-closed, **operator-configured** pin:
 
 - `GMAIL_DRAFT_ALLOWED_ACCOUNT` (default empty). Draft create **and** reconcile lookup are refused
-  with `ACCOUNT_NOT_ALLOWED` unless it is a single bare address equal (identity comparison:
-  `strip().casefold()`) to `GMAIL_USERNAME`.
+  with `ACCOUNT_NOT_ALLOWED` unless it is a single bare address equal to `GMAIL_USERNAME` under the
+  project's account normalization (`strip().casefold()`).
 - Checked in the service **before any ledger claim** (`_static_config`, `handle_reconcile`) and
   again in `GmailImapDraftProvider` **before any IMAP connection** (`_check_account`; the provider
   default `allowed_account=""` refuses). A refusal never changes an existing ledger row
   (an `UNCERTAIN` attempt stays `UNCERTAIN`).
-- Identity proof at runtime: the provider logs in as exactly that username; a successful LOGIN as
-  the pinned account is the only identity evidence trusted. The ledger's frozen `account_key`
-  additionally blocks reconciling/re-creating an attempt under a different account
-  (`ACCOUNT_CHANGED`).
+- The provider logs in as exactly that username. A successful LOGIN only means the App Password
+  authenticated to the configured account; it says nothing about what kind of account it is. The
+  ledger's frozen `account_key` additionally blocks reconciling/re-creating an attempt under a
+  different account (`ACCOUNT_CHANGED`).
+
+### What the pin guarantees — and what it does not
+
+**TECHNICAL GUARANTEE (enforced by code and tests):** no draft is created and no reconcile lookup
+connects unless the configured Gmail login (`GMAIL_USERNAME`) equals the operator-pinned account
+(`GMAIL_DRAFT_ALLOWED_ACCOUNT`), and an empty pin refuses everything. That is all the pin proves.
+
+The application **cannot determine** whether the pinned mailbox is personal, production,
+non-production, dedicated or isolated. If an operator sets both values to the same personal Gmail
+account, the pin passes and a draft would land in that personal mailbox. The pin does **not**
+prevent that; it only prevents the draft path from writing to an account nobody pinned.
+
+**OPERATIONAL GUARANTEE (human, not code):** before any live Stage 13C validation, the operator
+independently verifies that the pinned account is the intended **dedicated non-production
+validation mailbox** (see the operator preflight below). If the operator cannot verify that:
+**STOP — do not enable Gmail draft validation and do not perform any live write.**
 
 No new feature flag and **no schema change / migration**: the ledger already records everything
 Stage 13C needs. The pin is configuration, not a flag; it does not enable anything by itself.
@@ -57,7 +73,8 @@ Stage 13C needs. The pin is configuration, not a flag; it does not enable anythi
 
 | Threat | Control |
 |---|---|
-| Draft lands in the personal/production mailbox | `GMAIL_DRAFT_ALLOWED_ACCOUNT` pin (empty = refuse), double-checked in service and provider |
+| Draft lands in an account nobody pinned | `GMAIL_DRAFT_ALLOWED_ACCOUNT` pin (empty = refuse), double-checked in service and provider — technical |
+| Draft lands in the personal/production mailbox | **Operator verification only** (preflight items 2–3): the pin cannot tell a personal account from a validation account — operational |
 | Something gets sent | No send capability in the draft modules (AST-tested), no recipient field, flags independent of `OUTBOUND_SENDING_ENABLED` (which stays `false`) |
 | Draft created without approval / automatically | Only `handle_create` creates; only the Telegram callback (authorized operator, private chat, all three flags) calls it; the scheduler never does |
 | Content changed after approval | Full revalidation at claim and arm; frozen handoff + content hash; renderer reads only the approved revision |
@@ -66,8 +83,9 @@ Stage 13C needs. The pin is configuration, not a flag; it does not enable anythi
 | Credential leakage | App Password only from env (`repr=False`); fixed-string errors; logs carry no address, subject, body, marker, mailbox or UID |
 
 Accepted risk (unchanged, see `CLAUDE.md`): the Gmail App Password grants full mailbox access; the
-draft path uses one write type (APPEND to the verified `\Drafts` mailbox). The non-production
-mailbox limits the blast radius of the live test.
+draft path uses one write type (APPEND to the verified `\Drafts` mailbox). A dedicated
+non-production mailbox — verified as such by the operator, not by the application — limits the
+blast radius of the live test.
 
 ## Configuration
 
@@ -77,9 +95,9 @@ mailbox limits the blast radius of the live test.
 | `ALEMBIC_AUTO_UPGRADE` | `false` | **`false`** (unchanged) |
 | `TELEGRAM_GMAIL_DRAFT_ENABLED` | `false` | `true` **only** in the isolated validation environment, only after confirmation |
 | `TELEGRAM_BEWERBUNG_DRAFT_ENABLED`, `TELEGRAM_BEWERBUNG_APPROVAL_ENABLED` | `false` | `true` in the validation environment (required to reach an approval) |
-| `GMAIL_USERNAME` | empty | the dedicated non-production Gmail address |
+| `GMAIL_USERNAME` | empty | the operator-verified dedicated non-production Gmail address |
 | `GMAIL_APP_PASSWORD` | empty | that account's App Password (env only, never committed) |
-| `GMAIL_DRAFT_ALLOWED_ACCOUNT` | empty | the **same** non-production address |
+| `GMAIL_DRAFT_ALLOWED_ACCOUNT` | empty | the **same** operator-verified address |
 | `GMAIL_DRAFTS_MAILBOX` | `[Gmail]/Drafts` | the account's decoded Drafts name (e.g. `[Gmail]/Entwürfe` for a German UI) |
 
 Tracked configuration (`compose.yaml`, `.env.example`, `.env.stage10.example`) keeps every flag
@@ -94,7 +112,7 @@ Tracked configuration (`compose.yaml`, `.env.example`, `.env.stage10.example`) k
 | C stale approval / artifact changed | `TestExactBinding::test_profile_change_is_stale`, `test_job_change_is_stale`, `test_replaced_generation`, `test_api_approval_of_another_revision_is_refused`, `test_package_replaced_between_claim_and_arm_releases_the_claim` |
 | D/E/F recipient changed / missing / malformed | Structural — no recipient exists to change: `test_draft_message_has_no_recipient_field`, `test_entry_points_take_no_recipient_or_content_argument`, `test_created_mime_has_no_recipient_and_only_allowed_headers`, `TestCreate::test_mime_has_no_recipient_attachment_or_html` |
 | G feature disabled | `tests/test_telegram_gmail_draft_bot.py` (flag matrix), `test_draft_flag_never_consults_outbound_sending` |
-| H wrong/unknown mailbox | `tests/test_stage13c_gmail_draft_validation.py` (`test_unpinned_or_mismatched_account_refuses_before_any_claim`, `test_username_not_matching_the_pin_refuses`, `test_reconcile_lookup_requires_the_pin`, `test_provider_refuses_*_before_connecting`), `TestStickyUncertain::test_account_change_blocks_reconciliation_and_creation` |
+| H login account ≠ pinned account (technical guarantee only) | `tests/test_stage13c_gmail_draft_validation.py` (`test_unpinned_or_mismatched_account_refuses_before_any_claim`, `test_username_not_matching_the_pin_refuses`, `test_reconcile_lookup_requires_the_pin`, `test_provider_refuses_*_before_connecting`), `TestStickyUncertain::test_account_change_blocks_reconciliation_and_creation` |
 | I duplicate invocation | `TestCreate::test_sequential_duplicate_is_one_append_with_historical_wording`, `test_in_flight_duplicate_press_reports_progress_without_a_second_append` |
 | J concurrent duplicate | `tests/integration/test_gmail_application_draft_postgres.py::test_1_*`, `test_2_begin_append_race_grants_exactly_one_permit` (real PostgreSQL) |
 | K provider failure before creation | `TestProviderOutcomes::test_definite_failures_are_failed_with_retry_button` |
@@ -109,9 +127,20 @@ Tracked configuration (`compose.yaml`, `.env.example`, `.env.stage10.example`) k
 All of these must hold; any "no" is a STOP.
 
 1. Codex has passed the Stage 13C implementation review, and the branch is merged with green CI.
-2. A **dedicated non-production Gmail account** exists, created for this test, holding no personal
-   mail, with 2-step verification and its own App Password. It is not the personal mailbox, not
-   the XING-alert mailbox and not the inbox-sync account of any production environment.
+2. A **dedicated non-production Gmail account** exists, with 2-step verification and its own App
+   Password. The application cannot check any of the following; the operator verifies each one
+   independently and confirms it explicitly (in writing, in the live-test confirmation):
+   - this account was created or selected **specifically for Stage 13C validation**;
+   - it is **not** the user's personal mailbox and holds no personal mail;
+   - it is **not** a production or recruiter-facing mailbox (not the XING-alert mailbox, not the
+     inbox-sync account of any production environment, never used to contact employers);
+   - the operator has **visually/administratively verified the account identity** (signed in to
+     that account in a browser and checked the address shown by Google);
+   - `GMAIL_USERNAME` **and** `GMAIL_DRAFT_ALLOWED_ACCOUNT` both refer to exactly that verified
+     dedicated validation mailbox.
+
+   If any of these cannot be verified independently: **STOP. Do not enable Gmail draft validation.
+   Do not perform a live write.** A passing pin is not a substitute for this check.
 3. The validation runs in an **isolated environment**: a separate checkout/venv and a separate,
    disposable database (never the production PostgreSQL, never `ai_agent-db-1`, never the SQLite
    pilot). The production compose stack is not reconfigured; its pinned `false` flags stay.
@@ -129,7 +158,8 @@ All of these must hold; any "no" is a STOP.
 ## Live validation checklist (later, separately approved step)
 
 **No step below may run without explicit operator confirmation given for this live test.** The
-confirmation names the non-production address and the single approval capability to be used.
+confirmation names the non-production address, states that the operator has independently verified
+it per preflight item 2, and names the single approval capability to be used.
 
 1. Record: branch/main SHA, Alembic head, non-production address, timestamp.
 2. Confirm in Gmail (web UI) that the non-production Drafts folder is empty or note its count.
