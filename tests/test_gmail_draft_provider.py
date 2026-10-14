@@ -322,6 +322,7 @@ def _provider(client=None, *, enabled=True, clock=None, factory_calls=None):
         ACCOUNT,
         "app-password-secret",
         drafts_enabled=enabled,
+        allowed_account=ACCOUNT,
         client_factory=factory,
         clock=clock or Clock(),
     )
@@ -874,7 +875,14 @@ class TestCreateDraft:
             raise OSError("dns")
 
         provider = GmailImapDraftProvider(
-            "h", 993, ACCOUNT, "pw", drafts_enabled=True, client_factory=factory, clock=Clock()
+            "h",
+            993,
+            ACCOUNT,
+            "pw",
+            drafts_enabled=True,
+            allowed_account=ACCOUNT,
+            client_factory=factory,
+            clock=Clock(),
         )
         with pytest.raises(DraftConnectError):
             provider.create_draft(_message(), _target(), NOW + timedelta(seconds=60))
@@ -1027,7 +1035,13 @@ def test_default_connection_uses_verified_tls_bounded_timeout_and_no_debug(monke
 
     monkeypatch.setattr(imap_draft, "DeadlineIMAP4SSL", FakeSSL)
     provider = GmailImapDraftProvider(
-        "imap.example.com", 993, ACCOUNT, "pw", drafts_enabled=True, clock=Clock()
+        "imap.example.com",
+        993,
+        ACCOUNT,
+        "pw",
+        drafts_enabled=True,
+        allowed_account=ACCOUNT,
+        clock=Clock(),
     )
     provider.create_draft(_message(), _target(), NOW + timedelta(seconds=60))
     assert created["ctx"].verify_mode == ssl.CERT_REQUIRED and created["ctx"].check_hostname

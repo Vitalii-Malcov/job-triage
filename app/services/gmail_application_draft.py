@@ -31,6 +31,11 @@ FAILED or retryable.
 CREATED is historical: "Stage 9D created this draft at least once" -- not
 that it still exists, is unsent, unchanged or still recipient-less.
 
+Stage 13C: every create and every reconcile lookup also requires
+GMAIL_USERNAME to equal the operator-pinned GMAIL_DRAFT_ALLOWED_ACCOUNT
+(empty = refuse), checked before any ledger claim and again inside the
+provider before any IMAP connection.
+
 Logs carry only ledger/link ids, attempt counts, states, fixed codes,
 exception types and durations.
 """
@@ -167,6 +172,9 @@ NOTICES: dict[str, str] = {
     "DRAFTS_MAILBOX_INVALID": _CONFIG_NOTICE,
     "DRAFTS_MAILBOX_UNENCODABLE": _CONFIG_NOTICE,
     "GMAIL_DRAFT_DISABLED": "Gmail-Entwürfe sind deaktiviert. " + _NOTHING_DONE,
+    "ACCOUNT_NOT_ALLOWED": (
+        "Das konfigurierte Gmail-Konto ist nicht als Entwurfskonto freigegeben. " + _NOTHING_DONE
+    ),
     "UNKNOWN_CAPABILITY": "Unbekannte oder abgelaufene Freigabe. " + _NOTHING_DONE,
     "NOT_APPROVED": "Diese Prüfung ist nicht freigegeben. " + _NOTHING_DONE,
     "ALREADY_REJECTED": "Diese Prüfung wurde abgelehnt. " + _NOTHING_DONE,
@@ -377,12 +385,25 @@ class _Config:
     budget_seconds: int
 
 
+def account_allowed(settings) -> bool:
+    """Stage 13C mailbox pin: GMAIL_USERNAME must be exactly the account the
+    operator pinned in GMAIL_DRAFT_ALLOWED_ACCOUNT (identity comparison via
+    `normalize_account_key`). An unset pin is never a match."""
+    pinned = validate_from_address(getattr(settings, "gmail_draft_allowed_account", None))
+    username = getattr(settings, "gmail_username", None)
+    if pinned is None or not isinstance(username, str):
+        return False
+    return normalize_account_key(username) == normalize_account_key(pinned)
+
+
 def _static_config(settings) -> "_Config | GmailDraftOutcome":
     """Everything checkable without the DB or network -- refused BEFORE
     any ledger claim."""
     from_address = validate_from_address(getattr(settings, "gmail_username", None))
     if from_address is None:
         return _outcome("FROM_INVALID")
+    if not account_allowed(settings):
+        return _outcome("ACCOUNT_NOT_ALLOWED")
     if not is_configured(getattr(settings, "gmail_app_password", "")):
         return _outcome("CONFIG_INVALID")
     try:
@@ -405,6 +426,7 @@ def build_provider(settings) -> GmailImapDraftProvider:
         settings.gmail_username,
         settings.gmail_app_password,
         drafts_enabled=gmail_draft_flags_enabled(settings),
+        allowed_account=getattr(settings, "gmail_draft_allowed_account", ""),
     )
 
 
@@ -982,6 +1004,8 @@ async def handle_reconcile(
     password = getattr(settings, "gmail_app_password", "")
     if not is_configured(username) or not is_configured(password):
         return _outcome("CONFIG_INVALID")
+    if not account_allowed(settings):
+        return _outcome("ACCOUNT_NOT_ALLOWED")
 
     snapshot = _run_db(session_factory, _reconcile_snapshot(capability))
     if isinstance(snapshot, GmailDraftOutcome):

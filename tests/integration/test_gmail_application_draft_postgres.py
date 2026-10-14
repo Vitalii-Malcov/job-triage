@@ -106,6 +106,7 @@ def _settings(**overrides) -> Settings:
         telegram_bewerbung_approval_enabled=True,
         telegram_gmail_draft_enabled=True,
         gmail_username="me@example.com",
+        gmail_draft_allowed_account="me@example.com",
         gmail_app_password="app-pw",
         gmail_drafts_mailbox="[Gmail]/Drafts",
         gmail_draft_attempt_budget_seconds=60,
