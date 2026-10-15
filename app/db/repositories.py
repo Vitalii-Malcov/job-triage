@@ -204,7 +204,37 @@ def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
     return "UNIQUE constraint failed: jobs.fingerprint" in str(orig)
 
 
-def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]:
+def upsert_job(
+    db: Session,
+    job: Job,
+    score: JobScore,
+    *,
+    first_seen_at: datetime | None = None,
+    last_seen_at: datetime | None = None,
+) -> tuple[JobRecord, bool]:
+    """`first_seen_at`/`last_seen_at` (Stage 14B, keyword-only, both or
+    neither): the ORIGINAL collector observation times when a job is
+    transferred from another database, so import time is never mistaken
+    for collector freshness. Insert-only: if the fingerprint already exists
+    the call raises `ValueError` instead of rewriting an existing record's
+    observation history. Collectors never pass them. Concurrency (HARD-007)
+    is documented on `_upsert_job`.
+    """
+    if (first_seen_at is None) != (last_seen_at is None):
+        raise ValueError("first_seen_at and last_seen_at must be given together")
+    historical = first_seen_at is not None
+    if historical and last_seen_at < first_seen_at:
+        raise ValueError("last_seen_at must not be before first_seen_at")
+    return _upsert_job(db, job, score, first_seen_at, last_seen_at)
+
+
+def _upsert_job(
+    db: Session,
+    job: Job,
+    score: JobScore,
+    first_seen_at: datetime | None,
+    last_seen_at: datetime | None,
+) -> tuple[JobRecord, bool]:
     """HARD-007 (Codex master review): two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
     None` above (the classic check-then-act TOCTOU window between this
@@ -242,7 +272,10 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
     fingerprint = _fingerprint(job)
     existing = get_job_by_fingerprint(db, job)
     now = datetime.now(UTC)
+    historical = first_seen_at is not None
     if existing:
+        if historical:
+            raise ValueError("historical observation timestamps apply only to a new job record")
         _apply_job_update_fields(existing, job, score, now)
         _finalize_job_write(db, existing)
         return existing, False
@@ -264,8 +297,8 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         score=score.score,
         recommendation=score.recommendation,
         status="NEW",
-        first_seen_at=now,
-        last_seen_at=now,
+        first_seen_at=first_seen_at or now,
+        last_seen_at=last_seen_at or now,
     )
     db.add(record)
     try:
@@ -277,6 +310,10 @@ def upsert_job(db: Session, job: Job, score: JobScore) -> tuple[JobRecord, bool]
         winner = get_job_by_fingerprint(db, job)
         if winner is None:
             raise
+        if historical:
+            raise ValueError(
+                "historical observation timestamps apply only to a new job record"
+            ) from exc
         _apply_job_update_fields(winner, job, score, now)
         _finalize_job_write(db, winner)
         return winner, False
