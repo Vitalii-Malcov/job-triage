@@ -10,6 +10,7 @@ only a local read-only SQLite URI before creating any engine.
 import asyncio
 import hashlib
 import json
+import os
 import socket
 from datetime import UTC, datetime
 
@@ -647,3 +648,127 @@ def test_cli_still_reads_local_json_paths(factory, seeded, db_path, capsys, tmp_
     assert "refused" not in captured.err
     assert code == 1
     assert "READY_FOR_SEND_PACKAGE = NO" in captured.out
+
+
+# --- CLI: mapped network drives (Windows drive-type classification) ------------
+
+_LOCAL_DB_URL = "sqlite:///file:stage11_pilot.db?mode=ro&uri=true"
+
+
+@pytest.fixture
+def fake_drives(monkeypatch):
+    """Deterministic drive table: C: FIXED, E: REMOVABLE, Z: REMOTE (mapped
+    SMB), Y: UNKNOWN, X: NO_ROOT_DIR. Independent of the real machine."""
+    types = {"C:\\": 3, "E:\\": 2, "Z:\\": 4, "Y:\\": 0, "X:\\": 1}
+    calls: list[str] = []
+
+    def _fake_drive_type(root: str) -> int:
+        calls.append(root)
+        return types.get(root.upper(), 0)
+
+    monkeypatch.setattr(cli, "_IS_WINDOWS", True)
+    monkeypatch.setattr(cli, "_drive_type", _fake_drive_type)
+    monkeypatch.setattr(cli, "_cwd", lambda: "C:\\work")
+    return calls
+
+
+def _forbid_reads_and_engine(monkeypatch):
+    def _no_read(*args, **kwargs):
+        raise AssertionError("read_text called before drive classification")
+
+    def _no_engine(*args, **kwargs):
+        raise AssertionError("engine created before drive classification")
+
+    monkeypatch.setattr(cli.Path, "read_text", _no_read)
+    monkeypatch.setattr(cli, "create_engine", _no_engine)
+
+
+@pytest.mark.parametrize("flag", ["--destination-json", "--location-json"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "Z:\\research\\destination.json",
+        "Z:/research/destination.json",
+        "z:\\research\\destination.json",
+        "Z:destination.json",
+        "Y:\\research\\destination.json",
+        "X:\\research\\destination.json",
+    ],
+)
+def test_cli_rejects_json_on_mapped_or_unclassified_drive_before_read(
+    monkeypatch, capsys, fake_drives, flag, path
+):
+    _forbid_reads_and_engine(monkeypatch)
+    assert cli.main(["--database-url", _LOCAL_DB_URL, "--job-id", "1", flag, path]) == 2
+    assert "refused" in capsys.readouterr().err
+    assert fake_drives[-1].upper() == path[:2].upper() + "\\"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite:///file:Z:/data/stage11_pilot.db?mode=ro&uri=true",
+        "sqlite:///file:Z:\\data\\stage11_pilot.db?mode=ro&uri=true",
+        "sqlite:///file:/Z:/data/stage11_pilot.db?mode=ro&uri=true",
+        "sqlite:///file:Y:/data/stage11_pilot.db?mode=ro&uri=true",
+    ],
+)
+def test_cli_rejects_sqlite_on_mapped_drive_before_engine(monkeypatch, capsys, fake_drives, url):
+    _forbid_reads_and_engine(monkeypatch)
+    with pytest.raises(cli.UnsafeDatabaseUrlError, match="local drive"):
+        cli.validate_readonly_sqlite_url(url)
+    assert cli.main(["--database-url", url, "--job-id", "1"]) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_relative_paths_from_remote_cwd_are_rejected(monkeypatch, capsys, fake_drives):
+    monkeypatch.setattr(cli, "_cwd", lambda: "Z:\\shared\\work")
+    _forbid_reads_and_engine(monkeypatch)
+    with pytest.raises(cli.UnsafeInputPathError):
+        cli.validate_local_json_path("docs/research/destination.json")
+    with pytest.raises(cli.UnsafeDatabaseUrlError):
+        cli.validate_readonly_sqlite_url(_LOCAL_DB_URL)
+    assert cli.main(["--database-url", _LOCAL_DB_URL, "--job-id", "1"]) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_relative_paths_from_unc_cwd_are_rejected(monkeypatch, fake_drives):
+    monkeypatch.setattr(cli, "_cwd", lambda: "\\\\fileserver\\share\\work")
+    with pytest.raises(cli.UnsafeInputPathError):
+        cli.validate_local_json_path("destination.json")
+    with pytest.raises(cli.UnsafeDatabaseUrlError):
+        cli.validate_readonly_sqlite_url(_LOCAL_DB_URL)
+
+
+def test_relative_and_absolute_paths_on_local_drives_pass(fake_drives):
+    assert cli.validate_local_json_path("docs/research/destination.json")
+    assert cli.validate_local_json_path("C:\\local\\destination.json")
+    assert cli.validate_local_json_path("E:\\usb\\destination.json")
+    assert cli.validate_local_json_path("\\local\\destination.json")  # C: root
+    assert cli.validate_readonly_sqlite_url(_LOCAL_DB_URL)
+    assert cli.validate_readonly_sqlite_url("sqlite:///file:C:/data/pilot.db?mode=ro&uri=true")
+    assert cli.validate_readonly_sqlite_url("sqlite:///file:/C:/data/pilot.db?mode=ro&uri=true")
+    assert set(root.upper() for root in fake_drives) <= {"C:\\", "E:\\"}
+
+
+def test_relative_path_from_fixed_cwd_passes(monkeypatch, fake_drives):
+    monkeypatch.setattr(cli, "_cwd", lambda: "E:\\work")
+    assert cli.validate_local_json_path("destination.json") == "destination.json"
+    assert fake_drives[-1] == "E:\\"
+
+
+def test_drive_classification_failure_fails_closed(monkeypatch, fake_drives):
+    def _broken(root: str) -> int:
+        raise OSError("GetDriveTypeW unavailable")
+
+    monkeypatch.setattr(cli, "_drive_type", _broken)
+    with pytest.raises(cli.UnsafeInputPathError):
+        cli.validate_local_json_path("C:\\local\\destination.json")
+    with pytest.raises(cli.UnsafeDatabaseUrlError):
+        cli.validate_readonly_sqlite_url(_LOCAL_DB_URL)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real GetDriveTypeW only exists on Windows")
+def test_real_drive_classifier_accepts_local_tmp_path(tmp_path):
+    assert cli._drive_type(os.path.splitdrive(str(tmp_path))[0] + "\\") in cli._LOCAL_DRIVE_TYPES
+    assert cli.validate_local_json_path(str(tmp_path / "destination.json"))

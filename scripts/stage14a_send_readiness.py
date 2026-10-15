@@ -10,7 +10,10 @@ Every other form is rejected without connecting: any non-SQLite dialect
 (postgresql, mysql, ...), a sqlite driver suffix, a host/credentials, a
 plain sqlite path without `mode=ro`, in-memory databases, `file://host`
 authorities, UNC (`\\\\server\\share`) paths and extra URI parameters
-(`vfs`, `cache`, ...). The connection additionally runs `PRAGMA
+(`vfs`, `cache`, ...). On Windows the database file's drive (resolved
+against the working directory) must be a LOCAL volume per `GetDriveTypeW`:
+a mapped network drive (e.g. `Z:` -> SMB) or an unclassifiable drive is
+refused. The connection additionally runs `PRAGMA
 query_only = ON`. The session is always rolled back. Example:
 
     python scripts/stage14a_send_readiness.py \
@@ -26,11 +29,13 @@ Both are operator research artifacts; omitting them yields UNKNOWN /
 "no authoritative evidence", i.e. NOT ready. Both must be LOCAL filesystem
 paths, validated before any read: UNC (`\\\\server\\share`), `//server`,
 Win32 device namespaces (`\\\\?\\`, `\\\\.\\`) and any URI scheme
-(`file:`, `http:`, `smb:`, ...) are refused.
+(`file:`, `http:`, `smb:`, ...) are refused, and on Windows the same
+local-drive classification applies.
 """
 
 import argparse
 import json
+import ntpath
 import os
 import re
 import sys
@@ -72,10 +77,49 @@ def _is_network_or_device_path(path: str) -> bool:
     return path[:2] in ("//", "\\\\", "/\\", "\\/") or path.startswith("\\??\\")
 
 
+# GetDriveTypeW results that are a local volume. DRIVE_REMOTE (4),
+# DRIVE_UNKNOWN (0) and DRIVE_NO_ROOT_DIR (1) are refused (fail closed).
+_DRIVE_REMOVABLE, _DRIVE_FIXED, _DRIVE_REMOTE, _DRIVE_CDROM, _DRIVE_RAMDISK = 2, 3, 4, 5, 6
+_LOCAL_DRIVE_TYPES = frozenset({_DRIVE_REMOVABLE, _DRIVE_FIXED, _DRIVE_CDROM, _DRIVE_RAMDISK})
+_IS_WINDOWS = os.name == "nt"
+_DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:$")
+
+
+def _cwd() -> str:
+    return os.getcwd()
+
+
+def _drive_type(root: str) -> int:
+    """Win32 `GetDriveTypeW` for a drive root such as `Z:\\`. Classifies the
+    volume only; never opens the target file."""
+    import ctypes
+
+    return int(ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)))
+
+
+def _is_local_volume(path: str) -> bool:
+    """True only if `path` (resolved against the working directory) lies on
+    a drive letter that Windows classifies as a local volume. A mapped
+    network drive (`Z:` -> SMB), a UNC working directory or any drive whose
+    type cannot be determined is NOT local. Off Windows, only the string
+    checks apply (there are no drive letters to map)."""
+    if not _IS_WINDOWS:
+        return True
+    try:
+        absolute = ntpath.normpath(ntpath.join(_cwd(), path))
+        drive = ntpath.splitdrive(absolute)[0]
+        if not _DRIVE_LETTER_RE.match(drive):
+            return False  # UNC share or device namespace
+        return _drive_type(drive + "\\") in _LOCAL_DRIVE_TYPES
+    except Exception:  # noqa: BLE001 -- classification failure fails closed
+        return False
+
+
 def validate_local_json_path(raw: str) -> str:
     """Return `raw` unchanged if it is a plain local filesystem path, else
-    raise `UnsafeInputPathError`. Pure string parsing: never touches the
-    filesystem or the network."""
+    raise `UnsafeInputPathError`. Never reads the file and never touches
+    the network: string checks plus (on Windows) a drive-type
+    classification of the resolved drive root."""
     if not raw or not raw.strip():
         raise UnsafeInputPathError("input path is empty")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
@@ -88,6 +132,8 @@ def validate_local_json_path(raw: str) -> str:
     drive, _ = os.path.splitdrive(os.path.abspath(raw))
     if _is_network_or_device_path(drive or os.path.abspath(raw)):
         raise UnsafeInputPathError("input path resolves to a network location")
+    if not _is_local_volume(raw):
+        raise UnsafeInputPathError("input path is not on a local drive (mapped network drive?)")
     return raw
 
 
@@ -119,6 +165,12 @@ def validate_readonly_sqlite_url(raw: str) -> str:
         raise UnsafeDatabaseUrlError("UNC paths and file:// authorities are not allowed")
     if ":memory:" in path or "?" in path or "%" in path:
         raise UnsafeDatabaseUrlError("only a plain local database file path is allowed")
+    # SQLite reads `file:/C:/x.db` as `C:/x.db`; classify that drive.
+    fs_path = path[1:] if re.match(r"^/[A-Za-z]:", path) else path
+    if not _is_local_volume(fs_path):
+        raise UnsafeDatabaseUrlError(
+            "database file is not on a local drive (mapped network drive?)"
+        )
     return raw
 
 
