@@ -125,6 +125,22 @@ footer is no longer read as unevaluated required text):
   produced no evaluated requirement becomes a REQUIRED, UNKNOWN entry —
   so unevaluated required text always keeps `required_skill_score` < 100.
 
+**v4 (Codex acceptance review):**
+
+- Mixed lines: evaluated SKILL spans are removed from a requirement line
+  and its material residual is the OTHER requirement ("Kenntnisse in
+  Python und SAP ABAP" -> Python evaluated, "SAP ABAP" UNKNOWN); OTHER
+  requirements are deduplicated by casefolded, whitespace-collapsed text.
+- "<category> (z. B. A, B)" is ONE grouped SKILL requirement
+  (`group:<category>`): MATCH only when a trusted skill is one of the
+  vacancy's own named examples, otherwise UNKNOWN; the examples are not
+  individual requirements. Grouped requirements are excluded from the
+  experience-support denominator (no single named skill to back).
+- EXPERIENCE years are credited only from experience using a technology
+  named in that requirement's own clause; with no such technology the
+  requirement is UNKNOWN (or MISSING with no experience at all), never
+  MATCH. Year counts must directly modify the experience noun.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -132,6 +148,7 @@ to or reused as a v1 result (see app/db/candidate_job_match_repository.py's
 cache-identity key).
 """
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -140,6 +157,7 @@ from app.agents.requirement_extractor import (
     canonicalize_language_name,
     degree_field_names,
     extract_education_requirement,
+    extract_example_groups,
     extract_experience_requirement,
     extract_language_requirements,
     must_section_segments,
@@ -157,7 +175,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v3"
+ALGORITHM_VERSION = "v4"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -212,12 +230,80 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     collection time cannot silently vanish from the match.
     """
     fresh = extract_skills(None, job.description)
+    # v4: a technology the description names ONLY as an example ("z. B.
+    # LangChain") belongs to its grouped requirement, so a stored list from
+    # an older extractor must not resurrect it as an individual one -- unless
+    # the title itself names it.
+    example_only = (
+        {
+            normalize_skill(e)
+            for group in extract_example_groups(job.description)
+            for e in group.examples
+        }
+        - {normalize_skill(t) for t in [*fresh.must_have_skills, *fresh.nice_to_have_skills]}
+        - {normalize_skill(t) for t in extract_skills(job.title, None).must_have_skills}
+    )
     seen: dict[str, tuple[str, str]] = {}
     for text in [*job.must_have_skills, *fresh.must_have_skills]:
-        seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
+        if normalize_skill(text) not in example_only:
+            seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
     for text in [*job.nice_to_have_skills, *fresh.nice_to_have_skills]:
-        seen.setdefault(normalize_skill(text), (text, "PREFERRED"))
+        if normalize_skill(text) not in example_only:
+            seen.setdefault(normalize_skill(text), (text, "PREFERRED"))
     return list(seen.values())
+
+
+def _match_example_groups(job: JobMatchInput, trusted_skills: list) -> list[RequirementMatch]:
+    """v4: one requirement per "<category> (z. B. A, B)". MATCH only when a
+    trusted skill IS one of the vacancy's own named examples (the vacancy
+    itself states that example belongs to the category); otherwise UNKNOWN
+    -- whether some other trusted skill belongs to the category is a human
+    call, so it is never MISSING-by-assumption nor MATCH-by-guess."""
+    trusted_index: dict[str, object] = {}
+    for skill in trusted_skills:
+        trusted_index.setdefault(normalize_skill(skill.name), skill)
+    results: list[RequirementMatch] = []
+    seen: set[str] = set()
+    for group in extract_example_groups(job.description):
+        normalized = "group:" + " ".join(group.category.casefold().split())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        hits = [
+            trusted_index[normalize_skill(e)]
+            for e in group.examples
+            if normalize_skill(e) in trusted_index
+        ]
+        requirement = f"{group.category} (examples: {group.example_text})"
+        if hits:
+            status = "MATCH"
+            reason = (
+                f"Trusted skill {', '.join(repr(s.name) for s in hits)} is one of the "
+                f"vacancy's own examples of {group.category!r}."
+            )
+        else:
+            status = "UNKNOWN"
+            reason = (
+                f"No trusted skill is one of the named examples ({group.example_text}); whether "
+                f"another trusted skill counts as {group.category!r} needs human review "
+                "(HUMAN_REVIEW_REQUIRED)."
+            )
+        results.append(
+            RequirementMatch(
+                requirement=requirement,
+                normalized_requirement=normalized,
+                requirement_type="SKILL",
+                importance=group.importance,
+                match_status=status,
+                candidate_evidence=[
+                    CandidateEvidenceRef(entity_type="SKILL", entity_id=s.id, value=s.name)
+                    for s in hits
+                ],
+                job_evidence=[group.evidence_text],
+                reason=reason,
+            )
+        )
+    return results
 
 
 def _unstored_skill_requirements(job: JobMatchInput) -> list[str]:
@@ -430,28 +516,52 @@ def _merged_days(periods: list[tuple[date, date]]) -> int:
 def _match_experience_requirement(
     job: JobMatchInput,
     trusted_experiences: list,
-    relevant_experiences: list[RelevantExperience],
     as_of: date,
 ) -> RequirementMatch | None:
-    """Stage 14B: "at least N years of experience". Only trusted
-    EXPERIENCE rows the matcher already found relevant (they use a skill the
-    vacancy requires) count; projects never substitute for professional
-    experience. Overlapping periods are merged, never double counted."""
+    """Stage 14B: "at least N years of experience". v4: years are credited
+    only from trusted EXPERIENCE rows that use a technology named in THAT
+    requirement's own clause (`ExperienceRequirement.subjects`) -- relevance
+    to some other vacancy skill is not enough. With no technology subject
+    the requirement can never MATCH: UNKNOWN (human review) when trusted
+    experience exists, MISSING when there is none. Projects never count.
+    Overlapping periods are merged, never double counted."""
     req = extract_experience_requirement(job.title, job.description)
     if req is None:
         return None
-    requirement = f"At least {req.years} year(s) of relevant professional experience"
-    relevant_ids = {item.experience_id for item in relevant_experiences}
-    relevant = [exp for exp in trusted_experiences if exp.id in relevant_ids]
+    subject_norms = {normalize_skill(s) for s in req.subjects}
+    if req.subjects:
+        requirement = (
+            f"At least {req.years} year(s) of professional experience with "
+            f"{', '.join(req.subjects)}"
+        )
+        relevant = [
+            exp
+            for exp in trusted_experiences
+            if subject_norms & {normalize_skill(t) for t in exp.technologies}
+        ]
+    else:
+        requirement = (
+            f"At least {req.years} year(s) of professional experience ({req.subject_text})"
+        )
+        relevant = []
     evidence = [
         CandidateEvidenceRef(entity_type="EXPERIENCE", entity_id=exp.id, value=exp.job_title)
         for exp in relevant
     ]
-    if not relevant:
+    if not req.subjects and trusted_experiences:
+        status = "UNKNOWN"
+        reason = (
+            f"The required experience ({req.subject_text!r}) names no technology that can be "
+            "linked to structured experience; whether trusted experience qualifies needs "
+            "human review (HUMAN_REVIEW_REQUIRED)."
+        )
+    elif not relevant:
         status = "MISSING"
         reason = (
-            "No trusted professional experience uses a skill this vacancy requires; "
+            "No trusted professional experience uses the technology this requirement names; "
             "projects are not counted as professional experience."
+            if req.subjects
+            else "No trusted professional experience is on file."
         )
     elif any(
         exp.start_date is None or (exp.end_date is None and not exp.is_current) for exp in relevant
@@ -478,37 +588,119 @@ def _match_experience_requirement(
     )
 
 
+# Words that carry no requirement of their own once the evaluated parts of
+# a MIXED line are removed ("Kenntnisse in Python und ..." -> "Kenntnisse",
+# "in", "und"). Only applied to lines that had at least one evaluated span;
+# a line with none is always reported whole.
+_RESIDUAL_FILLER = frozenset(
+    """
+    kenntnisse kenntnis fachkenntnisse grundkenntnisse erfahrung erfahrungen
+    berufserfahrung praxiserfahrung grundverständnis verständnis umgang
+    sicherer sichere sicher gute guten gut sehr fundierte fundierten solide
+    tiefe praktische erste mehrjährige idealerweise wünschenswert vorteil
+    im in mit und oder sowie von der die das den dem des ein eine einer einem
+    für auf zu am an als bei bzw z b zum beispiel ist sind
+    entwicklung softwareentwicklung programmierung software development
+    programming moderne modernen modern tools technologien technologies
+    framework frameworks bereich umfeld
+    knowledge of experience with and or the a an skills strong good solid
+    basic understanding proficiency hands-on practical e g eg
+    """.split()
+)
+_TOKEN = re.compile(r"[^\s,;:()/.]+(?:\.[^\s,;:()/.]+)*")
+
+
+def _evaluated_spans(segment: str, groups: list) -> list[tuple[int, int]]:
+    """Character spans of `segment` the matcher evaluates as SKILL
+    requirements: each technology mention widened to its whole
+    (hyphen-)token ("Git-basierter"), the noun a parenthesised technology
+    list qualifies ("API-Entwicklung (REST)"), and each example group's
+    category + list."""
+    spans: list[tuple[int, int]] = [
+        group.span for group in groups if group.evidence_text == segment
+    ]
+    for _, pattern in _TECHNOLOGY_PATTERNS:
+        for mention in pattern.finditer(segment):
+            start, end = mention.start(), mention.end()
+            while start > 0 and not segment[start - 1].isspace() and segment[start - 1] not in "(,":
+                start -= 1
+            while end < len(segment) and not segment[end].isspace() and segment[end] not in "),.;":
+                end += 1
+            spans.append((start, end))
+            open_paren = segment.rfind("(", 0, start)
+            close_paren = segment.find(")", end)
+            if open_paren != -1 and close_paren != -1 and ")" not in segment[open_paren:start]:
+                before = segment[:open_paren].rstrip()
+                noun_start = max(before.rfind(" "), 0)
+                spans.append((noun_start, close_paren + 1))
+    return spans
+
+
+def _residual_text(segment: str, spans: list[tuple[int, int]]) -> str:
+    chars = list(segment)
+    for start, end in spans:
+        for i in range(start, min(end, len(chars))):
+            chars[i] = " "
+    words = [
+        token
+        for token in _TOKEN.findall("".join(chars))
+        if token.strip("-").casefold() not in _RESIDUAL_FILLER and len(token.strip("-")) > 1
+    ]
+    return " ".join(words)
+
+
 def _unevaluated_requirements(
     job: JobMatchInput, evaluated: list[RequirementMatch]
 ) -> list[RequirementMatch]:
-    """Stage 14B fail-closed net: a segment of a recognized requirement
-    section ("Ihr Profil", "Profil", ...) that produced no evaluated
-    requirement (no technology mention, not the language/education/
-    experience evidence) is exposed as a REQUIRED, UNKNOWN requirement
-    instead of disappearing. It can never be a MATCH."""
-    evidence_segments = {text for req in evaluated for text in req.job_evidence}
-    results: list[RequirementMatch] = []
+    """Stage 14B fail-closed net over every segment of a recognized
+    requirement section ("Ihr Profil", "Profil", ...):
+
+    - a language/education/experience evidence segment is evaluated whole;
+    - v4: otherwise the evaluated SKILL spans are removed and any material
+      RESIDUAL ("Kenntnisse in Python und SAP ABAP" -> "SAP ABAP") becomes
+      a REQUIRED, UNKNOWN OTHER requirement -- one recognized technology no
+      longer hides the rest of its line; a line with no evaluated span is
+      reported whole;
+    - v4: OTHER requirements are deduplicated by casefolded,
+      whitespace-collapsed text (repeated vacancy lines count once; every
+      source line is kept as job evidence).
+
+    An OTHER requirement can never be a MATCH."""
+    whole_segments = {
+        text
+        for req in evaluated
+        if req.requirement_type in ("LANGUAGE", "EDUCATION", "EXPERIENCE")
+        for text in req.job_evidence
+    }
+    groups = extract_example_groups(job.description)
+    by_identity: dict[str, RequirementMatch] = {}
     for segment in must_section_segments(job.description):
-        if segment in evidence_segments:
+        if segment in whole_segments:
             continue
-        if any(pattern.search(segment) for _, pattern in _TECHNOLOGY_PATTERNS):
+        spans = _evaluated_spans(segment, groups)
+        text = _residual_text(segment, spans) if spans else segment
+        if not text:
             continue
-        results.append(
-            RequirementMatch(
-                requirement=segment,
-                normalized_requirement=" ".join(segment.casefold().split()),
-                requirement_type="OTHER",
-                importance="REQUIRED",
-                match_status="UNKNOWN",
-                candidate_evidence=[],
-                job_evidence=[segment],
-                reason=(
-                    "Required vacancy text that the deterministic matcher cannot evaluate "
-                    "(NOT_EVALUATED); human review required."
-                ),
-            )
+        identity = " ".join(text.casefold().split())
+        existing = by_identity.get(identity)
+        if existing is not None:
+            if segment not in existing.job_evidence:
+                existing.job_evidence.append(segment)
+            continue
+        by_identity[identity] = RequirementMatch(
+            requirement=text,
+            normalized_requirement=identity,
+            requirement_type="OTHER",
+            importance="REQUIRED",
+            match_status="UNKNOWN",
+            candidate_evidence=[],
+            job_evidence=[segment],
+            reason=(
+                "Required vacancy text that the deterministic matcher cannot evaluate "
+                "(NOT_EVALUATED); human review required (HUMAN_REVIEW_REQUIRED)."
+            ),
         )
-    return results
+    return list(by_identity.values())
 
 
 def _relevant_experiences(
@@ -587,6 +779,7 @@ def compute_match(
 
     all_requirements: list[RequirementMatch] = []
     all_requirements.extend(_match_skill_requirements(job, trusted_skills))
+    all_requirements.extend(_match_example_groups(job, trusted_skills))
     all_requirements.extend(_match_language_requirements(job, trusted_languages))
     education_match = _match_education_requirement(job, trusted_education)
     if education_match is not None:
@@ -596,9 +789,7 @@ def compute_match(
     relevant_experiences = _relevant_experiences(trusted_experiences, required_skill_norms)
     relevant_projects = _relevant_projects(trusted_projects, required_skill_norms)
 
-    experience_match = _match_experience_requirement(
-        job, trusted_experiences, relevant_experiences, as_of
-    )
+    experience_match = _match_experience_requirement(job, trusted_experiences, as_of)
     if experience_match is not None:
         all_requirements.append(experience_match)
     all_requirements.extend(_unevaluated_requirements(job, all_requirements))
@@ -641,7 +832,11 @@ def compute_match(
     required_skill_norms_only = {
         r.normalized_requirement
         for r in all_requirements
-        if r.requirement_type == "SKILL" and r.importance == "REQUIRED"
+        if r.requirement_type == "SKILL"
+        and r.importance == "REQUIRED"
+        # v4: a grouped "<category> (z. B. ...)" requirement is not a single
+        # named skill an experience/project could list.
+        and not r.normalized_requirement.startswith("group:")
     }
     if required_skill_norms_only:
         # v2+: the share of REQUIRED skills backed by at least one relevant

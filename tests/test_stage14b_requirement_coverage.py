@@ -124,9 +124,11 @@ def _by_requirement(result) -> dict:
 def test_profil_header_and_ai_requirements_are_extracted():
     extraction = extract_skills("AI Engineer", E362_STYLE)
     assert set(extraction.must_have_skills) >= {
-        "python", "git", "rest", "langchain", "llamaindex", "llm", "generative ai",
-        "prompting", "fine-tuning", "ci/cd", "testing",
+        "python", "git", "rest", "llm", "generative ai", "prompting", "fine-tuning",
+        "ci/cd", "testing",
     }  # fmt: skip
+    # "(z. B. LangChain, LlamaIndex)" are examples, not individual requirements.
+    assert not {"langchain", "llamaindex"} & set(extraction.must_have_skills)
     # Task-section mentions (RAG, Testing und Monitoring) carry no requirement context.
     assert "rag" not in extraction.must_have_skills + extraction.nice_to_have_skills
 
@@ -135,13 +137,14 @@ def test_experience_and_degree_field_extraction():
     experience = extract_experience_requirement("AI Engineer", E362_STYLE)
     assert experience is not None and experience.years == 3
     assert experience.importance == "REQUIRED"
+    assert experience.subjects == ()
     education = extract_education_requirement("AI Engineer", E362_STYLE)
     assert education.fields == ("Wirtschaftsinformatik", "Informatik")
     assert education.importance == "REQUIRED"
-    assert (
-        extract_experience_requirement(None, "Ihr Profil:\n- 5+ years of Python experience").years
-        == 5
+    english = extract_experience_requirement(
+        None, "Ihr Profil:\n- 5+ years of professional experience with Python"
     )
+    assert (english.years, english.subjects) == (5, ("python",))
     assert extract_experience_requirement(None, "Wir bestehen seit 30 Jahren.") is None
 
 
@@ -163,18 +166,21 @@ def test_e362b_stale_extraction_no_longer_scores_perfect():
     )
     reqs = _by_requirement(result)
 
-    assert result.algorithm_version == ALGORITHM_VERSION == "v3"
+    assert result.algorithm_version == ALGORITHM_VERSION == "v4"
     assert result.overall_score < 100
     assert result.required_skill_score < 100
     for supported in ("git", "python", "rest"):
         assert reqs[supported].match_status == "MATCH"
-    for missing in ("langchain", "llamaindex", "llm", "generative-ai", "cicd"):
+    for missing in ("llm", "generative-ai", "cicd"):
         assert reqs[missing].match_status == "MISSING"
         assert reqs[missing].importance == "REQUIRED"
+    assert "langchain" not in reqs and "llamaindex" not in reqs
+    group = reqs["group:modernen ki-frameworks"]
+    assert (group.match_status, group.importance) == ("UNKNOWN", "REQUIRED")
     assert any("absent from the stored extraction" in w for w in result.warnings)
 
 
-def test_e362b_three_years_not_satisfied_by_projects():
+def test_e362b_unlinked_experience_subject_is_human_review_not_projects():
     result = compute_match(
         _job(E362_STYLE, must=["git", "python", "rest"]),
         _v3_like_profile(),
@@ -183,7 +189,11 @@ def test_e362b_three_years_not_satisfied_by_projects():
     )
     experience = _by_requirement(result)["experience-3y"]
     assert experience.requirement_type == "EXPERIENCE"
-    assert experience.match_status == "MISSING"
+    # "im genannten Aufgabenbereich und in der Softwareentwicklung" names no
+    # technology: never MATCH; with trusted experience on file, UNKNOWN.
+    assert experience.match_status == "UNKNOWN"
+    assert "HUMAN_REVIEW_REQUIRED" in experience.reason
+    assert experience.candidate_evidence == []
     assert result.relevant_experiences == []
     assert result.relevant_projects  # projects are still reported as project evidence
     assert result.experience_support_score == 0

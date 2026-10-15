@@ -43,7 +43,10 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
 - Stage 14B: "N years of experience" (`extract_experience_requirement`)
   and the list of must-section segments (`must_section_segments`) so the
   matcher can expose requirement text it could not evaluate instead of
-  dropping it.
+  dropping it. The year count must directly modify the experience noun,
+  and the technologies in that clause are kept as its `subjects`.
+- Stage 14B: "<category> (z. B. A, B)" lists (`extract_example_groups`) --
+  one grouped requirement whose examples are not individual requirements.
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -60,8 +63,11 @@ from app.agents.skill_extractor import (
     _MUST_HAVE_MARKERS,
     _NICE_TO_HAVE_MARKERS,
     _PROFILE_REQUIREMENT_MARKERS,
+    _TECHNOLOGY_PATTERNS,
     _classify_mention,
     _contextual_segments,
+    _postfix_nice_scopes_all_mentions,
+    example_lists,
 )
 
 RequirementImportance = Literal["REQUIRED", "PREFERRED", "UNKNOWN"]
@@ -112,25 +118,68 @@ _DEGREE_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 )
 
 _YEAR_WORDS = {
-    "ein": 1, "einem": 1, "einen": 1, "einjährige": 1, "one": 1,
+    "ein": 1, "einem": 1, "einen": 1, "one": 1,
     "zwei": 2, "two": 2, "drei": 3, "three": 3, "vier": 4, "four": 4,
     "fünf": 5, "five": 5, "sechs": 6, "six": 6, "sieben": 7, "seven": 7,
     "acht": 8, "eight": 8, "neun": 9, "nine": 9, "zehn": 10, "ten": 10,
 }  # fmt: skip
-_EXPERIENCE_YEARS_PATTERN = re.compile(
-    r"(?<!\w)(\d{1,2}|" + "|".join(_YEAR_WORDS) + r")\s*\+?\s*(?:jahre?n?|years?)(?!\w)",
-    re.IGNORECASE,
+_YEARS_NUMBER = r"(?P<years>\d{1,2}|" + "|".join(_YEAR_WORDS) + r")"
+_EXP_ADJECTIVE = (
+    r"(?:(?:einschlägige|relevante|praktische|professionelle|fundierte|"
+    r"professional|relevant|practical|industry|hands-on|work)\s+)?"
 )
-_EXPERIENCE_WORD_PATTERN = re.compile(r"(?:berufserfahrung|erfahrung|experience)", re.IGNORECASE)
+# Stage 14B: the year count must directly modify the experience noun --
+# "seit 20 Jahren bestehenden Team" or "30 Jahren Erfahrung am Markt" never
+# count. Accepted shapes: "N Jahre (adj) Berufserfahrung/Erfahrung",
+# "N-jährige Berufserfahrung", "Berufserfahrung von (mindestens) N Jahren",
+# "N(+) years (of) (adj) experience".
+_EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(?<!\w)" + _YEARS_NUMBER + r"\s*\+?\s*jahre\s+" + _EXP_ADJECTIVE
+        + r"(?:berufs|praxis)?erfahrung(?:en)?(?!\w)",
+        r"(?<!\w)" + _YEARS_NUMBER + r"[- ]?jährige\s+" + _EXP_ADJECTIVE
+        + r"(?:berufs|praxis)?erfahrung(?!\w)",
+        r"(?<!\w)(?:berufs|praxis)?erfahrung\s+von\s+(?:mindestens\s+|über\s+)?"
+        + _YEARS_NUMBER + r"\s*\+?\s*jahren(?!\w)",
+        r"(?<!\w)" + _YEARS_NUMBER + r"\s*\+?\s*years?\s+(?:of\s+)?" + _EXP_ADJECTIVE
+        + r"experience(?!\w)",
+    )
+)  # fmt: skip
+_CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class ExperienceRequirement:
-    """ "At least N years of (professional) experience" -- Stage 14B."""
+    """ "At least N years of (professional) experience" -- Stage 14B.
+
+    `subjects`: technologies named in the same clause from the duration on
+    ("3 Jahre Berufserfahrung mit Python" -> ("python",)); the matcher only
+    credits experience that uses them. `subject_text`: that clause, kept
+    for human review when no technology is named ("... in der
+    Softwareentwicklung")."""
 
     years: int
     importance: RequirementImportance
     evidence_text: str
+    subjects: tuple[str, ...] = ()
+    subject_text: str = ""
+
+
+@dataclass(frozen=True)
+class ExampleGroupRequirement:
+    """Stage 14B: "<category> (z. B. A, B)" -- ONE grouped requirement for
+    the category; A and B are the vacancy's own examples of it, never
+    individual hard requirements. `examples`: recognized technology names
+    in the list; `example_text`: the raw listed text; `span`: (start, end)
+    of category + list inside `evidence_text`."""
+
+    category: str
+    examples: tuple[str, ...]
+    example_text: str
+    importance: RequirementImportance
+    evidence_text: str
+    span: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -332,28 +381,101 @@ def must_section_segments(description: str | None) -> list[str]:
 def extract_experience_requirement(
     title: str | None, description: str | None
 ) -> ExperienceRequirement | None:
-    """Stage 14B: the first "N years ... experience" segment, e.g.
-    "Mindestens drei Jahre Berufserfahrung ...". Only a segment that names
-    BOTH a year count and an experience word counts; the largest year
-    count in that segment wins. Returns None if no such segment exists."""
+    """Stage 14B: the first segment where a year count directly modifies an
+    experience noun (`_EXPERIENCE_YEARS_PATTERNS`), e.g. "Mindestens drei
+    Jahre Berufserfahrung ..."; the largest such count in that segment
+    wins. Subjects are the technologies named in the same clause from the
+    duration on. Returns None if no such segment exists."""
     for segment, inherited_context in _segments_with_title(title, description):
-        if not _EXPERIENCE_WORD_PATTERN.search(segment):
-            continue
-        year_matches = list(_EXPERIENCE_YEARS_PATTERN.finditer(segment))
+        year_matches = [
+            match for pattern in _EXPERIENCE_YEARS_PATTERNS for match in pattern.finditer(segment)
+        ]
         if not year_matches:
             continue
 
         def _years(match: re.Match[str]) -> int:
-            token = match.group(1).casefold()
+            token = match.group("years").casefold()
             return int(token) if token.isdigit() else _YEAR_WORDS[token]
 
         best = max(year_matches, key=_years)
         years = _years(best)
         if years < 1:
             continue
+        boundary = _CLAUSE_BOUNDARY.search(segment, best.end())
+        clause = segment[best.start() : boundary.start() if boundary else len(segment)]
+        subjects = tuple(
+            dict.fromkeys(name for name, pattern in _TECHNOLOGY_PATTERNS if pattern.search(clause))
+        )
         must_markers, nice_markers = _segment_markers(segment, inherited_context)
         importance = _importance_for(best, must_markers, nice_markers, inherited_context, segment)
         return ExperienceRequirement(
-            years=years, importance=importance, evidence_text=segment.strip()
+            years=years,
+            importance=importance,
+            evidence_text=segment.strip(),
+            subjects=subjects,
+            subject_text=clause.strip(" .,;"),
         )
     return None
+
+
+# Where a category phrase starts, scanning back from "(z. B." / "such as".
+_CATEGORY_START = re.compile(
+    r"(?:^|[,;:]|\s(?:und|oder|sowie|in|mit|von|im|and|or|with|of)\s)", re.IGNORECASE
+)
+
+
+_TRAILING_CONNECTOR = re.compile(r"\s+(?:wie|etwa|like)\s*$", re.IGNORECASE)
+
+
+def extract_example_groups(description: str | None) -> list[ExampleGroupRequirement]:
+    """Stage 14B: every "<category> (z. B. A, B)" / "<category> such as A,
+    B" list in the description. The category is the phrase right before
+    the opening parenthesis (or the marker), back to the previous clause
+    word ("und", "in", "mit", ","). A list whose category itself names a
+    technology ("Python (z. B. Django)") is not a group -- that technology
+    is already its own requirement."""
+    results: list[ExampleGroupRequirement] = []
+    for raw_segment, inherited_context in _contextual_segments(description or ""):
+        segment = raw_segment.strip()
+        for item in example_lists(segment):
+            head_end = item.marker_start
+            paren = segment.rfind("(", 0, item.marker_start)
+            if paren != -1 and not segment[paren + 1 : item.marker_start].strip():
+                head_end = paren
+            head = segment[:head_end].rstrip(" ,")
+            starts = list(_CATEGORY_START.finditer(head))
+            category_start = starts[-1].end() if starts else 0
+            category = _TRAILING_CONNECTOR.sub("", head[category_start:]).strip(" ,;:")
+            if not category or any(p.search(category) for _, p in _TECHNOLOGY_PATTERNS):
+                continue
+            listed = segment[item.marker_end : item.list_end]
+            examples = tuple(
+                dict.fromkeys(name for name, p in _TECHNOLOGY_PATTERNS if p.search(listed))
+            )
+            span_end = item.list_end
+            if segment[span_end : span_end + 1] == ")":
+                span_end += 1
+            span_start = head.index(category, category_start)
+            must_markers, nice_markers = _segment_markers(segment, inherited_context)
+            anchor = re.compile(re.escape(category)).search(segment, span_start)
+            # Same postfix rule extract_skills applies ("... sind von Vorteil").
+            classification = _classify_mention(
+                anchor,
+                must_markers,
+                nice_markers,
+                inherited_context,
+                segment,
+                _postfix_nice_scopes_all_mentions(segment, [anchor], must_markers),
+            )
+            importance = {"must": "REQUIRED", "nice": "PREFERRED"}.get(classification, "UNKNOWN")
+            results.append(
+                ExampleGroupRequirement(
+                    category=category,
+                    examples=examples,
+                    example_text=listed.strip(" ,"),
+                    importance=importance,
+                    evidence_text=segment,
+                    span=(span_start, span_end),
+                )
+            )
+    return results

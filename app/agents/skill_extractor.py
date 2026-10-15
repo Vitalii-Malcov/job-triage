@@ -178,7 +178,16 @@ _PROFILE_REQUIREMENT_MARKERS = re.compile(
     re.IGNORECASE,
 )
 _IDEALLY_MARKER = re.compile(r"\bidealerweise\b", re.IGNORECASE)
-_ABBREVIATIONS = re.compile(r"\b(?:z\.\s?b\.|e\.g\.|d\.\s?h\.)", re.IGNORECASE)
+_ABBREVIATIONS = re.compile(r"\b(?:z\.\s?b\.|e\.g\.|d\.\s?h\.|bspw\.)", re.IGNORECASE)
+# Stage 14B: a list introduced by one of these names EXAMPLES of a category
+# ("KI-Frameworks (z. B. LangChain, LlamaIndex)"), not individual hard
+# requirements. The list runs to the closing parenthesis, ";", a sentence
+# end, " sowie ", the next requirement marker, or the end of the segment.
+_EXAMPLE_MARKERS = re.compile(
+    r"(?<!\w)(?:z\.\s?b\.|zum\s+beispiel|bspw\.|beispielsweise|e\.g\.|for\s+example|such\s+as)",
+    re.IGNORECASE,
+)
+_EXAMPLE_LIST_END = re.compile(r"\)|;|\.(?=\s|$)|\s+sowie\s+", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]+|>>+)\s*")
 _MUST_SECTION_HEADERS = {
     "das bringst du mit",
@@ -224,6 +233,19 @@ _OTHER_SECTION_HEADERS = {
     "ansprechpartnerin",
     "interested",
     "contact",
+    "jetzt bewerben",
+    "bewerben sie sich",
+    "bewerben sie sich jetzt",
+    "so bewerben sie sich",
+    "bewirb dich",
+    "bewirb dich jetzt",
+    "ihre bewerbung",
+    "deine bewerbung",
+    "bewerbung",
+    "kontaktperson",
+    "apply now",
+    "application",
+    "how to apply",
 }
 
 
@@ -395,8 +417,42 @@ def _postfix_nice_scopes_all_mentions(
     return not _EXPLICIT_REQUIRED_MARKERS.search(segment, first_mention, postfix.start())
 
 
+@dataclass(frozen=True)
+class ExampleList:
+    """Stage 14B: `segment[marker_start:list_end]` is an example list;
+    `segment[marker_end:list_end]` is the listed examples."""
+
+    marker_start: int
+    marker_end: int
+    list_end: int
+
+
+def example_lists(segment: str) -> list[ExampleList]:
+    results: list[ExampleList] = []
+    for marker in _EXAMPLE_MARKERS.finditer(segment):
+        end = len(segment)
+        stop = _EXAMPLE_LIST_END.search(segment, marker.end())
+        if stop is not None:
+            end = stop.start()
+        next_marker = _MUST_HAVE_MARKERS.search(segment, marker.end(), end)
+        if next_marker is not None:
+            end = next_marker.start()
+        if segment[marker.end() : end].strip(" ,:"):
+            results.append(ExampleList(marker.start(), marker.end(), end))
+    return results
+
+
+def _in_example_list(mention: re.Match[str], lists: list[ExampleList]) -> bool:
+    return any(item.marker_end <= mention.start() < item.list_end for item in lists)
+
+
 def extract_skills(title: str | None, description: str | None) -> SkillExtraction:
-    """Extract only technologies that literally occur in title/description."""
+    """Extract only technologies that literally occur in title/description.
+
+    Stage 14B: a technology named only inside an example list ("z. B.",
+    "e.g.", ...) is not extracted as an individual requirement -- see
+    `example_lists`; app.agents.requirement_extractor turns such a list
+    into one grouped requirement instead."""
     must_have: set[str] = set()
     nice_to_have: set[str] = set()
 
@@ -415,8 +471,11 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
             mention for _, pattern in _TECHNOLOGY_PATTERNS for mention in pattern.finditer(segment)
         ]
         postfix_nice_scope = _postfix_nice_scopes_all_mentions(segment, mentions, must_markers)
+        examples = example_lists(segment)
         for skill, pattern in _TECHNOLOGY_PATTERNS:
             for mention in pattern.finditer(segment):
+                if _in_example_list(mention, examples):
+                    continue
                 classification = _classify_mention(
                     mention,
                     must_markers,

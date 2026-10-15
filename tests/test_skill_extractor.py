@@ -1,5 +1,6 @@
 import pytest
 
+from app.agents.requirement_extractor import extract_example_groups
 from app.agents.skill_extractor import extract_skills
 
 
@@ -343,7 +344,7 @@ def test_explicit_requirement_before_optional_postfix_remains_must_have():
     assert result.nice_to_have_skills == ["docker"]
 
 
-@pytest.mark.parametrize("abbreviation", ["z. B.", "z.B.", "e.g.", "d. h.", "d.h."])
+@pytest.mark.parametrize("abbreviation", ["d. h.", "d.h."])
 def test_common_abbreviation_does_not_split_git_from_requirement(abbreviation):
     result = extract_skills(
         "Softwareentwickler",
@@ -352,6 +353,23 @@ def test_common_abbreviation_does_not_split_git_from_requirement(abbreviation):
 
     assert result.must_have_skills == []
     assert result.nice_to_have_skills == ["git"]
+
+
+@pytest.mark.parametrize("abbreviation", ["z. B.", "z.B.", "e.g."])
+def test_example_abbreviation_keeps_segment_and_names_an_example_not_a_skill(abbreviation):
+    """Stage 14B: "(z. B. Git)" names an EXAMPLE of the category
+    "Versionsverwaltung" -- one grouped, still nice-to-have requirement
+    (the segment is not split at the abbreviation), not an individual Git
+    requirement."""
+    description = f"Kenntnisse in Versionsverwaltung ({abbreviation} Git) sind von Vorteil."
+    result = extract_skills("Softwareentwickler", description)
+
+    assert result.must_have_skills == []
+    assert result.nice_to_have_skills == []
+    groups = extract_example_groups(description)
+    assert [(g.category, g.examples, g.importance) for g in groups] == [
+        ("Versionsverwaltung", ("git",), "PREFERRED")
+    ]
 
 
 @pytest.mark.parametrize(
