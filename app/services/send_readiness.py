@@ -88,6 +88,7 @@ from app.models.application_destination import (
     DestinationSourceType,
     is_channel_verified,
     is_email_send_ready,
+    is_strict_https_url,
 )
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
 from app.models.candidate_profile import (
@@ -158,8 +159,8 @@ class LocationEvidence(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "LocationEvidence":
-        if self.source_url is not None and not self.source_url.startswith("https://"):
-            raise ValueError("source_url must be an https:// URL")
+        if self.source_url is not None and not is_strict_https_url(self.source_url):
+            raise ValueError("source_url must be a valid https:// URL with a hostname")
         if self.authoritative and not _authority_ok(self):
             raise ValueError(
                 "only an employer source with https source_url and checked_at can be authoritative"
@@ -170,8 +171,7 @@ class LocationEvidence(BaseModel):
 def _authority_ok(item: LocationEvidence) -> bool:
     return (
         item.source_type in EMPLOYER_SOURCES
-        and item.source_url is not None
-        and item.source_url.startswith("https://")
+        and is_strict_https_url(item.source_url)
         and item.checked_at is not None
     )
 

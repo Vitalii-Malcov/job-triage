@@ -17,6 +17,8 @@ from app.models.application_destination import (
     ApplicationDestination,
     is_channel_verified,
     is_email_send_ready,
+    is_strict_https_url,
+    is_valid_email_address,
     unknown_destination,
 )
 from app.models.candidate_job_match import (
@@ -173,6 +175,133 @@ def test_email_shape_and_injection_rejected(value):
 def test_portal_requires_https_value():
     with pytest.raises(ValidationError):
         _destination(value="mailto:jobs@example.com")
+
+
+# --- strict URL / email syntax (Codex P1) --------------------------------
+
+_MALFORMED_URLS = [
+    "https://",
+    "https:///path",
+    "https://?x=1",
+    "https://#fragment",
+    "http://example.com",
+    "javascript:alert(1)",
+    "not-a-url",
+    "HTTPS://example.com",
+    "https://user:pw@careers.example.com/x",
+    "https://user@careers.example.com/x",
+    "https://careers.example.com\\@evil.example/x",
+    "https://careers.example.com/x\r\nX: y",
+    "https://careers.example.com/x\x00",
+    "https://careers example.com/x",
+    "https://localhost/x",
+    "https://10.0.0.1/x",
+    "https://[::1]/x",
+    "https://-careers.example.com/x",
+    "https://careers..example.com/x",
+    "https://careers.example.com:99999/x",
+    "https://careers.example.com:abc/x",
+    "https://careers%2eexample.com/x",
+]
+
+
+@pytest.mark.parametrize("url", _MALFORMED_URLS)
+def test_strict_https_url_rejects_malformed_values(url):
+    assert not is_strict_https_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        _AD,
+        _AD + "#apply",
+        "https://careers.example.com:8443/jobs?id=1",
+        "https://xn--bcher-kva.de/",
+    ],
+)
+def test_strict_https_url_accepts_real_https_urls(url):
+    assert is_strict_https_url(url)
+
+
+@pytest.mark.parametrize("url", _MALFORMED_URLS)
+def test_model_rejects_malformed_portal_value_and_source_url(url):
+    with pytest.raises(ValidationError):
+        _destination(value=url)
+    with pytest.raises(ValidationError):
+        _destination(source_url=url)
+    with pytest.raises(ValidationError):
+        _destination(kind="CAREERS_PAGE", value=url, verification_status="UNVERIFIED")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"value": "https://"},
+        {"value": "not-a-url"},
+        {"value": "https:///path"},
+        {"value": "https://user:pw@careers.example.com/x"},
+        {"value": None},
+        {"value": 42},
+        {"source_url": "https://"},
+        {"source_url": "not-a-url"},
+        {"source_url": "https://?x=1"},
+        {"source_type": "OPERATOR_ENTRY", "source_url": "https://"},
+        {"vacancy_specific": "yes"},
+    ],
+)
+def test_bypassed_validation_portal_with_malformed_fields_is_never_verified(overrides):
+    dest = _unvalidated_destination(**overrides)
+    assert not is_channel_verified(dest)
+    assert not is_email_send_ready(dest)
+    result = evaluate_send_readiness(_ready_inputs(destination=dest))
+    assert CHECK_CHANNEL_VERIFIED in _failed(result)
+    assert not result.ready
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-an-email",
+        "a@b",
+        "a@@example.com",
+        "ai-jobs@example.com\r\nBcc: attacker@example.net",
+        "ai-jobs@example.com\nBcc: attacker@example.net",
+        "ai-jobs@example.com\x00",
+        "ai-jobs@example.com, attacker@example.net",
+        "ai-jobs@example.com;attacker@example.net",
+        "ai-jobs@example.com attacker@example.net",
+        None,
+        42,
+    ],
+)
+def test_bypassed_validation_malformed_or_injected_email_is_never_ready(value):
+    assert not is_valid_email_address(value)
+    dest = _unvalidated_destination(kind="EMAIL", value=value)
+    assert not is_channel_verified(dest)
+    assert not is_email_send_ready(dest)
+    assert not evaluate_send_readiness(_ready_inputs(destination=dest)).ready
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"vacancy_specific": False},
+        {"verified_by": "NONE"},
+        {"verification_status": "UNVERIFIED"},
+        {"source_type": "EMPLOYER_CAREERS_SITE"},
+        {"source_type": "OPERATOR_ENTRY"},
+        {"source_type": "JOB_BOARD_LISTING"},
+        {"confidence": "MEDIUM"},
+        {"checked_at": None},
+        {"source_url": "https://"},
+    ],
+)
+def test_bypassed_validation_email_rechecks_every_condition(overrides):
+    base = {"kind": "EMAIL", "value": "ai-jobs@example.com"}
+    assert is_email_send_ready(_unvalidated_destination(**base))
+    dest = _unvalidated_destination(**base, **overrides)
+    assert not is_email_send_ready(dest)
+    assert not is_channel_verified(dest)
 
 
 def test_scraped_email_is_never_ready():
@@ -339,6 +468,36 @@ def test_authoritative_requires_provenance():
         _employer(["Hannover"], checked_at=None)
     with pytest.raises(ValidationError):
         _employer(["Hannover"], source_url="http://careers.example.com/x")
+
+
+@pytest.mark.parametrize("url", ["https://", "https:///x", "https://?x=1", "not-a-url"])
+def test_malformed_employer_location_source_url_rejected_by_model(url):
+    with pytest.raises(ValidationError):
+        _employer(["Hannover"], source_url=url)
+    with pytest.raises(ValidationError):
+        LocationEvidence(source_type="JOB_BOARD_LISTING", source_url=url, locations=["Hannover"])
+
+
+@pytest.mark.parametrize("url", ["https://", "https:///x", "https://?x=1", "not-a-url", None])
+def test_malformed_location_source_via_model_construct_is_never_authoritative(url):
+    smuggled = LocationEvidence.model_construct(
+        source_type="EMPLOYER_JOB_AD",
+        source_url=url,
+        locations=["Hannover"],
+        authoritative=True,
+        checked_at=_NOW,
+        note=None,
+    )
+    assert not send_readiness._authority_ok(smuggled)
+    conflicts = location_conflicts("Hannover", [smuggled])
+    assert conflicts != []
+    assert conflicts == [
+        "AUTHORITY_NOT_ALLOWED:EMPLOYER_JOB_AD",
+        "NO_AUTHORITATIVE_LOCATION_EVIDENCE",
+    ]
+    result = evaluate_send_readiness(_ready_inputs(location_evidence=[smuggled]))
+    assert CHECK_LOCATION_CONSISTENT in _failed(result)
+    assert not result.ready
 
 
 @pytest.mark.parametrize("job_location", [None, "", "   "])

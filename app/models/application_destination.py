@@ -28,12 +28,15 @@ E362/B finding). It therefore lives beside, not inside, company research.
   unsolicited applications, or one found on a careers FAQ) is never
   package-ready, whatever its other fields say.
 - The predicates re-check every condition themselves (defense in depth
-  against an instance built with `model_construct`, which skips validation).
+  against an instance built with `model_construct`, which skips validation),
+  including the URL/email syntax via `is_strict_https_url` /
+  `is_valid_email_address`.
 """
 
 import re
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -62,6 +65,55 @@ PACKAGE_READY_KINDS: frozenset[str] = frozenset({"APPLICATION_PORTAL", "EMAIL"})
 # Shape check only (same stance as app.services.follow_up_recipient).
 _EMAIL_SHAPE_RE = re.compile(r"^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$")
 _CONTROL_CHARS = ("\r", "\n", "\x00")
+_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _has_control_or_space(text: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in text)
+
+
+def is_strict_https_url(value: object) -> bool:
+    """True only for a syntactically valid `https://` URL with a real DNS
+    hostname: scheme exactly `https`, no userinfo, no control characters or
+    whitespace, no backslashes, no IP literal / bracketed host, a valid
+    port if any. Pure string parsing -- never resolves or connects."""
+    if not isinstance(value, str) or not value.startswith("https://"):
+        return False
+    if _has_control_or_space(value) or "\\" in value:
+        return False
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        parts.port  # noqa: B018 -- raises ValueError on a malformed port
+    except ValueError:
+        return False
+    netloc = parts.netloc
+    if parts.scheme != "https" or not netloc or not hostname:
+        return False
+    if "@" in netloc or "[" in netloc or "%" in netloc:
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    host = hostname.rstrip(".")
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2:
+        return False
+    if not all(_HOST_LABEL_RE.match(label) for label in labels):
+        return False
+    # The TLD must carry a letter: rejects IPv4 literals such as 10.0.0.1.
+    return any(ch.isalpha() for ch in labels[-1])
+
+
+def is_valid_email_address(value: object) -> bool:
+    """Exactly ONE syntactically plausible address: no control characters
+    (CR/LF/NUL header injection), no whitespace, no `,`/`;` recipient
+    lists, exactly one `@`."""
+    return (
+        isinstance(value, str)
+        and not _has_control_or_space(value)
+        and value.count("@") == 1
+        and _EMAIL_SHAPE_RE.match(value) is not None
+    )
 
 
 class ApplicationDestination(BaseModel):
@@ -89,8 +141,8 @@ class ApplicationDestination(BaseModel):
         for text in (self.value, self.source_url):
             if text is not None and any(ch in text for ch in _CONTROL_CHARS):
                 raise ValueError("destination fields must not contain control characters")
-        if self.source_url is not None and not self.source_url.startswith("https://"):
-            raise ValueError("source_url must be an https:// URL")
+        if self.source_url is not None and not is_strict_https_url(self.source_url):
+            raise ValueError("source_url must be a valid https:// URL with a hostname")
 
         if self.kind == "UNKNOWN":
             if self.value is not None:
@@ -100,10 +152,10 @@ class ApplicationDestination(BaseModel):
             if self.verification_status == "VERIFIED":
                 raise ValueError("an UNKNOWN destination cannot be VERIFIED")
         elif self.kind == "EMAIL":
-            if not self.value or not _EMAIL_SHAPE_RE.match(self.value):
-                raise ValueError("EMAIL destination requires a well-formed address")
-        elif not (self.value or "").startswith("https://"):
-            raise ValueError(f"{self.kind} destination requires an https:// URL value")
+            if not is_valid_email_address(self.value):
+                raise ValueError("EMAIL destination requires a single well-formed address")
+        elif not is_strict_https_url(self.value):
+            raise ValueError(f"{self.kind} destination requires a valid https:// URL value")
 
         if self.verification_status == "VERIFIED":
             if self.verified_by != "OPERATOR":
@@ -121,18 +173,32 @@ def unknown_destination(job_id: int, reason: str, **fields) -> ApplicationDestin
     return ApplicationDestination(job_id=job_id, kind="UNKNOWN", reason=reason, **fields)
 
 
+def _value_ok(destination: ApplicationDestination) -> bool:
+    if destination.kind == "EMAIL":
+        return is_valid_email_address(destination.value)
+    return is_strict_https_url(destination.value)
+
+
+def _source_url_ok(destination: ApplicationDestination) -> bool:
+    if destination.source_type == "OPERATOR_ENTRY" and destination.source_url is None:
+        return True
+    return is_strict_https_url(destination.source_url)
+
+
 def _operator_verified(destination: ApplicationDestination | None) -> bool:
     """Every condition a human verification must leave behind, re-checked
-    here rather than trusted from the validator."""
+    here rather than trusted from the validator -- including the value and
+    source_url syntax."""
     return (
         destination is not None
         and destination.kind in PACKAGE_READY_KINDS
+        and _value_ok(destination)
+        and _source_url_ok(destination)
         and destination.verification_status == "VERIFIED"
         and destination.verified_by == "OPERATOR"
         and destination.source_type in _VERIFIABLE_SOURCES
         and destination.checked_at is not None
-        and (destination.source_type == "OPERATOR_ENTRY" or destination.source_url is not None)
-        and destination.vacancy_specific
+        and destination.vacancy_specific is True
         and destination.confidence in ("HIGH", "MEDIUM")
     )
 
@@ -145,6 +211,7 @@ def is_email_send_ready(destination: ApplicationDestination | None) -> bool:
     return (
         _operator_verified(destination)
         and destination.kind == "EMAIL"
+        and is_valid_email_address(destination.value)
         and destination.source_type in _EMAIL_SOURCES
         and destination.confidence == "HIGH"
     )
