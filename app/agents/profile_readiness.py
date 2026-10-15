@@ -24,8 +24,12 @@ a language without a CEFR level, a certification that is not COMPLETED) are
 reported as `notes` so a reviewer can see what a generator is NOT allowed
 to say even though a trusted row exists.
 
-`SEND_PACKAGE_REQUIRED_AREAS` is the set the Stage 14A send-readiness gate
-(`app.services.send_readiness`) requires; everything else is advisory.
+This report is VACANCY-INDEPENDENT and advisory: `SEND_PACKAGE_REQUIRED_AREAS`
+/ `send_package_gaps` are a generic "what is the profile still missing"
+diagnostic for the operator. The authoritative Stage 14A send-readiness
+gate (`app.services.send_readiness`) does NOT accept this report as proof:
+it requires vacancy-relevant evidence from the pinned match, an exact
+trusted-title match, and requirement-aware education/language checks.
 """
 
 from dataclasses import dataclass, field
@@ -61,7 +65,7 @@ AREA_ORDER = (
     AREA_CERTIFICATIONS,
 )
 
-# Areas a future send-ready package (Stage 14B) cannot do without. EXPERIENCE
+# Generic diagnostic only (see module docstring). EXPERIENCE
 # and PROJECTS are deliberately absent here: the gate requires "at least one
 # of them" (see has_relevant_structured_evidence), not both.
 SEND_PACKAGE_REQUIRED_AREAS = frozenset(
@@ -159,7 +163,8 @@ class ProfileReadinessReport:
 
     @property
     def has_relevant_structured_evidence(self) -> bool:
-        """At least one trusted experience OR project entry."""
+        """At least one trusted experience OR project entry -- generic, NOT
+        vacancy-relevant; the send gate uses the pinned match instead."""
         return "VERIFIED" in (self.status(AREA_EXPERIENCE), self.status(AREA_PROJECTS))
 
     @property

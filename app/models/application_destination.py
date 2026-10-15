@@ -13,13 +13,22 @@ E362/B finding). It therefore lives beside, not inside, company research.
 
 **Fail closed.**
 - `kind="UNKNOWN"` is the default answer and requires a `reason`.
-- A destination is `VERIFIED` only with an `https://` employer or operator
-  `source_url` and a `checked_at`; aggregators/job boards can never verify.
-- An email becomes send-ready (`is_email_send_ready`) only when an operator
-  verified it against the employer's own vacancy-specific source. A scraped
-  or general-inbox address (e.g. a careers@ address for questions or
-  unsolicited applications) is never send-ready, whatever its other fields
-  say.
+- `VERIFIED` is a HUMAN statement: the model refuses `verification_status=
+  "VERIFIED"` unless `verified_by="OPERATOR"`, with an `https://` employer
+  `source_url` (or an operator entry) and a `checked_at`. Research code
+  never sets OPERATOR: an employer portal discovered by research stays
+  `UNVERIFIED` until a human confirms it. Aggregators/job boards can never
+  verify.
+- Package-ready kinds are `APPLICATION_PORTAL` and `EMAIL` only. A generic
+  `CAREERS_PAGE` is never a package-ready channel.
+- An `EMAIL` is package-ready only under the strict email rule
+  (`is_email_send_ready`): operator-verified against the employer's own job
+  ad for THIS vacancy, HIGH confidence. A scraped, general-inbox or
+  company-level address (e.g. a careers@ address for questions or
+  unsolicited applications, or one found on a careers FAQ) is never
+  package-ready, whatever its other fields say.
+- The predicates re-check every condition themselves (defense in depth
+  against an instance built with `model_construct`, which skips validation).
 """
 
 import re
@@ -45,6 +54,10 @@ VerifiedBy = Literal["OPERATOR", "NONE"]
 
 EMPLOYER_SOURCES: frozenset[str] = frozenset({"EMPLOYER_JOB_AD", "EMPLOYER_CAREERS_SITE"})
 _VERIFIABLE_SOURCES: frozenset[str] = EMPLOYER_SOURCES | {"OPERATOR_ENTRY"}
+# Only the employer's own ad for THIS vacancy can back a package-ready
+# email; a careers-site address is company-level by definition.
+_EMAIL_SOURCES: frozenset[str] = frozenset({"EMPLOYER_JOB_AD"})
+PACKAGE_READY_KINDS: frozenset[str] = frozenset({"APPLICATION_PORTAL", "EMAIL"})
 
 # Shape check only (same stance as app.services.follow_up_recipient).
 _EMAIL_SHAPE_RE = re.compile(r"^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$")
@@ -93,6 +106,8 @@ class ApplicationDestination(BaseModel):
             raise ValueError(f"{self.kind} destination requires an https:// URL value")
 
         if self.verification_status == "VERIFIED":
+            if self.verified_by != "OPERATOR":
+                raise ValueError("only an operator can mark a destination VERIFIED")
             if self.source_type not in _VERIFIABLE_SOURCES:
                 raise ValueError("only employer or operator sources can verify a destination")
             if self.checked_at is None:
@@ -106,28 +121,41 @@ def unknown_destination(job_id: int, reason: str, **fields) -> ApplicationDestin
     return ApplicationDestination(job_id=job_id, kind="UNKNOWN", reason=reason, **fields)
 
 
-def is_channel_verified(destination: ApplicationDestination | None) -> bool:
-    """A known, verified, vacancy-specific channel from an employer or
-    operator source -- what a Stage 14B package may target for HUMAN
-    delivery (portal upload or a human-sent email)."""
+def _operator_verified(destination: ApplicationDestination | None) -> bool:
+    """Every condition a human verification must leave behind, re-checked
+    here rather than trusted from the validator."""
     return (
         destination is not None
-        and destination.kind != "UNKNOWN"
+        and destination.kind in PACKAGE_READY_KINDS
         and destination.verification_status == "VERIFIED"
+        and destination.verified_by == "OPERATOR"
+        and destination.source_type in _VERIFIABLE_SOURCES
+        and destination.checked_at is not None
+        and (destination.source_type == "OPERATOR_ENTRY" or destination.source_url is not None)
         and destination.vacancy_specific
         and destination.confidence in ("HIGH", "MEDIUM")
     )
 
 
 def is_email_send_ready(destination: ApplicationDestination | None) -> bool:
-    """Stricter than `is_channel_verified`: an email address a future,
-    separately authorized stage could address a draft to. Requires an
-    operator verification against the employer's own vacancy source and
-    HIGH confidence; a scraped address can never satisfy `verified_by`."""
+    """The strict email rule: an address a future, separately authorized
+    stage could address a draft to. Operator-verified against the
+    employer's own job ad for this vacancy, HIGH confidence. A scraped or
+    company-level address can never satisfy it."""
     return (
-        is_channel_verified(destination)
+        _operator_verified(destination)
         and destination.kind == "EMAIL"
-        and destination.verified_by == "OPERATOR"
-        and destination.source_type in EMPLOYER_SOURCES
+        and destination.source_type in _EMAIL_SOURCES
         and destination.confidence == "HIGH"
     )
+
+
+def is_channel_verified(destination: ApplicationDestination | None) -> bool:
+    """A package-ready channel: a portal or email for THIS vacancy that a
+    human operator verified -- what a Stage 14B package may target for
+    HUMAN delivery (portal upload or a human-sent email). An EMAIL must
+    additionally pass the strict email rule; there is no weaker email
+    path."""
+    if destination is not None and destination.kind == "EMAIL":
+        return is_email_send_ready(destination)
+    return _operator_verified(destination)
