@@ -23,11 +23,13 @@ or reorder the displayed text. It never modifies the persisted artifacts.
 
 import unicodedata
 
+from app.agents.score_labels import CANDIDATE_MATCH_LABEL, SCORE_DIFFERENCE_NOTE
 from app.models.bewerbung import BewerbungDraft
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
 from app.models.cv_draft import TailoredCVDraft
 
-PREVIEW_RENDERER_VERSION = "tg-bw-preview-v1"
+# v2 (Stage 14A): labelled Kandidaten-Match + score note, German CV gap texts.
+PREVIEW_RENDERER_VERSION = "tg-bw-preview-v2"
 TELEGRAM_UNIT_LIMIT = 3500
 MAX_LETTER_PAGES = 20
 
@@ -51,6 +53,19 @@ _COVERED_WARNINGS = frozenset({"CONTACT_DATA_NOT_MODELED"})
 
 _WARNING_TEXT = {
     "NO_TRUSTED_NAME": "Kein bestätigter Name - die Unterschrift fehlt im Anschreiben.",
+}
+
+# Stage 14A: CV gap codes in operator language. Unknown codes still render
+# as the bare code, so a new warning is never silently dropped.
+_CV_WARNING_TEXT = {
+    "NO_TRUSTED_NAME": "Kein bestätigter Name im Profil.",
+    "NO_TRUSTED_TITLE": "Keine bestätigte Berufsbezeichnung im Profil.",
+    "NO_RELEVANT_SKILLS": "Keine passenden bestätigten Skills.",
+    "NO_RELEVANT_EXPERIENCE": "Keine bestätigte Berufserfahrung im Profil.",
+    "NO_MATCH_RELEVANT_EXPERIENCE": "Berufserfahrung vorhanden, aber ohne passende Technologien.",
+    "NO_RELEVANT_PROJECTS": "Keine passenden bestätigten Projekte.",
+    "NO_TRUSTED_EDUCATION": "Keine bestätigte Ausbildung im Profil.",
+    "NO_TRUSTED_LANGUAGES": "Keine bestätigten Sprachkenntnisse im Profil.",
 }
 
 
@@ -177,7 +192,8 @@ def _warning_lines(
     lines.append("• Kontaktdaten sind nicht Teil dieses Entwurfs.")
     codes = [code for code in [*cv.warnings, *match.warnings] if code not in _COVERED_WARNINGS]
     for code in codes[:_MAX_LIST_ITEMS]:
-        lines.append(f"• Hinweis: {cap_units(normalize_scalar(code), _ITEM_LIMIT)}")
+        text = _CV_WARNING_TEXT.get(code, code)
+        lines.append(f"• Hinweis: {cap_units(normalize_scalar(text), _ITEM_LIMIT)}")
     return lines
 
 
@@ -199,7 +215,8 @@ def render_summary(letter: BewerbungDraft, cv: TailoredCVDraft, match: Candidate
     body: list[str] = [
         f"Position: {_field(title, _TITLE_LIMIT)}",
         f"Firma: {_field(company, _COMPANY_LIMIT)}",
-        f"Kandidaten-Match (Profil vs. Stelle, 0-100): {match.overall_score}",
+        f"{CANDIDATE_MATCH_LABEL}: {match.overall_score}/100",
+        SCORE_DIFFERENCE_NOTE,
         "",
         *_section(
             "Belegte Anforderungen:",

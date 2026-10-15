@@ -149,7 +149,8 @@ class TestRendering:
             "🇩🇪 Deutsch: B2",
             "🔎 Quelle: bundesagentur",
         ]
-        assert "Match: 82%" in text
+        assert "Stellen-Score (Vorauswahl): 82/100" in text
+        assert "Match: 82%" not in text
         assert "✅ Python\n✅ FastAPI\n✅ SQL\n⚠️ Docker preferred" in text
         assert "Why it may fit:" in text
         assert "- 3 of 3 required technologies in your profile: Python, FastAPI, SQL" in text

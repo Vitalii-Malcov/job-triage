@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import extract_language_requirements
+from app.agents.score_labels import VACANCY_SCORE_LABEL
 from app.db.candidate_profile_repository import get_candidate_skills_for_scoring
 from app.db.models import JobRecord
 from app.db.repositories import get_job_by_id
@@ -232,7 +233,7 @@ def render_vacancy_card(card: VacancyCard) -> str:
         header.append(f"💰 {_cap(card.salary, LINE_MAX_LEN)}")
     header.append(f"🔎 Quelle: {_cap(card.source, SOURCE_MAX_LEN)}")
     header.append("")
-    header.append(f"Match: {card.score}%")
+    header.append(f"{VACANCY_SCORE_LABEL}: {card.score}/100")
 
     sections: list[str] = []
     if card.technologies:
@@ -315,7 +316,7 @@ def render_vacancy_details(record: JobRecord) -> str:
         f"Firma: {_cap(record.company, COMPANY_MAX_LEN)}",
         f"Ort: {_cap(record.location, LOCATION_MAX_LEN) if record.location else 'n/a'}",
         f"Quelle: {_cap(record.source, SOURCE_MAX_LEN)}",
-        f"Score: {record.score}/100 ({record.recommendation})",
+        f"{VACANCY_SCORE_LABEL}: {record.score}/100 ({record.recommendation})",
         f"Status: {record.status}",
         "Required: " + (", ".join(_cap(s, SKILL_MAX_LEN) for s in must) or "none extracted"),
         "Preferred: " + (", ".join(_cap(s, SKILL_MAX_LEN) for s in nice) or "none extracted"),

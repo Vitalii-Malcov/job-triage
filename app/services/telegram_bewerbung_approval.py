@@ -45,6 +45,7 @@ from app.agents.review_package_builder import (
     ReviewSourceMismatchError,
     ReviewVersionConflictError,
 )
+from app.agents.score_labels import CANDIDATE_MATCH_LABEL, SCORE_DIFFERENCE_NOTE
 from app.db.bewerbung_repository import get_bewerbung_draft_by_id, to_bewerbung_draft
 from app.db.candidate_cv_draft_repository import get_draft_by_id, to_tailored_cv_draft
 from app.db.candidate_job_match_repository import get_match_by_id, to_candidate_job_match
@@ -342,7 +343,8 @@ def _build_document(snapshot: ReviewSnapshot) -> _Document:
 
     match = snapshot.match
     doc.line("KANDIDATEN-MATCH (Profil vs. Stelle)")
-    doc.line(f"Kandidaten-Match (0-100): {match.overall_score}")
+    doc.line(f"{CANDIDATE_MATCH_LABEL}: {match.overall_score}/100")
+    doc.line(SCORE_DIFFERENCE_NOTE)
     _requirements(doc, "Belegte Anforderungen:", match.matched_requirements)
     _requirements(doc, "Teilweise belegt:", match.partial_requirements)
     _requirements(doc, "Nicht belegt (wird nicht behauptet):", match.missing_requirements)
