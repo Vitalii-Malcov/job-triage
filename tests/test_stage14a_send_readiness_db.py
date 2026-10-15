@@ -9,6 +9,7 @@ only a local read-only SQLite URI before creating any engine.
 
 import asyncio
 import hashlib
+import json
 import socket
 from datetime import UTC, datetime
 
@@ -551,3 +552,98 @@ def test_cli_connection_is_query_only(db_path, factory):
             assert conn.exec_driver_sql("PRAGMA query_only").scalar() == 1
     finally:
         engine.dispose()
+
+
+# --- CLI: local-only JSON input paths ------------------------------------------
+
+_NETWORK_JSON_PATHS = [
+    r"\\fileserver\share\destination.json",
+    "//fileserver/share/destination.json",
+    r"/\fileserver\share\destination.json",
+    r"\/fileserver/share/destination.json",
+    r"\\?\UNC\fileserver\share\destination.json",
+    r"\\?\C:\data\destination.json",
+    r"\\.\pipe\destination",
+    r"\??\UNC\fileserver\share\destination.json",
+    "file://fileserver/share/destination.json",
+    "file:///C:/data/destination.json",
+    "file:destination.json",
+    "http://example.com/destination.json",
+    "https://example.com/destination.json",
+    "smb://fileserver/share/destination.json",
+    "destination.json\x00",
+    "",
+]
+
+
+@pytest.mark.parametrize("path", _NETWORK_JSON_PATHS)
+def test_validate_local_json_path_rejects_network_and_uri_paths(path):
+    with pytest.raises(cli.UnsafeInputPathError):
+        cli.validate_local_json_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/research/stage14a_e362b_destination.json",
+        r"docs\research\stage14a_e362b_destination.json",
+        r"C:\local\destination.json",
+        "C:/local/destination.json",
+        "/srv/data/destination.json",
+    ],
+)
+def test_validate_local_json_path_accepts_local_paths(path):
+    assert cli.validate_local_json_path(path) == path
+
+
+@pytest.mark.parametrize("flag", ["--destination-json", "--location-json"])
+@pytest.mark.parametrize("path", _NETWORK_JSON_PATHS)
+def test_cli_rejects_network_json_paths_before_any_read(monkeypatch, capsys, flag, path):
+    def _no_read(*args, **kwargs):
+        raise AssertionError("read_text called for an unvalidated input path")
+
+    def _no_engine(*args, **kwargs):
+        raise AssertionError("engine created before input paths were validated")
+
+    monkeypatch.setattr(cli.Path, "read_text", _no_read)
+    monkeypatch.setattr(cli, "create_engine", _no_engine)
+    url = "sqlite:///file:stage11_pilot.db?mode=ro&uri=true"
+    assert cli.main(["--database-url", url, "--job-id", "1", flag, path]) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_load_json_validates_before_read(monkeypatch):
+    def _no_read(*args, **kwargs):
+        raise AssertionError("read_text called for an unvalidated input path")
+
+    monkeypatch.setattr(cli.Path, "read_text", _no_read)
+    with pytest.raises(cli.UnsafeInputPathError):
+        cli._load_json(r"\\fileserver\share\destination.json")
+
+
+def test_cli_still_reads_local_json_paths(factory, seeded, db_path, capsys, tmp_path):
+    job_id, _ = seeded
+    destination = tmp_path / "destination.json"
+    destination.write_text(
+        json.dumps({"job_id": job_id, "kind": "UNKNOWN", "reason": "not researched"}),
+        encoding="utf-8",
+    )
+    locations = tmp_path / "locations.json"
+    locations.write_text("[]", encoding="utf-8")
+    url = f"sqlite:///file:{db_path.as_posix()}?mode=ro&uri=true"
+    code = cli.main(
+        [
+            "--database-url",
+            url,
+            "--job-id",
+            str(job_id),
+            "--destination-json",
+            str(destination),
+            "--location-json",
+            str(locations),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert "refused" not in captured.err
+    assert code == 1
+    assert "READY_FOR_SEND_PACKAGE = NO" in captured.out
