@@ -163,7 +163,14 @@ def test_reproduces_live_83_vs_80_pair_from_two_algorithms():
 
 def test_trusted_experience_closes_the_gap_only_on_the_candidate_match():
     """The two scores move independently: structured evidence raises the
-    candidate match, JobScorer never sees it."""
+    candidate match, JobScorer never sees it.
+
+    Matcher v3 (Stage 14B) contract: experience support is the share of
+    REQUIRED skills backed by relevant experience/project evidence. The
+    experience backs python + git, i.e. 2 of the 3 required skills
+    (git, python, rest) -> round(2/3 * 100) = 67, and overall =
+    round(0.6*100 + 0.2*100 + 0.2*67) = 93. (v1 counted backing ROWS: 1/3
+    -> 33, overall 87.)"""
     profile = _profile()
     profile.experiences = [
         CandidateExperience(id=1, company="X", job_title="Dev", technologies=["Python", "Git"])
@@ -173,8 +180,10 @@ def test_trusted_experience_closes_the_gap_only_on_the_candidate_match():
         profile,
         company_research_id=None,
     )
-    assert data.experience_support_score == 33
-    assert data.overall_score == 87
+    assert data.required_skill_score == 100
+    assert data.preferred_skill_score == 100
+    assert data.experience_support_score == 67
+    assert data.overall_score == 93
     assert _vacancy_score() == 83
 
 
