@@ -50,6 +50,9 @@ Profil:
 - Erfahrung mit API-Entwicklung (REST) und Git-basierter Softwareentwicklung.
 - Grundverständnis von Software-Engineering-Prinzipien (Testing, CI/CD).
 - Ausgeprägte kommunikative Stärken sowie die Bereitschaft zur Dokumentation.
+
+Klingt interessant?
+Wir freuen uns über alle Bewerbungen unter Angabe der Kennziffer E362/B.
 """
 
 

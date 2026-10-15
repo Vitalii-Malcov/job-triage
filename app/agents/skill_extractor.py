@@ -210,6 +210,20 @@ _OTHER_SECTION_HEADERS = {
     "benefits",
     "über uns",
     "about us",
+    # Stage 14B: closing call-to-action / contact lines end a requirement
+    # section, so the application footer is not read as requirement text.
+    "klingt interessant",
+    "neugierig geworden",
+    "haben wir ihr interesse geweckt",
+    "haben wir dein interesse geweckt",
+    "interesse geweckt",
+    "kontakt",
+    "ihr kontakt",
+    "dein kontakt",
+    "ansprechpartner",
+    "ansprechpartnerin",
+    "interested",
+    "contact",
 }
 
 
