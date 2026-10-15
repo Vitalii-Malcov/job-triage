@@ -49,11 +49,20 @@ class DeterministicBewerbungProvider(BewerbungProvider):
             for claim in evidence.allowed_claims
             if claim.source_entity == "candidate_skill"
         ][:_MAX_SKILLS_PER_PARAGRAPH]
-        highlight_ids = [
-            claim.id
-            for claim in evidence.allowed_claims
-            if claim.source_entity in ("candidate_experience", "candidate_project")
-        ][:1]
+        # Stage 14A: structured employment evidence is the strongest claim
+        # a letter can make, so the first relevant experience is always
+        # preferred, followed by the first relevant project. Previously a
+        # single slot was filled by whichever came first in
+        # `allowed_claims` (projects precede experiences there), so a
+        # trusted, match-relevant experience could be silently dropped.
+        highlight_ids: list[str] = []
+        for source_entity in ("candidate_experience", "candidate_project"):
+            first = next(
+                (c.id for c in evidence.allowed_claims if c.source_entity == source_entity),
+                None,
+            )
+            if first is not None:
+                highlight_ids.append(first)
         language_ids = [
             claim.id
             for claim in evidence.allowed_claims

@@ -582,7 +582,7 @@ def test_draft_pins_match_and_profile_version_and_algorithm_version():
     assert draft.match_id == 42
     assert draft.candidate_profile_version == 9
     assert draft.match_algorithm_version == "v1"
-    assert draft.cv_adapter_version == CV_ADAPTER_VERSION == "v1"
+    assert draft.cv_adapter_version == CV_ADAPTER_VERSION == "v2"
     assert draft.status == "DRAFT"
 
 
