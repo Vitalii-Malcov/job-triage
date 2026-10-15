@@ -82,10 +82,23 @@ research. Fields: kind (`EMAIL` / `APPLICATION_PORTAL` / `CAREERS_PAGE` / `UNKNO
 source_url, source_type, verification_status, confidence, verified_by, vacancy_specific,
 provenance, checked_at, reason.
 
-Fail-closed rules: `UNKNOWN` needs a reason; only employer or operator sources can be `VERIFIED`;
-`VERIFIED` needs `checked_at` (and an https source for employer sources); CR/LF/NUL rejected.
-`is_email_send_ready` additionally requires operator verification, an employer source, a
-vacancy-specific address and HIGH confidence — a scraped or general-inbox address never qualifies.
+Fail-closed rules (hardened after the Codex 14A review):
+
+- `UNKNOWN` needs a reason; CR/LF/NUL rejected; URL values/sources must be `https://` (email: shape
+  check).
+- **`VERIFIED` is a human statement.** The model refuses `verification_status="VERIFIED"` unless
+  `verified_by="OPERATOR"`, plus `checked_at` and an https employer `source_url` (or an operator
+  entry). Aggregators/job boards can never verify. Research never sets `OPERATOR`: an employer
+  portal discovered by research stays `UNVERIFIED` until a human confirms it.
+- **Package-ready kinds:** `APPLICATION_PORTAL` and `EMAIL` only. A generic `CAREERS_PAGE` is never
+  package-ready.
+- `is_channel_verified` (package-ready) requires operator verification, a verifiable source,
+  `checked_at`, `vacancy_specific` and HIGH/MEDIUM confidence. For `EMAIL` there is no weaker path:
+  it must pass the strict email rule `is_email_send_ready` — operator-verified against the
+  employer's own **job ad** for this vacancy, HIGH confidence. Scraped, general-inbox and
+  company-level addresses (careers@, careers-site FAQ) are never package-ready.
+- Both predicates re-check every condition themselves, so an instance built with `model_construct`
+  (validation bypassed) still fails closed.
 
 No DB table in 14A (no schema change, no migration). Research results are committed as JSON under
 `docs/research/` and passed to the gate explicitly. 14B decides on persistence.
@@ -111,12 +124,54 @@ handoff (CV/PDF + letter text), not an email draft with a recipient.
 ## 6. Send-readiness gate
 
 `app/services/send_readiness.py` — pure `evaluate_send_readiness` + read-only
-`load_send_readiness_inputs`. Checks, all required:
+`load_send_readiness_inputs`. Every check is required; the gate is **vacancy-specific** and fails
+closed. `ProfileReadinessReport` (section 1) stays a vacancy-independent, advisory diagnostic and is
+never accepted as proof by the gate.
 
-`TRUSTED_CANDIDATE_TITLE`, `RELEVANT_STRUCTURED_EVIDENCE`, `REQUIRED_CV_DATA` (name, education,
-languages), `APPROVED_BEWERBUNG_REVISION`, `APPROVED_PACKAGE_MATCHES_CURRENT_PROFILE`,
-`APPLICATION_CHANNEL_VERIFIED`, `RECIPIENT_TYPE_KNOWN`, `NO_CONTRADICTORY_LOCATION_EVIDENCE`,
-`OUTBOUND_STILL_DISABLED` (fails if outbound is ever on).
+| Check | Passes only if |
+|---|---|
+| `TRUSTED_CANDIDATE_TITLE` | the approved package's reviewed CV title **equals** the current trusted profile title (whitespace-normalized). A differing title — including a human edit to another title — is NOT ready. There is no override path. |
+| `RELEVANT_STRUCTURED_EVIDENCE` | at least one experience or project that the **pinned match** marks relevant (non-empty `matched_skills`), that is still trusted in the current profile, and that the approved CV cites. Unrelated trusted history does not count. |
+| `REQUIRED_CV_DATA` | trusted first and last name. |
+| `EDUCATION_REQUIREMENT_SATISFIED` | every binding (`REQUIRED`/`UNKNOWN`-importance) education requirement of the pinned match is `MATCH` on trusted, **completed** education rows, and the CV never shows an unfinished degree as completed. No requirement → no education needed; `PREFERRED` is advisory. |
+| `LANGUAGE_REQUIREMENT_SATISFIED` | every binding language requirement is `MATCH` on trusted rows with a **stated** level (`UNKNOWN` never satisfies a required level; an insufficient level is `PARTIAL`). No requirement → no language needed. |
+| `APPROVED_BEWERBUNG_REVISION` | an APPROVED review whose loaded revision is exactly its `approved_revision_id`. |
+| `APPROVED_PACKAGE_MATCHES_CURRENT_PROFILE` | the package-currency check below reports no problem. |
+| `APPLICATION_CHANNEL_VERIFIED` | `is_channel_verified` (section 4): operator-verified, vacancy-specific portal or strict-rule email. |
+| `RECIPIENT_TYPE_KNOWN` | destination kind is not `UNKNOWN`. |
+| `NO_CONTRADICTORY_LOCATION_EVIDENCE` | location rules below. |
+| `OUTBOUND_STILL_DISABLED` | `OUTBOUND_SENDING_ENABLED` is false. |
+
+**Package currency — stale approved packages fail closed.** `package_currency_problems` rejects: a
+superseded review (a newer review exists for the job); a non-APPROVED or other-job review; an
+approved revision that is missing, not owned by the review, or not the review's current revision
+(revision number ≠ `review_version`, or a newer revision exists); a missing or inconsistent pinned
+match/CV/letter triple (every id and every version/fingerprint pin compared across review, match,
+CV and letter); a stale profile version; a stale job fingerprint; a matcher / CV-adapter /
+generator version older than the running code; and — reusing the Stage 8C/9B authority
+`bewerbung_draft_is_current` — a letter not current for the job's exact title/company display
+context. Packages generated under older semantic versions (e.g. CV adapter v1, generator v2)
+therefore never pass. Inputs assembled without the currency check default to
+`PACKAGE_CURRENCY_NOT_CHECKED` (fail).
+
+**Location rules.** Only an employer source (`EMPLOYER_JOB_AD` / `EMPLOYER_CAREERS_SITE`) with an
+https `source_url` and `checked_at` may be authoritative (validated, and re-checked in the gate).
+Authoritative sources are evaluated independently, never unioned: `AUTHORITATIVE_SOURCES_DISAGREE`
+if they differ; `JOB_LOCATION_MISSING` if the persisted job has no location;
+`JOB_LOCATION_NOT_IN_AUTHORITATIVE_LOCATIONS` if the persisted location is outside any
+authoritative set; `SOURCE_LISTS_OTHER_LOCATIONS:<type>` if a board/aggregator lists other places.
+A board can never overrule the employer. No operator location resolution is modeled in 14A: a
+conflict stays NOT ready until the stored data or the evidence changes.
+
+**Strict read-only loader.** `load_send_readiness_inputs` refuses (`SessionNotCleanError`) a session
+with pending new/dirty/deleted ORM state **before** any read, performs every read under
+`no_autoflush`, and never flushes, commits or mutates.
+
+**Zero-network CLI.** `scripts/stage14a_send_readiness.py` accepts only a local read-only SQLite URI
+`sqlite:///file:<local path>?mode=ro&uri=true`, validated before any engine is created. It rejects
+PostgreSQL/MySQL/any other dialect, driver suffixes, hosts/credentials, plain or writable SQLite
+URLs, extra URI parameters, `:memory:` and UNC / `file://host` paths. The connection also runs
+`PRAGMA query_only = ON`.
 
 ```
 python scripts/stage14a_send_readiness.py \
@@ -125,8 +180,11 @@ python scripts/stage14a_send_readiness.py \
   --location-json docs/research/stage14a_e362b_locations.json
 ```
 
-Result on the Stage 11 pilot copy of E362/B: `READY_FOR_SEND_PACKAGE = NO` — only
-`RECIPIENT_TYPE_KNOWN` and `OUTBOUND_STILL_DISABLED` pass. (The 13D approved package lives in the
+Result on the Stage 11 pilot copy of E362/B (re-run after hardening, DB SHA-256 unchanged):
+`READY_FOR_SEND_PACKAGE = NO` — only `REQUIRED_CV_DATA` (name), `RECIPIENT_TYPE_KNOWN` and
+`OUTBOUND_STILL_DISABLED` pass. Location: stored/BA Frankfurt am Main vs employer Hannover/Münster
+→ `JOB_LOCATION_NOT_IN_AUTHORITATIVE_LOCATIONS` + `SOURCE_LISTS_OTHER_LOCATIONS:JOB_BOARD_LISTING`.
+The portal stays `UNVERIFIED` until human confirmation. (The 13D approved package lives in the
 closed 13D environment and was deliberately not read.)
 
 ## 7. Operator input template (no data is pre-filled)
