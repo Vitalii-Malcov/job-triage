@@ -171,6 +171,7 @@ See [GMAIL_RESPONSE_WORKFLOW.md](GMAIL_RESPONSE_WORKFLOW.md) for the end-to-end 
 - `ResponseDraftRecord.requires_human_review` is always `True` — Stage 7C only ever proposes.
 - `send_response_draft` / `send_follow_up` both hard-require a persisted `*ApprovalRecord` with `decision == "APPROVED"` before any provider `send()` call — enforced in code, not just convention.
 - `ReviewPackageService` never auto-approves candidate-profile changes.
+- Stage 14A `app/services/send_readiness.py` is a read-only READY_FOR_SEND_PACKAGE gate (requires outbound DISABLED); an `ApplicationDestination` (`app/models/application_destination.py`) is never send-ready without operator verification against an employer source. Nothing transmits to it. See `docs/STAGE_14A_PROFILE_RECIPIENT_READINESS.md` (Stage 13D closed; 14B draft package, 14C human-send observation, 15 auto-send NOT authorized).
 
 ## Concurrency-sensitive areas
 

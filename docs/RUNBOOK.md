@@ -215,6 +215,10 @@ or the previous database, target = `restore_check`) reports PASS.
 
 CandidateProfile facts + provenance are the ONLY data carried over; the SQLite pilot is archived read-only and every other table starts empty in PostgreSQL. Never transfer the profile with `GET` → `PATCH` (it would upgrade absent trust to MANUAL_ENTRY/CONFIRMED). Full procedure, rationale and rehearsal evidence: `docs/STAGE_13B_REHEARSAL.md`.
 
+## Profile and send-readiness check (Stage 14A, read-only)
+
+`python scripts/stage14a_send_readiness.py --database-url <read-only URL> --job-id <id> [--destination-json ...] [--location-json ...]` prints per-area profile readiness and `READY_FOR_SEND_PACKAGE`. It never commits, sends or calls the network. Missing profile facts are entered via `PATCH /api/v1/candidate-profile` using the template in `docs/STAGE_14A_PROFILE_RECIPIENT_READINESS.md`.
+
 ## Credential rotation (IMAP/SMTP App Passwords, Bundesagentur key, Telegram token)
 
 1. Generate the new credential at the source (Google App Passwords page, Telegram BotFather, etc.).
