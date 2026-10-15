@@ -79,7 +79,7 @@ percentage).** Every requirement contributes `1.0` (MATCH), `0.5`
   requirements at all (same ambiguous-neutral rationale as above).
 - `experience_support_score` = how much of the REQUIRED skill coverage is
   actually backed by a relevant_experience/relevant_project (not just a
-  bare CandidateSkill row): v2 = `count(REQUIRED skills named in some
+  bare CandidateSkill row): v2+ = `count(REQUIRED skills named in some
   relevant experience/project) / count(REQUIRED skill requirements) * 100`
   (v1 counted backing rows instead of backed skills), then scaled by a
   years-of-experience requirement's points (Stage 14B, below).
@@ -101,8 +101,10 @@ and no divide-by-zero path.
 **Score means "coverage of vacancy requirements by trusted candidate
 evidence" — not "chance of getting the job"** (spec section 8/9).
 
-**Stage 14B (v2): no silent requirement loss.** A score is only as honest
-as the requirement list behind it, so v2 makes that list fail closed:
+**Stage 14B (v2, v3): no silent requirement loss.** A score is only as honest
+as the requirement list behind it, so v2 makes that list fail closed (v3:
+closing/contact headings end a requirement section, so an application
+footer is no longer read as unevaluated required text):
 
 - SKILL requirements are the persisted lists UNIONED with a fresh
   `skill_extractor.extract_skills` over the description; skills the stored
@@ -155,7 +157,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v2"
+ALGORITHM_VERSION = "v3"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -642,7 +644,7 @@ def compute_match(
         if r.requirement_type == "SKILL" and r.importance == "REQUIRED"
     }
     if required_skill_norms_only:
-        # v2: the share of REQUIRED skills backed by at least one relevant
+        # v2+: the share of REQUIRED skills backed by at least one relevant
         # experience/project (v1 divided the number of backing ROWS by the
         # number of skills, so one row covering every skill scored low and
         # three rows covering one skill scored high).
