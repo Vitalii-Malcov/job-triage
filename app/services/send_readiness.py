@@ -172,7 +172,8 @@ def _authority_ok(item: LocationEvidence) -> bool:
     return (
         item.source_type in EMPLOYER_SOURCES
         and is_strict_https_url(item.source_url)
-        and item.checked_at is not None
+        # isinstance, not `is not None`: model_construct can smuggle a str.
+        and isinstance(item.checked_at, datetime)
     )
 
 

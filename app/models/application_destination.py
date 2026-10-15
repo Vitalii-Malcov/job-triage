@@ -66,6 +66,7 @@ PACKAGE_READY_KINDS: frozenset[str] = frozenset({"APPLICATION_PORTAL", "EMAIL"})
 _EMAIL_SHAPE_RE = re.compile(r"^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$")
 _CONTROL_CHARS = ("\r", "\n", "\x00")
 _HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
 def _has_control_or_space(text: str) -> bool:
@@ -75,8 +76,10 @@ def _has_control_or_space(text: str) -> bool:
 def is_strict_https_url(value: object) -> bool:
     """True only for a syntactically valid `https://` URL with a real DNS
     hostname: scheme exactly `https`, no userinfo, no control characters or
-    whitespace, no backslashes, no IP literal / bracketed host, a valid
-    port if any. Pure string parsing -- never resolves or connects."""
+    whitespace, no backslashes, no IP literal / bracketed host, and an
+    explicit port (if any) of 1..65535 digits -- an empty `host:` port is
+    rejected, not treated as "no port". Pure string parsing -- never
+    resolves or connects."""
     if not isinstance(value, str) or not value.startswith("https://"):
         return False
     if _has_control_or_space(value) or "\\" in value:
@@ -84,7 +87,6 @@ def is_strict_https_url(value: object) -> bool:
     try:
         parts = urlsplit(value)
         hostname = parts.hostname
-        parts.port  # noqa: B018 -- raises ValueError on a malformed port
     except ValueError:
         return False
     netloc = parts.netloc
@@ -94,6 +96,13 @@ def is_strict_https_url(value: object) -> bool:
         return False
     if parts.username is not None or parts.password is not None:
         return False
+    if netloc.count(":") > 1:
+        return False
+    if ":" in netloc:
+        # Checked on the raw netloc: urlsplit().port is None for `host:`.
+        port = netloc.rsplit(":", 1)[1]
+        if not _PORT_RE.match(port) or not 1 <= int(port) <= 65535:
+            return False
     host = hostname.rstrip(".")
     labels = host.split(".")
     if len(host) > 253 or len(labels) < 2:
@@ -197,7 +206,8 @@ def _operator_verified(destination: ApplicationDestination | None) -> bool:
         and destination.verification_status == "VERIFIED"
         and destination.verified_by == "OPERATOR"
         and destination.source_type in _VERIFIABLE_SOURCES
-        and destination.checked_at is not None
+        # isinstance, not `is not None`: model_construct can smuggle a str.
+        and isinstance(destination.checked_at, datetime)
         and destination.vacancy_specific is True
         and destination.confidence in ("HIGH", "MEDIUM")
     )

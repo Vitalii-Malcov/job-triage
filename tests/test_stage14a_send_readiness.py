@@ -202,6 +202,20 @@ _MALFORMED_URLS = [
     "https://careers.example.com:99999/x",
     "https://careers.example.com:abc/x",
     "https://careers%2eexample.com/x",
+    "https://careers.example.com:",
+    "https://careers.example.com:/jobs",
+    "https://careers.example.com:?x=1",
+    "https://careers.example.com:#apply",
+    "https://careers.example.com:0",
+    "https://careers.example.com:00000",
+    "https://careers.example.com:65536",
+    "https://careers.example.com:99999",
+    "https://careers.example.com:-1",
+    "https://careers.example.com:+443",
+    "https://careers.example.com: 443",
+    "https://careers.example.com:443:443",
+    "https://careers.example.com:abc",
+    "https://careers.example.com:٤٤٣",
 ]
 
 
@@ -215,6 +229,11 @@ def test_strict_https_url_rejects_malformed_values(url):
     [
         _AD,
         _AD + "#apply",
+        "https://careers.example.com",
+        "https://careers.example.com:1",
+        "https://careers.example.com:443",
+        "https://careers.example.com:65535/",
+        "https://careers.example.com:8443/jobs/123",
         "https://careers.example.com:8443/jobs?id=1",
         "https://xn--bcher-kva.de/",
     ],
@@ -247,6 +266,14 @@ def test_model_rejects_malformed_portal_value_and_source_url(url):
         {"source_url": "https://?x=1"},
         {"source_type": "OPERATOR_ENTRY", "source_url": "https://"},
         {"vacancy_specific": "yes"},
+        {"value": "https://careers.example.com:"},
+        {"value": "https://careers.example.com:0"},
+        {"source_url": "https://careers.example.com:"},
+        {"source_url": "https://careers.example.com:0"},
+        {"checked_at": "not-a-date"},
+        {"checked_at": "2026-10-15T00:00:00Z"},
+        {"checked_at": 0},
+        {"checked_at": None},
     ],
 )
 def test_bypassed_validation_portal_with_malformed_fields_is_never_verified(overrides):
@@ -293,7 +320,11 @@ def test_bypassed_validation_malformed_or_injected_email_is_never_ready(value):
         {"source_type": "JOB_BOARD_LISTING"},
         {"confidence": "MEDIUM"},
         {"checked_at": None},
+        {"checked_at": "not-a-date"},
+        {"checked_at": "2026-10-15T00:00:00Z"},
         {"source_url": "https://"},
+        {"source_url": "https://careers.example.com:"},
+        {"source_url": "https://careers.example.com:0"},
     ],
 )
 def test_bypassed_validation_email_rechecks_every_condition(overrides):
@@ -470,7 +501,17 @@ def test_authoritative_requires_provenance():
         _employer(["Hannover"], source_url="http://careers.example.com/x")
 
 
-@pytest.mark.parametrize("url", ["https://", "https:///x", "https://?x=1", "not-a-url"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://",
+        "https:///x",
+        "https://?x=1",
+        "not-a-url",
+        "https://careers.example.com:",
+        "https://careers.example.com:0",
+    ],
+)
 def test_malformed_employer_location_source_url_rejected_by_model(url):
     with pytest.raises(ValidationError):
         _employer(["Hannover"], source_url=url)
@@ -478,14 +519,32 @@ def test_malformed_employer_location_source_url_rejected_by_model(url):
         LocationEvidence(source_type="JOB_BOARD_LISTING", source_url=url, locations=["Hannover"])
 
 
-@pytest.mark.parametrize("url", ["https://", "https:///x", "https://?x=1", "not-a-url", None])
-def test_malformed_location_source_via_model_construct_is_never_authoritative(url):
+@pytest.mark.parametrize(
+    "url,checked_at",
+    [
+        ("https://", _NOW),
+        ("https:///x", _NOW),
+        ("https://?x=1", _NOW),
+        ("not-a-url", _NOW),
+        (None, _NOW),
+        ("https://careers.example.com:", _NOW),
+        ("https://careers.example.com:/jobs", _NOW),
+        ("https://careers.example.com:0", _NOW),
+        ("https://careers.example.com:99999", _NOW),
+        ("https://careers.example.com:abc", _NOW),
+        (_AD, "not-a-date"),
+        (_AD, "2026-10-15T00:00:00Z"),
+        (_AD, 0),
+        (_AD, None),
+    ],
+)
+def test_malformed_location_source_via_model_construct_is_never_authoritative(url, checked_at):
     smuggled = LocationEvidence.model_construct(
         source_type="EMPLOYER_JOB_AD",
         source_url=url,
         locations=["Hannover"],
         authoritative=True,
-        checked_at=_NOW,
+        checked_at=checked_at,
         note=None,
     )
     assert not send_readiness._authority_ok(smuggled)
