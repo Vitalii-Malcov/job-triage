@@ -34,9 +34,16 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
   correct for a skill but wrong for a negated language level).
 - Education requirement detection is a single coarse signal ("this vacancy
   requires *a* completed degree") — it does not attempt to determine
-  degree level (Bachelor vs. Master) or field of study. The first matching
+  degree level (Bachelor vs. Master). Stage 14B: field-of-study names
+  literally present in that segment (Informatik, Wirtschaftsinformatik,
+  ...) are reported in `fields` so the matcher never treats an arbitrary
+  completed degree as that specific one. The first matching
   segment (in title-then-description order) wins; multiple mentions of the
   same requirement do not change the result.
+- Stage 14B: "N years of experience" (`extract_experience_requirement`)
+  and the list of must-section segments (`must_section_segments`) so the
+  matcher can expose requirement text it could not evaluate instead of
+  dropping it.
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -90,6 +97,42 @@ _DEGREE_PATTERN = re.compile(
 )
 
 
+# Stage 14B: a named field of study inside the degree segment ("Studium
+# der Informatik, Wirtschaftsinformatik oder vergleichbare Qualifikation").
+# Literal names only; "comparable" is never resolved automatically.
+_DEGREE_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(pattern, re.IGNORECASE))
+    for name, pattern in (
+        ("Wirtschaftsinformatik", r"(?<!\w)wirtschaftsinformatik(?!\w)"),
+        ("Informatik", r"(?<![\w-])informatik(?!\w)"),
+        ("Computer Science", r"(?<!\w)computer\s+science(?!\w)"),
+        ("Mathematik", r"(?<!\w)mathematik(?!\w)"),
+        ("Physik", r"(?<!\w)physik(?!\w)"),
+    )
+)
+
+_YEAR_WORDS = {
+    "ein": 1, "einem": 1, "einen": 1, "einjährige": 1, "one": 1,
+    "zwei": 2, "two": 2, "drei": 3, "three": 3, "vier": 4, "four": 4,
+    "fünf": 5, "five": 5, "sechs": 6, "six": 6, "sieben": 7, "seven": 7,
+    "acht": 8, "eight": 8, "neun": 9, "nine": 9, "zehn": 10, "ten": 10,
+}  # fmt: skip
+_EXPERIENCE_YEARS_PATTERN = re.compile(
+    r"(?<!\w)(\d{1,2}|" + "|".join(_YEAR_WORDS) + r")\s*\+?\s*(?:jahre?n?|years?)(?!\w)",
+    re.IGNORECASE,
+)
+_EXPERIENCE_WORD_PATTERN = re.compile(r"(?:berufserfahrung|erfahrung|experience)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ExperienceRequirement:
+    """ "At least N years of (professional) experience" -- Stage 14B."""
+
+    years: int
+    importance: RequirementImportance
+    evidence_text: str
+
+
 @dataclass(frozen=True)
 class LanguageRequirement:
     language: str
@@ -102,6 +145,9 @@ class LanguageRequirement:
 class EducationRequirement:
     importance: RequirementImportance
     evidence_text: str
+    # Stage 14B: fields of study literally named in the degree segment;
+    # empty means the vacancy asks only for "a completed degree".
+    fields: tuple[str, ...] = ()
 
 
 def canonicalize_language_name(name: str) -> str | None:
@@ -259,5 +305,55 @@ def extract_education_requirement(
         importance = _importance_for(
             degree_matches[0], must_markers, nice_markers, inherited_context, segment
         )
-        return EducationRequirement(importance=importance, evidence_text=segment.strip())
+        fields = degree_field_names(segment)
+        return EducationRequirement(
+            importance=importance, evidence_text=segment.strip(), fields=fields
+        )
+    return None
+
+
+def degree_field_names(text: str | None) -> tuple[str, ...]:
+    """Stage 14B: the `_DEGREE_FIELDS` names literally present in `text`
+    (job segment or a candidate's education program/degree/field)."""
+    return tuple(name for name, pattern in _DEGREE_FIELDS if pattern.search(text or ""))
+
+
+def must_section_segments(description: str | None) -> list[str]:
+    """Stage 14B: every description segment inside a recognized
+    requirement section ("Ihr Profil", "Profil", "Anforderungen", ...), in
+    order -- the text the vacancy itself marks as required."""
+    return [
+        segment.strip()
+        for segment, context in _contextual_segments(description or "")
+        if context == "must" and segment.strip()
+    ]
+
+
+def extract_experience_requirement(
+    title: str | None, description: str | None
+) -> ExperienceRequirement | None:
+    """Stage 14B: the first "N years ... experience" segment, e.g.
+    "Mindestens drei Jahre Berufserfahrung ...". Only a segment that names
+    BOTH a year count and an experience word counts; the largest year
+    count in that segment wins. Returns None if no such segment exists."""
+    for segment, inherited_context in _segments_with_title(title, description):
+        if not _EXPERIENCE_WORD_PATTERN.search(segment):
+            continue
+        year_matches = list(_EXPERIENCE_YEARS_PATTERN.finditer(segment))
+        if not year_matches:
+            continue
+
+        def _years(match: re.Match[str]) -> int:
+            token = match.group(1).casefold()
+            return int(token) if token.isdigit() else _YEAR_WORDS[token]
+
+        best = max(year_matches, key=_years)
+        years = _years(best)
+        if years < 1:
+            continue
+        must_markers, nice_markers = _segment_markers(segment, inherited_context)
+        importance = _importance_for(best, must_markers, nice_markers, inherited_context, segment)
+        return ExperienceRequirement(
+            years=years, importance=importance, evidence_text=segment.strip()
+        )
     return None

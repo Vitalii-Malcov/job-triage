@@ -29,7 +29,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-RequirementType = Literal["SKILL", "LANGUAGE", "EDUCATION"]
+# EXPERIENCE ("N years of experience") and OTHER (required vacancy text the
+# deterministic matcher could not evaluate -- always UNKNOWN) are Stage 14B.
+RequirementType = Literal["SKILL", "LANGUAGE", "EDUCATION", "EXPERIENCE", "OTHER"]
 RequirementImportance = Literal["REQUIRED", "PREFERRED", "UNKNOWN"]
 MatchStatus = Literal["MATCH", "PARTIAL", "MISSING", "UNKNOWN"]
 EvidenceEntityType = Literal["SKILL", "EXPERIENCE", "EDUCATION", "PROJECT", "LANGUAGE"]

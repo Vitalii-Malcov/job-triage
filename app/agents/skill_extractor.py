@@ -130,6 +130,16 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("tosca", r"(?<!\w)tosca(?!\w)"),
         ("groovy", r"(?<!\w)groovy(?:\s+script)?(?!\w)"),
         ("pytest", r"(?<!\w)pytest(?!\w)"),
+        # Stage 14B: AI/LLM vacancy requirements observed in live postings
+        # (E362/B). Literal mentions only, like every entry above.
+        ("langchain", r"(?<!\w)lang[ -]?chain(?!\w)"),
+        ("llamaindex", r"(?<!\w)llama[ -]?index(?!\w)"),
+        ("llm", r"(?<!\w)(?:llms?|large\s+language\s+models?)(?!\w)"),
+        ("generative ai", r"(?<!\w)(?:generative[ -]ai|gen[ -]?ai)(?!\w)"),
+        ("rag", r"(?<!\w)(?:rag|retrieval[ -]augmented[ -]generation)(?!\w)"),
+        ("prompting", r"(?<!\w)(?:prompting|prompt[ -]engineering)(?!\w)"),
+        ("fine-tuning", r"(?<!\w)fine[ -]?tuning(?!\w)"),
+        ("testing", r"(?<!\w)testing(?!\w)"),
     )
 )
 
@@ -179,6 +189,12 @@ _MUST_SECTION_HEADERS = {
     "qualifications",
     "qualifikationen",
     "was sollst du mitbringen",
+    # Stage 14B: bare "Profil:" / "Anforderungen:" requirement sections
+    # (E362/B) were previously skipped as generic headings, so profile
+    # lines without their own marker word were silently dropped.
+    "profil",
+    "anforderungen",
+    "anforderungsprofil",
 }
 _NICE_SECTION_HEADERS = {"ideal skills", "nice to have", "wünschenswert"}
 _OTHER_SECTION_HEADERS = {

@@ -79,8 +79,10 @@ percentage).** Every requirement contributes `1.0` (MATCH), `0.5`
   requirements at all (same ambiguous-neutral rationale as above).
 - `experience_support_score` = how much of the REQUIRED skill coverage is
   actually backed by a relevant_experience/relevant_project (not just a
-  bare CandidateSkill row): `min(1.0, (len(relevant_experiences) +
-  len(relevant_projects)) / count(REQUIRED skill requirements)) * 100`.
+  bare CandidateSkill row): v2 = `count(REQUIRED skills named in some
+  relevant experience/project) / count(REQUIRED skill requirements) * 100`
+  (v1 counted backing rows instead of backed skills), then scaled by a
+  years-of-experience requirement's points (Stage 14B, below).
   `50` if there are no REQUIRED skill requirements (same rationale).
 - `overall_score` = `round(required_skill_score * 0.6 +
   preferred_skill_score * 0.2 + experience_support_score * 0.2)` —
@@ -99,6 +101,28 @@ and no divide-by-zero path.
 **Score means "coverage of vacancy requirements by trusted candidate
 evidence" — not "chance of getting the job"** (spec section 8/9).
 
+**Stage 14B (v2): no silent requirement loss.** A score is only as honest
+as the requirement list behind it, so v2 makes that list fail closed:
+
+- SKILL requirements are the persisted lists UNIONED with a fresh
+  `skill_extractor.extract_skills` over the description; skills the stored
+  (older) extraction lacked are named in a warning.
+- A generic skill (`_GENERIC_SKILL_RELATED`, e.g. "testing") with only a
+  related, more specific trusted skill (e.g. Pytest) is UNKNOWN (human
+  review), never MATCH.
+- EXPERIENCE ("at least N years"): MATCH only when merged date ranges of
+  trusted experiences that are themselves relevant (use a required skill)
+  reach N years; PARTIAL below that; UNKNOWN when a relevant row lacks
+  dates; MISSING when no relevant experience exists. Projects never count.
+  When such a requirement exists, `experience_support_score` is multiplied
+  by its points, so projects alone cannot yield a high experience score.
+- EDUCATION naming fields ("Informatik, Wirtschaftsinformatik oder
+  vergleichbar"): MATCH only for a completed education literally naming one
+  of them; another completed degree is UNKNOWN (comparable is a human call).
+- OTHER: every remaining segment of a recognized requirement section that
+  produced no evaluated requirement becomes a REQUIRED, UNKNOWN entry —
+  so unevaluated required text always keeps `required_skill_score` < 100.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -107,13 +131,18 @@ cache-identity key).
 """
 
 from dataclasses import dataclass, field
+from datetime import date
 
 from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import (
     canonicalize_language_name,
+    degree_field_names,
     extract_education_requirement,
+    extract_experience_requirement,
     extract_language_requirements,
+    must_section_segments,
 )
+from app.agents.skill_extractor import _TECHNOLOGY_PATTERNS, extract_skills
 from app.models.candidate_job_match import (
     CandidateEvidenceRef,
     CandidateJobMatchData,
@@ -126,7 +155,18 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v1"
+ALGORITHM_VERSION = "v2"
+
+# Stage 14B: a GENERIC skill requirement that a more specific trusted
+# candidate skill may relate to, but never silently satisfies. A related
+# skill turns MISSING into UNKNOWN (human review), never into MATCH; only an
+# exactly normalized candidate skill matches.
+_GENERIC_SKILL_RELATED: dict[str, frozenset[str]] = {
+    normalize_skill(generic): frozenset(normalize_skill(name) for name in related)
+    for generic, related in (
+        ("testing", ("pytest", "unit testing", "unittest", "selenium", "playwright")),
+    )
+}
 
 _CEFR_ORDER = {"A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
 _MATCH_POINTS = {"MATCH": 1.0, "PARTIAL": 0.5, "MISSING": 0.0, "UNKNOWN": 0.0}
@@ -163,15 +203,24 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     """Return (original_text, importance) pairs, deduplicated by normalized
     identity — a must-have wins over a nice-to-have naming the same skill
     (shouldn't happen given skill_extractor's own dedup, but defensive).
+
+    Stage 14B: the persisted lists are unioned with a fresh extraction of
+    the DESCRIPTION (not the title, whose literal technologies the stored
+    lists already carry) so a requirement an older extractor dropped at
+    collection time cannot silently vanish from the match.
     """
+    fresh = extract_skills(None, job.description)
     seen: dict[str, tuple[str, str]] = {}
-    for text in job.must_have_skills:
-        seen[normalize_skill(text)] = (text, "REQUIRED")
-    for text in job.nice_to_have_skills:
-        key = normalize_skill(text)
-        if key not in seen:
-            seen[key] = (text, "PREFERRED")
+    for text in [*job.must_have_skills, *fresh.must_have_skills]:
+        seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
+    for text in [*job.nice_to_have_skills, *fresh.nice_to_have_skills]:
+        seen.setdefault(normalize_skill(text), (text, "PREFERRED"))
     return list(seen.values())
+
+
+def _unstored_skill_requirements(job: JobMatchInput) -> list[str]:
+    stored = {normalize_skill(text) for text in [*job.must_have_skills, *job.nice_to_have_skills]}
+    return [text for text, _ in _skill_requirements(job) if normalize_skill(text) not in stored]
 
 
 def _match_skill_requirements(job: JobMatchInput, trusted_skills: list) -> list[RequirementMatch]:
@@ -183,7 +232,32 @@ def _match_skill_requirements(job: JobMatchInput, trusted_skills: list) -> list[
     for text, importance in _skill_requirements(job):
         normalized = normalize_skill(text)
         candidate_skill = trusted_index.get(normalized)
-        if candidate_skill is not None:
+        related = [
+            skill
+            for key, skill in trusted_index.items()
+            if key in _GENERIC_SKILL_RELATED.get(normalized, frozenset())
+        ]
+        if candidate_skill is None and related:
+            results.append(
+                RequirementMatch(
+                    requirement=text,
+                    normalized_requirement=normalized,
+                    requirement_type="SKILL",
+                    importance=importance,
+                    match_status="UNKNOWN",
+                    candidate_evidence=[
+                        CandidateEvidenceRef(entity_type="SKILL", entity_id=s.id, value=s.name)
+                        for s in related
+                    ],
+                    job_evidence=[text],
+                    reason=(
+                        f"Generic requirement {text!r}: related trusted skills "
+                        f"{', '.join(repr(s.name) for s in related)} exist, but no explicit "
+                        "taxonomy rule makes them satisfy it (HUMAN_REVIEW_REQUIRED)."
+                    ),
+                )
+            )
+        elif candidate_skill is not None:
             results.append(
                 RequirementMatch(
                     requirement=text,
@@ -289,26 +363,150 @@ def _match_education_requirement(
         return None
 
     completed = [edu for edu in trusted_education if edu.completed]
-    if completed:
+    evidence = completed
+    requirement = "Completed degree"
+    if req.fields:
+        requirement = f"Completed degree ({', '.join(req.fields)} or comparable)"
+    if not completed:
+        status = "MISSING"
+        reason = "No trusted, completed education record is on file."
+    elif not req.fields:
         status = "MATCH"
         reason = "At least one trusted, completed education record is on file."
     else:
-        status = "MISSING"
-        reason = "No trusted, completed education record is on file."
+        # Stage 14B: a field-specific requirement is matched only by a
+        # completed education literally naming one of those fields; any
+        # other completed degree may be "comparable", which is a human call.
+        evidence = [edu for edu in completed if set(_education_fields(edu)) & set(req.fields)]
+        if evidence:
+            status = "MATCH"
+            reason = f"Trusted, completed education names {', '.join(req.fields)}."
+        else:
+            evidence = completed
+            status = "UNKNOWN"
+            reason = (
+                f"A trusted, completed degree is on file, but none names "
+                f"{', '.join(req.fields)}; whether it is a comparable qualification "
+                "needs human review (HUMAN_REVIEW_REQUIRED)."
+            )
 
     return RequirementMatch(
-        requirement="Completed degree",
+        requirement=requirement,
         normalized_requirement="completed-degree",
         requirement_type="EDUCATION",
         importance=req.importance,
         match_status=status,
         candidate_evidence=[
             CandidateEvidenceRef(entity_type="EDUCATION", entity_id=edu.id, value=edu.institution)
-            for edu in completed
+            for edu in evidence
         ],
         job_evidence=[req.evidence_text],
         reason=reason,
     )
+
+
+def _education_fields(edu) -> tuple[str, ...]:
+    return degree_field_names(" ".join(filter(None, (edu.field_of_study, edu.program, edu.degree))))
+
+
+def _merged_days(periods: list[tuple[date, date]]) -> int:
+    total = 0
+    current_start: date | None = None
+    current_end: date | None = None
+    for start, end in sorted(periods):
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                total += (current_end - current_start).days
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    if current_end is not None:
+        total += (current_end - current_start).days
+    return total
+
+
+def _match_experience_requirement(
+    job: JobMatchInput,
+    trusted_experiences: list,
+    relevant_experiences: list[RelevantExperience],
+    as_of: date,
+) -> RequirementMatch | None:
+    """Stage 14B: "at least N years of experience". Only trusted
+    EXPERIENCE rows the matcher already found relevant (they use a skill the
+    vacancy requires) count; projects never substitute for professional
+    experience. Overlapping periods are merged, never double counted."""
+    req = extract_experience_requirement(job.title, job.description)
+    if req is None:
+        return None
+    requirement = f"At least {req.years} year(s) of relevant professional experience"
+    relevant_ids = {item.experience_id for item in relevant_experiences}
+    relevant = [exp for exp in trusted_experiences if exp.id in relevant_ids]
+    evidence = [
+        CandidateEvidenceRef(entity_type="EXPERIENCE", entity_id=exp.id, value=exp.job_title)
+        for exp in relevant
+    ]
+    if not relevant:
+        status = "MISSING"
+        reason = (
+            "No trusted professional experience uses a skill this vacancy requires; "
+            "projects are not counted as professional experience."
+        )
+    elif any(
+        exp.start_date is None or (exp.end_date is None and not exp.is_current) for exp in relevant
+    ):
+        status = "UNKNOWN"
+        reason = "Relevant trusted experience has no complete dates; duration cannot be computed."
+    else:
+        days = _merged_days([(exp.start_date, exp.end_date or as_of) for exp in relevant])
+        if days >= req.years * 365:
+            status = "MATCH"
+            reason = f"Relevant trusted experience covers {days // 365} year(s) or more."
+        else:
+            status = "PARTIAL"
+            reason = f"Relevant trusted experience covers {days} day(s), below {req.years} year(s)."
+    return RequirementMatch(
+        requirement=requirement,
+        normalized_requirement=f"experience-{req.years}y",
+        requirement_type="EXPERIENCE",
+        importance=req.importance,
+        match_status=status,
+        candidate_evidence=evidence,
+        job_evidence=[req.evidence_text],
+        reason=reason,
+    )
+
+
+def _unevaluated_requirements(
+    job: JobMatchInput, evaluated: list[RequirementMatch]
+) -> list[RequirementMatch]:
+    """Stage 14B fail-closed net: a segment of a recognized requirement
+    section ("Ihr Profil", "Profil", ...) that produced no evaluated
+    requirement (no technology mention, not the language/education/
+    experience evidence) is exposed as a REQUIRED, UNKNOWN requirement
+    instead of disappearing. It can never be a MATCH."""
+    evidence_segments = {text for req in evaluated for text in req.job_evidence}
+    results: list[RequirementMatch] = []
+    for segment in must_section_segments(job.description):
+        if segment in evidence_segments:
+            continue
+        if any(pattern.search(segment) for _, pattern in _TECHNOLOGY_PATTERNS):
+            continue
+        results.append(
+            RequirementMatch(
+                requirement=segment,
+                normalized_requirement=" ".join(segment.casefold().split()),
+                requirement_type="OTHER",
+                importance="REQUIRED",
+                match_status="UNKNOWN",
+                candidate_evidence=[],
+                job_evidence=[segment],
+                reason=(
+                    "Required vacancy text that the deterministic matcher cannot evaluate "
+                    "(NOT_EVALUATED); human review required."
+                ),
+            )
+        )
+    return results
 
 
 def _relevant_experiences(
@@ -374,7 +572,11 @@ def compute_match(
     profile: CandidateProfile,
     *,
     company_research_id: int | None,
+    as_of: date | None = None,
 ) -> CandidateJobMatchData:
+    """`as_of` is the end date for a current (open-ended) experience in the
+    Stage 14B years-of-experience check; defaults to today."""
+    as_of = as_of or date.today()
     trusted_skills = _trusted(profile.skills)
     trusted_experiences = _trusted(profile.experiences)
     trusted_education = _trusted(profile.education)
@@ -391,6 +593,13 @@ def compute_match(
     required_skill_norms = {normalize_skill(text) for text, importance in _skill_requirements(job)}
     relevant_experiences = _relevant_experiences(trusted_experiences, required_skill_norms)
     relevant_projects = _relevant_projects(trusted_projects, required_skill_norms)
+
+    experience_match = _match_experience_requirement(
+        job, trusted_experiences, relevant_experiences, as_of
+    )
+    if experience_match is not None:
+        all_requirements.append(experience_match)
+    all_requirements.extend(_unevaluated_requirements(job, all_requirements))
 
     has_education_requirement = education_match is not None
     relevant_education = (
@@ -427,17 +636,34 @@ def compute_match(
     )
     coverage_score = _score(_weighted_coverage_fraction(all_requirements), _NEUTRAL_NO_REQUIREMENTS)
 
-    required_skill_requirement_count = sum(
-        1 for r in all_requirements if r.requirement_type == "SKILL" and r.importance == "REQUIRED"
-    )
-    if required_skill_requirement_count:
-        experience_support_fraction = min(
-            1.0,
-            (len(relevant_experiences) + len(relevant_projects)) / required_skill_requirement_count,
+    required_skill_norms_only = {
+        r.normalized_requirement
+        for r in all_requirements
+        if r.requirement_type == "SKILL" and r.importance == "REQUIRED"
+    }
+    if required_skill_norms_only:
+        # v2: the share of REQUIRED skills backed by at least one relevant
+        # experience/project (v1 divided the number of backing ROWS by the
+        # number of skills, so one row covering every skill scored low and
+        # three rows covering one skill scored high).
+        backed = {
+            normalize_skill(name)
+            for item in (*relevant_experiences, *relevant_projects)
+            for name in item.matched_skills
+        }
+        experience_support_fraction = len(backed & required_skill_norms_only) / len(
+            required_skill_norms_only
         )
         experience_support_score = _score(experience_support_fraction, _NEUTRAL_NO_REQUIREMENTS)
     else:
         experience_support_score = _NEUTRAL_NO_REQUIREMENTS
+    if experience_match is not None:
+        # Stage 14B: projects cannot stand in for a stated years-of-
+        # experience requirement -- support scales with that requirement's
+        # own points (MISSING/UNKNOWN -> 0, PARTIAL -> half).
+        experience_support_score = round(
+            experience_support_score * _MATCH_POINTS[experience_match.match_status]
+        )
 
     overall_score = round(
         required_skill_score * 0.6 + preferred_skill_score * 0.2 + experience_support_score * 0.2
@@ -460,6 +686,12 @@ def compute_match(
         trusted_languages,
         trusted_projects,
     )
+    unstored = _unstored_skill_requirements(job)
+    if unstored:
+        warnings.append(
+            "Vacancy text names skill requirements absent from the stored extraction "
+            f"(re-extracted for this match): {', '.join(sorted(unstored))}"
+        )
 
     return CandidateJobMatchData(
         job_id=job.job_id,
