@@ -181,7 +181,7 @@ footer is no longer read as unevaluated required text):
 
 **v7 (Codex v6 review, one canonical clause model):**
 
-- `requirement_extractor.REQUIREMENT_HEAD` + `CLAUSE_MODIFIER` +
+- `requirement_extractor.REQUIREMENT_HEAD` + (v7) `CLAUSE_MODIFIER` +
   `starts_requirement_clause` are the only head vocabulary: degree and
   duration boundaries (`independent_boundaries`), the residual net's head
   test and its shared-complement test all use them, after any number of
@@ -196,6 +196,22 @@ footer is no longer read as unevaluated required text):
   Engineer" cannot authorize a stale stored "python".
 - ANY durations are evaluated per alternative; years of different
   alternatives are never summed.
+
+**v8 (Codex v7 review, head-anchored clauses):**
+
+- A known `REQUIREMENT_HEAD` anchors its clause: after a boundary, the
+  words before the head (at most `MAX_HEAD_MODIFIERS`, never across a
+  conjunction or preposition) are its own modifiers whatever they are --
+  "und umfangreiche Kenntnisse in Informatik" ends a Mathematik degree's
+  fields; v7's modifier whitelist (`CLAUSE_MODIFIER`) is gone.
+- Experience is QUALIFIED when any non-article, non-discourse word is
+  attached to its head ("fundierte/solide/gute Erfahrung", "strong
+  experience"), so it stays a REQUIRED/UNKNOWN requirement; only a bare
+  head shares a complement ("Kenntnisse und Erfahrung in Python").
+- A "<technology>-Frameworks" category is ONE grouped requirement wherever
+  it is named -- title ("Python-Frameworks Engineer", REQUIRED), description
+  example group or bare token -- deduplicated by `category_key` with the
+  description's examples kept; without examples it is always UNKNOWN.
 
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
@@ -212,9 +228,10 @@ from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import (
     REQUIREMENT_HEAD,
     canonicalize_language_name,
+    category_key,
     degree_field_names,
+    extract_category_requirements,
     extract_education_requirement,
-    extract_example_groups,
     extract_experience_requirement,
     extract_language_requirements,
     must_section_segments,
@@ -238,7 +255,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v7"
+ALGORITHM_VERSION = "v8"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -325,40 +342,92 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     return list(seen.values())
 
 
+_IMPORTANCE_RANK = {"REQUIRED": 2, "PREFERRED": 1, "UNKNOWN": 0}
+
+
+@dataclass
+class _Category:
+    category: str
+    examples: tuple[str, ...]
+    example_text: str
+    importance: str
+    evidence: list[str]
+
+
+def _category_requirements(job: JobMatchInput) -> dict[str, _Category]:
+    """v8: the vacancy's category requirements, one per `category_key`. The
+    title's "Python-Frameworks Engineer" and the description's "Python-
+    Frameworks (z. B. Django, Flask)" are ONE requirement: the description's
+    examples are kept, the strongest importance wins (a title category is
+    REQUIRED) and every source text is job evidence."""
+    merged: dict[str, _Category] = {}
+    mentions = extract_category_requirements(job.title, job.description)
+    # description first: its wording and examples are the richer source
+    for group in sorted(mentions, key=lambda g: g.source == "title"):
+        key = category_key(group.category)
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = _Category(
+                group.category,
+                group.examples,
+                group.example_text,
+                group.importance,
+                [group.evidence_text],
+            )
+            continue
+        if not existing.example_text and group.example_text:
+            existing.category = group.category
+            existing.examples = group.examples
+            existing.example_text = group.example_text
+        if _IMPORTANCE_RANK[group.importance] > _IMPORTANCE_RANK[existing.importance]:
+            existing.importance = group.importance
+        if group.evidence_text not in existing.evidence:
+            existing.evidence.append(group.evidence_text)
+    return merged
+
+
 def _match_example_groups(job: JobMatchInput, trusted_skills: list) -> list[RequirementMatch]:
     """v4: one requirement per "<category> (z. B. A, B)". MATCH only when a
     trusted skill IS one of the vacancy's own named examples (the vacancy
     itself states that example belongs to the category); otherwise UNKNOWN
     -- whether some other trusted skill belongs to the category is a human
-    call, so it is never MISSING-by-assumption nor MATCH-by-guess."""
+    call, so it is never MISSING-by-assumption nor MATCH-by-guess.
+
+    v8: a category named without examples ("Python-Frameworks Engineer",
+    "Kenntnisse in LLM-Frameworks") is the same kind of requirement with no
+    example to match: always UNKNOWN. Its base technology never satisfies
+    it -- no taxonomy says which skills belong to the category."""
     trusted_index: dict[str, object] = {}
     for skill in trusted_skills:
         trusted_index.setdefault(normalize_skill(skill.name), skill)
     results: list[RequirementMatch] = []
-    seen: set[str] = set()
-    for group in extract_example_groups(job.description):
-        normalized = "group:" + " ".join(group.category.casefold().split())
-        if normalized in seen:
-            continue
-        seen.add(normalized)
+    for normalized, group in _category_requirements(job).items():
         hits = [
             trusted_index[normalize_skill(e)]
             for e in group.examples
             if normalize_skill(e) in trusted_index
         ]
-        requirement = f"{group.category} (examples: {group.example_text})"
+        requirement = group.category
+        if group.example_text:
+            requirement = f"{group.category} (examples: {group.example_text})"
         if hits:
             status = "MATCH"
             reason = (
                 f"Trusted skill {', '.join(repr(s.name) for s in hits)} is one of the "
                 f"vacancy's own examples of {group.category!r}."
             )
-        else:
+        elif group.example_text:
             status = "UNKNOWN"
             reason = (
                 f"No trusted skill is one of the named examples ({group.example_text}); whether "
                 f"another trusted skill counts as {group.category!r} needs human review "
                 "(HUMAN_REVIEW_REQUIRED)."
+            )
+        else:
+            status = "UNKNOWN"
+            reason = (
+                f"The vacancy names the category {group.category!r} without examples; whether "
+                "a trusted skill belongs to it needs human review (HUMAN_REVIEW_REQUIRED)."
             )
         results.append(
             RequirementMatch(
@@ -371,7 +440,7 @@ def _match_example_groups(job: JobMatchInput, trusted_skills: list) -> list[Requ
                     CandidateEvidenceRef(entity_type="SKILL", entity_id=s.id, value=s.name)
                     for s in hits
                 ],
-                job_evidence=[group.evidence_text],
+                job_evidence=list(group.evidence),
                 reason=reason,
             )
         )
@@ -932,7 +1001,9 @@ def _unevaluated_requirements(
       count once; every source line is kept as job evidence).
 
     An OTHER requirement can never be a MATCH."""
-    groups = extract_example_groups(job.description)
+    # v8: every category mention (example groups and bare "<technology>-
+    # Frameworks" tokens) is evaluated by its category requirement.
+    groups = extract_category_requirements(job.title, job.description)
     by_identity: dict[str, RequirementMatch] = {}
     for segment in must_section_segments(job.description):
         spans = _evaluated_spans(job, segment, groups)

@@ -478,6 +478,18 @@ def example_category_span(segment: str, item: ExampleList) -> tuple[int, int] | 
     return start, start + len(category)
 
 
+def category_token_spans(text: str) -> list[tuple[int, int]]:
+    """v8: (start, end) of every "<technology>-Frameworks" / "-Bibliotheken"
+    / "-Libraries" token in `text` -- a category requirement of its own,
+    with or without an example list."""
+    return sorted(
+        (mention.start(), suffix.end())
+        for _, pattern in _TECHNOLOGY_PATTERNS
+        for mention in pattern.finditer(text)
+        if (suffix := _CATEGORY_SUFFIX.match(text, mention.end())) is not None
+    )
+
+
 def _names_only_a_category(
     mention: re.Match[str], segment: str, categories: list[tuple[int, int]]
 ) -> bool:

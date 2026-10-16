@@ -193,7 +193,8 @@ def test_language_plus_experience_cannot_score_like_language_alone():
             {"llm", "group:llm-frameworks"},
         ),
         ("Java-Frameworks (z. B. Spring Boot)", {"group:java-frameworks"}),
-        ("Erfahrung mit Docker und Python-Frameworks", {"docker", "python-frameworks"}),
+        # v8: a bare category token is the same grouped requirement
+        ("Erfahrung mit Docker und Python-Frameworks", {"docker", "group:python-frameworks"}),
     ],
 )
 def test_category_name_never_creates_a_base_skill_requirement(line, expected):

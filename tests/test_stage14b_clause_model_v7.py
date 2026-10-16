@@ -423,7 +423,7 @@ def test_non_heads_never_start_a_requirement_clause(text):
 # --- v7 cache identity -------------------------------------------------------------------
 
 
-def test_v6_row_is_kept_and_cache_lookup_uses_v7():
+def test_v6_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -464,10 +464,9 @@ def test_v6_row_is_kept_and_cache_lookup_uses_v7():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert matcher.ALGORITHM_VERSION == "v7"
-        assert result.algorithm_version == "v7"
+        assert result.algorithm_version == matcher.ALGORITHM_VERSION
         assert "mehrjährige Erfahrung" in [r.requirement for r in result.unknown_requirements]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v6", "v7"]
+        assert versions == ["v6", matcher.ALGORITHM_VERSION]

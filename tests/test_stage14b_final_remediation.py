@@ -221,7 +221,14 @@ def test_only_a_technology_own_category_noun_is_consumed():
 
 def test_python_frameworks_token_is_not_the_python_technology():
     result = _match(_profil("Erfahrung mit Docker und Python-Frameworks"), _profile(["Python"]))
-    assert _others(result) == ["Python-Frameworks"]
+    # v8: the category is its grouped requirement (no examples -> UNKNOWN), not OTHER
+    assert _others(result) == []
+    group = next(r for r in result.unknown_requirements if r.requirement == "Python-Frameworks")
+    assert (group.normalized_requirement, group.requirement_type) == (
+        "group:python-frameworks",
+        "SKILL",
+    )
+    assert "python" not in [r.normalized_requirement for r in result.matched_requirements]
 
 
 # --- P1 experience clause binding -----------------------------------------------

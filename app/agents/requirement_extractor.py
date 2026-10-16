@@ -51,11 +51,18 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
   reports the character span(s) of its segment it actually evaluated, so
   the matcher can keep any other material clause of the same line ("Deutsch
   B2 und Erfahrung mit SAP ABAP") instead of treating the line as consumed.
-- Stage 14B (matcher v6/v7): `REQUIREMENT_HEAD`, `CLAUSE_MODIFIER`,
-  `starts_requirement_clause` and `independent_boundaries` are THE shared
-  clause-ownership model -- a degree's fields and a duration's subjects come
-  only from their own independent clause, and a duration's subjects combine
-  as ALL / ANY / AMBIGUOUS (`subject_mode`).
+- Stage 14B (matcher v6-v8): `REQUIREMENT_HEAD`, `starts_requirement_clause`
+  and `independent_boundaries` are THE shared clause-ownership model -- a
+  degree's fields and a duration's subjects come only from their own
+  independent clause, and a duration's subjects combine as ALL / ANY /
+  AMBIGUOUS (`subject_mode`). v8: a known head anchors its clause
+  (`anchored_head`); the words before it are never checked against a
+  modifier list, and experience is qualified by any attached modifier
+  phrase (`qualified_experience_words`), not by a qualifier list.
+- Stage 14B (matcher v8): `extract_category_requirements` -- a
+  "<technology>-Frameworks" category is a requirement wherever it is named
+  (title, description, with or without examples), identified by
+  `category_key`.
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -76,6 +83,7 @@ from app.agents.skill_extractor import (
     _classify_mention,
     _contextual_segments,
     _postfix_nice_scopes_all_mentions,
+    category_token_spans,
     example_category_span,
     example_lists,
 )
@@ -158,43 +166,57 @@ _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )  # fmt: skip
 _CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)
-# v7: THE clause model, shared by every requirement type and the matcher's
-# residual net. One vocabulary says what can head an independent
+# v7/v8: THE clause model, shared by every requirement type and the
+# matcher's residual net. One vocabulary says what can head an independent
 # requirement clause (experience, knowledge, a degree); one predicate
-# (`starts_requirement_clause`) says whether a text begins one, skipping
-# any number of `CLAUSE_MODIFIER` words ("sehr gute praktische
-# Kenntnisse"). No other head list exists (see the contract test).
+# (`starts_requirement_clause`) says whether a text begins one. No other
+# head list exists (see the contract test).
 _HEAD_STEMS = (
     r"erfahrung(?:en)?|kenntniss?e?n?|know-how|verständnis|expertise|"
     r"experience|knowledge|understanding|proficiency|skills|"
     r"studium|abschl(?:uss|üsse)|degree"
 )
 REQUIREMENT_HEAD = re.compile(r"(?<!\w)[\w-]*?(?:" + _HEAD_STEMS + r")(?!\w)", re.IGNORECASE)
-CLAUSE_MODIFIER = re.compile(
-    r"sehr|gut(?:e[nrs]?)?|fundiert(?:e[nrs]?)?|solide[nrs]?|tief(?:gehend)?(?:e[nrs]?)?|"
-    r"praktisch(?:e[nrs]?)?|ausgeprägt(?:e[nrs]?)?|mehrjährig(?:e[nrs]?)?|"
-    r"langjährig(?:e[nrs]?)?|einschlägig(?:e[nrs]?)?|relevant(?:e[nrs]?)?|"
-    r"umfassend(?:e[nrs]?)?|nachgewiesen(?:e[nrs]?)?|vertieft(?:e[nrs]?)?|"
-    r"erste[nrs]?|grundlegend(?:e[nrs]?)?|sicher(?:e[nrs]?)?|"
-    r"abgeschlossen(?:e[nrs]?)?|ein(?:e[nmrs]?)?|idealerweise|zudem|auch|"
-    r"good|strong|solid|deep|practical|professional|hands-on|proven|extensive|"
-    r"excellent|basic|working|sound|prior|previous|demonstrable|first|some|a|an|"
-    r"very|ideally|also",
+# v8: the head ANCHORS its clause. Whatever words stand between a boundary
+# and a known head are that head's own local modifiers ("umfangreiche",
+# "außerordentlich gute", "advanced working") -- no adjective list is
+# consulted, so an unfamiliar modifier can never hide a clause. The scan is
+# bounded: at most `MAX_HEAD_MODIFIERS` words, and it stops at a hard
+# separator, a coordinating conjunction or a preposition (a CLOSED word
+# class: a head behind one is some other phrase's complement, "und in der
+# Softwareentwicklung").
+MAX_HEAD_MODIFIERS = 5
+_HARD_SEPARATOR = re.compile(r"[,;():]|\.(?=\s|$)")
+_CLAUSE_STOP_WORD = re.compile(
+    r"und|oder|sowie|bzw|sondern|aber|and|or|plus|but|nor|"
+    r"in|im|ins|mit|von|vom|zu|zum|zur|auf|für|über|bei|beim|aus|nach|an|am|ans|um|"
+    r"durch|gegen|ohne|unter|vor|neben|zwischen|seit|wegen|während|bis|als|wie|"
+    r"of|with|for|on|at|by|from|to|into|about|as|like|than|within|including",
     re.IGNORECASE,
 )
 _WORD = re.compile(r"[\w-]+")
 
 
-def starts_requirement_clause(text: str) -> bool:
-    """v7: whether `text` begins a requirement clause of its own -- its
-    first word that is not a `CLAUSE_MODIFIER` is a `REQUIREMENT_HEAD`."""
-    for word in _WORD.finditer(text):
+def anchored_head(text: str) -> re.Match[str] | None:
+    """v8: the `REQUIREMENT_HEAD` word that anchors a clause starting at
+    `text`, or None -- the first word that is a head, reached before the
+    first hard separator through at most `MAX_HEAD_MODIFIERS` words none of
+    which is a conjunction or preposition."""
+    separator = _HARD_SEPARATOR.search(text)
+    end = separator.start() if separator else len(text)
+    for count, word in enumerate(_WORD.finditer(text, 0, end)):
         token = word.group().strip("-")
         if REQUIREMENT_HEAD.fullmatch(token):
-            return True
-        if not CLAUSE_MODIFIER.fullmatch(token):
-            return False
-    return False
+            return word
+        if count >= MAX_HEAD_MODIFIERS or _CLAUSE_STOP_WORD.fullmatch(token):
+            return None
+    return None
+
+
+def starts_requirement_clause(text: str) -> bool:
+    """v7/v8: whether `text` begins a requirement clause of its own -- a
+    known head anchors it (`anchored_head`)."""
+    return anchored_head(text) is not None
 
 
 # v5-v7: "... und Erfahrung mit X", ", Kenntnisse in X", "(Erfahrung mit X)",
@@ -230,38 +252,46 @@ def independent_clause_bounds(segment: str, start: int, end: int) -> tuple[int, 
 _QUALIFIED_EXPERIENCE_HEAD = re.compile(
     r"(?:berufs|praxis|arbeits|projekt)erfahrung(?:en)?", re.IGNORECASE
 )
-_EXPERIENCE_QUALIFIER = re.compile(
-    r"praktisch(?:e[nrs]?)?|mehrjährig(?:e[nrs]?)?|langjährig(?:e[nrs]?)?|"
-    r"einschlägig(?:e[nrs]?)?|nachgewiesen(?:e[nrs]?)?|"
-    r"practical|professional|hands-on|proven|extensive|work|industry|prior",
+_EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
+# v8: words that sit before an experience head without qualifying it -- the
+# CLOSED classes of articles and discourse adverbs ("eine Erfahrung",
+# "idealerweise Erfahrung"). Anything else attached to the head qualifies it.
+_NON_QUALIFYING = re.compile(
+    r"ein(?:e[mnrs]?)?|der|die|das|den|dem|des|a|an|the|"
+    r"idealerweise|ideally|zudem|auch|also|gerne|möglichst|ggf",
     re.IGNORECASE,
 )
-_EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
 
 
 def qualified_experience_words(words: list[str]) -> list[int]:
-    """v7: indexes in `words` of qualified experience wording -- a
-    `_QUALIFIED_EXPERIENCE_HEAD` ("Berufserfahrung") or an experience head
-    with its qualifiers ("mehrjährige Erfahrung", "practical experience")."""
+    """v7/v8: indexes in `words` (one clause, in order) of qualified
+    experience wording -- a lexicalized head ("Berufserfahrung") or an
+    experience head with a non-empty attached modifier phrase ("fundierte
+    Erfahrung", "sehr gute praktische Erfahrung", "solid experience").
+
+    v8: structural, not a qualifier list -- the modifier phrase is the
+    contiguous words right before the head (at most `MAX_HEAD_MODIFIERS`,
+    never across a conjunction or preposition); it qualifies the head when
+    any of its words is not an article or discourse adverb. A bare head
+    ("Kenntnisse und Erfahrung in Python") stays bare."""
     indexes: list[int] = []
     for index, word in enumerate(words):
         token = word.strip("-")
         if not _EXPERIENCE_HEAD.fullmatch(token):
             continue
-        # the head's own modifiers: the contiguous modifier words before it
         first = index
-        while first > 0 and _modifies(words[first - 1]):
+        while (
+            first > 0
+            and index - first < MAX_HEAD_MODIFIERS
+            and not _CLAUSE_STOP_WORD.fullmatch(words[first - 1].strip("-"))
+            and not REQUIREMENT_HEAD.fullmatch(words[first - 1].strip("-"))
+        ):
             first -= 1
         if _QUALIFIED_EXPERIENCE_HEAD.fullmatch(token) or any(
-            _EXPERIENCE_QUALIFIER.fullmatch(words[i].strip("-")) for i in range(first, index)
+            not _NON_QUALIFYING.fullmatch(words[i].strip("-")) for i in range(first, index)
         ):
             indexes.extend(i for i in range(first, index + 1) if i not in indexes)
     return indexes
-
-
-def _modifies(word: str) -> bool:
-    token = word.strip("-")
-    return bool(CLAUSE_MODIFIER.fullmatch(token) or _EXPERIENCE_QUALIFIER.fullmatch(token))
 
 
 # v5: degree wording an education requirement evaluates inside its clause.
@@ -328,6 +358,9 @@ class ExampleGroupRequirement:
     importance: RequirementImportance
     evidence_text: str
     span: tuple[int, int]
+    # v8: "title" for a category the job title names ("Python-Frameworks
+    # Engineer"); "description" otherwise.
+    source: Literal["title", "description"] = "description"
 
 
 @dataclass(frozen=True)
@@ -679,4 +712,71 @@ def extract_example_groups(description: str | None) -> list[ExampleGroupRequirem
                     span=(span_start, span_end),
                 )
             )
+    return results
+
+
+def category_key(category: str) -> str:
+    """v8: identity of a category requirement. A category built on one
+    "<technology>-Frameworks" token is that token ("moderne Python-
+    Frameworks" and the title's "Python-Frameworks" are one requirement);
+    any other category is its own casefolded, whitespace-collapsed text."""
+    tokens = category_token_spans(category)
+    text = category[tokens[0][0] : tokens[0][1]] if len(tokens) == 1 else category
+    return "group:" + " ".join(text.casefold().split())
+
+
+def extract_category_requirements(
+    title: str | None, description: str | None
+) -> list[ExampleGroupRequirement]:
+    """v8: every category requirement, one entry per mention (not yet
+    deduplicated -- see `category_key`): the description's example groups
+    (`extract_example_groups`), every other "<technology>-Frameworks" token
+    in the description, and every such token in the title. A category the
+    title names is REQUIRED (the title names the candidate being sought,
+    the same rule as a title technology) and has no examples of its own."""
+    results = extract_example_groups(description)
+    for raw_segment, inherited_context in _contextual_segments(description or ""):
+        segment = raw_segment.strip()
+        lists = example_lists(segment)
+        covered = [(item.marker_start, item.list_end) for item in lists] + [
+            g.span for g in results if g.evidence_text == segment
+        ]
+        must_markers, nice_markers = _segment_markers(segment, inherited_context)
+        for start, end in category_token_spans(segment):
+            if any(c_start <= start and end <= c_end for c_start, c_end in covered):
+                continue
+            anchor = re.compile(re.escape(segment[start:end])).search(segment, start)
+            classification = _classify_mention(
+                anchor,
+                must_markers,
+                nice_markers,
+                inherited_context,
+                segment,
+                _postfix_nice_scopes_all_mentions(segment, [anchor], must_markers),
+            )
+            results.append(
+                ExampleGroupRequirement(
+                    category=segment[start:end],
+                    examples=(),
+                    example_text="",
+                    importance={"must": "REQUIRED", "nice": "PREFERRED"}.get(
+                        classification, "UNKNOWN"
+                    ),
+                    evidence_text=segment,
+                    span=(start, end),
+                )
+            )
+    title_text = (title or "").strip()
+    for start, end in category_token_spans(title_text):
+        results.append(
+            ExampleGroupRequirement(
+                category=title_text[start:end],
+                examples=(),
+                example_text="",
+                importance="REQUIRED",
+                evidence_text=title_text,
+                span=(start, end),
+                source="title",
+            )
+        )
     return results
