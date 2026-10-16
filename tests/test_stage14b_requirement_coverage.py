@@ -166,7 +166,7 @@ def test_e362b_stale_extraction_no_longer_scores_perfect():
     )
     reqs = _by_requirement(result)
 
-    assert result.algorithm_version == ALGORITHM_VERSION == "v4"
+    assert result.algorithm_version == ALGORITHM_VERSION == "v5"
     assert result.overall_score < 100
     assert result.required_skill_score < 100
     for supported in ("git", "python", "rest"):
@@ -214,10 +214,15 @@ def test_e362b_unevaluable_required_text_is_exposed():
         _job(E362_STYLE), _v3_like_profile(), company_research_id=None, as_of=AS_OF
     )
     other = [r for r in result.unknown_requirements if r.requirement_type == "OTHER"]
-    assert len(other) == 1
-    assert other[0].importance == "REQUIRED"
-    assert "kommunikative" in other[0].requirement
-    assert "NOT_EVALUATED" in other[0].reason
+    # v5: the software-development domain and the principles noun before
+    # "(Testing, CI/CD)" are material clauses of mixed lines, not filler.
+    assert [r.requirement for r in other] == [
+        "Softwareentwicklung",
+        "Software-Engineering-Prinzipien",
+        "Ausgeprägte kommunikative Stärken sowie die Bereitschaft zur Dokumentation.",
+    ]
+    assert {(r.importance, r.match_status) for r in other} == {("REQUIRED", "UNKNOWN")}
+    assert all("NOT_EVALUATED" in r.reason for r in other)
 
 
 # --- generic fail-closed rules --------------------------------------------------

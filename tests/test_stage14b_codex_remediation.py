@@ -109,13 +109,19 @@ def test_entirely_unknown_line_is_one_whole_other():
     assert [o.requirement for o in _others(result)] == ["Kenntnisse in SAP ABAP"]
 
 
-def test_qualified_and_compound_technology_mentions_leave_no_residual():
+def test_qualified_and_compound_technology_mentions_keep_only_material_residual():
+    # v5: "API-Entwicklung (REST)" and "Git-basierter" are consumed by their
+    # technology; the domain "Softwareentwicklung" and the noun before an
+    # unrelated parenthesis stay material (final Codex review P1-2).
     description = (
         "Profil:\n"
         "- Erfahrung mit API-Entwicklung (REST) und Git-basierter Softwareentwicklung.\n"
         "- Grundverständnis von Software-Engineering-Prinzipien (Testing, CI/CD)."
     )
-    assert _others(_match(description, _profile(["Git"]))) == []
+    assert [o.requirement for o in _others(_match(description, _profile(["Git"])))] == [
+        "Softwareentwicklung",
+        "Software-Engineering-Prinzipien",
+    ]
 
 
 def test_mixed_unknown_requirement_cannot_reach_the_shortlist_threshold():

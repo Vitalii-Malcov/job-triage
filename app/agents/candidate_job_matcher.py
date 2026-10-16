@@ -141,6 +141,27 @@ footer is no longer read as unevaluated required text):
   requirement is UNKNOWN (or MISSING with no experience at all), never
   MATCH. Year counts must directly modify the experience noun.
 
+**v5 (Codex final review):**
+
+- Every typed requirement consumes only the span it evaluated: a language
+  name + level, a degree's wording/fields/"oder vergleichbar", a duration
+  phrase (plus its clause only when that clause names no technology), a
+  technology mention (widened only over attached words like "-basierter"
+  or a plural "s"), the noun a parenthesised technology qualifies only
+  when `_TECHNOLOGY_CATEGORY_NOUNS` says it names that technology's own
+  category ("API-Entwicklung (REST)"), and example groups. The rest of a
+  required line is split into clauses at `,` `;` parentheses and
+  conjunctions; each clause with a material (non-filler) word is its own
+  REQUIRED/UNKNOWN OTHER requirement. Domains ("Softwareentwicklung") and
+  category nouns ("Frameworks") are material, never filler.
+- A duration binds only to its own clause ("3 Jahre ... mit Python und
+  Erfahrung mit Kubernetes" -> Python only).
+- "Python-Frameworks (z. B. Django, Flask)" is a group of its own; the base
+  technology never satisfies it.
+- Skill importance: the current extraction (title + description) wins over
+  a stale stored list; stored lists only add skills it does not name.
+- OTHER identity also ignores trailing punctuation.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -175,7 +196,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v4"
+ALGORITHM_VERSION = "v5"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -224,30 +245,40 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     identity — a must-have wins over a nice-to-have naming the same skill
     (shouldn't happen given skill_extractor's own dedup, but defensive).
 
-    Stage 14B: the persisted lists are unioned with a fresh extraction of
-    the DESCRIPTION (not the title, whose literal technologies the stored
-    lists already carry) so a requirement an older extractor dropped at
-    collection time cannot silently vanish from the match.
+    Stage 14B: the persisted lists are unioned with a fresh extraction so a
+    requirement an older extractor dropped at collection time cannot
+    silently vanish from the match. v5: the CURRENT extraction decides
+    importance -- a stored must-have the title names (collection extracts
+    title + description) first, then the fresh description extraction; a
+    stored list only adds skills neither names, so a stale stored must-have
+    never promotes a currently PREFERRED mention.
     """
+    title_skills = set(extract_skills(job.title, None).must_have_skills)
     fresh = extract_skills(None, job.description)
-    # v4: a technology the description names ONLY as an example ("z. B.
+    # v4: a technology the vacancy names ONLY as an example ("z. B.
     # LangChain") belongs to its grouped requirement, so a stored list from
-    # an older extractor must not resurrect it as an individual one -- unless
-    # the title itself names it.
-    example_only = (
-        {
-            normalize_skill(e)
-            for group in extract_example_groups(job.description)
-            for e in group.examples
-        }
-        - {normalize_skill(t) for t in [*fresh.must_have_skills, *fresh.nice_to_have_skills]}
-        - {normalize_skill(t) for t in extract_skills(job.title, None).must_have_skills}
-    )
+    # an older extractor must not resurrect it as an individual one.
+    example_only = {
+        normalize_skill(e)
+        for group in extract_example_groups(job.description)
+        for e in group.examples
+    } - {
+        normalize_skill(t)
+        for t in [*title_skills, *fresh.must_have_skills, *fresh.nice_to_have_skills]
+    }
     seen: dict[str, tuple[str, str]] = {}
-    for text in [*job.must_have_skills, *fresh.must_have_skills]:
+    title_norms = {normalize_skill(t) for t in title_skills}
+    for text in job.must_have_skills:
+        if normalize_skill(text) in title_norms:
+            seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
+    for text in fresh.must_have_skills:
+        seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
+    for text in fresh.nice_to_have_skills:
+        seen.setdefault(normalize_skill(text), (text, "PREFERRED"))
+    for text in job.must_have_skills:
         if normalize_skill(text) not in example_only:
             seen.setdefault(normalize_skill(text), (text, "REQUIRED"))
-    for text in [*job.nice_to_have_skills, *fresh.nice_to_have_skills]:
+    for text in job.nice_to_have_skills:
         if normalize_skill(text) not in example_only:
             seen.setdefault(normalize_skill(text), (text, "PREFERRED"))
     return list(seen.values())
@@ -591,116 +622,178 @@ def _match_experience_requirement(
 # Words that carry no requirement of their own once the evaluated parts of
 # a MIXED line are removed ("Kenntnisse in Python und ..." -> "Kenntnisse",
 # "in", "und"). Only applied to lines that had at least one evaluated span;
-# a line with none is always reported whole.
+# a line with none is always reported whole. v5: domains and category nouns
+# ("Softwareentwicklung", "Frameworks", "Tools") are NOT filler.
 _RESIDUAL_FILLER = frozenset(
-    """
-    kenntnisse kenntnis fachkenntnisse grundkenntnisse erfahrung erfahrungen
-    berufserfahrung praxiserfahrung grundverständnis verständnis umgang
-    sicherer sichere sicher gute guten gut sehr fundierte fundierten solide
-    tiefe praktische erste mehrjährige idealerweise wünschenswert vorteil
+    word.casefold()
+    for word in """
+    kenntnisse kenntnis kenntnissen fachkenntnisse grundkenntnisse erfahrung
+    erfahrungen berufserfahrung praxiserfahrung grundverständnis verständnis
+    umgang know-how sicherer sichere sicher gute guten gut sehr fundierte
+    fundierten solide tiefe praktische erste mehrjährige idealerweise
+    wünschenswert vorteil mindestens min über mehr
     im in mit und oder sowie von der die das den dem des ein eine einer einem
     für auf zu am an als bei bzw z b zum beispiel ist sind
-    entwicklung softwareentwicklung programmierung software development
-    programming moderne modernen modern tools technologien technologies
-    framework frameworks bereich umfeld
+    moderne modernen modern bereich umfeld
+    fließend fließende fließendes fließenden verhandlungssicher
+    verhandlungssichere verhandlungssicheres verhandlungssicheren wort schrift
+    niveau level sprachkenntnisse fluent business
     knowledge of experience with and or the a an skills strong good solid
-    basic understanding proficiency hands-on practical e g eg
-    """.split()
+    basic understanding proficiency hands-on practical e g eg at least more than
+    """.split()  # casefolded: "fließend" -> "fliessend"
 )
 _TOKEN = re.compile(r"[^\s,;:()/.]+(?:\.[^\s,;:()/.]+)*")
+# v5: residual clauses -- split at punctuation, parentheses and conjunctions.
+_RESIDUAL_CLAUSE_BOUNDARY = re.compile(
+    r"[,;()]|\s(?:und|oder|sowie|bzw\.?|and|or|plus|as\s+well\s+as)\s", re.IGNORECASE
+)
+# v5: hyphen parts that attach to a technology without naming anything else
+# ("Git-basierter", "Python-Kenntnisse", "CI/CD-Pipelines"); "Python-
+# Frameworks" is NOT the technology, so that token stays material.
+_ATTACHED_PARTS = frozenset(
+    """
+    basiert basierte basierter basiertes basierten basierend basierende based
+    kenntnisse kenntnis erfahrung erfahrungen skills entwicklung development
+    programmierung programming umgebung umgebungen environment stack
+    pipeline pipelines
+    """.split()
+)
+# v5: a noun before "(<technology>)" is consumed only when it names that
+# technology's own category -- "API-Entwicklung (REST)". "SAP ABAP (Python)"
+# or "XYZ-Plattform (Python)" keep their noun.
+_TECHNOLOGY_CATEGORY_NOUNS: dict[str, frozenset[str]] = {
+    "rest": frozenset(
+        {"api", "apis", "api-entwicklung", "api-design", "schnittstellen", "webservices"}
+    ),
+}
 
 
-def _evaluated_spans(segment: str, groups: list) -> list[tuple[int, int]]:
-    """Character spans of `segment` the matcher evaluates as SKILL
-    requirements: each technology mention widened to its whole
-    (hyphen-)token ("Git-basierter"), the noun a parenthesised technology
-    list qualifies ("API-Entwicklung (REST)"), and each example group's
-    category + list."""
-    spans: list[tuple[int, int]] = [
-        group.span for group in groups if group.evidence_text == segment
-    ]
-    for _, pattern in _TECHNOLOGY_PATTERNS:
+def _technology_spans(segment: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for skill, pattern in _TECHNOLOGY_PATTERNS:
         for mention in pattern.finditer(segment):
             start, end = mention.start(), mention.end()
-            while start > 0 and not segment[start - 1].isspace() and segment[start - 1] not in "(,":
+            while (
+                start > 0 and not segment[start - 1].isspace() and segment[start - 1] not in "(,;:/"
+            ):
                 start -= 1
-            while end < len(segment) and not segment[end].isspace() and segment[end] not in "),.;":
+            while (
+                end < len(segment) and not segment[end].isspace() and segment[end] not in "),.;:/"
+            ):
                 end += 1
-            spans.append((start, end))
-            open_paren = segment.rfind("(", 0, start)
-            close_paren = segment.find(")", end)
-            if open_paren != -1 and close_paren != -1 and ")" not in segment[open_paren:start]:
+            attached = (
+                segment[start : mention.start()] + "-" + segment[mention.end() : end]
+            ).split("-")
+            if all(len(part) <= 2 or part.casefold() in _ATTACHED_PARTS for part in attached):
+                spans.append((start, end))
+            open_paren = segment.rfind("(", 0, mention.start())
+            close_paren = segment.find(")", mention.end())
+            if (
+                open_paren != -1
+                and close_paren != -1
+                and ")" not in segment[open_paren : mention.start()]
+            ):
                 before = segment[:open_paren].rstrip()
-                noun_start = max(before.rfind(" "), 0)
-                spans.append((noun_start, close_paren + 1))
+                noun_start = before.rfind(" ") + 1
+                if before[noun_start:].casefold() in _TECHNOLOGY_CATEGORY_NOUNS.get(skill, ()):
+                    spans.append((noun_start, len(before)))
     return spans
 
 
-def _residual_text(segment: str, spans: list[tuple[int, int]]) -> str:
+def _evaluated_spans(job: JobMatchInput, segment: str, groups: list) -> list[tuple[int, int]]:
+    """v5: character spans of `segment` some typed requirement evaluated --
+    technology mentions (`_technology_spans`), example groups, and the
+    spans the language/education/experience extractors report."""
+    spans = [group.span for group in groups if group.evidence_text == segment]
+    spans.extend(_technology_spans(segment))
+    for language in extract_language_requirements(job.title, job.description):
+        if language.evidence_text == segment and language.span is not None:
+            spans.append(language.span)
+    education = extract_education_requirement(job.title, job.description)
+    if education is not None and education.evidence_text == segment:
+        spans.extend(education.spans)
+    experience = extract_experience_requirement(job.title, job.description)
+    if experience is not None and experience.evidence_text == segment and experience.span:
+        spans.append(experience.span)
+    return spans
+
+
+def _is_material(token: str) -> bool:
+    word = token.strip("-")
+    return len(word) > 1 and word.casefold() not in _RESIDUAL_FILLER
+
+
+def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
+    """v5: blank out `spans`, split the rest into clauses, and return each
+    clause's material words (from its first to its last material token)."""
     chars = list(segment)
     for start, end in spans:
         for i in range(start, min(end, len(chars))):
             chars[i] = " "
-    words = [
-        token
-        for token in _TOKEN.findall("".join(chars))
-        if token.strip("-").casefold() not in _RESIDUAL_FILLER and len(token.strip("-")) > 1
-    ]
-    return " ".join(words)
+    masked = "".join(chars)
+    clauses: list[str] = []
+    position = 0
+    for boundary in [*_RESIDUAL_CLAUSE_BOUNDARY.finditer(masked), None]:
+        end = boundary.start() if boundary is not None else len(masked)
+        material = [t for t in _TOKEN.finditer(masked, position, end) if _is_material(t.group())]
+        if material:
+            clauses.append(" ".join(masked[material[0].start() : material[-1].end()].split()))
+        if boundary is not None:
+            position = boundary.end()
+    return clauses
+
+
+def _other_identity(text: str) -> str:
+    """Casefolded, whitespace-collapsed, trailing punctuation ignored (v5)."""
+    return " ".join(text.casefold().split()).rstrip(" .!?;:,")
 
 
 def _unevaluated_requirements(
-    job: JobMatchInput, evaluated: list[RequirementMatch]
+    job: JobMatchInput,
 ) -> list[RequirementMatch]:
     """Stage 14B fail-closed net over every segment of a recognized
     requirement section ("Ihr Profil", "Profil", ...):
 
-    - a language/education/experience evidence segment is evaluated whole;
-    - v4: otherwise the evaluated SKILL spans are removed and any material
-      RESIDUAL ("Kenntnisse in Python und SAP ABAP" -> "SAP ABAP") becomes
-      a REQUIRED, UNKNOWN OTHER requirement -- one recognized technology no
-      longer hides the rest of its line; a line with no evaluated span is
-      reported whole;
-    - v4: OTHER requirements are deduplicated by casefolded,
-      whitespace-collapsed text (repeated vacancy lines count once; every
-      source line is kept as job evidence).
+    - v5: the spans every typed requirement (SKILL, group, LANGUAGE,
+      EDUCATION, EXPERIENCE) evaluated are removed and each remaining
+      material clause ("Deutsch B2 und Erfahrung mit SAP ABAP" -> "SAP
+      ABAP") becomes a REQUIRED, UNKNOWN OTHER requirement -- a recognized
+      part never hides the rest of its line; a line with no evaluated span
+      is reported whole;
+    - OTHER requirements are deduplicated by casefolded, whitespace-
+      collapsed text without trailing punctuation (repeated vacancy lines
+      count once; every source line is kept as job evidence).
 
     An OTHER requirement can never be a MATCH."""
-    whole_segments = {
-        text
-        for req in evaluated
-        if req.requirement_type in ("LANGUAGE", "EDUCATION", "EXPERIENCE")
-        for text in req.job_evidence
-    }
     groups = extract_example_groups(job.description)
     by_identity: dict[str, RequirementMatch] = {}
     for segment in must_section_segments(job.description):
-        if segment in whole_segments:
-            continue
-        spans = _evaluated_spans(segment, groups)
-        text = _residual_text(segment, spans) if spans else segment
-        if not text:
-            continue
-        identity = " ".join(text.casefold().split())
-        existing = by_identity.get(identity)
-        if existing is not None:
-            if segment not in existing.job_evidence:
-                existing.job_evidence.append(segment)
-            continue
-        by_identity[identity] = RequirementMatch(
-            requirement=text,
-            normalized_requirement=identity,
-            requirement_type="OTHER",
-            importance="REQUIRED",
-            match_status="UNKNOWN",
-            candidate_evidence=[],
-            job_evidence=[segment],
-            reason=(
-                "Required vacancy text that the deterministic matcher cannot evaluate "
-                "(NOT_EVALUATED); human review required (HUMAN_REVIEW_REQUIRED)."
-            ),
-        )
+        spans = _evaluated_spans(job, segment, groups)
+        for text in _residual_clauses(segment, spans) if spans else [segment]:
+            identity = _other_identity(text)
+            existing = by_identity.get(identity)
+            if existing is not None:
+                if segment not in existing.job_evidence:
+                    existing.job_evidence.append(segment)
+                continue
+            by_identity[identity] = _other_requirement(text, identity, segment)
     return list(by_identity.values())
+
+
+def _other_requirement(text: str, identity: str, segment: str) -> RequirementMatch:
+    return RequirementMatch(
+        requirement=text,
+        normalized_requirement=identity,
+        requirement_type="OTHER",
+        importance="REQUIRED",
+        match_status="UNKNOWN",
+        candidate_evidence=[],
+        job_evidence=[segment],
+        reason=(
+            "Required vacancy text that the deterministic matcher cannot evaluate "
+            "(NOT_EVALUATED); human review required (HUMAN_REVIEW_REQUIRED)."
+        ),
+    )
 
 
 def _relevant_experiences(
@@ -792,7 +885,7 @@ def compute_match(
     experience_match = _match_experience_requirement(job, trusted_experiences, as_of)
     if experience_match is not None:
         all_requirements.append(experience_match)
-    all_requirements.extend(_unevaluated_requirements(job, all_requirements))
+    all_requirements.extend(_unevaluated_requirements(job))
 
     has_education_requirement = education_match is not None
     relevant_education = (

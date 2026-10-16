@@ -47,6 +47,10 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
   and the technologies in that clause are kept as its `subjects`.
 - Stage 14B: "<category> (z. B. A, B)" lists (`extract_example_groups`) --
   one grouped requirement whose examples are not individual requirements.
+- Stage 14B (matcher v5): each language/education/experience requirement
+  reports the character span(s) of its segment it actually evaluated, so
+  the matcher can keep any other material clause of the same line ("Deutsch
+  B2 und Erfahrung mit SAP ABAP") instead of treating the line as consumed.
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -147,6 +151,36 @@ _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )  # fmt: skip
 _CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)
+# v5: "... und Erfahrung mit X" / "and experience with X" starts a NEW,
+# independent requirement -- a year count or degree never extends across it.
+_INDEPENDENT_CLAUSE = re.compile(
+    r"\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+(?=(?:[\w-]+\s+){0,2}?[\w-]*?"
+    r"(?:erfahrung(?:en)?|kenntniss?e?|experience|knowledge|expertise)(?!\w))",
+    re.IGNORECASE,
+)
+# v5: degree wording an education requirement evaluates inside its clause.
+_EDUCATION_WORD = re.compile(
+    r"(?<!\w)[\w-]*?(?:bachelor|master|diplom|studium|studiengang|abschluss|degree|"
+    r"abgeschlossen\w*|completed|university|college|hochschule)[\w-]*(?!\w)",
+    re.IGNORECASE,
+)
+_COMPARABLE_QUALIFICATION = re.compile(
+    r"(?<!\w)(?:vergleichbare[nrs]?|ähnliche[nrs]?|verwandte[nrs]?|entsprechende[nrs]?|"
+    r"comparable|similar|related|equivalent)"
+    r"(?:\s+(?:qualifikation(?:en)?|ausbildung|fachrichtung|field|qualification))?(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _clause_end(segment: str, position: int) -> int:
+    """v5: end of the clause continuing at `position` -- the first `,`,
+    `;`, "sowie" or new independent "und Erfahrung/Kenntnisse ..." clause."""
+    ends = [
+        match.start()
+        for pattern in (_CLAUSE_BOUNDARY, _INDEPENDENT_CLAUSE)
+        if (match := pattern.search(segment, position)) is not None
+    ]
+    return min(ends, default=len(segment))
 
 
 @dataclass(frozen=True)
@@ -164,6 +198,11 @@ class ExperienceRequirement:
     evidence_text: str
     subjects: tuple[str, ...] = ()
     subject_text: str = ""
+    # v5: (start, end) in `evidence_text` this requirement evaluated -- only
+    # the duration phrase when it names a technology subject (the rest of
+    # the clause is evaluated or kept elsewhere), the whole clause when it
+    # names none (that clause IS the UNKNOWN requirement's text).
+    span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +227,8 @@ class LanguageRequirement:
     level: str
     importance: RequirementImportance
     evidence_text: str
+    # v5: (start, end) in `evidence_text` of the language name and its level.
+    span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +238,9 @@ class EducationRequirement:
     # Stage 14B: fields of study literally named in the degree segment;
     # empty means the vacancy asks only for "a completed degree".
     fields: tuple[str, ...] = ()
+    # v5: spans in `evidence_text` of the degree wording, the named fields
+    # and an "or comparable" phrase inside the degree's own clause.
+    spans: tuple[tuple[int, int], ...] = ()
 
 
 def canonicalize_language_name(name: str) -> str | None:
@@ -327,12 +371,19 @@ def extract_language_requirements(
             importance = _importance_for(
                 language_mention, must_markers, nice_markers, inherited_context, segment
             )
+            level_match = (cefr_matches or native_matches)[0]
+            offset = len(segment) - len(segment.lstrip())
+            span = (
+                min(language_mention.start(), clause_start + level_match.start()) - offset,
+                max(language_mention.end(), clause_start + level_match.end()) - offset,
+            )
             results.append(
                 LanguageRequirement(
                     language=language_name,
                     level=level,
                     importance=importance,
                     evidence_text=segment.strip(),
+                    span=span,
                 )
             )
     return results
@@ -355,8 +406,31 @@ def extract_education_requirement(
             degree_matches[0], must_markers, nice_markers, inherited_context, segment
         )
         fields = degree_field_names(segment)
+        # v5: what this requirement evaluated -- degree wording, field names
+        # and "oder vergleichbar" inside the degree's own clause; anything
+        # else on the line ("... und Kenntnisse in SAP ABAP") stays material.
+        degree = degree_matches[0]
+        offset = len(segment) - len(segment.lstrip())
+        clause_start = max(
+            (m.end() for m in _INDEPENDENT_CLAUSE.finditer(segment, 0, degree.start())), default=0
+        )
+        boundary = _INDEPENDENT_CLAUSE.search(segment, degree.end())
+        semicolon = segment.find(";", degree.end())
+        clause_end = min(
+            boundary.start() if boundary else len(segment),
+            semicolon if semicolon != -1 else len(segment),
+        )
+        spans = tuple(
+            (match.start() - offset, match.end() - offset)
+            for pattern in (
+                _EDUCATION_WORD,
+                _COMPARABLE_QUALIFICATION,
+                *(field_pattern for _, field_pattern in _DEGREE_FIELDS),
+            )
+            for match in pattern.finditer(segment, clause_start, clause_end)
+        )
         return EducationRequirement(
-            importance=importance, evidence_text=segment.strip(), fields=fields
+            importance=importance, evidence_text=segment.strip(), fields=fields, spans=spans
         )
     return None
 
@@ -401,19 +475,24 @@ def extract_experience_requirement(
         years = _years(best)
         if years < 1:
             continue
-        boundary = _CLAUSE_BOUNDARY.search(segment, best.end())
-        clause = segment[best.start() : boundary.start() if boundary else len(segment)]
+        # v5: the duration binds only to its own clause -- "3 Jahre ... mit
+        # Python und Erfahrung mit Kubernetes" is a Python-only duration.
+        clause_end = _clause_end(segment, best.end())
+        clause = segment[best.start() : clause_end]
         subjects = tuple(
             dict.fromkeys(name for name, pattern in _TECHNOLOGY_PATTERNS if pattern.search(clause))
         )
         must_markers, nice_markers = _segment_markers(segment, inherited_context)
         importance = _importance_for(best, must_markers, nice_markers, inherited_context, segment)
+        offset = len(segment) - len(segment.lstrip())
+        span_end = best.end() if subjects else clause_end
         return ExperienceRequirement(
             years=years,
             importance=importance,
             evidence_text=segment.strip(),
             subjects=subjects,
             subject_text=clause.strip(" .,;"),
+            span=(best.start() - offset, span_end - offset),
         )
     return None
 
@@ -431,9 +510,11 @@ def extract_example_groups(description: str | None) -> list[ExampleGroupRequirem
     """Stage 14B: every "<category> (z. B. A, B)" / "<category> such as A,
     B" list in the description. The category is the phrase right before
     the opening parenthesis (or the marker), back to the previous clause
-    word ("und", "in", "mit", ","). A list whose category itself names a
-    technology ("Python (z. B. Django)") is not a group -- that technology
-    is already its own requirement."""
+    word ("und", "in", "mit", ","). A list whose category IS a technology
+    ("Python (z. B. Django)") is not a group -- that technology is already
+    its own requirement. v5: a category merely containing one
+    ("Python-Frameworks", "LLM-Frameworks") is a group of its own; the base
+    technology never stands in for it."""
     results: list[ExampleGroupRequirement] = []
     for raw_segment, inherited_context in _contextual_segments(description or ""):
         segment = raw_segment.strip()
@@ -446,7 +527,7 @@ def extract_example_groups(description: str | None) -> list[ExampleGroupRequirem
             starts = list(_CATEGORY_START.finditer(head))
             category_start = starts[-1].end() if starts else 0
             category = _TRAILING_CONNECTOR.sub("", head[category_start:]).strip(" ,;:")
-            if not category or any(p.search(category) for _, p in _TECHNOLOGY_PATTERNS):
+            if not category or any(p.fullmatch(category) for _, p in _TECHNOLOGY_PATTERNS):
                 continue
             listed = segment[item.marker_end : item.list_end]
             examples = tuple(
