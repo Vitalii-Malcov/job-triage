@@ -110,8 +110,6 @@ CASES = [
     ("blorpy Python experience", {"python"}, "blorpy Python experience"),  # no list has it
     ("Python professional experience", {"python"}, "Python professional experience"),
     ("Python practical experience", {"python"}, "Python practical experience"),
-    ("3 years professional Python experience", {"python"},
-     "3 years professional Python experience"),
     ("Kenntnisse und gute Python-Erfahrung", {"python"}, "gute Python-Erfahrung"),
     ("Kenntnisse in Java und professional Docker experience", {"java", "docker"},
      "professional Docker experience"),
@@ -162,7 +160,12 @@ def test_docker_only_work_never_establishes_python_and_docker_experience():
 
 @pytest.mark.parametrize(
     "line",
-    ["Python-Erfahrung von mindestens 3 Jahren", "Mindestens 3 Jahre Berufserfahrung mit Python"],
+    [
+        "Python-Erfahrung von mindestens 3 Jahren",
+        "Mindestens 3 Jahre Berufserfahrung mit Python",
+        # v11: a typed duration ("N years <technology> experience")
+        "3 years professional Python experience",
+    ],
 )
 def test_a_typed_duration_still_owns_the_phrase_without_a_duplicate(line):
     reqs = _by_norm(_match(_profil(line), SKILLS_AND_PROJECT))
@@ -197,7 +200,7 @@ def test_no_experience_row_without_qualified_experience(line):
 # --- v10 cache identity ----------------------------------------------------------------------
 
 
-def test_v9_row_is_kept_and_cache_lookup_uses_v10():
+def test_v9_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -238,12 +241,11 @@ def test_v9_row_is_kept_and_cache_lookup_uses_v10():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert matcher.ALGORITHM_VERSION == "v10"
-        assert result.algorithm_version == "v10"
+        assert result.algorithm_version == matcher.ALGORITHM_VERSION
         assert "professional Python experience" in [
             r.requirement for r in result.unknown_requirements
         ]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v9", "v10"]
+        assert versions == ["v9", matcher.ALGORITHM_VERSION]

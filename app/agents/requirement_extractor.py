@@ -151,7 +151,9 @@ _EXP_ADJECTIVE = (
 # "seit 20 Jahren bestehenden Team" or "30 Jahren Erfahrung am Markt" never
 # count. Accepted shapes: "N Jahre (adj) Berufserfahrung/Erfahrung",
 # "N-jährige Berufserfahrung", "Berufserfahrung von (mindestens) N Jahren",
-# "N(+) years (of) (adj) experience".
+# "N(+) years (of) (adj) experience", v11: "N(+) years (of) (adj)
+# <technology> experience" ("3 years Python experience").
+_TECHNOLOGY_ALTERNATION = "|".join(f"(?:{p.pattern})" for _, p in _TECHNOLOGY_PATTERNS)
 _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -163,6 +165,8 @@ _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         + _YEARS_NUMBER + r"\s*\+?\s*jahren(?!\w)",
         r"(?<!\w)" + _YEARS_NUMBER + r"\s*\+?\s*years?\s+(?:of\s+)?" + _EXP_ADJECTIVE
         + r"experience(?!\w)",
+        r"(?<!\w)" + _YEARS_NUMBER + r"\s*\+?\s*years?\s+(?:of\s+)?" + _EXP_ADJECTIVE
+        + r"(?:" + _TECHNOLOGY_ALTERNATION + r")\s+experience(?!\w)",
     )
 )  # fmt: skip
 _CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)

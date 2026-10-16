@@ -237,6 +237,16 @@ footer is no longer read as unevaluated required text):
 - A German hyphen ellipsis ("Python- und", "Python-,") is never a clause
   boundary.
 
+**v11 (bare technology experience):**
+
+- An experience head directly after an evaluated technology of the same
+  clause ("Python experience", "Docker Erfahrung") is a technology
+  compound, qualified like "Python-Erfahrung": it stays a REQUIRED/UNKNOWN
+  requirement naming that technology, never erased by masking the SKILL
+  span. Never across a clause boundary ("Python; experience").
+- "N years (of) <technology> experience" is a typed duration, so the
+  phrase is owned by `experience-Ny` and never duplicated as OTHER.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -281,7 +291,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v10"
+ALGORITHM_VERSION = "v11"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -945,6 +955,9 @@ class _Clause:
     owned: bool  # some typed requirement evaluated part of it
     conjunction_after: bool  # the boundary after it is "und"/"and"/..., not punctuation
     start: int = 0  # v10: where the clause starts in the segment
+    # v11: starts of experience heads that directly follow an evaluated
+    # technology of this clause ("Python experience", "Python Erfahrung")
+    compound: frozenset[int] = frozenset()
 
 
 def _is_head(token: str) -> bool:
@@ -952,8 +965,36 @@ def _is_head(token: str) -> bool:
 
 
 def _qualified_experience(clause: _Clause) -> list[re.Match[str]]:
-    words = [t.group() for t in clause.tokens]
+    # v11: a technology compound is qualified like "Python-Erfahrung"
+    words = ["-" + t.group() if t.start() in clause.compound else t.group() for t in clause.tokens]
     return [clause.tokens[i] for i in qualified_experience_words(words)]
+
+
+def _technology_compounds(
+    segment: str,
+    tokens: list[re.Match[str]],
+    technology: list[tuple[int, int]],
+    clause_start: int,
+) -> frozenset[int]:
+    """v11: experience heads separated only by whitespace from an evaluated
+    technology inside the same clause ("Python experience") -- the
+    experience is WITH that technology, so masking the SKILL span must not
+    turn it into a bare head. Never across the clause start ("Python;
+    experience").
+    """
+    starts: set[int] = set()
+    for token in tokens:
+        word = token.group()
+        if word.startswith("-") or not EXPERIENCE_HEAD.fullmatch(word):
+            continue
+        i = token.start()
+        while i > clause_start and segment[i - 1] in " \t":
+            i -= 1
+        if clause_start < i < token.start() and any(
+            t_start <= i - 1 < t_end for t_start, t_end in technology
+        ):
+            starts.add(token.start())
+    return frozenset(starts)
 
 
 def _shares_right_complement(clause: _Clause, right: _Clause | None, masked: str) -> bool:
@@ -993,6 +1034,7 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
         for i in range(start, min(end, len(chars))):
             chars[i] = " "
     masked = "".join(chars)
+    technology = _technology_spans(segment)
     pieces: list[_Clause] = []
     position = 0
     # v10: the hyphen of an ellipsis may be masked with its technology, so the
@@ -1006,12 +1048,13 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
         end = boundary.start() if boundary is not None else len(masked)
         pieces.append(
             _Clause(
-                tokens=list(_TOKEN.finditer(masked, position, end)),
+                tokens=(tokens := list(_TOKEN.finditer(masked, position, end))),
                 owned=any(
                     span_start < end and position < span_end for span_start, span_end in spans
                 ),
                 conjunction_after=boundary is not None and boundary.group() not in ",;()",
                 start=position,
+                compound=_technology_compounds(segment, tokens, technology, position),
             )
         )
         if boundary is not None:
