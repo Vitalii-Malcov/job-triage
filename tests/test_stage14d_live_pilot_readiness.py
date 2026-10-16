@@ -311,37 +311,97 @@ def test_preflight_flags_wrong_revision_and_unexpected_digest(canonical_db):
     assert not report.ok
 
 
-def test_runtime_cli_exit_codes_and_serve_only_after_a_passing_preflight(
-    canonical_db, capsys, monkeypatch
-):
+def test_runtime_cli_preflight_exit_codes(canonical_db, capsys):
+    # preflight keeps an optional, diagnostic-only digest
     assert runtime_cli.main(["preflight", "--database", str(canonical_db)]) == 0
     assert "RESULT: PASS" in capsys.readouterr().out
     assert runtime_cli.main(["preflight", "--database", str(canonical_db.with_name("x.db"))]) == 2
     assert "does not exist" in capsys.readouterr().err
 
+
+def _sha(path: Path) -> str:
+    return canonical_runtime.file_sha256(path)
+
+
+def _other_db_at_head(canonical_db: Path, name: str, marker: str) -> Path:
+    """Another database at the SAME migration head as canonical (like the audit
+    or pilot DB): only its content, hence its digest, differs."""
+    path = canonical_db.with_name(name)
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.execute("INSERT INTO alembic_version VALUES (?)", expected_alembic_heads())
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES (?)", (marker,))
+    return path
+
+
+def _serve(database: Path, *extra: str):
+    """Run `serve` with a recording callback; the process env is restored."""
     started = []
     saved = dict(os.environ)
     try:
         code = runtime_cli.main(
-            ["serve", "--database", str(canonical_db), "--port", "8123"],
+            ["serve", "--database", str(database), *extra],
             start_server=lambda port: started.append(
-                (port, os.environ["DATABASE_URL"], os.environ["OUTBOUND_SENDING_ENABLED"])
+                (
+                    port,
+                    os.environ["DATABASE_URL"],
+                    {flag: os.environ[flag.upper()] for flag in SAFETY_FLAGS},
+                )
             ),
         )
     finally:
         os.environ.clear()
         os.environ.update(saved)
-    assert code == 0
-    assert started == [(8123, f"sqlite:///{canonical_db.as_posix()}", "false")]
+    return code, started
 
+
+def test_serve_without_expected_sha_is_refused_and_never_starts(canonical_db, capsys):
+    code, started = _serve(canonical_db, "--port", "8123")  # A
+    assert code == 2
+    assert started == []
+    assert "serve requires --expect-sha256" in capsys.readouterr().err
+
+
+def test_serve_canonical_with_the_approved_sha_starts_exactly_once(canonical_db):
+    code, started = _serve(canonical_db, "--expect-sha256", _sha(canonical_db), "--port", "8123")
+    assert code == 0  # B
+    assert len(started) == 1
+    port, url, flags = started[0]
+    assert (port, url) == (8123, f"sqlite:///{canonical_db.as_posix()}")
+    assert set(flags.values()) == {"false"}  # G: every safety flag forced off
+    assert flags["outbound_sending_enabled"] == "false"
+    assert flags["alembic_auto_upgrade"] == "false"
+
+
+@pytest.mark.parametrize(
+    "name", ["stage14b_working.db", "stage11_pilot.db"]
+)  # C, D: wrong DB at the same migration head
+def test_serve_refuses_another_database_given_the_canonical_sha(canonical_db, capsys, name):
+    approved = _sha(canonical_db)
+    other = _other_db_at_head(canonical_db, name, marker=name)
+    assert _sha(other) != approved
+    assert run_preflight(other).ok  # path + head + flags alone would pass
+    code, started = _serve(other, "--expect-sha256", approved)
+    assert code == 1
+    assert started == []
+    assert "DATABASE_SHA256_UNEXPECTED" in capsys.readouterr().out
+
+
+def test_serve_refuses_the_canonical_database_with_a_wrong_sha(canonical_db):
+    for wrong in ("0" * 64, "F" * 64):  # E
+        code, started = _serve(canonical_db, "--expect-sha256", wrong)
+        assert code == 1 and started == []
+    code, started = _serve(canonical_db, "--expect-sha256", "not-a-digest")
+    assert code == 2 and started == []
+
+
+def test_serve_refuses_a_migration_head_mismatch_even_with_the_matching_sha(canonical_db):
     with sqlite3.connect(canonical_db) as conn:
         conn.execute("UPDATE alembic_version SET version_num = 'deadbeef'")
-    refused = []
-    assert (
-        runtime_cli.main(["serve", "--database", str(canonical_db)], start_server=refused.append)
-        == 1
-    )
-    assert refused == []
+    code, started = _serve(canonical_db, "--expect-sha256", _sha(canonical_db))  # F
+    assert code == 1
+    assert started == []
 
 
 # --- 3. application contact data ------------------------------------------------

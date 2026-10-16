@@ -36,9 +36,23 @@ READ-ONLY (SQLite `mode=ro` URI + `PRAGMA query_only`; SHA-256 compared before/a
 DATABASE TARGET, OUTBOUND STATE, ALEMBIC STATE, MATCHER VERSION and MIGRATION HEAD. Exit 0 PASS,
 1 FAIL, 2 refused (missing file, relative/UNC/mapped-drive path, bad digest syntax).
 
-`serve` runs the same preflight and only then starts the web app on `127.0.0.1` with those
-overrides. A running app writes to its database as normal operation; use `preflight` or a scratch
-copy whenever the canonical file must stay byte-identical.
+For `preflight`, `--expect-sha256` is optional (diagnostic only: without it the report shows the
+file's digest but cannot prove it is the approved one).
+
+```
+python scripts/stage14d_canonical_runtime.py serve \
+  --database D:/AI_agent/stage14b_canonical_v12.db \
+  --expect-sha256 874d2cab6fc78efe3574dd1fb123c06e60662da48c32c240227313778f41e35d
+```
+
+**A database path alone is NOT authorization to serve.** Another database at the same migration
+head (the audit `stage14b_working.db`, the pilot `stage11_pilot.db`) passes every other check, so
+`serve` REQUIRES `--expect-sha256` with the independently approved canonical digest (never derived
+from the selected file) and refuses without it (exit 2). Only after path validation, digest match,
+migration-head check and safety-flag check does it start the web app on `127.0.0.1` with those
+overrides; any mismatch exits nonzero without starting the server. A running app writes to its
+database as normal operation (the digest then changes, and a later `serve` needs a newly approved
+digest); use `preflight` or a scratch copy whenever the canonical file must stay byte-identical.
 
 ## 2. Application contact data
 

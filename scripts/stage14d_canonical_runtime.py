@@ -10,10 +10,20 @@ READ-ONLY: reports DATABASE TARGET, OUTBOUND STATE, ALEMBIC STATE,
 MATCHER VERSION and MIGRATION HEAD; the database file's SHA-256 must be
 identical before and after. Exit 0 = PASS, 1 = FAIL, 2 = refused input.
 
-    python scripts/stage14d_canonical_runtime.py serve \
-        --database D:/AI_agent/stage14b_canonical_v12.db [--port 8000]
+`--expect-sha256` is optional for `preflight` only (diagnostic: without it
+the report shows the file's digest but cannot prove it is the approved one).
 
-Runs the same preflight and, only if it passes, starts the web app on
+    python scripts/stage14d_canonical_runtime.py serve \
+        --database D:/AI_agent/stage14b_canonical_v12.db \
+        --expect-sha256 <approved canonical sha256> [--port 8000]
+
+A database path alone is NOT authorization to serve: another database at
+the same migration head (e.g. an audit or pilot copy) would pass every other
+check. `serve` therefore REQUIRES `--expect-sha256`, supplied independently
+by the operator / launch command and never derived from the selected file,
+and refuses (exit 2, server not started) without it. It runs the same
+preflight and, only if it passes -- path, approved digest, migration head
+and safety flags -- starts the web app on
 127.0.0.1 with the canonical overrides (DATABASE_URL, POSTGRES_HOST="", every
 safety flag false) applied to THIS process's environment before the
 application is imported. A running app writes to its database as normal
@@ -65,6 +75,13 @@ def main(argv: list[str] | None = None, *, start_server=_start_server) -> int:
             command.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
 
+    if args.command == "serve" and args.expect_sha256 is None:
+        print(
+            "refused: serve requires --expect-sha256 <approved canonical sha256>; "
+            "a database path alone is not authorization to serve",
+            file=sys.stderr,
+        )
+        return 2
     if args.expect_sha256 is not None and not _SHA256_RE.match(args.expect_sha256):
         print("refused: --expect-sha256 must be 64 hex characters", file=sys.stderr)
         return 2
@@ -78,6 +95,14 @@ def main(argv: list[str] | None = None, *, start_server=_start_server) -> int:
     if not report.ok:
         return 1
     if args.command == "serve":
+        # Defense in depth: the approved digest must have been checked and matched.
+        if (
+            report.expected_sha256 is None
+            or report.sha256_before != report.expected_sha256.lower()
+            or report.sha256_after != report.sha256_before
+        ):
+            print("refused: database digest is not the approved one", file=sys.stderr)
+            return 1
         if not 1 <= args.port <= 65535:
             print("refused: --port must be 1..65535", file=sys.stderr)
             return 2
