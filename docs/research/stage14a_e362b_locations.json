@@ -1,16 +1,33 @@
 [
   {
+    "vacancy": {
+      "source": "bundesagentur",
+      "source_reference": "20079-GR6IFL6L-S",
+      "fingerprint": "72d52b51fd59fd7ef92df4a6e89b963b96cbe0504346cbbb3196c6a10025d2a7"
+    },
     "source_type": "EMPLOYER_JOB_AD",
     "source_url": "https://www.f-i.de/karriere/offene-stellen/hannover/ai-engineer-ki-entwickler-m-w-d",
-    "locations": ["Hannover", "Münster"],
+    "locations": [
+      "Hannover",
+      "Münster"
+    ],
     "authoritative": true,
     "note": "'fuer den Standort Hannover oder Muenster'; 'Hinweis: die Abteilung ist ausschliesslich am Standort Hannover angesiedelt'",
     "checked_at": "2026-10-15T00:00:00Z"
   },
   {
+    "vacancy": {
+      "source": "bundesagentur",
+      "source_reference": "20079-GR6IFL6L-S",
+      "fingerprint": "72d52b51fd59fd7ef92df4a6e89b963b96cbe0504346cbbb3196c6a10025d2a7"
+    },
     "source_type": "JOB_BOARD_LISTING",
     "source_url": "https://www.arbeitsagentur.de/jobsuche/jobdetail/20079-GR6IFL6L-S",
-    "locations": ["Hannover", "Frankfurt am Main", "Münster"],
+    "locations": [
+      "Hannover",
+      "Frankfurt am Main",
+      "Münster"
+    ],
     "authoritative": false,
     "note": "BA lists 'verschiedene Arbeitsorte' incl. the Frankfurt company address, with the same 'ausschliesslich am Standort Hannover' note; collector persisted only Frankfurt am Main",
     "checked_at": "2026-10-15T00:00:00Z"

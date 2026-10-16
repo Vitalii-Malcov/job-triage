@@ -18,9 +18,13 @@ in the draft JSON. v1 drafts stay readable but are never reused as current.
 v3 (Stage 14A): the deterministic provider references the first relevant
 trusted experience AND the first relevant project (experience first) instead
 of a single slot that projects always won.
+v4 (Stage 14D): a language is cited only when the vacancy gives a concrete
+reason (a language requirement, the language named in the ad, or the ad's
+own language) -- see app.agents.language_relevance; a verified but unrelated
+language is no longer inserted.
 """
 
-BEWERBUNG_GENERATOR_VERSION = "v3"
+BEWERBUNG_GENERATOR_VERSION = "v4"
 
 
 class BewerbungCVDraftNotFoundError(Exception):

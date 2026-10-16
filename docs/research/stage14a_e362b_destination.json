@@ -1,5 +1,9 @@
 {
-  "job_id": 27,
+  "vacancy": {
+    "source": "bundesagentur",
+    "source_reference": "20079-GR6IFL6L-S",
+    "fingerprint": "72d52b51fd59fd7ef92df4a6e89b963b96cbe0504346cbbb3196c6a10025d2a7"
+  },
   "kind": "APPLICATION_PORTAL",
   "value": "https://www.f-i.de/karriere/offene-stellen/hannover/ai-engineer-ki-entwickler-m-w-d#bewerbung",
   "source_url": "https://www.f-i.de/karriere/offene-stellen/hannover/ai-engineer-ki-entwickler-m-w-d",

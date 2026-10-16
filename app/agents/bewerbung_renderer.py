@@ -62,6 +62,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
+from app.agents.language_relevance import relevant_languages
 from app.models.bewerbung import (
     AllowedClaim,
     BewerbungEvidenceCandidate,
@@ -210,11 +211,14 @@ def build_evidence(
             technologies=list(experience.technologies),
         )
 
-    # UNKNOWN level carries no renderable fact — excluded rather than
-    # rendered as a vague/empty claim.
-    for language in cv_draft.languages[:_MAX_LANGUAGE_CLAIMS]:
-        if language.level == "UNKNOWN":
-            continue
+    # Stage 14D: only languages the vacancy gives a concrete reason for
+    # (requirement, named in the ad, or the ad's own language), best reason
+    # first -- never a verified but unrelated language. UNKNOWN level carries
+    # no renderable fact and is excluded there too.
+    languages = relevant_languages(
+        cv_draft.languages, job_title=job_title, job_description=job_description
+    )
+    for language in languages[:_MAX_LANGUAGE_CLAIMS]:
         claim_id = _claim_id("candidate_language", language.source_id)
         allowed_claims.append(
             AllowedClaim(

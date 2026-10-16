@@ -21,6 +21,7 @@ from app.models.application_destination import (
     is_valid_email_address,
     unknown_destination,
 )
+from app.models.application_identity import ApplicationIdentity
 from app.models.candidate_job_match import (
     CandidateEvidenceRef,
     CandidateJobMatch,
@@ -56,6 +57,7 @@ from app.services.send_readiness import (
     CHECK_APPROVED_IS_CURRENT,
     CHECK_APPROVED_REVISION,
     CHECK_CHANNEL_VERIFIED,
+    CHECK_CONTACT_DATA,
     CHECK_EDUCATION_REQUIREMENT,
     CHECK_LANGUAGE_REQUIREMENT,
     CHECK_LOCATION_CONSISTENT,
@@ -766,9 +768,23 @@ def _ready_inputs(**overrides) -> SendReadinessInputs:
         package_problems=(),
         destination=_destination(),
         location_evidence=[_employer(["Hannover"])],
+        application_identity=_identity(),
     )
     data.update(overrides)
     return SendReadinessInputs(**data)
+
+
+def _identity(**overrides) -> ApplicationIdentity:
+    """Synthetic Stage 14D contact data matching `_profile()`'s trusted name."""
+    data = dict(
+        full_name="Anna Example",
+        email="anna.example@example.org",
+        phone="+49 30 1234567",
+        confirmed_by="OPERATOR",
+        confirmed_at=_NOW,
+    )
+    data.update(overrides)
+    return ApplicationIdentity(**data)
 
 
 def _failed(result) -> set[str]:
@@ -968,8 +984,10 @@ def test_no_education_or_language_requirement_does_not_require_them():
 
 def test_name_is_always_required():
     profile = _profile(field_trust={"professional_title": _TRUSTED})
+    # Stage 14D: without a trusted name the contact data cannot be bound either.
     assert _failed(evaluate_send_readiness(_ready_inputs(profile=profile))) == {
-        CHECK_REQUIRED_CV_DATA
+        CHECK_REQUIRED_CV_DATA,
+        CHECK_CONTACT_DATA,
     }
 
 

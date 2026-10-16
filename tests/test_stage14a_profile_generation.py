@@ -251,7 +251,14 @@ def test_irrelevant_project_not_claimed():
 
 
 def test_language_rendered_only_with_known_level_and_education_never_rendered():
-    _, cv, evidence, body = _pipeline(_complete_profile())
+    # Stage 14D: the vacancy names German, so the trusted German level is relevant.
+    job = JobMatchInput(
+        job_id=_JOB.job_id,
+        title=_JOB.title,
+        description=_JOB.description + " Sehr gute Deutsch- und Englischkenntnisse.",
+        must_have_skills=_JOB.must_have_skills,
+    )
+    _, cv, evidence, body = _pipeline(_complete_profile(), job)
     assert "Deutschkenntnisse auf B2-Niveau" in body
     assert "Englisch" not in body  # UNKNOWN level: listed in CV, never claimed in letter
     assert {item.language for item in cv.languages} == {"Deutsch", "Englisch"}

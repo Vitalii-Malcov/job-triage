@@ -34,6 +34,7 @@ from app.db.models import (
     JobRecord,
 )
 from app.models.application_destination import ApplicationDestination
+from app.models.application_identity import ApplicationIdentity
 from app.models.candidate_profile import (
     CandidateExperience,
     CandidateProfilePatchRequest,
@@ -61,6 +62,7 @@ from app.services.send_readiness import (
     SUPERSEDED_BY_NEWER_REVIEW,
     LocationEvidence,
     SessionNotCleanError,
+    VacancyEvidenceMismatchError,
     evaluate_send_readiness,
     load_send_readiness_inputs,
     render_send_readiness,
@@ -177,6 +179,16 @@ _EVIDENCE = [
 ]
 
 
+# Stage 14D: synthetic operator-confirmed contact data for the seeded profile.
+_IDENTITY = ApplicationIdentity(
+    full_name="Anna Example",
+    email="anna.example@example.org",
+    phone="+49 30 1234567",
+    confirmed_by="OPERATOR",
+    confirmed_at=_NOW,
+)
+
+
 def _evaluate(factory, job_id: int):
     with factory() as db:
         job = db.get(JobRecord, job_id)
@@ -186,6 +198,7 @@ def _evaluate(factory, job_id: int):
             settings=Settings(_env_file=None),
             destination=_destination(job_id),
             location_evidence=_EVIDENCE,
+            application_identity=_IDENTITY,
         )
         db.rollback()
     return inputs, evaluate_send_readiness(inputs)
@@ -470,7 +483,7 @@ def test_clean_load_reads_only_under_no_autoflush(factory, seeded, db_path, monk
 def test_loader_rejects_destination_of_other_job(factory, seeded):
     job_id, _ = seeded
     with factory() as db:
-        with pytest.raises(ValueError, match="different job"):
+        with pytest.raises(VacancyEvidenceMismatchError, match="DESTINATION_VACANCY_MISMATCH"):
             load_send_readiness_inputs(
                 db,
                 db.get(JobRecord, job_id),

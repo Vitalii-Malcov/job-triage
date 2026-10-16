@@ -125,10 +125,60 @@ def is_valid_email_address(value: object) -> bool:
     )
 
 
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class VacancyIdentity(BaseModel):
+    """Stage 14D: the STABLE identity of a vacancy, independent of any one
+    database. A numeric job id is database-local (pilot job 27 is canonical
+    job 1), so long-lived research evidence names the vacancy by its source
+    plus the source's own reference (as derived by
+    `app.services.email_matching.extract_reference_tokens`) and/or the job
+    fingerprint. Every field given must match; at least one of
+    `source_reference` / `fingerprint` is required."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source: str = Field(min_length=1, max_length=64)
+    source_reference: str | None = Field(default=None, min_length=1, max_length=64)
+    fingerprint: str | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "VacancyIdentity":
+        if self.source_reference is None and self.fingerprint is None:
+            raise ValueError("a vacancy identity needs source_reference and/or fingerprint")
+        if self.fingerprint is not None and not _FINGERPRINT_RE.match(self.fingerprint):
+            raise ValueError("fingerprint must be 64 lowercase hex characters")
+        for text in (self.source, self.source_reference or ""):
+            if any(ch in text for ch in _CONTROL_CHARS):
+                raise ValueError("vacancy identity must not contain control characters")
+        return self
+
+
+def vacancy_identity_matches(
+    identity: VacancyIdentity,
+    *,
+    source: str,
+    reference_tokens: frozenset[str],
+    fingerprint: str,
+) -> bool:
+    """True only if every field the identity states matches the job."""
+    if identity.source != source:
+        return False
+    if identity.source_reference is not None and identity.source_reference not in reference_tokens:
+        return False
+    return identity.fingerprint is None or identity.fingerprint == fingerprint
+
+
 class ApplicationDestination(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    job_id: int
+    # Stage 14D: `vacancy` is the stable identity and, when present, the
+    # ONLY binding to a job. `job_id` is a legacy, database-local hint kept
+    # for backward compatibility; it binds only artifacts that carry no
+    # `vacancy`. At least one of the two is required.
+    job_id: int | None = None
+    vacancy: VacancyIdentity | None = None
     kind: DestinationKind = "UNKNOWN"
     # An email address for EMAIL, an https URL for PORTAL/CAREERS_PAGE,
     # None for UNKNOWN.
@@ -147,6 +197,8 @@ class ApplicationDestination(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "ApplicationDestination":
+        if self.job_id is None and self.vacancy is None:
+            raise ValueError("a destination must name its vacancy (vacancy and/or job_id)")
         for text in (self.value, self.source_url):
             if text is not None and any(ch in text for ch in _CONTROL_CHARS):
                 raise ValueError("destination fields must not contain control characters")

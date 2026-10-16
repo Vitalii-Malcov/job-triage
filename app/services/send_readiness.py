@@ -39,6 +39,13 @@ to turn outbound on.
   persisted / board location outside the authoritative set is a conflict.
   No operator resolution is modeled in Stage 14A: a conflict stays NOT
   ready until the underlying data or evidence changes.
+- Contact data (Stage 14D): operator-confirmed `ApplicationIdentity` with
+  e-mail and phone whose name equals the trusted profile name; absent ->
+  `CONTACT_DATA_MISSING`.
+- Research binding (Stage 14D): a destination / location evidence item that
+  carries a stable `VacancyIdentity` binds by it (never by a database-local
+  job id); a mismatch raises `VacancyEvidenceMismatchError` (typed, so the
+  CLI reports BLOCKED instead of a traceback).
 
 Stage 14B must consume this module rather than re-implement any check.
 """
@@ -86,10 +93,13 @@ from app.models.application_destination import (
     EMPLOYER_SOURCES,
     ApplicationDestination,
     DestinationSourceType,
+    VacancyIdentity,
     is_channel_verified,
     is_email_send_ready,
     is_strict_https_url,
+    vacancy_identity_matches,
 )
+from app.models.application_identity import ApplicationIdentity, contact_data_problems
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
 from app.models.candidate_profile import (
     CandidateProfile,
@@ -99,10 +109,12 @@ from app.models.candidate_profile import (
 from app.models.cv_draft import TailoredCVDraft
 from app.models.review_package import ReviewPackage
 from app.services.bewerbung_reuse import bewerbung_draft_is_current
+from app.services.email_matching import extract_reference_tokens
 
 CHECK_TRUSTED_TITLE = "TRUSTED_CANDIDATE_TITLE"
 CHECK_RELEVANT_EVIDENCE = "RELEVANT_STRUCTURED_EVIDENCE"
 CHECK_REQUIRED_CV_DATA = "REQUIRED_CV_DATA"
+CHECK_CONTACT_DATA = "APPLICATION_CONTACT_DATA_COMPLETE"
 CHECK_EDUCATION_REQUIREMENT = "EDUCATION_REQUIREMENT_SATISFIED"
 CHECK_LANGUAGE_REQUIREMENT = "LANGUAGE_REQUIREMENT_SATISFIED"
 CHECK_APPROVED_REVISION = "APPROVED_BEWERBUNG_REVISION"
@@ -140,6 +152,24 @@ class SessionNotCleanError(ValueError):
     could flush them, so the read-only loader refuses."""
 
 
+class NoCandidateProfileError(ValueError):
+    """There is no candidate profile to evaluate."""
+
+
+DESTINATION_VACANCY_MISMATCH = "DESTINATION_VACANCY_MISMATCH"
+LOCATION_EVIDENCE_VACANCY_MISMATCH = "LOCATION_EVIDENCE_VACANCY_MISMATCH"
+
+
+class VacancyEvidenceMismatchError(ValueError):
+    """Stage 14D: a research artifact names a different vacancy than the
+    job being evaluated. Expected operator-input failure; `code` is one of
+    the *_VACANCY_MISMATCH constants."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
 class LocationEvidence(BaseModel):
     """What one source says about where the job is. `locations` are
     city names as published; comparison is casefolded.
@@ -154,6 +184,9 @@ class LocationEvidence(BaseModel):
     source_url: str | None = None
     locations: list[str] = Field(default_factory=list)
     authoritative: bool = False
+    # Stage 14D: stable vacancy binding (see VacancyIdentity). Optional for
+    # backward compatibility; when present it must match the job.
+    vacancy: VacancyIdentity | None = None
     note: str | None = Field(default=None, max_length=500)
     checked_at: datetime | None = None
 
@@ -213,6 +246,8 @@ class SendReadinessInputs:
     package_problems: tuple[str, ...] = (PACKAGE_CURRENCY_NOT_CHECKED,)
     destination: ApplicationDestination | None = None
     location_evidence: list[LocationEvidence] = field(default_factory=list)
+    # Stage 14D: operator-confirmed contact data (None -> CONTACT_DATA_MISSING).
+    application_identity: ApplicationIdentity | None = None
 
     @property
     def profile_report(self) -> ProfileReadinessReport:
@@ -506,6 +541,13 @@ def evaluate_send_readiness(inputs: SendReadinessInputs) -> SendReadinessResult:
         f"name={report.status(AREA_NAME)}",
     )
 
+    contact = contact_data_problems(inputs.application_identity, profile)
+    add(
+        CHECK_CONTACT_DATA,
+        not contact,
+        ", ".join(contact) if contact else "operator-confirmed e-mail and phone present",
+    )
+
     edu = education_problems(profile, match if pinned else None, cv)
     add(
         CHECK_EDUCATION_REQUIREMENT,
@@ -581,6 +623,25 @@ def evaluate_send_readiness(inputs: SendReadinessInputs) -> SendReadinessResult:
 # --- read-only loader --------------------------------------------------------
 
 
+def _identity_matches_job(identity: VacancyIdentity, job: JobRecord) -> bool:
+    return vacancy_identity_matches(
+        identity,
+        source=job.source,
+        reference_tokens=extract_reference_tokens(job.title, job.url),
+        fingerprint=job.fingerprint,
+    )
+
+
+def destination_matches_job(destination: ApplicationDestination, job: JobRecord) -> bool:
+    """Stage 14D: a destination with a stable `vacancy` identity binds by
+    that identity only (its `job_id`, if any, is a database-local hint from
+    the database it was researched in and is ignored); a legacy destination
+    without one still binds by `job_id`."""
+    if destination.vacancy is not None:
+        return _identity_matches_job(destination.vacancy, job)
+    return destination.job_id == job.id
+
+
 def load_send_readiness_inputs(
     db: Session,
     job: JobRecord,
@@ -588,6 +649,7 @@ def load_send_readiness_inputs(
     settings: Settings,
     destination: ApplicationDestination | None,
     location_evidence: list[LocationEvidence],
+    application_identity: ApplicationIdentity | None = None,
 ) -> SendReadinessInputs:
     """Read-only assembly through existing repositories.
 
@@ -600,8 +662,16 @@ def load_send_readiness_inputs(
             "session has pending ORM changes; the send-readiness loader reads only "
             "through a clean session"
         )
-    if destination is not None and destination.job_id != job.id:
-        raise ValueError("destination belongs to a different job")
+    if destination is not None and not destination_matches_job(destination, job):
+        raise VacancyEvidenceMismatchError(
+            DESTINATION_VACANCY_MISMATCH, "the destination names a different vacancy"
+        )
+    for item in location_evidence:
+        if item.vacancy is not None and not _identity_matches_job(item.vacancy, job):
+            raise VacancyEvidenceMismatchError(
+                LOCATION_EVIDENCE_VACANCY_MISMATCH,
+                "location evidence names a different vacancy",
+            )
 
     package: ReviewPackage | None = None
     cv: TailoredCVDraft | None = None
@@ -609,7 +679,7 @@ def load_send_readiness_inputs(
     with db.no_autoflush:
         record = get_candidate_profile(db)
         if record is None:
-            raise ValueError("no candidate profile exists")
+            raise NoCandidateProfileError("no candidate profile exists")
         profile = to_candidate_profile_response(record)
         review = get_latest_approved_review_for_job(db, job.id)
         if review is None:
@@ -653,6 +723,7 @@ def load_send_readiness_inputs(
         package_problems=problems,
         destination=destination,
         location_evidence=list(location_evidence),
+        application_identity=application_identity,
     )
 
 

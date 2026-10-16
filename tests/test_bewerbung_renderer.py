@@ -509,13 +509,19 @@ def test_employer_and_role_cannot_be_fabricated():
     assert "Senior Backend Engineer" not in "".join(p.text for p in rendered.body_paragraphs)
 
 
+# Stage 14D: a language is cited only when the vacancy gives a reason.
+_NAMES_GERMAN_AND_ENGLISH = "Gute Deutsch- und Englischkenntnisse."
+
+
 def test_language_level_stays_bound_to_its_own_record():
     """spec section 8/32: German B1 must render as B1; English B2 (a
     separate record) must render as B2 — selecting one must never leak the
     other's level."""
     cv_draft = _cv_draft()
     match = _match()
-    evidence, registry = build_evidence(cv_draft, match, "Python Developer", "Example GmbH", "")
+    evidence, registry = build_evidence(
+        cv_draft, match, "Python Developer", "Example GmbH", _NAMES_GERMAN_AND_ENGLISH
+    )
     german_id = next(
         c.id
         for c in evidence.allowed_claims
@@ -560,7 +566,9 @@ def test_native_wording_only_for_native_level():
         languages=[CVLanguageItem(source_id=3, language="German", level="B2", certificate=None)]
     )
     match = _match()
-    evidence, registry = build_evidence(cv_draft, match, "Python Developer", "Example GmbH", "")
+    evidence, registry = build_evidence(
+        cv_draft, match, "Python Developer", "Example GmbH", _NAMES_GERMAN_AND_ENGLISH
+    )
     claim_id = next(
         c.id for c in evidence.allowed_claims if c.source_entity == "candidate_language"
     )
@@ -584,7 +592,9 @@ def test_native_level_renders_native_wording():
         languages=[CVLanguageItem(source_id=3, language="German", level="NATIVE", certificate=None)]
     )
     match = _match()
-    evidence, registry = build_evidence(cv_draft, match, "Python Developer", "Example GmbH", "")
+    evidence, registry = build_evidence(
+        cv_draft, match, "Python Developer", "Example GmbH", _NAMES_GERMAN_AND_ENGLISH
+    )
     claim_id = next(
         c.id for c in evidence.allowed_claims if c.source_entity == "candidate_language"
     )

@@ -22,6 +22,13 @@ query_only = ON`. The session is always rolled back. Example:
         --destination-json docs/research/stage14a_e362b_destination.json \
         --location-json docs/research/stage14a_e362b_locations.json
 
+`--identity-json` (Stage 14D) holds the operator-confirmed
+`ApplicationIdentity` (contact data); omitting it yields
+CONTACT_DATA_MISSING, i.e. NOT ready. Expected failures (an artifact naming
+a different vacancy, a missing profile, an invalid input file) print a
+BLOCKED or refused line with a reason code and exit nonzero, never a
+traceback.
+
 `--destination-json` holds one `ApplicationDestination` object and
 `--location-json` a list of `LocationEvidence` objects (see
 app/models/application_destination.py and app/services/send_readiness.py).
@@ -41,6 +48,7 @@ import re
 import sys
 from pathlib import Path
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -50,8 +58,14 @@ from app.agents.profile_readiness import render_profile_readiness
 from app.core.config import Settings
 from app.db.models import JobRecord
 from app.models.application_destination import ApplicationDestination
+from app.models.application_identity import (
+    ApplicationIdentityInvalidError,
+    load_application_identity,
+)
 from app.services.send_readiness import (
     LocationEvidence,
+    NoCandidateProfileError,
+    VacancyEvidenceMismatchError,
     evaluate_send_readiness,
     load_send_readiness_inputs,
     render_send_readiness,
@@ -71,6 +85,11 @@ class UnsafeDatabaseUrlError(ValueError):
 
 class UnsafeInputPathError(ValueError):
     """The JSON input path is not a plain local filesystem path."""
+
+
+class InputInvalidError(ValueError):
+    """Stage 14D: an operator input file is unreadable or invalid. The
+    message names files/fields only, never values."""
 
 
 def _is_network_or_device_path(path: str) -> bool:
@@ -189,12 +208,59 @@ def _load_json(path: str | None):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _validation_fields(exc: ValidationError) -> str:
+    return ", ".join(
+        sorted({".".join(str(p) for p in error["loc"]) or "<root>" for error in exc.errors()})
+    )
+
+
+def _load_inputs(args) -> tuple:
+    """Parse the operator input files; `InputInvalidError` for any
+    unreadable/invalid file (Stage 14D: never a traceback)."""
+    try:
+        raw_destination = _load_json(args.destination_json)
+    except (OSError, ValueError):
+        raise InputInvalidError("destination file is unreadable or not JSON") from None
+    try:
+        destination = (
+            ApplicationDestination.model_validate(raw_destination) if raw_destination else None
+        )
+    except ValidationError as exc:
+        raise InputInvalidError(f"destination is invalid: {_validation_fields(exc)}") from None
+    try:
+        raw_locations = _load_json(args.location_json) or []
+    except (OSError, ValueError):
+        raise InputInvalidError("location file is unreadable or not JSON") from None
+    if not isinstance(raw_locations, list):
+        raise InputInvalidError("location file must hold a JSON list")
+    try:
+        evidence = [LocationEvidence.model_validate(e) for e in raw_locations]
+    except ValidationError as exc:
+        raise InputInvalidError(
+            f"location evidence is invalid: {_validation_fields(exc)}"
+        ) from None
+    try:
+        identity = load_application_identity(
+            Path(args.identity_json) if args.identity_json is not None else None
+        )
+    except ApplicationIdentityInvalidError as exc:
+        raise InputInvalidError(str(exc)) from None
+    return destination, evidence, identity
+
+
+def _blocked(code: str, detail: str, job_id: int) -> int:
+    print(f"READY_FOR_SEND_PACKAGE = NO (job_id={job_id})")
+    print(f"BLOCKED {code}: {detail}")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--job-id", type=int, required=True)
     parser.add_argument("--destination-json")
     parser.add_argument("--location-json")
+    parser.add_argument("--identity-json")
     args = parser.parse_args(argv)
 
     try:
@@ -203,18 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     try:
-        for json_path in (args.destination_json, args.location_json):
+        for json_path in (args.destination_json, args.location_json, args.identity_json):
             if json_path is not None:
                 validate_local_json_path(json_path)
     except UnsafeInputPathError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
 
-    raw_destination = _load_json(args.destination_json)
-    destination = (
-        ApplicationDestination.model_validate(raw_destination) if raw_destination else None
-    )
-    evidence = [LocationEvidence.model_validate(e) for e in _load_json(args.location_json) or []]
+    try:
+        destination, evidence, identity = _load_inputs(args)
+    except InputInvalidError as exc:
+        print(f"refused: INPUT_INVALID: {exc}", file=sys.stderr)
+        return 2
 
     engine = create_engine(database_url)
     event.listen(engine, "connect", _query_only)
@@ -225,13 +291,19 @@ def main(argv: list[str] | None = None) -> int:
                 if job is None:
                     print(f"job {args.job_id} not found", file=sys.stderr)
                     return 2
-                inputs = load_send_readiness_inputs(
-                    db,
-                    job,
-                    settings=Settings(),
-                    destination=destination,
-                    location_evidence=evidence,
-                )
+                try:
+                    inputs = load_send_readiness_inputs(
+                        db,
+                        job,
+                        settings=Settings(),
+                        destination=destination,
+                        location_evidence=evidence,
+                        application_identity=identity,
+                    )
+                except VacancyEvidenceMismatchError as exc:
+                    return _blocked(exc.code, "research artifact names a different vacancy", job.id)
+                except NoCandidateProfileError:
+                    return _blocked("NO_CANDIDATE_PROFILE", "no candidate profile exists", job.id)
                 print(render_profile_readiness(inputs.profile_report))
                 print()
                 result = evaluate_send_readiness(inputs)
