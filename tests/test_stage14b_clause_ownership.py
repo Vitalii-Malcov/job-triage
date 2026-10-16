@@ -152,7 +152,6 @@ def test_independent_generic_experience_clause_survives(line, typed, kept):
         "3+ years of professional experience with Python",
         "Mindestens drei Jahre Berufserfahrung im genannten Aufgabenbereich.",
         "Erfahrung mit Python",
-        "Praktische Erfahrung mit Python",
         # shared complement: one head noun coordinated with an evaluated one
         "Kenntnisse und Erfahrung in Python",
         "Fundierte Kenntnisse und Erfahrung im Umgang mit Python",
@@ -206,7 +205,7 @@ def test_category_embedded_technology_is_not_extracted():
     assert extraction.must_have_skills == []
     both = extract_skills(None, _profil("Python und Python-Frameworks (z. B. Django)"))
     assert both.must_have_skills == ["python"]
-    assert example_or_category_skills(_profil("Python-Frameworks (z. B. Django)")) == {
+    assert example_or_category_skills(None, _profil("Python-Frameworks (z. B. Django)")) == {
         "python",
         "django",
     }
@@ -451,18 +450,6 @@ GENERIC_PARTS = [
 CONNECTORS = [" und ", ", ", " sowie ", "; "]
 
 
-def _shares_complement(generic: str, typed: str, connector: str, generic_first: bool) -> bool:
-    """The one documented non-clause: a bare head noun coordinated with an
-    evaluated head-noun clause ("praktische Erfahrung und Kenntnisse in
-    Python" = practical experience and knowledge IN PYTHON)."""
-    return (
-        generic_first
-        and connector in (" und ", " sowie ")
-        and generic in ("praktische Erfahrung", "practical experience")
-        and typed.startswith("Kenntnisse")
-    )
-
-
 @pytest.mark.parametrize("typed", TYPED_PARTS)
 @pytest.mark.parametrize("generic", GENERIC_PARTS)
 @pytest.mark.parametrize("connector", CONNECTORS)
@@ -478,9 +465,8 @@ def test_every_independent_clause_is_typed_or_kept(typed, generic, connector, ge
     reqs = _by_norm(result)
     assert TYPED_PARTS[typed] in reqs
     others = [r for r in _all(result) if r.requirement_type == "OTHER"]
-    if _shares_complement(generic, typed, connector, generic_first):
-        assert others == []
-        return
+    # v7: every generic part is QUALIFIED experience, which is never shared
+    # away with a neighbouring head (see test_stage14b_clause_model_v7.py).
     assert [(o.normalized_requirement, o.importance, o.match_status) for o in others] == [
         (generic.casefold(), "REQUIRED", "UNKNOWN")
     ]
@@ -514,7 +500,7 @@ def test_no_typed_requirement_consumes_a_neighbouring_clause(first, second, conn
 # --- v6 cache identity -----------------------------------------------------------------
 
 
-def test_v5_row_is_kept_and_cache_lookup_uses_v6():
+def test_v5_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -555,10 +541,9 @@ def test_v5_row_is_kept_and_cache_lookup_uses_v6():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert ALGORITHM_VERSION == "v6"
-        assert result.algorithm_version == "v6"
+        assert result.algorithm_version == ALGORITHM_VERSION
         assert "mehrjährige Berufserfahrung" in [r.requirement for r in result.unknown_requirements]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v5", "v6"]
+        assert versions == ["v5", ALGORITHM_VERSION]

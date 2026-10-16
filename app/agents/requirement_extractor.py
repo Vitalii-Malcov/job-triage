@@ -51,10 +51,11 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
   reports the character span(s) of its segment it actually evaluated, so
   the matcher can keep any other material clause of the same line ("Deutsch
   B2 und Erfahrung mit SAP ABAP") instead of treating the line as consumed.
-- Stage 14B (matcher v6): `REQUIREMENT_HEAD` / `independent_clause_bounds`
-  are the shared clause-ownership model -- a degree's fields and a
-  duration's subjects come only from their own independent clause, and a
-  duration's subjects combine as ALL / ANY / AMBIGUOUS (`subject_mode`).
+- Stage 14B (matcher v6/v7): `REQUIREMENT_HEAD`, `CLAUSE_MODIFIER`,
+  `starts_requirement_clause` and `independent_boundaries` are THE shared
+  clause-ownership model -- a degree's fields and a duration's subjects come
+  only from their own independent clause, and a duration's subjects combine
+  as ALL / ANY / AMBIGUOUS (`subject_mode`).
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -157,38 +158,110 @@ _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )  # fmt: skip
 _CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)
-# v6: the shared clause-ownership vocabulary. A word naming a requirement of
-# its own -- experience, knowledge, a degree -- heads a clause; the matcher
-# never treats a clause headed by one as filler, and the extractors below
-# never let a typed requirement read fields/subjects across one.
-REQUIREMENT_HEAD = re.compile(
-    r"(?<!\w)[\w-]*?(?:erfahrung(?:en)?|kenntniss?e?n?|know-how|verständnis|"
-    r"experience|knowledge|expertise|understanding|proficiency|skills)(?!\w)",
+# v7: THE clause model, shared by every requirement type and the matcher's
+# residual net. One vocabulary says what can head an independent
+# requirement clause (experience, knowledge, a degree); one predicate
+# (`starts_requirement_clause`) says whether a text begins one, skipping
+# any number of `CLAUSE_MODIFIER` words ("sehr gute praktische
+# Kenntnisse"). No other head list exists (see the contract test).
+_HEAD_STEMS = (
+    r"erfahrung(?:en)?|kenntniss?e?n?|know-how|verständnis|expertise|"
+    r"experience|knowledge|understanding|proficiency|skills|"
+    r"studium|abschl(?:uss|üsse)|degree"
+)
+REQUIREMENT_HEAD = re.compile(r"(?<!\w)[\w-]*?(?:" + _HEAD_STEMS + r")(?!\w)", re.IGNORECASE)
+CLAUSE_MODIFIER = re.compile(
+    r"sehr|gut(?:e[nrs]?)?|fundiert(?:e[nrs]?)?|solide[nrs]?|tief(?:gehend)?(?:e[nrs]?)?|"
+    r"praktisch(?:e[nrs]?)?|ausgeprägt(?:e[nrs]?)?|mehrjährig(?:e[nrs]?)?|"
+    r"langjährig(?:e[nrs]?)?|einschlägig(?:e[nrs]?)?|relevant(?:e[nrs]?)?|"
+    r"umfassend(?:e[nrs]?)?|nachgewiesen(?:e[nrs]?)?|vertieft(?:e[nrs]?)?|"
+    r"erste[nrs]?|grundlegend(?:e[nrs]?)?|sicher(?:e[nrs]?)?|"
+    r"abgeschlossen(?:e[nrs]?)?|ein(?:e[nmrs]?)?|idealerweise|zudem|auch|"
+    r"good|strong|solid|deep|practical|professional|hands-on|proven|extensive|"
+    r"excellent|basic|working|sound|prior|previous|demonstrable|first|some|a|an|"
+    r"very|ideally|also",
     re.IGNORECASE,
 )
-_HEAD_LOOKAHEAD = (
-    r"(?=(?:[\w-]+\s+){0,2}?[\w-]*?(?:erfahrung(?:en)?|kenntniss?e?|experience|knowledge|"
-    r"expertise|studium|abschluss|degree)(?!\w))"
-)
-# v5/v6: "... und Erfahrung mit X", ", Kenntnisse in X", "(Erfahrung mit X)",
+_WORD = re.compile(r"[\w-]+")
+
+
+def starts_requirement_clause(text: str) -> bool:
+    """v7: whether `text` begins a requirement clause of its own -- its
+    first word that is not a `CLAUSE_MODIFIER` is a `REQUIREMENT_HEAD`."""
+    for word in _WORD.finditer(text):
+        token = word.group().strip("-")
+        if REQUIREMENT_HEAD.fullmatch(token):
+            return True
+        if not CLAUSE_MODIFIER.fullmatch(token):
+            return False
+    return False
+
+
+# v5-v7: "... und Erfahrung mit X", ", Kenntnisse in X", "(Erfahrung mit X)",
 # "und abgeschlossenes Studium" or ";" starts a NEW, independent
 # requirement -- a year count or degree never extends across it. "Bachelor-
 # und Masterabschluss" is one degree, not two clauses.
-_INDEPENDENT_CLAUSE = re.compile(
-    r"(?<!-)\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+" + _HEAD_LOOKAHEAD
-    + r"|\s*[,(]\s*" + _HEAD_LOOKAHEAD + r"|;",
-    re.IGNORECASE,
-)  # fmt: skip
+_BOUNDARY_CANDIDATE = re.compile(
+    r"(?<!-)\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+|\s*[,(]\s*|;", re.IGNORECASE
+)
+
+
+def independent_boundaries(segment: str) -> list[tuple[int, int]]:
+    """v7: (start, end) of every boundary in `segment` after which an
+    independent requirement clause starts."""
+    return [
+        match.span()
+        for match in _BOUNDARY_CANDIDATE.finditer(segment)
+        if match.group() == ";" or starts_requirement_clause(segment[match.end() :])
+    ]
 
 
 def independent_clause_bounds(segment: str, start: int, end: int) -> tuple[int, int]:
     """v6: the independent clause of `segment` containing [start, end)."""
-    # Whole-segment search: the boundary's lookahead reads past `start`.
-    clause_start = max(
-        (m.end() for m in _INDEPENDENT_CLAUSE.finditer(segment) if m.end() <= start), default=0
-    )
-    boundary = _INDEPENDENT_CLAUSE.search(segment, end)
-    return clause_start, boundary.start() if boundary else len(segment)
+    boundaries = independent_boundaries(segment)
+    clause_start = max((b_end for _, b_end in boundaries if b_end <= start), default=0)
+    clause_end = min((b_start for b_start, _ in boundaries if b_start >= end), default=len(segment))
+    return clause_start, clause_end
+
+
+# v7: an experience head whose wording adds hiring meaning beyond "knows the
+# technology" -- professional/practical/multi-year experience. Material
+# wherever no typed EXPERIENCE requirement evaluated it.
+_QUALIFIED_EXPERIENCE_HEAD = re.compile(
+    r"(?:berufs|praxis|arbeits|projekt)erfahrung(?:en)?", re.IGNORECASE
+)
+_EXPERIENCE_QUALIFIER = re.compile(
+    r"praktisch(?:e[nrs]?)?|mehrjährig(?:e[nrs]?)?|langjährig(?:e[nrs]?)?|"
+    r"einschlägig(?:e[nrs]?)?|nachgewiesen(?:e[nrs]?)?|"
+    r"practical|professional|hands-on|proven|extensive|work|industry|prior",
+    re.IGNORECASE,
+)
+_EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
+
+
+def qualified_experience_words(words: list[str]) -> list[int]:
+    """v7: indexes in `words` of qualified experience wording -- a
+    `_QUALIFIED_EXPERIENCE_HEAD` ("Berufserfahrung") or an experience head
+    with its qualifiers ("mehrjährige Erfahrung", "practical experience")."""
+    indexes: list[int] = []
+    for index, word in enumerate(words):
+        token = word.strip("-")
+        if not _EXPERIENCE_HEAD.fullmatch(token):
+            continue
+        # the head's own modifiers: the contiguous modifier words before it
+        first = index
+        while first > 0 and _modifies(words[first - 1]):
+            first -= 1
+        if _QUALIFIED_EXPERIENCE_HEAD.fullmatch(token) or any(
+            _EXPERIENCE_QUALIFIER.fullmatch(words[i].strip("-")) for i in range(first, index)
+        ):
+            indexes.extend(i for i in range(first, index + 1) if i not in indexes)
+    return indexes
+
+
+def _modifies(word: str) -> bool:
+    token = word.strip("-")
+    return bool(CLAUSE_MODIFIER.fullmatch(token) or _EXPERIENCE_QUALIFIER.fullmatch(token))
 
 
 # v5: degree wording an education requirement evaluates inside its clause.
@@ -208,11 +281,9 @@ _COMPARABLE_QUALIFICATION = re.compile(
 def _clause_end(segment: str, position: int) -> int:
     """v5: end of the clause continuing at `position` -- the first `,`,
     `;`, "sowie" or new independent "und Erfahrung/Kenntnisse ..." clause."""
-    ends = [
-        match.start()
-        for pattern in (_CLAUSE_BOUNDARY, _INDEPENDENT_CLAUSE)
-        if (match := pattern.search(segment, position)) is not None
-    ]
+    ends = [b_start for b_start, _ in independent_boundaries(segment) if b_start >= position]
+    if (match := _CLAUSE_BOUNDARY.search(segment, position)) is not None:
+        ends.append(match.start())
     return min(ends, default=len(segment))
 
 

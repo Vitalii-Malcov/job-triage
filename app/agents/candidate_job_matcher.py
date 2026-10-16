@@ -179,6 +179,24 @@ footer is no longer read as unevaluated required text):
   both, "Python oder Kubernetes" either, any other wording is never MATCH.
 - Degree fields come only from the degree's own clause.
 
+**v7 (Codex v6 review, one canonical clause model):**
+
+- `requirement_extractor.REQUIREMENT_HEAD` + `CLAUSE_MODIFIER` +
+  `starts_requirement_clause` are the only head vocabulary: degree and
+  duration boundaries (`independent_boundaries`), the residual net's head
+  test and its shared-complement test all use them, after any number of
+  modifiers ("und sehr gute praktische Kenntnisse in Informatik",
+  "and proficiency in Computer Science").
+- Qualified experience ("Berufserfahrung", "mehrjährige/praktische
+  Erfahrung", "professional/practical experience") is material in every
+  clause: a SKILL requirement for the same technology does not evaluate
+  it; only a typed EXPERIENCE duration span does. Only a BARE head shares
+  a complement ("Kenntnisse und Erfahrung in Python").
+- Titles use the description's category-only rule, so "Python-Frameworks
+  Engineer" cannot authorize a stale stored "python".
+- ANY durations are evaluated per alternative; years of different
+  alternatives are never summed.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -200,6 +218,8 @@ from app.agents.requirement_extractor import (
     extract_experience_requirement,
     extract_language_requirements,
     must_section_segments,
+    qualified_experience_words,
+    starts_requirement_clause,
 )
 from app.agents.skill_extractor import (
     _TECHNOLOGY_PATTERNS,
@@ -218,7 +238,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v6"
+ALGORITHM_VERSION = "v7"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -280,9 +300,9 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     # v4: a technology the vacancy names ONLY as an example ("z. B.
     # LangChain") belongs to its grouped requirement, so a stored list from
     # an older extractor must not resurrect it as an individual one. v6: nor
-    # one it names only inside a category ("Python-Frameworks").
+    # one it names only inside a category ("Python-Frameworks"), v7: title too.
     example_only = {
-        normalize_skill(name) for name in example_or_category_skills(job.description)
+        normalize_skill(name) for name in example_or_category_skills(job.title, job.description)
     } - {
         normalize_skill(t)
         for t in [*title_skills, *fresh.must_have_skills, *fresh.nice_to_have_skills]
@@ -594,19 +614,33 @@ def _match_experience_requirement(
         )
         # v6: "mit Python und Kubernetes" needs rows that use EVERY subject;
         # one subject's years never satisfy the whole quantified clause.
-        relevant = (
-            [
-                exp
-                for exp in using_any
-                if subject_norms <= {normalize_skill(t) for t in exp.technologies}
+        # v7: "Python oder Kubernetes" is evaluated per alternative -- each
+        # subject's own rows, merged only with each other; years of
+        # different alternatives are never summed.
+        if req.subject_mode == "ALL":
+            alternatives = [
+                [
+                    exp
+                    for exp in using_any
+                    if subject_norms <= {normalize_skill(t) for t in exp.technologies}
+                ]
             ]
-            if req.subject_mode == "ALL"
-            else using_any
-        )
+        else:
+            alternatives = [
+                [
+                    exp
+                    for exp in using_any
+                    if subject in {normalize_skill(t) for t in exp.technologies}
+                ]
+                for subject in sorted(subject_norms)
+            ]
+        # one row per experience even if it uses several alternatives
+        relevant = list({id(exp): exp for rows in alternatives for exp in rows}.values())
     else:
         requirement = (
             f"At least {req.years} year(s) of professional experience ({req.subject_text})"
         )
+        alternatives = []
         relevant = []
     evidence = [
         CandidateEvidenceRef(entity_type="EXPERIENCE", entity_id=exp.id, value=exp.job_title)
@@ -646,19 +680,8 @@ def _match_experience_requirement(
             if req.subjects
             else "No trusted professional experience is on file."
         )
-    elif any(
-        exp.start_date is None or (exp.end_date is None and not exp.is_current) for exp in relevant
-    ):
-        status = "UNKNOWN"
-        reason = "Relevant trusted experience has no complete dates; duration cannot be computed."
     else:
-        days = _merged_days([(exp.start_date, exp.end_date or as_of) for exp in relevant])
-        if days >= req.years * 365:
-            status = "MATCH"
-            reason = f"Relevant trusted experience covers {days // 365} year(s) or more."
-        else:
-            status = "PARTIAL"
-            reason = f"Relevant trusted experience covers {days} day(s), below {req.years} year(s)."
+        status, reason = _duration_status(alternatives, req.years, as_of)
     return RequirementMatch(
         requirement=requirement,
         normalized_requirement=f"experience-{req.years}y",
@@ -668,6 +691,36 @@ def _match_experience_requirement(
         candidate_evidence=evidence,
         job_evidence=[req.evidence_text],
         reason=reason,
+    )
+
+
+def _duration_status(alternatives: list[list], years: int, as_of: date) -> tuple[str, str]:
+    """v7: MATCH when ONE alternative's own merged rows reach `years`;
+    otherwise UNKNOWN when an alternative's rows lack dates (it might),
+    PARTIAL when some alternative has dated rows, MISSING never (callers
+    handle "no rows")."""
+    best_days = 0
+    undated = False
+    for rows in alternatives:
+        if not rows:
+            continue
+        if any(
+            exp.start_date is None or (exp.end_date is None and not exp.is_current) for exp in rows
+        ):
+            undated = True
+            continue
+        days = _merged_days([(exp.start_date, exp.end_date or as_of) for exp in rows])
+        if days >= years * 365:
+            return "MATCH", f"Relevant trusted experience covers {days // 365} year(s) or more."
+        best_days = max(best_days, days)
+    if undated:
+        return (
+            "UNKNOWN",
+            "Relevant trusted experience has no complete dates; duration cannot be computed.",
+        )
+    return (
+        "PARTIAL",
+        f"Relevant trusted experience covers {best_days} day(s), below {years} year(s).",
     )
 
 
@@ -786,24 +839,24 @@ def _is_head(token: str) -> bool:
     return REQUIREMENT_HEAD.fullmatch(token.strip("-")) is not None
 
 
-# v6: a bare head clause sharing its right neighbour's complement
-# ("Kenntnisse und Erfahrung in Python") -- never one that is itself a
-# distinct requirement ("Berufserfahrung", "mehrjährige ...").
-_INDEPENDENT_HEAD_PREFIXES = ("berufs", "praxis", "mehrjährig", "langjährig", "professional")
+def _qualified_experience(clause: _Clause) -> list[re.Match[str]]:
+    words = [t.group() for t in clause.tokens]
+    return [clause.tokens[i] for i in qualified_experience_words(words)]
 
 
-def _shares_right_complement(clause: _Clause, right: _Clause | None) -> bool:
-    if right is None or not clause.conjunction_after:
+def _shares_right_complement(clause: _Clause, right: _Clause | None, masked: str) -> bool:
+    """v6/v7: a BARE head clause ("Kenntnisse", "knowledge of") coordinated
+    with a right clause that itself starts with a requirement head
+    (`starts_requirement_clause`, the extractors' own predicate) shares that
+    clause's complement ("Kenntnisse und Erfahrung in Python"). A qualified
+    head on either side ("mehrjährige Erfahrung", "practical experience",
+    "Berufserfahrung") is never shared away -- the right side's qualifier is
+    kept by `_residual_clauses` itself."""
+    if right is None or not clause.conjunction_after or not right.tokens:
         return False
-    words = [t.group().casefold() for t in clause.tokens]
-    if any(_is_material(word) for word in words) or any(
-        word.startswith(_INDEPENDENT_HEAD_PREFIXES) for word in words
-    ):
+    if any(_is_material(t.group()) for t in clause.tokens) or _qualified_experience(clause):
         return False
-    first = next(
-        (t.group() for t in right.tokens if _is_material(t.group()) or _is_head(t.group())), None
-    )
-    return first is not None and _is_head(first)
+    return starts_requirement_clause(masked[right.tokens[0].start() : right.tokens[-1].end()])
 
 
 def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
@@ -817,7 +870,12 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     Berufserfahrung"); filler inside an owned clause ("Kenntnisse in
     Python") stays filler. Only a bare "Kenntnisse"/"Erfahrung" coordinated
     with an evaluated head ("Kenntnisse und Erfahrung in Python") is not a
-    clause of its own."""
+    clause of its own.
+
+    v7: qualified experience wording (`qualified_experience_words`:
+    "Berufserfahrung", "mehrjährige Erfahrung", "practical experience") is
+    material in EVERY clause -- a SKILL requirement for the same technology
+    does not evaluate it; only a typed EXPERIENCE span (masked) does."""
     chars = list(segment)
     for start, end in spans:
         for i in range(start, min(end, len(chars))):
@@ -841,11 +899,13 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     clauses: list[str] = []
     for index, clause in enumerate(pieces):
         kept = [t for t in clause.tokens if _is_material(t.group())]
+        kept.extend(t for t in _qualified_experience(clause) if t not in kept)
         if not kept and not clause.owned and any(_is_head(t.group()) for t in clause.tokens):
             right = pieces[index + 1] if index + 1 < len(pieces) else None
-            if not _shares_right_complement(clause, right):
+            if not _shares_right_complement(clause, right, masked):
                 kept = clause.tokens
         if kept:
+            kept.sort(key=lambda t: t.start())
             clauses.append(" ".join(masked[kept[0].start() : kept[-1].end()].split()))
     return clauses
 

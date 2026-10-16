@@ -503,13 +503,14 @@ def _non_requirement_mention_filter(segment: str):
     return skipped
 
 
-def example_or_category_skills(description: str | None) -> set[str]:
-    """v6: technologies the description names at least once only as an
-    example or inside a category name -- a stored list from an older
+def example_or_category_skills(title: str | None, description: str | None) -> set[str]:
+    """v6: technologies the title or description names at least once only as
+    an example or inside a category name -- a stored list from an older
     extractor must not resurrect them as individual requirements unless the
-    current extraction names them independently."""
+    current extraction names them independently (v7: titles included)."""
     names: set[str] = set()
-    for segment, _ in _contextual_segments(description or ""):
+    segments = [segment for segment, _ in _contextual_segments(description or "")]
+    for segment in [title or "", *segments]:
         skipped = _non_requirement_mention_filter(segment)
         for skill, pattern in _TECHNOLOGY_PATTERNS:
             if any(skipped(mention) for mention in pattern.finditer(segment)):
@@ -531,8 +532,11 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
 
     # A literal technology in the role title describes the candidate being
     # sought (for example, "Django Developer") and is therefore mandatory.
+    # v7: the same category-only rule as the description -- "Python-
+    # Frameworks Engineer" names no independent Python requirement.
+    title_skipped = _non_requirement_mention_filter(title or "")
     for skill, pattern in _TECHNOLOGY_PATTERNS:
-        if pattern.search(title or ""):
+        if any(not title_skipped(m) for m in pattern.finditer(title or "")):
             must_have.add(skill)
 
     for segment, inherited_context in _contextual_segments(description or ""):
