@@ -502,4 +502,4 @@ def test_algorithm_version_is_stamped():
     profile = _profile()
     job = _job()
     result = compute_match(job, profile, company_research_id=None)
-    assert result.algorithm_version == ALGORITHM_VERSION == "v5"
+    assert result.algorithm_version == ALGORITHM_VERSION == "v6"

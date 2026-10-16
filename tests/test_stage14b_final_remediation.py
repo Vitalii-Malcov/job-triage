@@ -491,7 +491,7 @@ def test_vanished_secondary_requirement_cannot_cross_the_threshold(complete, mix
 # --- v5 cache identity ---------------------------------------------------------------
 
 
-def test_v4_row_is_kept_and_cache_lookup_uses_v5():
+def test_v4_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -532,10 +532,9 @@ def test_v4_row_is_kept_and_cache_lookup_uses_v5():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert ALGORITHM_VERSION == "v5"
-        assert result.algorithm_version == "v5"
+        assert result.algorithm_version == ALGORITHM_VERSION
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v4", "v5"]
+        assert versions == ["v4", ALGORITHM_VERSION]
         assert db.scalar(select(func.count()).select_from(CandidateJobMatchRecord)) == 2

@@ -51,6 +51,10 @@ philosophy (CLAUDE.md: no hallucination, literal-mention only, no LLM):
   reports the character span(s) of its segment it actually evaluated, so
   the matcher can keep any other material clause of the same line ("Deutsch
   B2 und Erfahrung mit SAP ABAP") instead of treating the line as consumed.
+- Stage 14B (matcher v6): `REQUIREMENT_HEAD` / `independent_clause_bounds`
+  are the shared clause-ownership model -- a degree's fields and a
+  duration's subjects come only from their own independent clause, and a
+  duration's subjects combine as ALL / ANY / AMBIGUOUS (`subject_mode`).
 - Certification requirements (Stage 6B spec section 14's "certifications
   same rule") are NOT extracted in v1 — no reliable literal-mention pattern
   for "this vacancy requires certification X" exists yet in this codebase,
@@ -71,10 +75,12 @@ from app.agents.skill_extractor import (
     _classify_mention,
     _contextual_segments,
     _postfix_nice_scopes_all_mentions,
+    example_category_span,
     example_lists,
 )
 
 RequirementImportance = Literal["REQUIRED", "PREFERRED", "UNKNOWN"]
+SubjectMode = Literal["ALL", "ANY", "AMBIGUOUS"]
 
 _LANGUAGE_NAMES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("German", re.compile(r"(?<!\w)(?:german|deutsch)(?:kenntnisse)?(?!\w)", re.IGNORECASE)),
@@ -151,13 +157,40 @@ _EXPERIENCE_YEARS_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )  # fmt: skip
 _CLAUSE_BOUNDARY = re.compile(r",|;|\s+sowie\s+|\s+as\s+well\s+as\s+", re.IGNORECASE)
-# v5: "... und Erfahrung mit X" / "and experience with X" starts a NEW,
-# independent requirement -- a year count or degree never extends across it.
-_INDEPENDENT_CLAUSE = re.compile(
-    r"\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+(?=(?:[\w-]+\s+){0,2}?[\w-]*?"
-    r"(?:erfahrung(?:en)?|kenntniss?e?|experience|knowledge|expertise)(?!\w))",
+# v6: the shared clause-ownership vocabulary. A word naming a requirement of
+# its own -- experience, knowledge, a degree -- heads a clause; the matcher
+# never treats a clause headed by one as filler, and the extractors below
+# never let a typed requirement read fields/subjects across one.
+REQUIREMENT_HEAD = re.compile(
+    r"(?<!\w)[\w-]*?(?:erfahrung(?:en)?|kenntniss?e?n?|know-how|verständnis|"
+    r"experience|knowledge|expertise|understanding|proficiency|skills)(?!\w)",
     re.IGNORECASE,
 )
+_HEAD_LOOKAHEAD = (
+    r"(?=(?:[\w-]+\s+){0,2}?[\w-]*?(?:erfahrung(?:en)?|kenntniss?e?|experience|knowledge|"
+    r"expertise|studium|abschluss|degree)(?!\w))"
+)
+# v5/v6: "... und Erfahrung mit X", ", Kenntnisse in X", "(Erfahrung mit X)",
+# "und abgeschlossenes Studium" or ";" starts a NEW, independent
+# requirement -- a year count or degree never extends across it. "Bachelor-
+# und Masterabschluss" is one degree, not two clauses.
+_INDEPENDENT_CLAUSE = re.compile(
+    r"(?<!-)\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+" + _HEAD_LOOKAHEAD
+    + r"|\s*[,(]\s*" + _HEAD_LOOKAHEAD + r"|;",
+    re.IGNORECASE,
+)  # fmt: skip
+
+
+def independent_clause_bounds(segment: str, start: int, end: int) -> tuple[int, int]:
+    """v6: the independent clause of `segment` containing [start, end)."""
+    # Whole-segment search: the boundary's lookahead reads past `start`.
+    clause_start = max(
+        (m.end() for m in _INDEPENDENT_CLAUSE.finditer(segment) if m.end() <= start), default=0
+    )
+    boundary = _INDEPENDENT_CLAUSE.search(segment, end)
+    return clause_start, boundary.start() if boundary else len(segment)
+
+
 # v5: degree wording an education requirement evaluates inside its clause.
 _EDUCATION_WORD = re.compile(
     r"(?<!\w)[\w-]*?(?:bachelor|master|diplom|studium|studiengang|abschluss|degree|"
@@ -198,6 +231,11 @@ class ExperienceRequirement:
     evidence_text: str
     subjects: tuple[str, ...] = ()
     subject_text: str = ""
+    # v6: how several subjects combine -- "ALL" ("mit Python und
+    # Kubernetes": the duration needs every one), "ANY" ("Python oder
+    # Kubernetes": one alternative suffices), "AMBIGUOUS" (any other
+    # wording between them: never a definite MATCH). One subject is "ALL".
+    subject_mode: SubjectMode = "ALL"
     # v5: (start, end) in `evidence_text` this requirement evaluated -- only
     # the duration phrase when it names a technology subject (the rest of
     # the clause is evaluated or kept elsewhere), the whole clause when it
@@ -405,21 +443,15 @@ def extract_education_requirement(
         importance = _importance_for(
             degree_matches[0], must_markers, nice_markers, inherited_context, segment
         )
-        fields = degree_field_names(segment)
         # v5: what this requirement evaluated -- degree wording, field names
         # and "oder vergleichbar" inside the degree's own clause; anything
         # else on the line ("... und Kenntnisse in SAP ABAP") stays material.
+        # v6: the fields come from that clause only, so "Studium der
+        # Mathematik und Kenntnisse in Informatik" never asks for Informatik.
         degree = degree_matches[0]
         offset = len(segment) - len(segment.lstrip())
-        clause_start = max(
-            (m.end() for m in _INDEPENDENT_CLAUSE.finditer(segment, 0, degree.start())), default=0
-        )
-        boundary = _INDEPENDENT_CLAUSE.search(segment, degree.end())
-        semicolon = segment.find(";", degree.end())
-        clause_end = min(
-            boundary.start() if boundary else len(segment),
-            semicolon if semicolon != -1 else len(segment),
-        )
+        clause_start, clause_end = independent_clause_bounds(segment, degree.start(), degree.end())
+        fields = degree_field_names(segment[clause_start:clause_end])
         spans = tuple(
             (match.start() - offset, match.end() - offset)
             for pattern in (
@@ -482,6 +514,7 @@ def extract_experience_requirement(
         subjects = tuple(
             dict.fromkeys(name for name, pattern in _TECHNOLOGY_PATTERNS if pattern.search(clause))
         )
+        subject_mode = _subject_mode(clause)
         must_markers, nice_markers = _segment_markers(segment, inherited_context)
         importance = _importance_for(best, must_markers, nice_markers, inherited_context, segment)
         offset = len(segment) - len(segment.lstrip())
@@ -493,17 +526,37 @@ def extract_experience_requirement(
             subjects=subjects,
             subject_text=clause.strip(" .,;"),
             span=(best.start() - offset, span_end - offset),
+            subject_mode=subject_mode,
         )
     return None
 
 
-# Where a category phrase starts, scanning back from "(z. B." / "such as".
-_CATEGORY_START = re.compile(
-    r"(?:^|[,;:]|\s(?:und|oder|sowie|in|mit|von|im|and|or|with|of)\s)", re.IGNORECASE
-)
+_ALL_CONNECTOR = re.compile(r"(?:und|and|&)", re.IGNORECASE)
+_ANY_CONNECTOR = re.compile(r"(?:oder|or|bzw\.?)", re.IGNORECASE)
 
 
-_TRAILING_CONNECTOR = re.compile(r"\s+(?:wie|etwa|like)\s*$", re.IGNORECASE)
+def _subject_mode(clause: str) -> SubjectMode:
+    """v6: how the technologies of a quantified clause combine, from the
+    exact words between consecutive mentions. Only a pure "und"/"and" chain
+    is ALL and only a pure "oder"/"or" chain is ANY; a mix or any other
+    wording ("Python in Kubernetes-Umgebungen") is AMBIGUOUS."""
+    mentions: list[re.Match[str]] = sorted(
+        (m for _, pattern in _TECHNOLOGY_PATTERNS for m in pattern.finditer(clause)),
+        key=lambda m: m.start(),
+    )
+    gaps: list[str] = []
+    previous_end: int | None = None
+    for mention in mentions:
+        if previous_end is not None and mention.start() < previous_end:
+            continue
+        if previous_end is not None:
+            gaps.append(clause[previous_end : mention.start()].strip())
+        previous_end = mention.end()
+    if all(_ALL_CONNECTOR.fullmatch(gap) for gap in gaps):
+        return "ALL"
+    if all(_ANY_CONNECTOR.fullmatch(gap) for gap in gaps):
+        return "ANY"
+    return "AMBIGUOUS"
 
 
 def extract_example_groups(description: str | None) -> list[ExampleGroupRequirement]:
@@ -514,21 +567,18 @@ def extract_example_groups(description: str | None) -> list[ExampleGroupRequirem
     ("Python (z. B. Django)") is not a group -- that technology is already
     its own requirement. v5: a category merely containing one
     ("Python-Frameworks", "LLM-Frameworks") is a group of its own; the base
-    technology never stands in for it."""
+    technology never stands in for it (v6: nor is it extracted as a
+    requirement of its own from that category name, see
+    skill_extractor.extract_skills)."""
     results: list[ExampleGroupRequirement] = []
     for raw_segment, inherited_context in _contextual_segments(description or ""):
         segment = raw_segment.strip()
         for item in example_lists(segment):
-            head_end = item.marker_start
-            paren = segment.rfind("(", 0, item.marker_start)
-            if paren != -1 and not segment[paren + 1 : item.marker_start].strip():
-                head_end = paren
-            head = segment[:head_end].rstrip(" ,")
-            starts = list(_CATEGORY_START.finditer(head))
-            category_start = starts[-1].end() if starts else 0
-            category = _TRAILING_CONNECTOR.sub("", head[category_start:]).strip(" ,;:")
-            if not category or any(p.fullmatch(category) for _, p in _TECHNOLOGY_PATTERNS):
+            category_span = example_category_span(segment, item)
+            if category_span is None:
                 continue
+            span_start = category_span[0]
+            category = segment[span_start : category_span[1]]
             listed = segment[item.marker_end : item.list_end]
             examples = tuple(
                 dict.fromkeys(name for name, p in _TECHNOLOGY_PATTERNS if p.search(listed))
@@ -536,7 +586,6 @@ def extract_example_groups(description: str | None) -> list[ExampleGroupRequirem
             span_end = item.list_end
             if segment[span_end : span_end + 1] == ")":
                 span_end += 1
-            span_start = head.index(category, category_start)
             must_markers, nice_markers = _segment_markers(segment, inherited_context)
             anchor = re.compile(re.escape(category)).search(segment, span_start)
             # Same postfix rule extract_skills applies ("... sind von Vorteil").

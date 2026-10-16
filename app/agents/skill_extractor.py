@@ -446,13 +446,86 @@ def _in_example_list(mention: re.Match[str], lists: list[ExampleList]) -> bool:
     return any(item.marker_end <= mention.start() < item.list_end for item in lists)
 
 
+# Where a category phrase starts, scanning back from "(z. B." / "such as".
+_CATEGORY_START = re.compile(
+    r"(?:^|[,;:]|\s(?:und|oder|sowie|in|mit|von|im|and|or|with|of)\s)", re.IGNORECASE
+)
+_TRAILING_CONNECTOR = re.compile(r"\s+(?:wie|etwa|like)\s*$", re.IGNORECASE)
+# v6: "<technology>-Frameworks" names a category of that technology's
+# frameworks/libraries, not the technology itself.
+_CATEGORY_SUFFIX = re.compile(
+    r"-(?:frameworks?|bibliotheken|bibliothek|libraries|library)(?!\w)", re.IGNORECASE
+)
+
+
+def example_category_span(segment: str, item: ExampleList) -> tuple[int, int] | None:
+    """Stage 14B: (start, end) in `segment` of the category an example list
+    names examples of -- the phrase right before the opening parenthesis
+    (or the marker), back to the previous clause word ("und", "in", "mit",
+    ","). None when there is no category or the category IS a technology
+    ("Python (z. B. Django)": that technology is its own requirement)."""
+    head_end = item.marker_start
+    paren = segment.rfind("(", 0, item.marker_start)
+    if paren != -1 and not segment[paren + 1 : item.marker_start].strip():
+        head_end = paren
+    head = segment[:head_end].rstrip(" ,")
+    starts = list(_CATEGORY_START.finditer(head))
+    category_start = starts[-1].end() if starts else 0
+    category = _TRAILING_CONNECTOR.sub("", head[category_start:]).strip(" ,;:")
+    if not category or any(p.fullmatch(category) for _, p in _TECHNOLOGY_PATTERNS):
+        return None
+    start = head.index(category, category_start)
+    return start, start + len(category)
+
+
+def _names_only_a_category(
+    mention: re.Match[str], segment: str, categories: list[tuple[int, int]]
+) -> bool:
+    """v6: the mention is part of a category name, not an independent
+    requirement for the technology -- inside an example group's category
+    ("Python-Frameworks (z. B. Django)") or "<technology>-Frameworks"."""
+    if any(start <= mention.start() and mention.end() <= end for start, end in categories):
+        return True
+    return _CATEGORY_SUFFIX.match(segment, mention.end()) is not None
+
+
+def _non_requirement_mention_filter(segment: str):
+    examples = example_lists(segment)
+    categories = [
+        span for item in examples if (span := example_category_span(segment, item)) is not None
+    ]
+
+    def skipped(mention: re.Match[str]) -> bool:
+        return _in_example_list(mention, examples) or _names_only_a_category(
+            mention, segment, categories
+        )
+
+    return skipped
+
+
+def example_or_category_skills(description: str | None) -> set[str]:
+    """v6: technologies the description names at least once only as an
+    example or inside a category name -- a stored list from an older
+    extractor must not resurrect them as individual requirements unless the
+    current extraction names them independently."""
+    names: set[str] = set()
+    for segment, _ in _contextual_segments(description or ""):
+        skipped = _non_requirement_mention_filter(segment)
+        for skill, pattern in _TECHNOLOGY_PATTERNS:
+            if any(skipped(mention) for mention in pattern.finditer(segment)):
+                names.add(skill)
+    return names
+
+
 def extract_skills(title: str | None, description: str | None) -> SkillExtraction:
     """Extract only technologies that literally occur in title/description.
 
     Stage 14B: a technology named only inside an example list ("z. B.",
     "e.g.", ...) is not extracted as an individual requirement -- see
     `example_lists`; app.agents.requirement_extractor turns such a list
-    into one grouped requirement instead."""
+    into one grouped requirement instead. v6: neither is a technology named
+    only as part of a category ("Python-Frameworks"); an independent
+    mention elsewhere ("Python und Python-Frameworks") still counts."""
     must_have: set[str] = set()
     nice_to_have: set[str] = set()
 
@@ -471,10 +544,10 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
             mention for _, pattern in _TECHNOLOGY_PATTERNS for mention in pattern.finditer(segment)
         ]
         postfix_nice_scope = _postfix_nice_scopes_all_mentions(segment, mentions, must_markers)
-        examples = example_lists(segment)
+        skipped = _non_requirement_mention_filter(segment)
         for skill, pattern in _TECHNOLOGY_PATTERNS:
             for mention in pattern.finditer(segment):
-                if _in_example_list(mention, examples):
+                if skipped(mention):
                     continue
                 classification = _classify_mention(
                     mention,

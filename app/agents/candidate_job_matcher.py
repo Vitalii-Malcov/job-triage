@@ -162,6 +162,23 @@ footer is no longer read as unevaluated required text):
   a stale stored list; stored lists only add skills it does not name.
 - OTHER identity also ignores trailing punctuation.
 
+**v6 (Codex final review, clause ownership):**
+
+- One clause model shared by every requirement type
+  (`requirement_extractor.REQUIREMENT_HEAD` / `independent_clause_bounds`):
+  a clause headed by an experience/knowledge/degree word is independent,
+  and no typed requirement reads fields or subjects across it.
+- A clause no typed requirement evaluated is kept whole when a head word
+  heads it, even if every word is generic ("Deutsch B2 und mehrjährige
+  Berufserfahrung" -> "mehrjährige Berufserfahrung" REQUIRED/UNKNOWN).
+- A technology named only inside a category name ("Python-Frameworks (z.
+  B. Django)", "LLM-Frameworks") is not its own requirement, and a stale
+  stored list cannot resurrect it; an independent mention still is.
+- A duration ends at an independent parenthetical ("(Erfahrung mit
+  Kubernetes)"); "mit Python und Kubernetes" needs one experience using
+  both, "Python oder Kubernetes" either, any other wording is never MATCH.
+- Degree fields come only from the degree's own clause.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -175,6 +192,7 @@ from datetime import date
 
 from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import (
+    REQUIREMENT_HEAD,
     canonicalize_language_name,
     degree_field_names,
     extract_education_requirement,
@@ -183,7 +201,11 @@ from app.agents.requirement_extractor import (
     extract_language_requirements,
     must_section_segments,
 )
-from app.agents.skill_extractor import _TECHNOLOGY_PATTERNS, extract_skills
+from app.agents.skill_extractor import (
+    _TECHNOLOGY_PATTERNS,
+    example_or_category_skills,
+    extract_skills,
+)
 from app.models.candidate_job_match import (
     CandidateEvidenceRef,
     CandidateJobMatchData,
@@ -196,7 +218,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v5"
+ALGORITHM_VERSION = "v6"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -257,11 +279,10 @@ def _skill_requirements(job: JobMatchInput) -> list[tuple[str, str]]:
     fresh = extract_skills(None, job.description)
     # v4: a technology the vacancy names ONLY as an example ("z. B.
     # LangChain") belongs to its grouped requirement, so a stored list from
-    # an older extractor must not resurrect it as an individual one.
+    # an older extractor must not resurrect it as an individual one. v6: nor
+    # one it names only inside a category ("Python-Frameworks").
     example_only = {
-        normalize_skill(e)
-        for group in extract_example_groups(job.description)
-        for e in group.examples
+        normalize_skill(name) for name in example_or_category_skills(job.description)
     } - {
         normalize_skill(t)
         for t in [*title_skills, *fresh.must_have_skills, *fresh.nice_to_have_skills]
@@ -560,16 +581,28 @@ def _match_experience_requirement(
     if req is None:
         return None
     subject_norms = {normalize_skill(s) for s in req.subjects}
+    using_any = [
+        exp
+        for exp in trusted_experiences
+        if subject_norms & {normalize_skill(t) for t in exp.technologies}
+    ]
     if req.subjects:
+        joiner = {"ALL": " and ", "ANY": " or ", "AMBIGUOUS": ", "}[req.subject_mode]
         requirement = (
             f"At least {req.years} year(s) of professional experience with "
-            f"{', '.join(req.subjects)}"
+            f"{joiner.join(req.subjects)}"
         )
-        relevant = [
-            exp
-            for exp in trusted_experiences
-            if subject_norms & {normalize_skill(t) for t in exp.technologies}
-        ]
+        # v6: "mit Python und Kubernetes" needs rows that use EVERY subject;
+        # one subject's years never satisfy the whole quantified clause.
+        relevant = (
+            [
+                exp
+                for exp in using_any
+                if subject_norms <= {normalize_skill(t) for t in exp.technologies}
+            ]
+            if req.subject_mode == "ALL"
+            else using_any
+        )
     else:
         requirement = (
             f"At least {req.years} year(s) of professional experience ({req.subject_text})"
@@ -579,7 +612,26 @@ def _match_experience_requirement(
         CandidateEvidenceRef(entity_type="EXPERIENCE", entity_id=exp.id, value=exp.job_title)
         for exp in relevant
     ]
-    if not req.subjects and trusted_experiences:
+    covered = {normalize_skill(t) for exp in using_any for t in exp.technologies}
+    if req.subjects and req.subject_mode == "AMBIGUOUS" and using_any:
+        status = "UNKNOWN"
+        reason = (
+            f"The required experience ({req.subject_text!r}) names several technologies "
+            "without a clear 'and'/'or' relation; whether trusted experience satisfies it "
+            "needs human review (HUMAN_REVIEW_REQUIRED)."
+        )
+    elif req.subjects and req.subject_mode == "ALL" and not relevant and subject_norms <= covered:
+        evidence = [
+            CandidateEvidenceRef(entity_type="EXPERIENCE", entity_id=exp.id, value=exp.job_title)
+            for exp in using_any
+        ]
+        status = "UNKNOWN"
+        reason = (
+            "Every named technology is used in some trusted professional experience, but no "
+            "single experience uses all of them, so the combined duration cannot be "
+            "established (HUMAN_REVIEW_REQUIRED)."
+        )
+    elif not req.subjects and trusted_experiences:
         status = "UNKNOWN"
         reason = (
             f"The required experience ({req.subject_text!r}) names no technology that can be "
@@ -723,23 +775,78 @@ def _is_material(token: str) -> bool:
     return len(word) > 1 and word.casefold() not in _RESIDUAL_FILLER
 
 
+@dataclass(frozen=True)
+class _Clause:
+    tokens: list[re.Match[str]]
+    owned: bool  # some typed requirement evaluated part of it
+    conjunction_after: bool  # the boundary after it is "und"/"and"/..., not punctuation
+
+
+def _is_head(token: str) -> bool:
+    return REQUIREMENT_HEAD.fullmatch(token.strip("-")) is not None
+
+
+# v6: a bare head clause sharing its right neighbour's complement
+# ("Kenntnisse und Erfahrung in Python") -- never one that is itself a
+# distinct requirement ("Berufserfahrung", "mehrjährige ...").
+_INDEPENDENT_HEAD_PREFIXES = ("berufs", "praxis", "mehrjährig", "langjährig", "professional")
+
+
+def _shares_right_complement(clause: _Clause, right: _Clause | None) -> bool:
+    if right is None or not clause.conjunction_after:
+        return False
+    words = [t.group().casefold() for t in clause.tokens]
+    if any(_is_material(word) for word in words) or any(
+        word.startswith(_INDEPENDENT_HEAD_PREFIXES) for word in words
+    ):
+        return False
+    first = next(
+        (t.group() for t in right.tokens if _is_material(t.group()) or _is_head(t.group())), None
+    )
+    return first is not None and _is_head(first)
+
+
 def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     """v5: blank out `spans`, split the rest into clauses, and return each
-    clause's material words (from its first to its last material token)."""
+    clause's material words (from its first to its last material token).
+
+    v6 clause ownership: a clause none of whose text a typed requirement
+    evaluated is independent of them, so it is kept even when every word is
+    in `_RESIDUAL_FILLER` as long as a `REQUIREMENT_HEAD` word heads it
+    ("Deutsch B2 und mehrjährige Berufserfahrung" -> "mehrjährige
+    Berufserfahrung"); filler inside an owned clause ("Kenntnisse in
+    Python") stays filler. Only a bare "Kenntnisse"/"Erfahrung" coordinated
+    with an evaluated head ("Kenntnisse und Erfahrung in Python") is not a
+    clause of its own."""
     chars = list(segment)
     for start, end in spans:
         for i in range(start, min(end, len(chars))):
             chars[i] = " "
     masked = "".join(chars)
-    clauses: list[str] = []
+    pieces: list[_Clause] = []
     position = 0
     for boundary in [*_RESIDUAL_CLAUSE_BOUNDARY.finditer(masked), None]:
         end = boundary.start() if boundary is not None else len(masked)
-        material = [t for t in _TOKEN.finditer(masked, position, end) if _is_material(t.group())]
-        if material:
-            clauses.append(" ".join(masked[material[0].start() : material[-1].end()].split()))
+        pieces.append(
+            _Clause(
+                tokens=list(_TOKEN.finditer(masked, position, end)),
+                owned=any(
+                    span_start < end and position < span_end for span_start, span_end in spans
+                ),
+                conjunction_after=boundary is not None and boundary.group() not in ",;()",
+            )
+        )
         if boundary is not None:
             position = boundary.end()
+    clauses: list[str] = []
+    for index, clause in enumerate(pieces):
+        kept = [t for t in clause.tokens if _is_material(t.group())]
+        if not kept and not clause.owned and any(_is_head(t.group()) for t in clause.tokens):
+            right = pieces[index + 1] if index + 1 < len(pieces) else None
+            if not _shares_right_complement(clause, right):
+                kept = clause.tokens
+        if kept:
+            clauses.append(" ".join(masked[kept[0].start() : kept[-1].end()].split()))
     return clauses
 
 
