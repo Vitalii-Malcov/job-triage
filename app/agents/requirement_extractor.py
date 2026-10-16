@@ -180,12 +180,13 @@ REQUIREMENT_HEAD = re.compile(r"(?<!\w)[\w-]*?(?:" + _HEAD_STEMS + r")(?!\w)", r
 # v8: the head ANCHORS its clause. Whatever words stand between a boundary
 # and a known head are that head's own local modifiers ("umfangreiche",
 # "außerordentlich gute", "advanced working") -- no adjective list is
-# consulted, so an unfamiliar modifier can never hide a clause. The scan is
-# bounded: at most `MAX_HEAD_MODIFIERS` words, and it stops at a hard
-# separator, a coordinating conjunction or a preposition (a CLOSED word
-# class: a head behind one is some other phrase's complement, "und in der
-# Softwareentwicklung").
-MAX_HEAD_MODIFIERS = 5
+# consulted, so an unfamiliar modifier can never hide a clause. v9: the
+# scan is bounded STRUCTURALLY, never by a word count: it covers only the
+# local region up to a hard separator, a coordinating conjunction or a
+# preposition (a CLOSED word class: a head behind one is some other
+# phrase's complement, "und in der Softwareentwicklung"). The region is a
+# substring of one finite segment, so the scan always terminates; any
+# number of modifiers before the head is one clause.
 _HARD_SEPARATOR = re.compile(r"[,;():]|\.(?=\s|$)")
 _CLAUSE_STOP_WORD = re.compile(
     r"und|oder|sowie|bzw|sondern|aber|and|or|plus|but|nor|"
@@ -198,17 +199,17 @@ _WORD = re.compile(r"[\w-]+")
 
 
 def anchored_head(text: str) -> re.Match[str] | None:
-    """v8: the `REQUIREMENT_HEAD` word that anchors a clause starting at
-    `text`, or None -- the first word that is a head, reached before the
-    first hard separator through at most `MAX_HEAD_MODIFIERS` words none of
-    which is a conjunction or preposition."""
+    """v8/v9: the `REQUIREMENT_HEAD` word that anchors a clause starting
+    at `text`, or None -- the first word that is a head, reached before the
+    first hard separator through words none of which is a conjunction or
+    preposition (however many there are)."""
     separator = _HARD_SEPARATOR.search(text)
     end = separator.start() if separator else len(text)
-    for count, word in enumerate(_WORD.finditer(text, 0, end)):
+    for word in _WORD.finditer(text, 0, end):
         token = word.group().strip("-")
         if REQUIREMENT_HEAD.fullmatch(token):
             return word
-        if count >= MAX_HEAD_MODIFIERS or _CLAUSE_STOP_WORD.fullmatch(token):
+        if _CLAUSE_STOP_WORD.fullmatch(token):
             return None
     return None
 
@@ -253,6 +254,11 @@ _QUALIFIED_EXPERIENCE_HEAD = re.compile(
     r"(?:berufs|praxis|arbeits|projekt)erfahrung(?:en)?", re.IGNORECASE
 )
 _EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
+# v9: an experience head hyphenated to what precedes it ("Python-Erfahrung",
+# or "-Erfahrung" once the matcher masked the evaluated technology) is a
+# compound naming experience WITH that thing -- qualified like
+# "Berufserfahrung": a skill or project never establishes it.
+_COMPOUND_EXPERIENCE = re.compile(r"[\w-]*-(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
 # v8: words that sit before an experience head without qualifying it -- the
 # CLOSED classes of articles and discourse adverbs ("eine Erfahrung",
 # "idealerweise Erfahrung"). Anything else attached to the head qualifies it.
@@ -270,10 +276,12 @@ def qualified_experience_words(words: list[str]) -> list[int]:
     Erfahrung", "sehr gute praktische Erfahrung", "solid experience").
 
     v8: structural, not a qualifier list -- the modifier phrase is the
-    contiguous words right before the head (at most `MAX_HEAD_MODIFIERS`,
-    never across a conjunction or preposition); it qualifies the head when
-    any of its words is not an article or discourse adverb. A bare head
-    ("Kenntnisse und Erfahrung in Python") stays bare."""
+    contiguous words right before the head (v9: any number of them, never
+    across a conjunction, preposition or another head); it qualifies the
+    head when any of its words is not an article or discourse adverb. v9: a
+    hyphenated compound ("gute Python-Erfahrung", `_COMPOUND_EXPERIENCE`) is
+    qualified by its morphology alone. A bare head ("Kenntnisse und
+    Erfahrung in Python") stays bare."""
     indexes: list[int] = []
     for index, word in enumerate(words):
         token = word.strip("-")
@@ -282,13 +290,14 @@ def qualified_experience_words(words: list[str]) -> list[int]:
         first = index
         while (
             first > 0
-            and index - first < MAX_HEAD_MODIFIERS
             and not _CLAUSE_STOP_WORD.fullmatch(words[first - 1].strip("-"))
             and not REQUIREMENT_HEAD.fullmatch(words[first - 1].strip("-"))
         ):
             first -= 1
-        if _QUALIFIED_EXPERIENCE_HEAD.fullmatch(token) or any(
-            not _NON_QUALIFYING.fullmatch(words[i].strip("-")) for i in range(first, index)
+        if (
+            _QUALIFIED_EXPERIENCE_HEAD.fullmatch(token)
+            or _COMPOUND_EXPERIENCE.fullmatch(word)
+            or any(not _NON_QUALIFYING.fullmatch(words[i].strip("-")) for i in range(first, index))
         ):
             indexes.extend(i for i in range(first, index + 1) if i not in indexes)
     return indexes

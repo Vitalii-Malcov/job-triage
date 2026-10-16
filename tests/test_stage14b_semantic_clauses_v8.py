@@ -298,7 +298,6 @@ def test_a_known_head_anchors_its_clause_whatever_modifies_it(head):
         "in der Softwareentwicklung und Kenntnisse",  # a preposition: someone's complement
         "Mathematik oder Kenntnisse",  # a conjunction ends the scan
         "Mathematik, Kenntnisse",  # a hard separator ends the scan
-        "eins zwei drei vier fünf sechs Kenntnisse",  # bounded scan
         "Mathematik",
         "vergleichbare Qualifikation",
     ],
@@ -435,7 +434,7 @@ def test_python_title_is_still_a_python_requirement():
 # --- v8 cache identity -------------------------------------------------------------------
 
 
-def test_v7_row_is_kept_and_cache_lookup_uses_v8():
+def test_v7_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -476,10 +475,9 @@ def test_v7_row_is_kept_and_cache_lookup_uses_v8():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert matcher.ALGORITHM_VERSION == "v8"
-        assert result.algorithm_version == "v8"
+        assert result.algorithm_version == matcher.ALGORITHM_VERSION
         assert "Python-Frameworks" in [r.requirement for r in result.unknown_requirements]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v7", "v8"]
+        assert versions == ["v7", matcher.ALGORITHM_VERSION]

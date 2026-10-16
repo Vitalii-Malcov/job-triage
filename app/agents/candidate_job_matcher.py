@@ -200,8 +200,8 @@ footer is no longer read as unevaluated required text):
 **v8 (Codex v7 review, head-anchored clauses):**
 
 - A known `REQUIREMENT_HEAD` anchors its clause: after a boundary, the
-  words before the head (at most `MAX_HEAD_MODIFIERS`, never across a
-  conjunction or preposition) are its own modifiers whatever they are --
+  words before the head (never across a conjunction or preposition) are
+  its own modifiers whatever they are --
   "und umfangreiche Kenntnisse in Informatik" ends a Mathematik degree's
   fields; v7's modifier whitelist (`CLAUSE_MODIFIER`) is gone.
 - Experience is QUALIFIED when any non-article, non-discourse word is
@@ -212,6 +212,18 @@ footer is no longer read as unevaluated required text):
   it is named -- title ("Python-Frameworks Engineer", REQUIRED), description
   example group or bare token -- deduplicated by `category_key` with the
   description's examples kept; without examples it is always UNKNOWN.
+
+**v9 (known v8 gaps):**
+
+- The head scan and the qualified-experience modifier walk have no word
+  count limit (v8: 5); only structure ends them -- a hard separator, a
+  conjunction, a preposition or another head -- so a long chain of unknown
+  modifiers never merges a requirement into the previous clause.
+- A technology hyphenated to an experience head ("gute Python-Erfahrung",
+  "Python-Erfahrung") is no longer consumed by its technology span: the
+  technology is the SKILL requirement, the experience compound stays a
+  REQUIRED/UNKNOWN requirement (displayed with its technology) unless a
+  typed EXPERIENCE duration span owns it.
 
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
@@ -255,7 +267,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v8"
+ALGORITHM_VERSION = "v9"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -842,6 +854,9 @@ _TECHNOLOGY_CATEGORY_NOUNS: dict[str, frozenset[str]] = {
 }
 
 
+_EXPERIENCE_SUFFIX = re.compile(r"-[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
+
+
 def _technology_spans(segment: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for skill, pattern in _TECHNOLOGY_PATTERNS:
@@ -855,6 +870,11 @@ def _technology_spans(segment: str) -> list[tuple[int, int]]:
                 end < len(segment) and not segment[end].isspace() and segment[end] not in "),.;:/"
             ):
                 end += 1
+            # v9: "-Erfahrung" is an experience compound, not an attached
+            # part -- the technology alone is evaluated, the experience
+            # head stays visible to the residual net.
+            if _EXPERIENCE_SUFFIX.fullmatch(segment, mention.end(), end):
+                end = mention.end()
             attached = (
                 segment[start : mention.start()] + "-" + segment[mention.end() : end]
             ).split("-")
@@ -975,8 +995,25 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
                 kept = clause.tokens
         if kept:
             kept.sort(key=lambda t: t.start())
-            clauses.append(" ".join(masked[kept[0].start() : kept[-1].end()].split()))
+            clauses.append(_clause_text(segment, masked, kept))
     return clauses
+
+
+def _clause_text(segment: str, masked: str, kept: list[re.Match[str]]) -> str:
+    """The kept clause's text. v9: a hyphen-attached experience head
+    ("-Erfahrung" after a masked technology) is shown with that technology
+    ("gute Python-Erfahrung") -- the experience is WITH it."""
+    display = list(masked)
+    start = kept[0].start()
+    for token in kept:
+        if not token.group().startswith("-"):
+            continue
+        i = token.start()
+        while i > 0 and masked[i - 1] == " " and not segment[i - 1].isspace():
+            i -= 1
+            display[i] = segment[i]
+        start = min(start, i)
+    return " ".join("".join(display)[start : kept[-1].end()].split())
 
 
 def _other_identity(text: str) -> str:
