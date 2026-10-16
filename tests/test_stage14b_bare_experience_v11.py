@@ -164,7 +164,7 @@ def test_generic_experience_gets_no_technology_subject(line, kept):
 # --- v11 cache identity ----------------------------------------------------------------------
 
 
-def test_v10_row_is_kept_and_cache_lookup_uses_v11():
+def test_v10_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -205,10 +205,9 @@ def test_v10_row_is_kept_and_cache_lookup_uses_v11():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert matcher.ALGORITHM_VERSION == "v11"
-        assert result.algorithm_version == "v11"
+        assert result.algorithm_version == matcher.ALGORITHM_VERSION
         assert "Python experience" in [r.requirement for r in result.unknown_requirements]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v10", "v11"]
+        assert versions == ["v10", matcher.ALGORITHM_VERSION]

@@ -133,7 +133,7 @@ def test_post_match_valid_job_returns_200(client):
     assert response.status_code == 200
     body = response.json()
     assert body["job_id"] == job_id
-    assert body["algorithm_version"] == "v11"
+    assert body["algorithm_version"] == "v12"
     assert 0 <= body["overall_score"] <= 100
 
 

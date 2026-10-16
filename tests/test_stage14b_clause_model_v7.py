@@ -106,21 +106,29 @@ PYTHON_PROJECT_ONLY = _profile(
 
 
 @pytest.mark.parametrize(
-    "line",
-    ["Kenntnisse und Erfahrung in Python", "Knowledge and experience with Python"],
+    ("line", "kept"),
+    [
+        ("Kenntnisse und Erfahrung in Python", "erfahrung in python"),
+        ("Knowledge and experience with Python", "experience with python"),
+    ],
 )
-def test_bare_coordinated_heads_share_one_complement(line):
+def test_bare_coordinated_heads_share_one_complement(line, kept):
+    """v12: they share the SUBJECT, not the requirement -- the experience
+    WITH Python stays (was: one Python requirement, overall 100)."""
     result = _match(_profil(line), PYTHON_PROJECT_ONLY)
-    assert {n: r.match_status for n, r in _by_norm(result).items()} == {"python": "MATCH"}
-    assert result.overall_score == 100  # a genuine complete match
+    assert {n: r.match_status for n, r in _by_norm(result).items()} == {
+        "python": "MATCH",
+        kept: "UNKNOWN",
+    }
+    assert result.overall_score == 70
 
 
 QUALIFIED = [
-    ("Kenntnisse und mehrjährige Erfahrung in Python", "mehrjährige Erfahrung"),
-    ("Kenntnisse und praktische Erfahrung in Python", "praktische Erfahrung"),
+    ("Kenntnisse und mehrjährige Erfahrung in Python", "mehrjährige Erfahrung in Python"),
+    ("Kenntnisse und praktische Erfahrung in Python", "praktische Erfahrung in Python"),
     ("Berufserfahrung und Kenntnisse in Python", "Berufserfahrung"),
     ("Practical experience and knowledge of Python", "Practical experience"),
-    ("Knowledge and practical experience with Python", "practical experience"),
+    ("Knowledge and practical experience with Python", "practical experience with Python"),
     ("Professional experience and knowledge of Python", "Professional experience"),
     # reversed order
     ("Mehrjährige Erfahrung und Kenntnisse in Python", "Mehrjährige Erfahrung"),
@@ -149,7 +157,7 @@ def test_qualified_experience_never_disappears_with_a_shared_complement(line, ke
 def test_professional_work_does_not_silently_evaluate_the_qualification():
     profile = _profile(["Python"], [_experience(1, date(2018, 1, 1), None, ["Python"])])
     result = _match(_profil("Kenntnisse und mehrjährige Erfahrung in Python"), profile)
-    assert _by_norm(result)["mehrjährige erfahrung"].match_status == "UNKNOWN"
+    assert _by_norm(result)["mehrjährige erfahrung in python"].match_status == "UNKNOWN"
 
 
 def test_a_typed_duration_owns_its_qualified_experience():
@@ -465,7 +473,9 @@ def test_v6_row_is_kept_and_cache_lookup_uses_the_current_version():
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
         assert result.algorithm_version == matcher.ALGORITHM_VERSION
-        assert "mehrjährige Erfahrung" in [r.requirement for r in result.unknown_requirements]
+        assert "mehrjährige Erfahrung in Python" in [
+            r.requirement for r in result.unknown_requirements
+        ]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()

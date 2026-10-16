@@ -247,6 +247,18 @@ footer is no longer read as unevaluated required text):
 - "N years (of) <technology> experience" is a typed duration, so the
   phrase is owned by `experience-Ny` and never duplicated as OTHER.
 
+**v12 (bare experience with a technology complement):**
+
+- Experience WITH a technology is a requirement of its own, never the
+  SKILL requirement for it: "Erfahrung mit Python", "experience with
+  Python" keep a REQUIRED/UNKNOWN OTHER requirement naming Python (the
+  head takes the technology of its own clause as its complement).
+- A shared complement shares the SUBJECT, not the requirement: in
+  "Kenntnisse und Erfahrung in Python" only the knowledge head folds into
+  the Python SKILL requirement; the experience stays ("Erfahrung in
+  Python"), likewise "Erfahrung und Kenntnisse in Python" and "Python
+  knowledge and experience".
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -291,7 +303,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v11"
+ALGORITHM_VERSION = "v12"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -860,6 +872,8 @@ _RESIDUAL_CLAUSE_BOUNDARY = re.compile(
     r"(?<!-)[,;]|[()]|(?<!-)\s(?:und|oder|sowie|bzw\.?|and|or|plus|as\s+well\s+as)\s",
     re.IGNORECASE,
 )
+_LIST_SEPARATORS = re.compile(r"[\s,;/&]+|(?<!\w)(?:und|oder|and|or)(?!\w)", re.IGNORECASE)
+_TECHNOLOGY_PARENTHETICAL = re.compile(r"\s*\(([^()]*)\)")
 _LEADING_WORD = re.compile(r"(?<![\w-])([\w][\w-]*)\s+$")
 # v10: "<technology>- und " / "<technology>-, " before an experience compound.
 _HYPHEN_ELLIPSIS = re.compile(
@@ -955,8 +969,10 @@ class _Clause:
     owned: bool  # some typed requirement evaluated part of it
     conjunction_after: bool  # the boundary after it is "und"/"and"/..., not punctuation
     start: int = 0  # v10: where the clause starts in the segment
+    end: int = 0  # v12: where it ends
     # v11: starts of experience heads that directly follow an evaluated
-    # technology of this clause ("Python experience", "Python Erfahrung")
+    # technology of this clause ("Python experience", "Python Erfahrung");
+    # v12: or take one as their complement ("Erfahrung mit Python")
     compound: frozenset[int] = frozenset()
 
 
@@ -975,12 +991,18 @@ def _technology_compounds(
     tokens: list[re.Match[str]],
     technology: list[tuple[int, int]],
     clause_start: int,
+    clause_end: int,
 ) -> frozenset[int]:
     """v11: experience heads separated only by whitespace from an evaluated
     technology inside the same clause ("Python experience") -- the
     experience is WITH that technology, so masking the SKILL span must not
     turn it into a bare head. Never across the clause start ("Python;
     experience").
+
+    v12: likewise a head whose own clause names an evaluated technology
+    after it ("Erfahrung mit Python", "experience with Python") -- bare
+    experience WITH a technology is a requirement of its own, never the
+    SKILL requirement for that technology. Never past the clause end.
     """
     starts: set[int] = set()
     for token in tokens:
@@ -993,6 +1015,8 @@ def _technology_compounds(
         if clause_start < i < token.start() and any(
             t_start <= i - 1 < t_end for t_start, t_end in technology
         ):
+            starts.add(token.start())
+        elif any(token.end() <= t_start < clause_end for t_start, _ in technology):
             starts.add(token.start())
     return frozenset(starts)
 
@@ -1054,7 +1078,8 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
                 ),
                 conjunction_after=boundary is not None and boundary.group() not in ",;()",
                 start=position,
-                compound=_technology_compounds(segment, tokens, technology, position),
+                end=end,
+                compound=_technology_compounds(segment, tokens, technology, position, end),
             )
         )
         if boundary is not None:
@@ -1066,11 +1091,29 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
         kept.extend(t for t in qualified if t not in kept)
         if not kept and not clause.owned and any(_is_head(t.group()) for t in clause.tokens):
             right = pieces[index + 1] if index + 1 < len(pieces) else None
-            if not _shares_right_complement(clause, right, masked):
-                kept = clause.tokens
+            left = pieces[index - 1] if index > 0 else None
+            if _shares_right_complement(clause, right, masked):
+                # v12: only a KNOWLEDGE head folds into the shared complement's
+                # SKILL requirement; experience WITH it stays ("Erfahrung und
+                # Kenntnisse in Python").
+                if _has_experience_head(clause):
+                    clauses.append(
+                        _restored_text(
+                            segment, masked, technology, clause.tokens[0].start(), right.end
+                        )
+                    )
+                continue
+            shared = _left_shared_technology(left, clause, technology)
+            if shared is not None:
+                # v12: "Python knowledge and experience"
+                clauses.append(
+                    _restored_text(segment, masked, technology, shared, clause.tokens[-1].end())
+                )
+                continue
+            kept = clause.tokens
         if kept:
             kept.sort(key=lambda t: t.start())
-            clauses.append(_clause_text(segment, masked, kept, qualified, clause.start))
+            clauses.append(_clause_text(segment, masked, kept, qualified, clause.start, clause.end))
     return clauses
 
 
@@ -1080,6 +1123,7 @@ def _clause_text(
     kept: list[re.Match[str]],
     qualified: list[re.Match[str]],
     clause_start: int,
+    clause_end: int,
 ) -> str:
     """The kept clause's text.
 
@@ -1091,7 +1135,9 @@ def _clause_text(
     ("professional Python experience", "gute Python-Erfahrung"), one
     directly before it ("Python-Erfahrung", "Python professional
     experience"), and hyphen-ellipsis coordinations before that ("Python-
-    und Docker-Erfahrung", "Python-, Java- und Docker-Erfahrung")."""
+    und Docker-Erfahrung", "Python-, Java- und Docker-Erfahrung"). v12: and
+    technologies after the head inside its clause ("Erfahrung mit Python",
+    "practical experience with Python")."""
     technology = _technology_spans(segment)
     display = list(masked)
 
@@ -1101,6 +1147,7 @@ def _clause_text(
                 display[i] = segment[i]
 
     start = kept[0].start()
+    end = kept[-1].end()
     group: list[re.Match[str]] = []
     for token in sorted(qualified, key=lambda t: t.start()):
         group.append(token)
@@ -1110,6 +1157,20 @@ def _clause_text(
         group = []
         coordinated = False
         restore(phrase_start, token.start())
+        trailing = [t_end for t_start, t_end in technology if token.end() <= t_start < clause_end]
+        if trailing:
+            restore(token.end(), max(trailing))
+            end = max(end, max(trailing))
+            # "Erfahrung mit API-Entwicklung (REST)": a parenthetical holding
+            # nothing but evaluated technologies names the same subject
+            paren = _TECHNOLOGY_PARENTHETICAL.match(segment, end)
+            if paren is not None and not _LIST_SEPARATORS.sub(
+                "", masked[paren.start(1) : paren.end(1)]
+            ):
+                restore(paren.start(1), paren.end(1))
+                for i in (paren.start(1) - 1, paren.end(1)):
+                    display[i] = segment[i]
+                end = paren.end()
         while True:
             # a technology directly before the phrase (at most whitespace between)
             gap = phrase_start
@@ -1142,7 +1203,45 @@ def _clause_text(
                 continue
             break
         start = min(start, phrase_start)
-    return " ".join("".join(display)[start : kept[-1].end()].split())
+    return " ".join("".join(display)[start:end].split())
+
+
+def _has_experience_head(clause: _Clause) -> bool:
+    return any(EXPERIENCE_HEAD.fullmatch(t.group().strip("-")) for t in clause.tokens)
+
+
+def _left_shared_technology(
+    left: _Clause | None, clause: _Clause, technology: list[tuple[int, int]]
+) -> int | None:
+    """v12: "Python knowledge and experience" -- a bare experience clause
+    coordinated after a bare head clause whose only content is a
+    technology before that head shares that technology. Returns where the
+    technology starts, or None."""
+    if (
+        left is None
+        or not left.conjunction_after
+        or not left.tokens
+        or not _has_experience_head(clause)
+        or not all(_is_head(t.group()) for t in [*left.tokens, *clause.tokens])
+    ):
+        return None
+    before = [
+        t_start
+        for t_start, t_end in technology
+        if left.start <= t_start and t_end <= left.tokens[0].start()
+    ]
+    return min(before) if before else None
+
+
+def _restored_text(
+    segment: str, masked: str, technology: list[tuple[int, int]], start: int, end: int
+) -> str:
+    """v12: segment[start:end] with only its evaluated technologies restored."""
+    chars = [
+        segment[i] if any(t_start <= i < t_end for t_start, t_end in technology) else masked[i]
+        for i in range(start, end)
+    ]
+    return " ".join("".join(chars).split())
 
 
 def _other_identity(text: str) -> str:

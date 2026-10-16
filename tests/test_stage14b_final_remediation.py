@@ -134,17 +134,19 @@ def test_experience_line_binds_years_to_python_only():
 
 
 @pytest.mark.parametrize(
-    "line",
+    ("line", "others"),
     [
-        "Deutsch B2 und Erfahrung mit Docker",
-        "Abgeschlossenes Studium der Informatik und Kenntnisse in Docker",
-        "Mindestens 3 Jahre Berufserfahrung mit Python und Erfahrung mit Docker",
+        # v12: experience WITH Docker is its own requirement next to the skill
+        ("Deutsch B2 und Erfahrung mit Docker", ["Erfahrung mit Docker"]),
+        ("Abgeschlossenes Studium der Informatik und Kenntnisse in Docker", []),
+        ("Mindestens 3 Jahre Berufserfahrung mit Python und Erfahrung mit Docker",
+         ["Erfahrung mit Docker"]),
     ],
-)
-def test_recognized_secondary_skill_is_evaluated_without_an_other(line):
+)  # fmt: skip
+def test_recognized_secondary_skill_is_evaluated_without_an_other(line, others):
     result = _match(_profil(line))
     assert _by_norm(result)["docker"].importance == "REQUIRED"
-    assert _others(result) == []
+    assert _others(result) == others
 
 
 @pytest.mark.parametrize(
@@ -200,29 +202,36 @@ def test_fully_evaluated_typed_line_has_no_duplicate_other(line):
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
-        ("Erfahrung mit Python in der Softwareentwicklung", ["Softwareentwicklung"]),
+        # v12: the experience WITH Python keeps its domain in one requirement
+        ("Erfahrung mit Python in der Softwareentwicklung",
+         ["Erfahrung mit Python in der Softwareentwicklung"]),
         (
             "Kenntnisse in Git und professionelle Softwareentwicklung",
             ["professionelle Softwareentwicklung"],
         ),
         ("Kenntnisse in SAP ABAP (Python)", ["SAP ABAP"]),
         ("Kenntnisse in proprietärer XYZ-Plattform (Python)", ["proprietärer XYZ-Plattform"]),
-        ("Experience with Python in software development", ["software development"]),
+        ("Experience with Python in software development",
+         ["Experience with Python in software development"]),
     ],
-)
+)  # fmt: skip
 def test_domains_and_products_next_to_a_technology_are_kept(line, expected):
     assert _others(_match(_profil(line), _profile(["Python", "Git"]))) == expected
 
 
 def test_only_a_technology_own_category_noun_is_consumed():
-    # "API-Entwicklung (REST)" names REST's own category -- one requirement.
-    assert _others(_match(_profil("Erfahrung mit API-Entwicklung (REST)"))) == []
+    # "API-Entwicklung (REST)" names REST's own category -- one SKILL
+    # requirement; v12: the experience WITH it is the only other requirement.
+    result = _match(_profil("Erfahrung mit API-Entwicklung (REST)"))
+    assert _others(result) == ["Erfahrung mit API-Entwicklung (REST)"]
+    assert "rest" in _by_norm(result)
 
 
 def test_python_frameworks_token_is_not_the_python_technology():
     result = _match(_profil("Erfahrung mit Docker und Python-Frameworks"), _profile(["Python"]))
-    # v8: the category is its grouped requirement (no examples -> UNKNOWN), not OTHER
-    assert _others(result) == []
+    # v8: the category is its grouped requirement (no examples -> UNKNOWN), not OTHER;
+    # v12: the experience WITH Docker is the only OTHER
+    assert _others(result) == ["Erfahrung mit Docker"]
     group = next(r for r in result.unknown_requirements if r.requirement == "Python-Frameworks")
     assert (group.normalized_requirement, group.requirement_type) == (
         "group:python-frameworks",
@@ -484,8 +493,9 @@ PYTHON_WORK = _experience(1, date(2018, 1, 1), None, ["Python"])
             _profile(["Python"], [PYTHON_WORK]),
         ),
         (
-            "Erfahrung mit Python",
-            "Erfahrung mit Python in der Softwareentwicklung",
+            # v12: "Erfahrung mit Python" itself keeps an UNKNOWN experience row
+            "Kenntnisse in Python",
+            "Kenntnisse in Python in der Softwareentwicklung",
             _profile(["Python"], [PYTHON_WORK]),
         ),
     ],

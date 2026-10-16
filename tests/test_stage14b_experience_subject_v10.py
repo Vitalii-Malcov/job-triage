@@ -189,7 +189,6 @@ def test_technologies_of_another_clause_are_not_attached(line, kept):
     "line",
     [
         "Kenntnisse in Python- und Docker-Umgebungen",  # an ellipsis without experience
-        "Kenntnisse und Erfahrung in Python",  # bare shared complement
     ],
 )
 def test_no_experience_row_without_qualified_experience(line):

@@ -118,7 +118,9 @@ def test_qualified_and_compound_technology_mentions_keep_only_material_residual(
         "- Erfahrung mit API-Entwicklung (REST) und Git-basierter Softwareentwicklung.\n"
         "- Grundverständnis von Software-Engineering-Prinzipien (Testing, CI/CD)."
     )
+    # v12: the experience WITH "API-Entwicklung (REST)" is its own requirement
     assert [o.requirement for o in _others(_match(description, _profile(["Git"])))] == [
+        "Erfahrung mit API-Entwicklung (REST)",
         "Softwareentwicklung",
         "Software-Engineering-Prinzipien",
     ]

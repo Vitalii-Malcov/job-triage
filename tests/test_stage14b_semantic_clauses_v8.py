@@ -116,15 +116,18 @@ PYTHON_PROJECT_ONLY = _profile(
 )
 
 QUALIFIED = [
-    ("Kenntnisse und fundierte Erfahrung in Python", "fundierte Erfahrung"),
-    ("Kenntnisse und solide Erfahrung in Python", "solide Erfahrung"),
-    ("Kenntnisse und gute Erfahrung in Python", "gute Erfahrung"),
-    ("Kenntnisse und relevante Erfahrung in Python", "relevante Erfahrung"),
-    ("Kenntnisse und umfangreiche Erfahrung in Python", "umfangreiche Erfahrung"),
-    ("Kenntnisse und blorpige Erfahrung in Python", "blorpige Erfahrung"),  # no list has it
-    ("Knowledge and strong experience with Python", "strong experience"),
-    ("Knowledge and solid experience with Python", "solid experience"),
-    ("Knowledge and significant experience with Python", "significant experience"),
+    ("Kenntnisse und fundierte Erfahrung in Python", "fundierte Erfahrung in Python"),
+    ("Kenntnisse und solide Erfahrung in Python", "solide Erfahrung in Python"),
+    ("Kenntnisse und gute Erfahrung in Python", "gute Erfahrung in Python"),
+    ("Kenntnisse und relevante Erfahrung in Python", "relevante Erfahrung in Python"),
+    ("Kenntnisse und umfangreiche Erfahrung in Python", "umfangreiche Erfahrung in Python"),
+    (
+        "Kenntnisse und blorpige Erfahrung in Python",
+        "blorpige Erfahrung in Python",
+    ),  # no list has it
+    ("Knowledge and strong experience with Python", "strong experience with Python"),
+    ("Knowledge and solid experience with Python", "solid experience with Python"),
+    ("Knowledge and significant experience with Python", "significant experience with Python"),
     ("Fundierte Erfahrung und Kenntnisse in Python", "Fundierte Erfahrung"),  # reversed
 ]
 
@@ -148,9 +151,9 @@ def test_any_attached_modifier_qualifies_experience(line, kept):
 @pytest.mark.parametrize(
     ("line", "kept"),
     [
-        ("Kenntnisse und langjährige Erfahrung in Python", "langjährige Erfahrung"),
+        ("Kenntnisse und langjährige Erfahrung in Python", "langjährige Erfahrung in Python"),
         ("Kenntnisse und sehr gute praktische Erfahrung in Python",
-         "sehr gute praktische Erfahrung"),
+         "sehr gute praktische Erfahrung in Python"),
         ("Professional experience and knowledge of Python", "Professional experience"),
         ("Berufserfahrung und Kenntnisse in Python", "Berufserfahrung"),
         ("Praxiserfahrung und Kenntnisse in Python", "Praxiserfahrung"),
@@ -163,19 +166,22 @@ def test_previously_qualified_and_lexicalized_experience_stays_material(line, ke
 
 
 @pytest.mark.parametrize(
-    "line",
+    ("line", "kept"),
     [
-        "Kenntnisse und Erfahrung in Python",
-        "Kenntnisse und Erfahrung mit Python",
-        "Knowledge and experience with Python",
-        "Gute Kenntnisse und Erfahrung in Python",  # the modifier qualifies KNOWLEDGE
-        "Kenntnisse und eine Erfahrung in Python",  # an article is not a qualifier
+        ("Kenntnisse und Erfahrung in Python", "Erfahrung in Python"),
+        ("Kenntnisse und Erfahrung mit Python", "Erfahrung mit Python"),
+        ("Knowledge and experience with Python", "experience with Python"),
+        ("Gute Kenntnisse und Erfahrung in Python", "Erfahrung in Python"),
+        ("Kenntnisse und eine Erfahrung in Python", "eine Erfahrung in Python"),
     ],
 )
-def test_bare_experience_still_shares_the_complement(line):
+def test_bare_experience_shares_the_subject_not_the_requirement(line, kept):
+    """v12 (was: bare experience folds into the skill): the knowledge head
+    folds into the Python SKILL requirement, the experience WITH Python is
+    its own REQUIRED/UNKNOWN requirement."""
     result = _match(_profil(line), PYTHON_PROJECT_ONLY)
-    assert _statuses(result) == {"python": "MATCH"}
-    assert result.overall_score == 100
+    assert _statuses(result) == {"python": "MATCH", kept.casefold(): "UNKNOWN"}
+    assert result.overall_score == 70
 
 
 def test_qualified_experience_threshold_safety():

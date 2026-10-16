@@ -157,12 +157,13 @@ def test_a_typed_duration_owns_the_experience_without_a_duplicate(line):
 
 @pytest.mark.parametrize(
     "line",
+    # v12: "Erfahrung mit Python" -- experience WITH Python is its own OTHER
     ["Python-Kenntnisse", "Git-basierte Softwareentwicklung", "Erfahrung mit Python"],
 )
 def test_knowledge_and_attached_parts_still_belong_to_the_technology(line):
     result = _match(_profil(line), _skill_and_project("Python"))
     assert [r.requirement_type for r in _all(result)].count("OTHER") == (
-        1 if line.startswith("Git") else 0
+        0 if line == "Python-Kenntnisse" else 1
     )
 
 
@@ -230,7 +231,7 @@ def test_long_modifier_experience_stays_qualified(modifiers):
         _profil(f"Kenntnisse und {modifiers} Erfahrung in Python"), _skill_and_project("Python")
     )
     reqs = _by_norm(result)
-    assert set(reqs) == {"python", f"{modifiers} erfahrung".casefold()}
+    assert set(reqs) == {"python", f"{modifiers} erfahrung in python".casefold()}
     assert result.overall_score < _threshold()
 
 

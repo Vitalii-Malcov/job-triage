@@ -166,7 +166,7 @@ def test_e362b_stale_extraction_no_longer_scores_perfect():
     )
     reqs = _by_requirement(result)
 
-    assert result.algorithm_version == ALGORITHM_VERSION == "v11"
+    assert result.algorithm_version == ALGORITHM_VERSION == "v12"
     assert result.overall_score < 100
     assert result.required_skill_score < 100
     for supported in ("git", "python", "rest"):
@@ -217,9 +217,12 @@ def test_e362b_unevaluable_required_text_is_exposed():
     # v5: the software-development domain and the principles noun before
     # "(Testing, CI/CD)" are material clauses of mixed lines, not filler.
     # v7: "Praxiserfahrung im Umgang mit LLMs" -- practical experience is a
-    # qualification the LLM skill requirement does not evaluate.
+    # qualification the LLM skill requirement does not evaluate. v12: it keeps
+    # its technology subject, and the experience WITH "API-Entwicklung (REST)"
+    # is a requirement of its own.
     assert [r.requirement for r in other] == [
-        "Praxiserfahrung",
+        "Praxiserfahrung im Umgang mit LLMs",
+        "Erfahrung mit API-Entwicklung (REST)",
         "Softwareentwicklung",
         "Software-Engineering-Prinzipien",
         "Ausgeprägte kommunikative Stärken sowie die Bereitschaft zur Dokumentation.",

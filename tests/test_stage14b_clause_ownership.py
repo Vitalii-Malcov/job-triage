@@ -151,15 +151,26 @@ def test_independent_generic_experience_clause_survives(line, typed, kept):
         "Mindestens 3 Jahre Berufserfahrung mit Python",
         "3+ years of professional experience with Python",
         "Mindestens drei Jahre Berufserfahrung im genannten Aufgabenbereich.",
-        "Erfahrung mit Python",
-        # shared complement: one head noun coordinated with an evaluated one
-        "Kenntnisse und Erfahrung in Python",
-        "Fundierte Kenntnisse und Erfahrung im Umgang mit Python",
-        "Knowledge of and experience with Python",
     ],
 )
 def test_fully_evaluated_experience_line_has_no_duplicate_other(line):
     assert _others(_match(_profil(line))) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "kept"),
+    [
+        ("Erfahrung mit Python", "Erfahrung mit Python"),
+        # v12: a shared complement shares the subject, not the requirement --
+        # the knowledge head folds into the SKILL, the experience stays
+        ("Kenntnisse und Erfahrung in Python", "Erfahrung in Python"),
+        ("Fundierte Kenntnisse und Erfahrung im Umgang mit Python",
+         "Erfahrung im Umgang mit Python"),
+        ("Knowledge of and experience with Python", "experience with Python"),
+    ],
+)  # fmt: skip
+def test_experience_with_a_technology_is_one_other(line, kept):
+    assert [o.requirement for o in _others(_match(_profil(line)))] == [kept]
 
 
 def test_a_wholly_generic_line_is_one_other():
@@ -190,11 +201,14 @@ def test_language_plus_experience_cannot_score_like_language_alone():
         ("LLM-Frameworks (z. B. LangChain, LlamaIndex)", {"group:llm-frameworks"}),
         (
             "Erfahrung mit LLM und LLM-Frameworks (z. B. LangChain, LlamaIndex)",
-            {"llm", "group:llm-frameworks"},
+            {"llm", "group:llm-frameworks", "erfahrung mit llm"},  # v12: experience WITH LLM
         ),
         ("Java-Frameworks (z. B. Spring Boot)", {"group:java-frameworks"}),
         # v8: a bare category token is the same grouped requirement
-        ("Erfahrung mit Docker und Python-Frameworks", {"docker", "group:python-frameworks"}),
+        (
+            "Erfahrung mit Docker und Python-Frameworks",
+            {"docker", "group:python-frameworks", "erfahrung mit docker"},
+        ),
     ],
 )
 def test_category_name_never_creates_a_base_skill_requirement(line, expected):
