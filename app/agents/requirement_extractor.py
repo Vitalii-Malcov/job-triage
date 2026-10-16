@@ -223,9 +223,11 @@ def starts_requirement_clause(text: str) -> bool:
 # v5-v7: "... und Erfahrung mit X", ", Kenntnisse in X", "(Erfahrung mit X)",
 # "und abgeschlossenes Studium" or ";" starts a NEW, independent
 # requirement -- a year count or degree never extends across it. "Bachelor-
-# und Masterabschluss" is one degree, not two clauses.
+# und Masterabschluss" is one degree, not two clauses (v10: nor is
+# "Python-, Java- und Docker-Erfahrung" -- a hyphen ellipsis never ends one).
 _BOUNDARY_CANDIDATE = re.compile(
-    r"(?<!-)\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+|\s*[,(]\s*|;", re.IGNORECASE
+    r"(?<!-)\s+(?:und|sowie|and|plus|as\s+well\s+as)\s+|(?<!-)\s*,\s*|\s*\(\s*|;",
+    re.IGNORECASE,
 )
 
 
@@ -253,7 +255,7 @@ def independent_clause_bounds(segment: str, start: int, end: int) -> tuple[int, 
 _QUALIFIED_EXPERIENCE_HEAD = re.compile(
     r"(?:berufs|praxis|arbeits|projekt)erfahrung(?:en)?", re.IGNORECASE
 )
-_EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
+EXPERIENCE_HEAD = re.compile(r"[\w-]*?(?:erfahrung(?:en)?|experience)", re.IGNORECASE)
 # v9: an experience head hyphenated to what precedes it ("Python-Erfahrung",
 # or "-Erfahrung" once the matcher masked the evaluated technology) is a
 # compound naming experience WITH that thing -- qualified like
@@ -285,7 +287,7 @@ def qualified_experience_words(words: list[str]) -> list[int]:
     indexes: list[int] = []
     for index, word in enumerate(words):
         token = word.strip("-")
-        if not _EXPERIENCE_HEAD.fullmatch(token):
+        if not EXPERIENCE_HEAD.fullmatch(token):
             continue
         first = index
         while (

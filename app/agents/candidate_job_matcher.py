@@ -225,6 +225,18 @@ footer is no longer read as unevaluated required text):
   REQUIRED/UNKNOWN requirement (displayed with its technology) unless a
   typed EXPERIENCE duration span owns it.
 
+**v10 (experience subject preservation):**
+
+- A qualified experience requirement keeps the technologies it is about:
+  masking a SKILL span no longer generalizes "professional Python
+  experience" to "professional experience" or "Python- und Docker-
+  Erfahrung" to "Docker-Erfahrung". Its text and identity name every
+  technology subject; it stays REQUIRED/UNKNOWN (an OTHER requirement is
+  never MATCH), so a skill, a project or other-technology work never
+  establishes it.
+- A German hyphen ellipsis ("Python- und", "Python-,") is never a clause
+  boundary.
+
 **algorithm_version.** `"v1"` — bumped whenever this scoring/matching logic
 changes in a way that would produce a different result for the same
 inputs, so a cached analysis from a future v2 is never silently compared
@@ -238,6 +250,8 @@ from datetime import date
 
 from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import (
+    _CLAUSE_STOP_WORD,
+    EXPERIENCE_HEAD,
     REQUIREMENT_HEAD,
     canonicalize_language_name,
     category_key,
@@ -267,7 +281,7 @@ from app.models.candidate_job_match import (
 )
 from app.models.candidate_profile import CandidateProfile, is_usable_for_generation
 
-ALGORITHM_VERSION = "v9"
+ALGORITHM_VERSION = "v10"
 
 # Stage 14B: a GENERIC skill requirement that a more specific trusted
 # candidate skill may relate to, but never silently satisfies. A related
@@ -830,8 +844,16 @@ _RESIDUAL_FILLER = frozenset(
 )
 _TOKEN = re.compile(r"[^\s,;:()/.]+(?:\.[^\s,;:()/.]+)*")
 # v5: residual clauses -- split at punctuation, parentheses and conjunctions.
+# v10: never at a German hyphen ellipsis ("Python- und Docker-Erfahrung",
+# "Python-, Docker-Erfahrung"): the coordinated words share the last head.
 _RESIDUAL_CLAUSE_BOUNDARY = re.compile(
-    r"[,;()]|\s(?:und|oder|sowie|bzw\.?|and|or|plus|as\s+well\s+as)\s", re.IGNORECASE
+    r"(?<!-)[,;]|[()]|(?<!-)\s(?:und|oder|sowie|bzw\.?|and|or|plus|as\s+well\s+as)\s",
+    re.IGNORECASE,
+)
+_LEADING_WORD = re.compile(r"(?<![\w-])([\w][\w-]*)\s+$")
+# v10: "<technology>- und " / "<technology>-, " before an experience compound.
+_HYPHEN_ELLIPSIS = re.compile(
+    r"[^\s,;()]+-(?:\s*,\s*|\s+(?:und|oder|bzw\.?|sowie|and|or|&)\s+)$", re.IGNORECASE
 )
 # v5: hyphen parts that attach to a technology without naming anything else
 # ("Git-basierter", "Python-Kenntnisse", "CI/CD-Pipelines"); "Python-
@@ -922,6 +944,7 @@ class _Clause:
     tokens: list[re.Match[str]]
     owned: bool  # some typed requirement evaluated part of it
     conjunction_after: bool  # the boundary after it is "und"/"and"/..., not punctuation
+    start: int = 0  # v10: where the clause starts in the segment
 
 
 def _is_head(token: str) -> bool:
@@ -972,7 +995,14 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     masked = "".join(chars)
     pieces: list[_Clause] = []
     position = 0
-    for boundary in [*_RESIDUAL_CLAUSE_BOUNDARY.finditer(masked), None]:
+    # v10: the hyphen of an ellipsis may be masked with its technology, so the
+    # original segment decides ("Python- und Docker-Erfahrung" is one clause).
+    boundaries = [
+        b
+        for b in _RESIDUAL_CLAUSE_BOUNDARY.finditer(masked)
+        if b.group() in "()" or segment[b.start() - 1 : b.start()] != "-"
+    ]
+    for boundary in [*boundaries, None]:
         end = boundary.start() if boundary is not None else len(masked)
         pieces.append(
             _Clause(
@@ -981,6 +1011,7 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
                     span_start < end and position < span_end for span_start, span_end in spans
                 ),
                 conjunction_after=boundary is not None and boundary.group() not in ",;()",
+                start=position,
             )
         )
         if boundary is not None:
@@ -988,31 +1019,86 @@ def _residual_clauses(segment: str, spans: list[tuple[int, int]]) -> list[str]:
     clauses: list[str] = []
     for index, clause in enumerate(pieces):
         kept = [t for t in clause.tokens if _is_material(t.group())]
-        kept.extend(t for t in _qualified_experience(clause) if t not in kept)
+        qualified = _qualified_experience(clause)
+        kept.extend(t for t in qualified if t not in kept)
         if not kept and not clause.owned and any(_is_head(t.group()) for t in clause.tokens):
             right = pieces[index + 1] if index + 1 < len(pieces) else None
             if not _shares_right_complement(clause, right, masked):
                 kept = clause.tokens
         if kept:
             kept.sort(key=lambda t: t.start())
-            clauses.append(_clause_text(segment, masked, kept))
+            clauses.append(_clause_text(segment, masked, kept, qualified, clause.start))
     return clauses
 
 
-def _clause_text(segment: str, masked: str, kept: list[re.Match[str]]) -> str:
-    """The kept clause's text. v9: a hyphen-attached experience head
-    ("-Erfahrung" after a masked technology) is shown with that technology
-    ("gute Python-Erfahrung") -- the experience is WITH it."""
+def _clause_text(
+    segment: str,
+    masked: str,
+    kept: list[re.Match[str]],
+    qualified: list[re.Match[str]],
+    clause_start: int,
+) -> str:
+    """The kept clause's text.
+
+    v10: a qualified experience phrase keeps its technology subjects -- the
+    technology is evaluated as a SKILL requirement, but the experience is
+    WITH it, so masking the SKILL span must not generalize the experience
+    requirement. Restored (only evaluated technology spans, never before
+    the phrase's clause start): technologies inside the phrase
+    ("professional Python experience", "gute Python-Erfahrung"), one
+    directly before it ("Python-Erfahrung", "Python professional
+    experience"), and hyphen-ellipsis coordinations before that ("Python-
+    und Docker-Erfahrung", "Python-, Java- und Docker-Erfahrung")."""
+    technology = _technology_spans(segment)
     display = list(masked)
+
+    def restore(start: int, end: int) -> None:
+        for i in range(start, end):
+            if segment[i].isspace() or any(t_start <= i < t_end for t_start, t_end in technology):
+                display[i] = segment[i]
+
     start = kept[0].start()
-    for token in kept:
-        if not token.group().startswith("-"):
+    group: list[re.Match[str]] = []
+    for token in sorted(qualified, key=lambda t: t.start()):
+        group.append(token)
+        if not EXPERIENCE_HEAD.fullmatch(token.group().strip("-")):
             continue
-        i = token.start()
-        while i > 0 and masked[i - 1] == " " and not segment[i - 1].isspace():
-            i -= 1
-            display[i] = segment[i]
-        start = min(start, i)
+        phrase_start = group[0].start()
+        group = []
+        coordinated = False
+        restore(phrase_start, token.start())
+        while True:
+            # a technology directly before the phrase (at most whitespace between)
+            gap = phrase_start
+            while gap > clause_start and segment[gap - 1] in " \t":
+                gap -= 1
+            run = gap
+            while run > clause_start and masked[run - 1] == " " and not segment[run - 1].isspace():
+                run -= 1
+            if run < gap and any(t_start <= run < t_end for t_start, t_end in technology):
+                restore(run, phrase_start)
+                phrase_start = run
+                continue
+            # "<technology>- und " coordinated with it
+            ellipsis = _HYPHEN_ELLIPSIS.search(segment, clause_start, phrase_start)
+            if ellipsis is not None:
+                restore(ellipsis.start(), phrase_start)
+                phrase_start = ellipsis.start()
+                coordinated = True
+                continue
+            # a modifier of the whole coordination ("gute Python- und Docker-")
+            word = _LEADING_WORD.search(masked, clause_start, phrase_start)
+            if (
+                coordinated
+                and word is not None
+                and not _CLAUSE_STOP_WORD.fullmatch(word.group(1))
+                and not REQUIREMENT_HEAD.fullmatch(word.group(1))
+            ):
+                restore(word.start(), phrase_start)
+                phrase_start = word.start()
+                continue
+            break
+        start = min(start, phrase_start)
     return " ".join("".join(display)[start : kept[-1].end()].split())
 
 

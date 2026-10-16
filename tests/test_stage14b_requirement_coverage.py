@@ -166,7 +166,7 @@ def test_e362b_stale_extraction_no_longer_scores_perfect():
     )
     reqs = _by_requirement(result)
 
-    assert result.algorithm_version == ALGORITHM_VERSION == "v9"
+    assert result.algorithm_version == ALGORITHM_VERSION == "v10"
     assert result.overall_score < 100
     assert result.required_skill_score < 100
     for supported in ("git", "python", "rest"):

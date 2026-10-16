@@ -251,7 +251,7 @@ def test_head_scan_stops_only_at_structure(text):
 # --- v9 cache identity -----------------------------------------------------------------------
 
 
-def test_v8_row_is_kept_and_cache_lookup_uses_v9():
+def test_v8_row_is_kept_and_cache_lookup_uses_the_current_version():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -292,10 +292,9 @@ def test_v8_row_is_kept_and_cache_lookup_uses_v9():
 
         result = prepare_candidate_job_match(db, job.id, force_recompute=False)
 
-        assert matcher.ALGORITHM_VERSION == "v9"
-        assert result.algorithm_version == "v9"
+        assert result.algorithm_version == matcher.ALGORITHM_VERSION
         assert "gute Python-Erfahrung" in [r.requirement for r in result.unknown_requirements]
         versions = db.scalars(
             select(CandidateJobMatchRecord.algorithm_version).order_by(CandidateJobMatchRecord.id)
         ).all()
-        assert versions == ["v8", "v9"]
+        assert versions == ["v8", matcher.ALGORITHM_VERSION]
