@@ -63,8 +63,23 @@ on `JobRecord` is left exactly as it was.
   name both; INBOUND_MESSAGE never has a new status); STATUS_OVERRIDDEN
   requires a non-empty reason.
 
-The migration is additive. Its downgrade drops both tables (and therefore
-lifecycle history); use it only on disposable databases.
+**Append-only in the database (remediation migration `c8e4a2f6d1b9`).**
+SQLite `BEFORE UPDATE`/`BEFORE DELETE` triggers and a PostgreSQL
+`BEFORE UPDATE OR DELETE` row trigger refuse every change to an existing
+`application_events` row — including Core statements such as
+`session.execute(update(ApplicationEventRecord)…)` that bypass the ORM
+guards. `Base.metadata.create_all` installs the same triggers. (PostgreSQL
+`TRUNCATE` is a privileged maintenance statement row triggers do not see;
+the application never issues it — only the disposable-DB tests use it.)
+
+**Foreign keys on SQLite.** Every project-created SQLite engine (the app
+session engine and the Stage 15 CLI) runs `PRAGMA foreign_keys = ON`
+(`app/db/session_engine.py`), so an application with events cannot be
+deleted (ON DELETE RESTRICT), exactly as on PostgreSQL.
+
+Both migrations are additive. Downgrading `c8e4a2f6d1b9` removes only the
+triggers; downgrading `b5d2e8f4a1c7` drops both tables (and therefore
+lifecycle history) — use that only on disposable databases.
 
 ## 3. State machine
 
@@ -96,6 +111,10 @@ OTHER) and adds:
    prefixes removed (Re/AW/WG/Fwd/…);
 2. TECHNICAL_INTERVIEW_INVITATION (interview + technical/coding marker, or an
    explicit "Einladung zum technischen Interview / Fachgespräch");
+   A technical marker counts only when it is affirmative in its own clause:
+   "This is not a technical interview" / "Es handelt sich nicht um ein
+   technisches Gespräch" stay INTERVIEW_INVITATION; a "nicht" in another
+   sentence or clause does not suppress a real technical invitation;
 3. UNDER_REVIEW_NOTICE only for explicit present-tense review wording and
    only when no Stage 7B lifecycle category matched — a receipt saying
    "in Bearbeitung" stays a receipt, and the future-tense "Sobald wir Ihre
@@ -109,24 +128,43 @@ Ihrer Bewerbung", "Eingangsbestätigung Ihrer Bewerbung", subject shape
 HTML-only mail: the Stage 7A IMAP provider keeps `body_plain` = text/plain
 only (unchanged). Stage 15 added an in-memory `ParsedGmailMessage.body_html_text`
 (inert tag stripping, bounded, **never persisted**), used by the live IMAP
-path. Messages read from the stored `gmail_messages` table still have no
-HTML text and are classified from subject + plain body only.
+path. Only an UNNAMED, non-attachment `text/html` part is a body: a part
+with a filename is a file even when it says `Content-Disposition: inline`
+(e.g. an attached `old-rejection.html`), and is never classified. Messages
+read from the stored `gmail_messages` table still have no HTML text and are
+classified from subject + plain body only.
 
 ## 5. Email → status policy
 
-| classification | target | min. correlation |
+| classification | e-mail may apply | min. correlation |
 |---|---|---|
 | RECEIPT_CONFIRMATION | RECEIVED | MEDIUM |
 | UNDER_REVIEW_NOTICE | UNDER_REVIEW | MEDIUM |
 | INTERVIEW_INVITATION | INTERVIEW | MEDIUM |
 | TECHNICAL_INTERVIEW_INVITATION | TECHNICAL_INTERVIEW | MEDIUM |
-| OFFER | OFFER | **HIGH** (+ classifier HIGH) |
-| REJECTION | REJECTED | **HIGH** (+ classifier HIGH) |
+| OFFER | **nothing** — recorded, `operator_confirmation_required` | MEDIUM (to record) |
+| REJECTION | **nothing** — recorded, `operator_confirmation_required` | MEDIUM (to record) |
 | REQUEST_FOR_INFORMATION | — (sets `followup_required`) | MEDIUM |
 | OTHER_APPLICATION_MESSAGE / UNKNOWN | — | MEDIUM |
 
-Below MEDIUM nothing is written. MEDIUM+ without a lawful forward
-transition is recorded as an INBOUND_MESSAGE event (status unchanged).
+**E-mail never makes an application terminal.** Inbound mail is
+unauthenticated, and an unrelated sender who copies the company name and the
+public vacancy reference reaches HIGH correlation (Codex reproduction:
+`news@unrelated.example`, "Reference 20385-2347902-S. We regret to inform
+you…"). A REJECTION/OFFER message is therefore only recorded as an
+INBOUND_MESSAGE event (status unchanged) with
+`reason=TERMINAL_EMAIL_REQUIRES_OPERATOR_CONFIRMATION`,
+`operator_confirmation_required=True`, the proposed status in the event
+metadata and `followup_required=True` on the application. The operator then
+confirms with the audited CLI (`transition <id> REJECTED --actor … --reason
+… --apply`). The single lifecycle writer (`ApplicationTracker`) enforces the
+same rule independently: OFFER/REJECTED/WITHDRAWN only from origin OPERATOR
+with a non-empty reason; overrides are always OPERATOR; an application can
+never be created terminal.
+
+Below MEDIUM nothing is written. MEDIUM+ without a lawful forward,
+non-terminal transition is recorded as an INBOUND_MESSAGE event (status
+unchanged).
 
 ## 6. Correlation
 
@@ -188,9 +226,26 @@ python scripts/stage15_import_ald_application.py --database <db> --receipt-sourc
 ```
 
 Target guard: the database must already be at the Alembic head (no
-auto-upgrade); SQLite paths must be local files; the protected Stage 14B
-canonical DB (by SHA-256), Stage 13D paths and `ai_agent-db-1` are refused
-(exit 2).
+auto-upgrade); SQLite paths must be local files; Stage 13D paths and
+`ai_agent-db-1` are refused; the protected Stage 14B canonical DB
+`D:\AI_agent\stage14b_canonical_v12.db` is refused by **file identity**
+(normalized real path: relative, `..`, `/` vs `\`, case, symlink, junction;
+plus `samefile` for hard links) before it is opened — whatever its current
+contents or SHA-256 — and additionally by its historical SHA-256 (byte
+copies). Exit 2.
+
+### Runtime database (never the canonical DB)
+
+`D:\AI_agent\stage14b_canonical_v12.db` is immutable historical input.
+**Never upgrade it, never point Stage 15 at it, never write to it.** Stage 15
+lifecycle data lives in a separate runtime database built from a copy:
+
+1. verify the source: `certutil -hashfile D:\AI_agent\stage14b_canonical_v12.db SHA256`
+   must print `874d2cab…e35d` (or `sha256sum` in Git Bash);
+2. byte-copy it to a new file, e.g. `D:\AI_agent\runtime\application_tracker.db`;
+3. run `alembic upgrade head` with `DATABASE_URL` pointing at the **copy** only;
+4. run every Stage 15 command (`--database <copy>`) against the copy;
+5. re-check the canonical SHA-256 afterwards — it must be unchanged.
 
 ## 9. Safety constraints
 
@@ -211,8 +266,9 @@ canonical DB (by SHA-256), Stage 13D paths and `ai_agent-db-1` are refused
   in the text.
 - Classified RECEIPT_CONFIRMATION (rule PHRASE_MATCH:APPLICATION_RECEIVED),
   correlated MEDIUM [DOMAIN, COMPANY].
-- On a scratch copy of the canonical DB upgraded to `b5d2e8f4a1c7`
-  (canonical file itself unchanged, SHA-256 `874d2cab…e35d`):
+- On a byte copy of the canonical DB (the copy upgraded to head; the
+  canonical file itself never opened for writing, SHA-256 `874d2cab…e35d`
+  unchanged):
   1. `CREATED → SUBMITTED` 2026-10-17T14:02:50Z (origin PORTAL, evidence hash of the portal confirmation)
   2. `SUBMITTED → RECEIVED` 2026-10-17T14:06:17Z (origin GMAIL, keyed by the receipt message)
   - current status RECEIVED, 2 events; bootstrap re-run and two Gmail
@@ -222,17 +278,18 @@ canonical DB (by SHA-256), Stage 13D paths and `ai_agent-db-1` are refused
 
 ## 11. Known limitations
 
-- No sender authentication: a forged message that matches domain + role could
-  record OFFER/REJECTED. Mitigated by the HIGH-only rule for terminal states,
-  the manual override path and visible history; a real fix needs
-  Authentication-Results evidence (backlog).
+- No sender authentication: a forged message can still be *recorded* as
+  correspondence and can move an application along the NON-terminal ladder
+  (RECEIVED … TECHNICAL_INTERVIEW) when it imitates the employer well
+  enough; it can never make it terminal (operator confirmation). A real fix
+  needs Authentication-Results evidence (backlog). Every event is visible in
+  the history and correctable with an override.
 - HTML-only messages are fully classifiable on the live IMAP path only; the
   stored `gmail_messages` path sees subject + plain text.
-- The production/canonical database is still at `a7c3e9f1b2d4`. Using Stage
-  15 there requires an explicit, operator-approved `alembic upgrade head`,
-  which changes the canonical DB's SHA-256 (new approval for the Stage 14D
-  `serve --expect-sha256` gate). Until then the Stage 14D preflight of the
-  old canonical DB reports "database at head: NO".
+- The Stage 14B canonical DB stays at `a7c3e9f1b2d4` permanently (it is
+  immutable input). The Stage 14D preflight of that file therefore reports
+  "database at head: NO" against the newer code; Stage 15 runs against a
+  separate runtime copy (section 8), never against the canonical file.
 - `employer_domains` are operator-confirmed per application; an employer
   writing from an undeclared ATS domain correlates via COMPANY + ROLE only.
 - Follow-up dates are informational; nothing reminds or sends.

@@ -8,6 +8,19 @@ PostgreSQL URL (`--database-url`). The tool refuses the protected Stage 14B
 canonical database, Stage 13D paths and `ai_agent-db-1`, and any database
 not at head (upgrade explicitly; there is no auto-upgrade).
 
+## Never use the canonical database
+
+`D:\AI_agent\stage14b_canonical_v12.db` is immutable. Do not upgrade it and
+do not pass it to these tools (they refuse it by path identity and by hash).
+Create the runtime database from a verified byte copy instead:
+
+    sha256sum D:/AI_agent/stage14b_canonical_v12.db      # must be 874d2cab…e35d
+    cp D:/AI_agent/stage14b_canonical_v12.db D:/AI_agent/runtime/application_tracker.db
+    DATABASE_URL=sqlite:///D:/AI_agent/runtime/application_tracker.db python -m alembic upgrade head
+    sha256sum D:/AI_agent/stage14b_canonical_v12.db      # still 874d2cab…e35d
+
+Use `--database D:/AI_agent/runtime/application_tracker.db` everywhere below.
+
 ## List applications
 
     python scripts/stage15_application_tracker.py --database <db> list
@@ -45,6 +58,19 @@ network).
 
 Each message is one transaction: event + status projection, keyed by the
 message. Re-running is safe.
+
+## Confirm a rejection or offer (operator only)
+
+E-mail never sets REJECTED or OFFER. Such a message appears with
+`operator_confirmation_required=True`, `proposed_status=REJECTED|OFFER` and
+`reason=TERMINAL_EMAIL_REQUIRES_OPERATOR_CONFIRMATION`; the application keeps
+its status and gets `followup_required=True`. Read the actual mail in Gmail,
+then confirm it yourself:
+
+    python scripts/stage15_application_tracker.py --database <db> transition 1 REJECTED --actor <you> --reason "Absage per E-Mail vom 2026-10-30, im Postfach geprüft" --apply
+
+Terminal statuses (OFFER, REJECTED, WITHDRAWN) always need `--actor` and a
+non-empty `--reason` and are recorded with origin OPERATOR.
 
 ## Manually correct a state
 
