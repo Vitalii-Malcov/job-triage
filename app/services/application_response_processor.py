@@ -119,9 +119,13 @@ def inbound_from_record(record: GmailMessageRecord) -> InboundMessage:
     )
 
 
-def _thread_hashes(db: Session) -> dict[int, frozenset[str]]:
+def _thread_hashes(db: Session, message: InboundMessage) -> dict[int, frozenset[str]]:
+    """Applications whose already-recorded Gmail events are the messages this
+    one replies to: an indexed lookup of the referenced messages' own
+    correlation keys (bounded by the provider's MAX_REFERENCES), never a
+    scan of all events."""
     by_app: dict[int, set[str]] = {}
-    for event in repo.list_events_with_correlation_prefix(db, "gmail:"):
+    for event in repo.get_events_by_correlation_keys(db, message.reply_correlation_keys):
         value = json.loads(event.metadata_json or "{}").get("message_id_hash")
         if value:
             by_app.setdefault(event.application_id, set()).add(value)
@@ -170,18 +174,13 @@ class ApplicationResponseProcessor:
         only_application_ids: frozenset[int] | None,
     ) -> ResponseTrackingResult:
         ref = message.correlation_key.removeprefix("gmail:")[:12]
-        applications = [
-            a
-            for a in self.tracker.list_applications(db)
-            if a.submitted_at is not None
-            and (only_application_ids is None or a.id in only_application_ids)
-        ]
-        by_id = {a.id: a for a in applications}
+        # Complete candidate set via a batched keyset scan (bounded memory);
+        # never a single page that could silently drop application #201+.
         correlation = correlate_message(
             message,
-            applications,
+            self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
             applicant_addresses=applicant_addresses,
-            thread_hashes_by_application=_thread_hashes(db),
+            thread_hashes_by_application=_thread_hashes(db, message),
         )
         base = dict(
             message_ref=ref,
@@ -214,7 +213,7 @@ class ApplicationResponseProcessor:
                 duplicate=False,
                 reason=correlation.reason,
             )
-        application: Application = by_id[correlation.application_id]
+        application: Application = self.tracker.get_application(db, correlation.application_id)
         logger.info(
             "gmail_correlated message_ref=%s application_id=%s confidence=%s signals=%s",
             ref,

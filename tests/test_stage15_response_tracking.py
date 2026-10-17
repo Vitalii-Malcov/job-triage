@@ -108,7 +108,7 @@ def _msg(
     *,
     sender=fx.ALD_RECEIPT_FROM,
     display=fx.ALD_RECEIPT_DISPLAY_NAME,
-    key="mid:ald-receipt",
+    key="mid:ald-receipt@ald-vt.de",
     at=fx.ALD_RECEIPT_ARRIVAL,
     html=False,
     replies=(),
@@ -388,7 +388,7 @@ def test_thread_reply_supports_correlation(db):
     result = correlate_message(
         reply,
         [ApplicationTracker().get_application(db, ald.id)],
-        thread_hashes_by_application=_thread_hashes(db),
+        thread_hashes_by_application=_thread_hashes(db, reply),
     )
     assert result.signals == ("DOMAIN", "THREAD") and result.confidence == "MEDIUM"
 

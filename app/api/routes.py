@@ -477,11 +477,17 @@ def patch_job_status(
 )
 def get_applications(
     status: ApplicationLifecycleStatus | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
+    after_id: int | None = Query(default=None, ge=0, le=MAX_OFFSET),
     db: Session = Depends(get_db),
 ) -> list[Application]:
-    """Stage 15: read-only application lifecycle list (no mutation endpoint
-    exists; status changes go through the operator CLI)."""
-    return ApplicationTracker().list_applications(db, (status,) if status else None)
+    """Stage 15: read-only application lifecycle list, one keyset page in id
+    order (`after_id` = last id of the previous page; a full page means more
+    may exist). No mutation endpoint exists; status changes go through the
+    operator CLI."""
+    return ApplicationTracker().list_applications(
+        db, (status,) if status else None, limit=limit, after_id=after_id
+    )
 
 
 @router.get(

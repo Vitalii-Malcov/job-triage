@@ -90,6 +90,16 @@ class InboundMessage:
         return stable_hash(_norm_id(self.message_id_header)) if self.message_id_header else None
 
     @property
+    def reply_correlation_keys(self) -> frozenset[str]:
+        """Correlation keys the referenced messages got when THEY were
+        processed (same account, "mid:" message key)."""
+        return frozenset(
+            "gmail:" + stable_hash(self.account_key, "mid:" + _norm_id(i))
+            for i in self.reply_to_ids
+            if i and _norm_id(i)
+        )
+
+    @property
     def reply_to_hashes(self) -> frozenset[str]:
         return frozenset(stable_hash(_norm_id(i)) for i in self.reply_to_ids if i)
 

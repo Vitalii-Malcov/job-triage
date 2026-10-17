@@ -11,6 +11,7 @@ There is no function that updates or deletes an `ApplicationEventRecord`
 """
 
 import json
+from collections.abc import Collection, Iterator
 from datetime import datetime
 from typing import Any
 
@@ -98,16 +99,54 @@ def get_application_by_source_reference(
     ).one_or_none()
 
 
+MAX_PAGE_SIZE = 500
+DEFAULT_SCAN_BATCH_SIZE = 200
+
+
 def list_applications(
     db: Session,
     *,
     statuses: tuple[ApplicationLifecycleStatus, ...] | None = None,
-    limit: int = 200,
+    limit: int,
+    after_id: int | None = None,
 ) -> list[ApplicationRecord]:
+    """One page in id order (keyset: `id > after_id`). `limit` is explicit
+    and bounded -- a caller that needs everything pages (or uses
+    `iter_applications`); nothing is truncated silently."""
+    if not 1 <= limit <= MAX_PAGE_SIZE:
+        raise ValueError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
     query = select(ApplicationRecord).order_by(ApplicationRecord.id)
     if statuses:
         query = query.where(ApplicationRecord.current_status.in_([s.value for s in statuses]))
+    if after_id is not None:
+        query = query.where(ApplicationRecord.id > after_id)
     return list(db.scalars(query.limit(limit)))
+
+
+def iter_applications(
+    db: Session,
+    *,
+    submitted_only: bool = False,
+    only_ids: frozenset[int] | None = None,
+    batch_size: int = DEFAULT_SCAN_BATCH_SIZE,
+) -> Iterator[ApplicationRecord]:
+    """Complete scan in id order, `batch_size` rows per query (keyset
+    pagination), so memory stays bounded by one batch however many
+    applications exist."""
+    if not 1 <= batch_size <= MAX_PAGE_SIZE:
+        raise ValueError(f"batch_size must be between 1 and {MAX_PAGE_SIZE}")
+    last_id = 0
+    while True:
+        query = select(ApplicationRecord).where(ApplicationRecord.id > last_id)
+        if submitted_only:
+            query = query.where(ApplicationRecord.submitted_at.is_not(None))
+        if only_ids is not None:
+            query = query.where(ApplicationRecord.id.in_(sorted(only_ids)))
+        batch = list(db.scalars(query.order_by(ApplicationRecord.id).limit(batch_size)))
+        yield from batch
+        if len(batch) < batch_size:
+            return
+        last_id = batch[-1].id
 
 
 def list_applications_for_company(db: Session, company_name: str) -> list[ApplicationRecord]:
@@ -130,11 +169,16 @@ def list_events(db: Session, application_id: int) -> list[ApplicationEventRecord
     )
 
 
-def list_events_with_correlation_prefix(db: Session, prefix: str) -> list[ApplicationEventRecord]:
+def get_events_by_correlation_keys(
+    db: Session, correlation_keys: Collection[str]
+) -> list[ApplicationEventRecord]:
+    """Indexed lookup (UNIQUE correlation_key); callers pass a bounded set."""
+    if not correlation_keys:
+        return []
     return list(
         db.scalars(
             select(ApplicationEventRecord).where(
-                ApplicationEventRecord.correlation_key.startswith(prefix, autoescape=True)
+                ApplicationEventRecord.correlation_key.in_(sorted(correlation_keys))
             )
         )
     )

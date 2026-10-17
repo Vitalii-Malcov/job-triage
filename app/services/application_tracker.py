@@ -28,6 +28,7 @@ status change.
 
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -52,6 +53,7 @@ from app.models.application_lifecycle import (
 logger = logging.getLogger(__name__)
 
 S = ApplicationLifecycleStatus
+DEFAULT_PAGE_SIZE = 200
 FOLLOWUP_INTERVAL = timedelta(days=14)
 _WAITING_STATUSES = frozenset({S.SUBMITTED, S.RECEIVED, S.UNDER_REVIEW})
 MAX_ACTOR_LENGTH = 100
@@ -122,9 +124,34 @@ class ApplicationTracker:
         return repo.to_application(record)
 
     def list_applications(
-        self, db: Session, statuses: tuple[S, ...] | None = None
+        self,
+        db: Session,
+        statuses: tuple[S, ...] | None = None,
+        *,
+        limit: int = DEFAULT_PAGE_SIZE,
+        after_id: int | None = None,
     ) -> list[Application]:
-        return [repo.to_application(r) for r in repo.list_applications(db, statuses=statuses)]
+        """One explicit page (id order). A full page means more may exist:
+        continue with `after_id=<last id>`. For a complete set use
+        `iter_correlation_candidates` / `repo.iter_applications`."""
+        return [
+            repo.to_application(r)
+            for r in repo.list_applications(db, statuses=statuses, limit=limit, after_id=after_id)
+        ]
+
+    def iter_correlation_candidates(
+        self,
+        db: Session,
+        *,
+        only_ids: frozenset[int] | None = None,
+        batch_size: int = repo.DEFAULT_SCAN_BATCH_SIZE,
+    ) -> Iterator[Application]:
+        """Every submitted application (batched keyset scan) -- correlation
+        must never miss a candidate because of a page size."""
+        for record in repo.iter_applications(
+            db, submitted_only=True, only_ids=only_ids, batch_size=batch_size
+        ):
+            yield repo.to_application(record)
 
     def get_application_history(self, db: Session, application_id: int) -> list[ApplicationEvent]:
         self.get_application(db, application_id)

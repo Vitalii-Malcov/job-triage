@@ -237,6 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
     lst.add_argument(
         "--status", action="append", choices=[s.value for s in ApplicationLifecycleStatus]
     )
+    lst.add_argument("--limit", type=int, default=200, help="page size (1-500, default 200)")
+    lst.add_argument("--after-id", type=int, default=None, help="continue after this id")
     for name in ("show", "history"):
         sub.add_parser(name).add_argument("application_id", type=int)
     gmail = sub.add_parser("process-gmail")
@@ -276,8 +278,17 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
     try:
         if args.command == "list":
             statuses = tuple(ApplicationLifecycleStatus(s) for s in args.status or ()) or None
-            rows = [_application_row(a) for a in tracker.list_applications(session, statuses)]
-            _print(rows, args.json)
+            if not 1 <= args.limit <= 500:
+                raise TargetRefusedError("--limit must be between 1 and 500")
+            page = tracker.list_applications(
+                session, statuses, limit=args.limit, after_id=args.after_id
+            )
+            _print([_application_row(a) for a in page], args.json)
+            if len(page) == args.limit:
+                # Never truncate silently: tell the operator how to continue.
+                print(
+                    f"MORE: page is full; continue with --after-id {page[-1].id}", file=sys.stderr
+                )
         elif args.command == "show":
             _print(
                 _application_row(tracker.get_application(session, args.application_id)), args.json
