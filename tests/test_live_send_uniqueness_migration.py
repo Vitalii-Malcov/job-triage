@@ -60,13 +60,17 @@ def test_migration_is_the_single_head_and_chains_from_previous() -> None:
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(_cfg(Path("unused.db")))
-    assert script.get_heads() == [REVISION]
+    # Stage 15 added b5d2e8f4a1c7 on top; this revision must stay on the
+    # single head's ancestry, chained from PREVIOUS.
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert REVISION in {rev.revision for rev in script.walk_revisions("base", heads[0])}
     assert script.get_revision(REVISION).down_revision == PREVIOUS
 
 
 def test_upgrade_creates_both_partial_unique_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "live_send.db"
-    upgrade(_cfg(db_path), "head")
+    upgrade(_cfg(db_path), REVISION)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.connect() as conn:
         for table, (index_name, _owner) in TABLES.items():
@@ -83,7 +87,7 @@ def test_upgrade_creates_both_partial_unique_indexes(tmp_path: Path) -> None:
 @pytest.mark.parametrize("table", sorted(TABLES))
 def test_index_rejects_a_second_live_row_for_the_same_target(tmp_path: Path, table) -> None:
     db_path = tmp_path / "live_send.db"
-    upgrade(_cfg(db_path), "head")
+    upgrade(_cfg(db_path), REVISION)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as conn:
         _insert_send(conn, table, target_id=1, gmail_message_id=10, status="SENT")
@@ -96,7 +100,7 @@ def test_index_rejects_a_second_live_row_for_the_same_target(tmp_path: Path, tab
 @pytest.mark.parametrize("table", sorted(TABLES))
 def test_index_allows_failed_rows_other_targets_and_other_accounts(tmp_path: Path, table) -> None:
     db_path = tmp_path / "live_send.db"
-    upgrade(_cfg(db_path), "head")
+    upgrade(_cfg(db_path), REVISION)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as conn:
         _insert_send(conn, table, target_id=1, gmail_message_id=10, status="FAILED")
@@ -128,7 +132,7 @@ def test_upgrade_refuses_existing_live_duplicates_without_touching_data(
         _insert_send(conn, table, target_id=2, gmail_message_id=10, status="UNCERTAIN")
 
     with pytest.raises(RuntimeError) as excinfo:
-        upgrade(cfg, "head")
+        upgrade(cfg, REVISION)
     message = str(excinfo.value)
     assert table in message
     assert "me@example.com" not in message  # counts only, never identities
@@ -151,7 +155,7 @@ def test_upgrade_accepts_existing_failed_duplicates(tmp_path: Path) -> None:
         for table in TABLES:
             _insert_send(conn, table, target_id=1, gmail_message_id=10, status="FAILED")
             _insert_send(conn, table, target_id=2, gmail_message_id=10, status="SENT")
-    upgrade(cfg, "head")
+    upgrade(cfg, REVISION)
     with engine.connect() as conn:
         assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
             REVISION
@@ -161,7 +165,7 @@ def test_upgrade_accepts_existing_failed_duplicates(tmp_path: Path) -> None:
 def test_downgrade_drops_indexes_and_keeps_rows_then_upgrade_restores(tmp_path: Path) -> None:
     db_path = tmp_path / "live_send.db"
     cfg = _cfg(db_path)
-    upgrade(cfg, "head")
+    upgrade(cfg, REVISION)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as conn:
         for table in TABLES:
@@ -174,7 +178,7 @@ def test_downgrade_drops_indexes_and_keeps_rows_then_upgrade_restores(tmp_path: 
         for table in TABLES:
             assert conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one() == 1
 
-    upgrade(cfg, "head")
+    upgrade(cfg, REVISION)
     for table, (index_name, _owner) in TABLES.items():
         assert index_name in _index_names(engine, table)
 
@@ -216,13 +220,13 @@ def test_second_index_failure_leaves_no_partial_state_and_retry_succeeds(
     with monkeypatch.context() as patched:
         _fail_creating(patched, SECOND_INDEX)
         with pytest.raises(sqlalchemy.exc.OperationalError):
-            upgrade(cfg, "head")
+            upgrade(cfg, REVISION)
 
     assert _revision(engine) == PREVIOUS
     for table, (index_name, _owner) in TABLES.items():
         assert index_name not in _index_names(engine, table)
 
-    upgrade(cfg, "head")  # injected failure removed
+    upgrade(cfg, REVISION)  # injected failure removed
     assert _revision(engine) == REVISION
     for table, (index_name, _owner) in TABLES.items():
         assert index_name in _index_names(engine, table)
@@ -239,7 +243,7 @@ def test_failed_upgrade_never_drops_an_index_that_existed_before_it(tmp_path: Pa
         )
 
     with pytest.raises(sqlalchemy.exc.OperationalError):
-        upgrade(cfg, "head")  # second CREATE hits "already exists"
+        upgrade(cfg, REVISION)  # second CREATE hits "already exists"
 
     assert _revision(engine) == PREVIOUS
     assert FIRST_INDEX not in _index_names(engine, "response_draft_sends")
@@ -259,7 +263,7 @@ def test_cleanup_failure_is_reported_never_swallowed(tmp_path: Path, monkeypatch
         _fail_creating(patched, SECOND_INDEX)
         patched.setattr(DefaultImpl, "drop_index", drop_index)
         with pytest.raises(RuntimeError, match=FIRST_INDEX):
-            upgrade(cfg, "head")
+            upgrade(cfg, REVISION)
 
     assert _revision(engine) == PREVIOUS
 

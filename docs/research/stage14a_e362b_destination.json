@@ -1,0 +1,18 @@
+{
+  "vacancy": {
+    "source": "bundesagentur",
+    "source_reference": "20079-GR6IFL6L-S",
+    "fingerprint": "72d52b51fd59fd7ef92df4a6e89b963b96cbe0504346cbbb3196c6a10025d2a7"
+  },
+  "kind": "APPLICATION_PORTAL",
+  "value": "https://www.f-i.de/karriere/offene-stellen/hannover/ai-engineer-ki-entwickler-m-w-d#bewerbung",
+  "source_url": "https://www.f-i.de/karriere/offene-stellen/hannover/ai-engineer-ki-entwickler-m-w-d",
+  "source_type": "EMPLOYER_JOB_AD",
+  "verification_status": "UNVERIFIED",
+  "confidence": "MEDIUM",
+  "verified_by": "NONE",
+  "vacancy_specific": true,
+  "provenance": "Stage 14A read-only GET of the employer job ad ('Jetzt bewerben!' -> #bewerbung) and the employer FAQ ('Bewerbungen sind ausschliesslich ueber das Online-Portal moeglich'; e-mail only for Initiativbewerbungen). Form is script-rendered and was not inspected; operator must confirm in a browser without submitting.",
+  "checked_at": "2026-10-15T00:00:00Z",
+  "reason": "Portal channel identified from employer sources but not operator-verified. No vacancy-specific recruiting e-mail is published; the general careers address is for questions/unsolicited applications only."
+}

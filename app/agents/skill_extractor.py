@@ -130,6 +130,16 @@ _TECHNOLOGY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("tosca", r"(?<!\w)tosca(?!\w)"),
         ("groovy", r"(?<!\w)groovy(?:\s+script)?(?!\w)"),
         ("pytest", r"(?<!\w)pytest(?!\w)"),
+        # Stage 14B: AI/LLM vacancy requirements observed in live postings
+        # (E362/B). Literal mentions only, like every entry above.
+        ("langchain", r"(?<!\w)lang[ -]?chain(?!\w)"),
+        ("llamaindex", r"(?<!\w)llama[ -]?index(?!\w)"),
+        ("llm", r"(?<!\w)(?:llms?|large\s+language\s+models?)(?!\w)"),
+        ("generative ai", r"(?<!\w)(?:generative[ -]ai|gen[ -]?ai)(?!\w)"),
+        ("rag", r"(?<!\w)(?:rag|retrieval[ -]augmented[ -]generation)(?!\w)"),
+        ("prompting", r"(?<!\w)(?:prompting|prompt[ -]engineering)(?!\w)"),
+        ("fine-tuning", r"(?<!\w)fine[ -]?tuning(?!\w)"),
+        ("testing", r"(?<!\w)testing(?!\w)"),
     )
 )
 
@@ -168,7 +178,16 @@ _PROFILE_REQUIREMENT_MARKERS = re.compile(
     re.IGNORECASE,
 )
 _IDEALLY_MARKER = re.compile(r"\bidealerweise\b", re.IGNORECASE)
-_ABBREVIATIONS = re.compile(r"\b(?:z\.\s?b\.|e\.g\.|d\.\s?h\.)", re.IGNORECASE)
+_ABBREVIATIONS = re.compile(r"\b(?:z\.\s?b\.|e\.g\.|d\.\s?h\.|bspw\.)", re.IGNORECASE)
+# Stage 14B: a list introduced by one of these names EXAMPLES of a category
+# ("KI-Frameworks (z. B. LangChain, LlamaIndex)"), not individual hard
+# requirements. The list runs to the closing parenthesis, ";", a sentence
+# end, " sowie ", the next requirement marker, or the end of the segment.
+_EXAMPLE_MARKERS = re.compile(
+    r"(?<!\w)(?:z\.\s?b\.|zum\s+beispiel|bspw\.|beispielsweise|e\.g\.|for\s+example|such\s+as)",
+    re.IGNORECASE,
+)
+_EXAMPLE_LIST_END = re.compile(r"\)|;|\.(?=\s|$)|\s+sowie\s+", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]+|>>+)\s*")
 _MUST_SECTION_HEADERS = {
     "das bringst du mit",
@@ -179,6 +198,12 @@ _MUST_SECTION_HEADERS = {
     "qualifications",
     "qualifikationen",
     "was sollst du mitbringen",
+    # Stage 14B: bare "Profil:" / "Anforderungen:" requirement sections
+    # (E362/B) were previously skipped as generic headings, so profile
+    # lines without their own marker word were silently dropped.
+    "profil",
+    "anforderungen",
+    "anforderungsprofil",
 }
 _NICE_SECTION_HEADERS = {"ideal skills", "nice to have", "wünschenswert"}
 _OTHER_SECTION_HEADERS = {
@@ -194,6 +219,33 @@ _OTHER_SECTION_HEADERS = {
     "benefits",
     "über uns",
     "about us",
+    # Stage 14B: closing call-to-action / contact lines end a requirement
+    # section, so the application footer is not read as requirement text.
+    "klingt interessant",
+    "neugierig geworden",
+    "haben wir ihr interesse geweckt",
+    "haben wir dein interesse geweckt",
+    "interesse geweckt",
+    "kontakt",
+    "ihr kontakt",
+    "dein kontakt",
+    "ansprechpartner",
+    "ansprechpartnerin",
+    "interested",
+    "contact",
+    "jetzt bewerben",
+    "bewerben sie sich",
+    "bewerben sie sich jetzt",
+    "so bewerben sie sich",
+    "bewirb dich",
+    "bewirb dich jetzt",
+    "ihre bewerbung",
+    "deine bewerbung",
+    "bewerbung",
+    "kontaktperson",
+    "apply now",
+    "application",
+    "how to apply",
 }
 
 
@@ -365,15 +417,138 @@ def _postfix_nice_scopes_all_mentions(
     return not _EXPLICIT_REQUIRED_MARKERS.search(segment, first_mention, postfix.start())
 
 
+@dataclass(frozen=True)
+class ExampleList:
+    """Stage 14B: `segment[marker_start:list_end]` is an example list;
+    `segment[marker_end:list_end]` is the listed examples."""
+
+    marker_start: int
+    marker_end: int
+    list_end: int
+
+
+def example_lists(segment: str) -> list[ExampleList]:
+    results: list[ExampleList] = []
+    for marker in _EXAMPLE_MARKERS.finditer(segment):
+        end = len(segment)
+        stop = _EXAMPLE_LIST_END.search(segment, marker.end())
+        if stop is not None:
+            end = stop.start()
+        next_marker = _MUST_HAVE_MARKERS.search(segment, marker.end(), end)
+        if next_marker is not None:
+            end = next_marker.start()
+        if segment[marker.end() : end].strip(" ,:"):
+            results.append(ExampleList(marker.start(), marker.end(), end))
+    return results
+
+
+def _in_example_list(mention: re.Match[str], lists: list[ExampleList]) -> bool:
+    return any(item.marker_end <= mention.start() < item.list_end for item in lists)
+
+
+# Where a category phrase starts, scanning back from "(z. B." / "such as".
+_CATEGORY_START = re.compile(
+    r"(?:^|[,;:]|\s(?:und|oder|sowie|in|mit|von|im|and|or|with|of)\s)", re.IGNORECASE
+)
+_TRAILING_CONNECTOR = re.compile(r"\s+(?:wie|etwa|like)\s*$", re.IGNORECASE)
+# v6: "<technology>-Frameworks" names a category of that technology's
+# frameworks/libraries, not the technology itself.
+_CATEGORY_SUFFIX = re.compile(
+    r"-(?:frameworks?|bibliotheken|bibliothek|libraries|library)(?!\w)", re.IGNORECASE
+)
+
+
+def example_category_span(segment: str, item: ExampleList) -> tuple[int, int] | None:
+    """Stage 14B: (start, end) in `segment` of the category an example list
+    names examples of -- the phrase right before the opening parenthesis
+    (or the marker), back to the previous clause word ("und", "in", "mit",
+    ","). None when there is no category or the category IS a technology
+    ("Python (z. B. Django)": that technology is its own requirement)."""
+    head_end = item.marker_start
+    paren = segment.rfind("(", 0, item.marker_start)
+    if paren != -1 and not segment[paren + 1 : item.marker_start].strip():
+        head_end = paren
+    head = segment[:head_end].rstrip(" ,")
+    starts = list(_CATEGORY_START.finditer(head))
+    category_start = starts[-1].end() if starts else 0
+    category = _TRAILING_CONNECTOR.sub("", head[category_start:]).strip(" ,;:")
+    if not category or any(p.fullmatch(category) for _, p in _TECHNOLOGY_PATTERNS):
+        return None
+    start = head.index(category, category_start)
+    return start, start + len(category)
+
+
+def category_token_spans(text: str) -> list[tuple[int, int]]:
+    """v8: (start, end) of every "<technology>-Frameworks" / "-Bibliotheken"
+    / "-Libraries" token in `text` -- a category requirement of its own,
+    with or without an example list."""
+    return sorted(
+        (mention.start(), suffix.end())
+        for _, pattern in _TECHNOLOGY_PATTERNS
+        for mention in pattern.finditer(text)
+        if (suffix := _CATEGORY_SUFFIX.match(text, mention.end())) is not None
+    )
+
+
+def _names_only_a_category(
+    mention: re.Match[str], segment: str, categories: list[tuple[int, int]]
+) -> bool:
+    """v6: the mention is part of a category name, not an independent
+    requirement for the technology -- inside an example group's category
+    ("Python-Frameworks (z. B. Django)") or "<technology>-Frameworks"."""
+    if any(start <= mention.start() and mention.end() <= end for start, end in categories):
+        return True
+    return _CATEGORY_SUFFIX.match(segment, mention.end()) is not None
+
+
+def _non_requirement_mention_filter(segment: str):
+    examples = example_lists(segment)
+    categories = [
+        span for item in examples if (span := example_category_span(segment, item)) is not None
+    ]
+
+    def skipped(mention: re.Match[str]) -> bool:
+        return _in_example_list(mention, examples) or _names_only_a_category(
+            mention, segment, categories
+        )
+
+    return skipped
+
+
+def example_or_category_skills(title: str | None, description: str | None) -> set[str]:
+    """v6: technologies the title or description names at least once only as
+    an example or inside a category name -- a stored list from an older
+    extractor must not resurrect them as individual requirements unless the
+    current extraction names them independently (v7: titles included)."""
+    names: set[str] = set()
+    segments = [segment for segment, _ in _contextual_segments(description or "")]
+    for segment in [title or "", *segments]:
+        skipped = _non_requirement_mention_filter(segment)
+        for skill, pattern in _TECHNOLOGY_PATTERNS:
+            if any(skipped(mention) for mention in pattern.finditer(segment)):
+                names.add(skill)
+    return names
+
+
 def extract_skills(title: str | None, description: str | None) -> SkillExtraction:
-    """Extract only technologies that literally occur in title/description."""
+    """Extract only technologies that literally occur in title/description.
+
+    Stage 14B: a technology named only inside an example list ("z. B.",
+    "e.g.", ...) is not extracted as an individual requirement -- see
+    `example_lists`; app.agents.requirement_extractor turns such a list
+    into one grouped requirement instead. v6: neither is a technology named
+    only as part of a category ("Python-Frameworks"); an independent
+    mention elsewhere ("Python und Python-Frameworks") still counts."""
     must_have: set[str] = set()
     nice_to_have: set[str] = set()
 
     # A literal technology in the role title describes the candidate being
     # sought (for example, "Django Developer") and is therefore mandatory.
+    # v7: the same category-only rule as the description -- "Python-
+    # Frameworks Engineer" names no independent Python requirement.
+    title_skipped = _non_requirement_mention_filter(title or "")
     for skill, pattern in _TECHNOLOGY_PATTERNS:
-        if pattern.search(title or ""):
+        if any(not title_skipped(m) for m in pattern.finditer(title or "")):
             must_have.add(skill)
 
     for segment, inherited_context in _contextual_segments(description or ""):
@@ -385,8 +560,11 @@ def extract_skills(title: str | None, description: str | None) -> SkillExtractio
             mention for _, pattern in _TECHNOLOGY_PATTERNS for mention in pattern.finditer(segment)
         ]
         postfix_nice_scope = _postfix_nice_scopes_all_mentions(segment, mentions, must_markers)
+        skipped = _non_requirement_mention_filter(segment)
         for skill, pattern in _TECHNOLOGY_PATTERNS:
             for mention in pattern.finditer(segment):
+                if skipped(mention):
+                    continue
                 classification = _classify_mention(
                     mention,
                     must_markers,

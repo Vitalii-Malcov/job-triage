@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.agents.cv_adapter import CV_ADAPTER_VERSION
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.models import JobRecord
@@ -185,7 +186,7 @@ def test_post_cv_draft_valid_returns_200(client):
     body = response.json()
     assert body["job_id"] == job_id
     assert body["match_id"] == match_id
-    assert body["cv_adapter_version"] == "v1"
+    assert body["cv_adapter_version"] == CV_ADAPTER_VERSION
     assert body["status"] == "DRAFT"
 
 

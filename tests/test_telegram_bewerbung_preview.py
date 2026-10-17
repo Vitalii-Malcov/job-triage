@@ -171,7 +171,7 @@ class TestSummaryContent:
         text = render_summary(_letter(), _cv(), _match())
         assert "Position: Junior Python Developer" in text
         assert "Firma: Example GmbH" in text
-        assert "Kandidaten-Match (Profil vs. Stelle, 0-100): 82" in text
+        assert "Kandidaten-Match (belegte Profil-Nachweise): 82/100" in text
 
     def test_missing_requirement_is_labeled_as_not_evidenced_gap(self):
         text = render_summary(_letter(), _cv(), _match())

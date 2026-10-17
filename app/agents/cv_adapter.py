@@ -40,10 +40,13 @@ metadata where available).
 value is either copied verbatim from a trusted Candidate Profile field or
 a short structured label — never rewritten, expanded, or invented.
 
-**CV_ADAPTER_VERSION.** `"v1"` — bumped whenever selection/ordering logic
+**CV_ADAPTER_VERSION.** `"v2"` — bumped whenever selection/ordering logic
 here changes in a way that would produce a different draft for the same
 inputs (mirrors app.agents.candidate_job_matcher.ALGORITHM_VERSION's
-rationale exactly).
+rationale exactly). v2 (Stage 14A): explicit gap warnings for sections that
+render empty (projects/education/languages) and for trusted experience that
+the pinned match does not evidence, so a missing fact is always surfaced as
+a warning and never silently rendered as "keine".
 """
 
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
@@ -64,7 +67,7 @@ from app.models.cv_draft import (
     TailoredCVDraftData,
 )
 
-CV_ADAPTER_VERSION = "v1"
+CV_ADAPTER_VERSION = "v2"
 
 
 class CVDraftMatchNotFoundError(Exception):
@@ -403,6 +406,14 @@ def compute_cv_draft(profile: CandidateProfile, match: CandidateJobMatch) -> Tai
         warnings.append("NO_RELEVANT_SKILLS")
     if trusted_experience_count == 0:
         warnings.append("NO_RELEVANT_EXPERIENCE")
+    elif not any(item.matched_skills for item in experience):
+        warnings.append("NO_MATCH_RELEVANT_EXPERIENCE")
+    if not projects:
+        warnings.append("NO_RELEVANT_PROJECTS")
+    if not education:
+        warnings.append("NO_TRUSTED_EDUCATION")
+    if not languages:
+        warnings.append("NO_TRUSTED_LANGUAGES")
     # Always present in v1 (section 13/37) — the Candidate Profile schema
     # never models contact fields at all, not a situational gap.
     warnings.append("CONTACT_DATA_NOT_MODELED")

@@ -82,6 +82,7 @@ from app.providers.email.imap_deadline import (
 from app.providers.email.imap_mailbox import MailboxNameError, mailbox_command_arg
 from app.providers.email.mime_utils import decode_mime_part
 from app.utils.config_flags import is_configured
+from app.utils.html_text import html_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +423,42 @@ def _extract_content(
     if truncated:
         body_plain = body_plain[:MAX_BODY_LENGTH]
     return body_plain, truncated, state["has_html"], tuple(attachments)
+
+
+def _first_html_part(part: Message, state: dict, depth: int = 0) -> str | None:
+    """The first BODY text/html part, with the same attachment pruning and
+    MIME bounds as `_walk_body_and_attachments`.
+
+    Codex S15 P2: stricter than `_is_attachment_part` -- a part that carries
+    a filename is a file even when it says `Content-Disposition: inline`
+    (e.g. an attached "old-rejection.html"), so it is never read as the
+    employer's message. Only unnamed text/html parts count as the body."""
+    if depth > MAX_MIME_DEPTH or _is_attachment_part(part) or part.get_filename():
+        return None
+    if part.is_multipart():
+        for sub_part in part.get_payload():
+            if state["parts_seen"] >= MAX_MIME_PARTS:
+                return None
+            state["parts_seen"] += 1
+            found = _first_html_part(sub_part, state, depth + 1)
+            if found is not None:
+                return found
+        return None
+    if part.get_content_type() == "text/html":
+        return decode_mime_part(part)
+    return None
+
+
+def _extract_html_text(msg: Message) -> str:
+    """Stage 15: inert text of an HTML-only message (see
+    app/utils/html_text.py -- tags stripped lexically, nothing rendered or
+    fetched), bounded like `body_plain`. Kept in a separate field so
+    `body_plain`'s Stage 7A meaning (text/plain only) is unchanged; never
+    persisted."""
+    markup = _first_html_part(msg, {"parts_seen": 0})
+    if not markup:
+        return ""
+    return html_to_text(markup[: MAX_BODY_LENGTH * 10])[:MAX_BODY_LENGTH]
 
 
 def _direction(*, trusted_outbound: bool) -> Direction:
@@ -969,6 +1006,7 @@ class GmailImapProvider:
         subject = _decode_mime_words(msg.get("Subject", ""))[:MAX_SUBJECT_LENGTH]
         sent_at = _parse_date(msg.get("Date"))
         body_plain, body_truncated, has_html, attachments = _extract_content(msg)
+        body_html_text = _extract_html_text(msg) if has_html and not body_plain else ""
         direction = _direction(trusted_outbound=self.trusted_outbound)
 
         return ParsedGmailMessage(
@@ -989,6 +1027,7 @@ class GmailImapProvider:
             body_plain=body_plain,
             body_truncated=body_truncated,
             has_html=has_html,
+            body_html_text=body_html_text,
             provider_arrival_at=provider_arrival_at,
             attachments=attachments,
         )

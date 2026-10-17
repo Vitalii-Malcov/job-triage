@@ -13,6 +13,8 @@ __pycache__/
 coverage.xml
 htmlcov/
 *.db
+# Stage 14D: operator application identity (contact data) stays local.
+*.local.json
 *.db-journal
 *.egg-info/
 

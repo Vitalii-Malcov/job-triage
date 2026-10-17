@@ -194,6 +194,14 @@ _CATEGORY_PATTERNS: dict[EmailCategory, re.Pattern[str]] = {
         r"vielen\s+dank\s+f(?:ü|ue)r\s+ihre\s+bewerbung|"
         r"ihre\s+bewerbung\s+ist\s+bei\s+uns\s+eingegangen|"
         r"bewerbungseingang|"
+        # Stage 15: receipt wording seen in real employer mail, e.g.
+        # "...die Zusendung Ihrer Bewerbung, deren Eingang wir hiermit
+        # bestätigen" (ALD Vacuum Technologies, 2026-10-17).
+        r"eingang\s+(?:wir\s+)?(?:ihnen\s+)?hiermit\s+best(?:ä|ae)tigen|"
+        r"best(?:ä|ae)tigen\s+(?:wir\s+)?(?:ihnen\s+)?(?:hiermit\s+)?den\s+eingang\s+ihrer\s+"
+        r"(?:bewerbung|unterlagen|bewerbungsunterlagen)|"
+        r"eingangsbest(?:ä|ae)tigung\s+(?:ihrer\s+)?bewerbung|"
+        r"bewerbung\s*[-–:|]\s*eingangsbest(?:ä|ae)tigung|"
         r"we\s+have\s+received\s+your\s+application|"
         r"thank\s+you\s+for\s+your\s+application|"
         r"your\s+application\s+has\s+been\s+received",
