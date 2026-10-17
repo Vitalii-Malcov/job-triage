@@ -37,6 +37,7 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
+from app.db.session_engine import enable_sqlite_foreign_keys
 from app.domain.application_lifecycle import InvalidApplicationTransitionError
 from app.models.application_lifecycle import (
     ApplicationEventOrigin,
@@ -54,9 +55,39 @@ except ModuleNotFoundError:  # run as `python scripts/...`
     from stage14a_send_readiness import UnsafeInputPathError, validate_local_json_path
 
 # Databases this tool must never open: the frozen Stage 14B canonical DB.
+# Codex S15 P1: the PATH/FILE IDENTITY is the primary guard (the file's hash
+# changes the moment anyone writes it, so a hash-only guard expires); the
+# historical SHA-256 stays as defense in depth for byte-identical copies.
+PROTECTED_DATABASE_PATHS: tuple[Path, ...] = (
+    Path(__file__).resolve().parents[1] / "stage14b_canonical_v12.db",
+)
 PROTECTED_DATABASE_SHA256 = frozenset(
     {"874d2cab6fc78efe3574dd1fb123c06e60662da48c32c240227313778f41e35d"}
 )
+
+
+def _identity(path: Path) -> str:
+    """Windows-safe comparable identity: absolute, `..` collapsed, symlinks
+    and junctions resolved, separators and case normalized."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def is_protected_database(path: Path) -> bool:
+    """True when `path` names a protected database by any spelling or alias:
+    same normalized real path (relative, `..`, `/` vs `\\`, case, symlink,
+    junction), or the same file (`samefile`: hard links)."""
+    target = _identity(path)
+    for protected in PROTECTED_DATABASE_PATHS:
+        if target == _identity(protected):
+            return True
+        try:
+            if path.exists() and protected.exists() and os.path.samefile(path, protected):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 _PROTECTED_PATH = re.compile(r"stage[-_ ]?13d", re.IGNORECASE)
 _PROTECTED_URL = re.compile(r"ai_agent-db-1", re.IGNORECASE)
 
@@ -82,13 +113,17 @@ def resolve_engine(database: str | None, database_url: str | None) -> Engine:
         except UnsafeInputPathError as exc:
             raise TargetRefusedError(str(exc)) from None
         path = Path(os.path.abspath(database))
-        if _PROTECTED_PATH.search(str(path)):
+        # Identity first: refused before the file is even opened or hashed.
+        if is_protected_database(path):
+            raise TargetRefusedError("refusing the protected Stage 14B canonical database")
+        if _PROTECTED_PATH.search(_identity(path)) or _PROTECTED_PATH.search(str(path)):
             raise TargetRefusedError("Stage 13D databases are out of scope for this tool")
         if not path.is_file():
             raise TargetRefusedError("database file does not exist")
         if _sha256(path) in PROTECTED_DATABASE_SHA256:
             raise TargetRefusedError("refusing the protected Stage 14B canonical database")
         engine = create_engine(f"sqlite:///{path.as_posix()}", poolclass=NullPool)
+        enable_sqlite_foreign_keys(engine)
     else:
         url = make_url(database_url)
         if not url.drivername.startswith("postgresql"):
