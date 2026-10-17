@@ -128,6 +128,10 @@ jobs:
       # drops its OWN databases on this server (fresh `alembic upgrade head`
       # per test), so its position only has to precede HARD-008.
       #
+      # Stage 15: test_application_lifecycle_postgres.py ends with its own
+      # one-step downgrade/upgrade cycle (restoring head in `finally`), so it
+      # runs after the at-head modules and before HARD-008.
+      #
       # Every module here skips when TEST_POSTGRES_URL is unset, so the
       # step refuses to run without it and then fails on ANY skipped test:
       # a green job must mean every PostgreSQL test actually executed.
@@ -149,6 +153,7 @@ jobs:
             tests/integration/test_candidate_profile_transfer_postgres.py \
             tests/integration/test_gmail_mailbox_width_postgres.py \
             tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
+            tests/integration/test_application_lifecycle_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'
           import sys
