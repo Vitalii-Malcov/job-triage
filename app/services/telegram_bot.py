@@ -33,7 +33,7 @@ from a stranger probing the bot.
 import functools
 import logging
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -83,6 +83,7 @@ from app.services.telegram_bewerbung_approval import (
     parse_request_callback_data,
 )
 from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
+from app.services.telegram_operator_control import OperatorCallback, handle_callback
 from app.services.telegram_vacancy_feed import (
     ACTION_APPLY,
     ACTION_DETAILS,
@@ -773,6 +774,62 @@ async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+def _inline_markup(markup: dict | None) -> InlineKeyboardMarkup | None:
+    if not markup:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row]
+            for row in markup["inline_keyboard"]
+        ]
+    )
+
+
+@require_authorized
+async def on_operator_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stage 16 operator card buttons (`s16:<a|s|d|l>:<token>`).
+
+    Two gates: the shared `@require_authorized` chat gate (silence for any
+    other chat), then `telegram_operator_control.authorize` inside
+    `handle_callback` (configured operator user, or a private chat whose id
+    is the sender's). All validation and every state change happen in
+    `handle_callback`; this handler only relays its outcome. APPROVE is a
+    local decision -- nothing is ever sent to an employer.
+    """
+    query = update.callback_query
+    chat = update.effective_chat
+    sender = getattr(query, "from_user", None)
+    message = getattr(query, "message", None)
+    callback = OperatorCallback(
+        chat_id=str(chat.id) if chat is not None else "",
+        chat_type=getattr(chat, "type", None),
+        user_id=str(sender.id) if sender is not None else None,
+        callback_query_id=str(query.id),
+        data=query.data,
+        message_id=getattr(message, "message_id", None),
+    )
+    settings = get_settings()
+    db = SessionLocal()
+    try:
+        outcome = handle_callback(db, settings, callback)
+    finally:
+        db.close()
+    if outcome.answer is None:
+        return
+    await query.answer(outcome.answer or None, show_alert=outcome.alert)
+    if outcome.details_text:
+        # Always the configured operator chat, never a caller-chosen one.
+        await context.bot.send_message(chat_id=settings.telegram_chat_id, text=outcome.details_text)
+    if outcome.card is not None:
+        try:
+            await query.edit_message_text(
+                outcome.card.text, reply_markup=_inline_markup(outcome.card.reply_markup)
+            )
+        except Exception as exc:
+            # Cosmetic only: the decision is already committed.
+            logger.warning("telegram_operator_card_edit_failed error_type=%s", type(exc).__name__)
+
+
 async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Catch-all for exceptions raised by any command handler.
 
@@ -824,6 +881,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CallbackQueryHandler(on_review_page_callback, pattern=r"^bv:"))
     application.add_handler(CallbackQueryHandler(on_review_decision_callback, pattern=r"^bz:"))
     application.add_handler(CallbackQueryHandler(on_gmail_draft_callback, pattern=r"^bm:"))
+    application.add_handler(CallbackQueryHandler(on_operator_callback, pattern=r"^s16:"))
     application.add_error_handler(_handle_error)
     return application
 
