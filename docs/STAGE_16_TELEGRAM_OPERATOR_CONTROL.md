@@ -125,6 +125,19 @@ press):
 Otherwise the card shows `Package: PACKAGE_NOT_READY (reasons)`, no APPROVE
 button, and a forged APPROVE callback is refused with the same reasons.
 
+**Concurrent review changes (Codex S16 P1).** The readiness read before
+the write is never trusted on its own. Inside the APPROVE transaction (the
+callback and the CLI override SKIP → APPROVE), after the decision row is
+flushed and before the lifecycle write commits, the review row is re-read
+with `SELECT ... FOR UPDATE` and readiness is re-assessed; the press is
+refused (`PACKAGE_NOT_READY`, e.g. `REVIEW_PACKAGE_REJECTED` or
+`REVIEW_PACKAGE_CHANGED` for a different status/version/revision) and the
+whole transaction rolled back — no decision, no `APPROVED` event. On
+PostgreSQL a concurrent Stage 6E reject/revision either commits first (and is
+seen) or waits for the approval's commit; on SQLite the flushed INSERT
+already holds the database write lock. Proven by
+`tests/integration/test_telegram_operator_control_postgres.py`.
+
 The Stage 6E review status itself is not changed by Stage 16; its own
 approve/reject flow (API, Stage 9C) is unchanged.
 
@@ -290,6 +303,11 @@ Stage 16 tables reference `applications`/`application_events`.
 - **Stage 17:** Telegram confirmation buttons for REJECTION/OFFER e-mails
   (`[Confirm rejection] [Confirm offer] [Details]`); today the notification
   is informational and confirmation goes through the Stage 15 CLI.
+- **Stage 17 (Codex S16 P2):** the lifecycle-notification scan takes the
+  oldest `limit × scan factor` candidate events in its time window and
+  filters already-notified ones afterwards, so once that many notified events
+  sit in the window, newer events are overlooked; it needs pagination/keyset over
+  un-notified events.
 - Card dispatch and the notification sweep are operator-driven CLI commands;
   wiring them into the scheduler is a later decision.
 - Callback tokens do not expire; every press re-validates the current state

@@ -31,6 +31,16 @@ decision is never silently replaced: a conflicting press is refused with
 CONFLICT_REQUIRES_OVERRIDE, and only `override_decision` (operator CLI,
 mandatory reason) records a superseding decision. Concurrent presses are
 serialized by UNIQUE(idempotency_key).
+
+**Approval vs. concurrent review changes (Codex S16 P1).** An APPROVE never
+trusts the readiness read by `load_target`: inside the approval
+transaction -- after the decision row is flushed, before the lifecycle
+write commits -- `_recheck_review_locked` re-reads the review row with
+`SELECT ... FOR UPDATE` (PostgreSQL: waits for, then sees, a concurrent
+Stage 6E reject/revision; holding the lock makes later review writes wait
+for this commit) and refuses unless the package is still ready with the
+same review status, version and revision. On SQLite the flushed INSERT
+already holds the database write lock, so the re-read is final.
 """
 
 import hashlib
@@ -40,6 +50,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,7 +62,12 @@ from app.db.candidate_job_match_repository import (
 )
 from app.db.candidate_profile_repository import get_candidate_profile
 from app.db.datetime_utils import ensure_utc
-from app.db.models import CompanyResearchRecord, JobRecord, TelegramOperatorCardRecord
+from app.db.models import (
+    ApplicationPackageReviewRecord,
+    CompanyResearchRecord,
+    JobRecord,
+    TelegramOperatorCardRecord,
+)
 from app.db.review_package_repository import get_current_revision, get_review_by_id
 from app.domain.application_lifecycle import InvalidApplicationTransitionError
 from app.models.application_lifecycle import (
@@ -555,6 +571,32 @@ async def send_card(
 # --- callbacks -----------------------------------------------------------------------
 
 
+def _recheck_review_locked(
+    db: Session, application: Application, pinned: PackageSummary
+) -> tuple[str, ...]:
+    """Inside the approval transaction: lock and re-read the authoritative
+    review row, then re-assess readiness. Returns refusal reasons (empty
+    means still approvable with exactly the pinned status/version/revision).
+    Must run after this transaction has written (SQLite write lock)."""
+    if application.review_package_id is None:
+        return ("NO_REVIEW_PACKAGE",)
+    db.execute(
+        select(ApplicationPackageReviewRecord)
+        .where(ApplicationPackageReviewRecord.id == application.review_package_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    fresh, _ = assess_package(db, application)
+    reasons = list(fresh.reasons)
+    if not reasons and (
+        fresh.review_status != pinned.review_status
+        or fresh.review_version != pinned.review_version
+        or fresh.revision_id != pinned.revision_id
+    ):
+        reasons.append("REVIEW_PACKAGE_CHANGED")
+    return tuple(reasons)
+
+
 def _card_after_change(
     db: Session, card: TelegramOperatorCardRecord, *, tracker: ApplicationTracker, now: datetime
 ) -> RenderedMessage:
@@ -706,6 +748,19 @@ def handle_callback(
         if decision is OperatorDecision.APPROVE:
             correlation_key = f"s16:approve:{target.key}:g{state.generation}"
             record = repo.add_decision(db, lifecycle_correlation_key=correlation_key, **values)
+            stale = _recheck_review_locked(db, application, target.view.package)
+            if stale:
+                db.rollback()
+                reasons = ", ".join(stale)
+                logger.warning(
+                    "telegram_callback_refused reason=package_changed card_id=%s reasons=%s",
+                    card.id,
+                    reasons,
+                )
+                return _outcome(
+                    CallbackCode.PACKAGE_NOT_READY,
+                    answer=f"PACKAGE_NOT_READY: {reasons}. Nothing changed."[:200],
+                )
             outcome = tracker.transition_application(
                 db,
                 application.id,
@@ -886,6 +941,10 @@ def override_decision(
             metadata={"source": "operator_override"},
         )
         if decision is OperatorDecision.APPROVE:
+            stale = _recheck_review_locked(db, application, target.view.package)
+            if stale:
+                db.rollback()
+                return OverrideResult(OverrideCode.PACKAGE_NOT_READY, ", ".join(stale))
             lifecycle = tracker.transition_application(
                 db,
                 application.id,

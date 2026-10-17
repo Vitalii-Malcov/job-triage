@@ -18,10 +18,12 @@ from app.db.base import Base
 from app.db.models import (
     ApplicationEventRecord,
     ApplicationOperatorDecisionRecord,
+    ApplicationPackageReviewRecord,
     ApplicationRecord,
     OperatorDecisionImmutableError,
     TelegramOperatorCardRecord,
 )
+from app.db.review_package_repository import decide_review
 from app.db.session_engine import enable_sqlite_foreign_keys
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
 from app.models.telegram_operator import OperatorAction, OperatorDecision
@@ -576,6 +578,96 @@ class TestState:
         )
         assert outcome.code is CallbackCode.STATE_CHANGED
         assert _counts(db, carded["target"].application_id) == (0, 1, S.PACKAGE_READY.value)
+
+
+# --- Codex S16 P1: review changed between readiness read and APPROVE commit --------------
+
+
+def _reject_review_concurrently(factory, review_id):
+    """A separate session rejects the review (Stage 6E CAS) and commits."""
+    other = factory()
+    try:
+        review = other.get(ApplicationPackageReviewRecord, review_id)
+        decide_review(
+            other,
+            review_id=review_id,
+            expected_review_version=review.review_version,
+            new_status="REJECTED",
+            decision_note="rejected concurrently",
+        )
+    finally:
+        other.close()
+
+
+def _after_load_target(monkeypatch, action):
+    """Run `action` right after the callback's own readiness read."""
+    real = control.load_target
+
+    def wrapped(*args, **kwargs):
+        target = real(*args, **kwargs)
+        action()
+        return target
+
+    monkeypatch.setattr(control, "load_target", wrapped)
+
+
+class TestConcurrentReviewChange:
+    def test_review_rejected_after_readiness_read_refuses_approve(
+        self, factory, db, settings, carded, monkeypatch
+    ):
+        target = carded["target"]
+        reject = lambda: _reject_review_concurrently(factory, target.review_id)  # noqa: E731
+        _after_load_target(monkeypatch, reject)
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.PACKAGE_NOT_READY
+        assert "REVIEW_PACKAGE_REJECTED" in outcome.answer
+        db.expire_all()
+        assert _counts(db, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+        assert db.get(ApplicationPackageReviewRecord, target.review_id).status == "REJECTED"
+
+    def test_review_version_bumped_after_readiness_read_refuses_approve(
+        self, factory, db, settings, carded, monkeypatch
+    ):
+        target = carded["target"]
+
+        def bump():
+            other = factory()
+            try:
+                other.execute(
+                    update(ApplicationPackageReviewRecord)
+                    .where(ApplicationPackageReviewRecord.id == target.review_id)
+                    .values(review_version=ApplicationPackageReviewRecord.review_version + 1)
+                )
+                other.commit()
+            finally:
+                other.close()
+
+        _after_load_target(monkeypatch, bump)
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.PACKAGE_NOT_READY
+        assert "REVIEW_PACKAGE_CHANGED" in outcome.answer
+        assert _counts(db, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+
+    def test_unchanged_review_still_approves_and_replay_is_idempotent(self, db, settings, carded):
+        target = carded["target"]
+        first = _press(db, settings, OperatorAction.APPROVE, carded["token"], query_id="same")
+        replay = _press(db, settings, OperatorAction.APPROVE, carded["token"], query_id="same")
+        assert first.code is CallbackCode.APPROVED
+        assert replay.code is CallbackCode.DUPLICATE_CALLBACK
+        assert _counts(db, target.application_id) == (1, 2, S.APPROVED.value)
+
+    def test_override_to_approve_refused_when_review_rejected_concurrently(
+        self, factory, db, settings, carded, monkeypatch
+    ):
+        target = carded["target"]
+        _press(db, settings, OperatorAction.SKIP, carded["token"])
+        reject = lambda: _reject_review_concurrently(factory, target.review_id)  # noqa: E731
+        _after_load_target(monkeypatch, reject)
+        result = control.override_decision(
+            db, target.application_id, OperatorDecision.APPROVE, reason="retry", now=NOW
+        )
+        assert result.code is control.OverrideCode.PACKAGE_NOT_READY
+        assert _counts(db, target.application_id) == (1, 1, S.PACKAGE_READY.value)
 
 
 # --- card delivery ----------------------------------------------------------------------

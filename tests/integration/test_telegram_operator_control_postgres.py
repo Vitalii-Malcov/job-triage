@@ -8,7 +8,10 @@
   atomically, and a replayed callback stays one decision / one event;
 - `application_operator_decisions` is append-only in the database (Core
   UPDATE/DELETE refused by the trigger);
-- the notification ledger admits one row per lifecycle event.
+- the notification ledger admits one row per lifecycle event;
+- Codex S16 P1: a review rejected by another session after the callback's
+  readiness read makes APPROVE refuse (nothing written), and an APPROVE
+  holding the review row lock makes a concurrent rejection wait for it.
 
 No Telegram, IMAP or SMTP anywhere: transports are in-memory fakes.
 
@@ -31,9 +34,11 @@ from app.db import telegram_operator_repository as repo
 from app.db.models import (
     ApplicationEventRecord,
     ApplicationOperatorDecisionRecord,
+    ApplicationPackageReviewRecord,
     ApplicationRecord,
     TelegramOperatorCardRecord,
 )
+from app.db.review_package_repository import decide_review
 from app.models.application_lifecycle import ApplicationEventOrigin as O
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
 from app.models.telegram_operator import OperatorAction
@@ -255,5 +260,121 @@ def test_check_constraints_are_enforced(factory, carded):
                 {"id": carded["card_id"]},
             )
         session.rollback()
+    finally:
+        session.close()
+
+
+def _reject_review(factory, review_id):
+    other = factory()
+    try:
+        review = other.get(ApplicationPackageReviewRecord, review_id)
+        decide_review(
+            other,
+            review_id=review_id,
+            expected_review_version=review.review_version,
+            new_status="REJECTED",
+            decision_note="rejected concurrently",
+        )
+    finally:
+        other.close()
+
+
+def test_review_rejected_after_readiness_read_refuses_approve(factory, carded, monkeypatch):
+    """Codex S16 P1 sequence: A reads a ready review; B rejects it and
+    COMMITS; A resumes APPROVE -> refused, nothing written."""
+    target = carded["target"]
+    real = control.load_target
+
+    def read_then_concurrent_reject(*args, **kwargs):
+        loaded = real(*args, **kwargs)  # session A: ready review read
+        assert loaded.view.package.ready
+        _reject_review(factory, target.review_id)  # session B: reject + COMMIT
+        return loaded
+
+    monkeypatch.setattr(control, "load_target", read_then_concurrent_reject)
+    session = factory()
+    try:
+        outcome = control.handle_callback(
+            session,
+            carded["settings"],
+            callback(build_callback_data(OperatorAction.APPROVE, carded["token"])),
+            now=NOW,
+        )
+    finally:
+        session.close()
+    assert outcome.code is control.CallbackCode.PACKAGE_NOT_READY
+    assert "REVIEW_PACKAGE_REJECTED" in outcome.answer
+    session = factory()
+    try:
+        assert _counts(session, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ApplicationEventRecord)
+                .where(ApplicationEventRecord.new_status == S.APPROVED.value)
+            )
+            == 0
+        )
+        assert session.get(ApplicationPackageReviewRecord, target.review_id).status == "REJECTED"
+    finally:
+        session.close()
+
+
+def test_approve_holding_review_lock_makes_concurrent_reject_wait(factory, carded):
+    """A has locked the review row (approval transaction open); B's Stage 6E
+    rejection blocks until A commits -- it can never land in between."""
+    target = carded["target"]
+    tracker = ApplicationTracker()
+    real_transition = tracker.transition_application
+    locked = threading.Event()
+    release = threading.Event()
+    order = []
+
+    def paused_transition(*args, **kwargs):
+        locked.set()  # review row is locked by A's transaction now
+        release.wait(10)
+        result = real_transition(*args, **kwargs)
+        order.append("approve_committed")
+        return result
+
+    tracker.transition_application = paused_transition
+    results = {}
+
+    def operator_a():
+        session = factory()
+        try:
+            results["a"] = control.handle_callback(
+                session,
+                carded["settings"],
+                callback(build_callback_data(OperatorAction.APPROVE, carded["token"])),
+                tracker=tracker,
+                now=NOW,
+            )
+        finally:
+            session.close()
+
+    def reviewer_b():
+        locked.wait(10)
+        try:
+            _reject_review(factory, target.review_id)
+            order.append("reject_committed")
+        except Exception as exc:  # CAS loss is fine; landing first is not
+            order.append(f"reject_failed:{type(exc).__name__}")
+
+    a = threading.Thread(target=operator_a)
+    b = threading.Thread(target=reviewer_b)
+    a.start()
+    b.start()
+    assert locked.wait(10)
+    b.join(1.5)
+    assert b.is_alive(), "rejection must wait for the approval's review row lock"
+    release.set()
+    a.join(30)
+    b.join(30)
+    assert results["a"].code is control.CallbackCode.APPROVED
+    assert order[0] == "approve_committed"
+    session = factory()
+    try:
+        assert _counts(session, target.application_id) == (1, 2, S.APPROVED.value)
     finally:
         session.close()
