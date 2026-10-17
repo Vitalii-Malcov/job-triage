@@ -62,10 +62,33 @@ _TECHNICAL_INVITATION = re.compile(
     r"einladung\s+zu[mr]?\s+(?:einem\s+)?(?:technischen|fachlichen)\s+"
     r"(?:interview|gespr(?:ä|ae)ch)|"
     r"einladung\s+zu[mr]?\s+(?:einem\s+)?fachgespr(?:ä|ae)ch|"
+    r"laden\s+(?:wir\s+)?sie\s+(?:gerne\s+|herzlich\s+)?zu\s+einem\s+"
+    r"(?:technischen|fachlichen)\s+(?:interview|gespr(?:ä|ae)ch)\s+ein\b|"
+    r"zu\s+einem\s+(?:technischen|fachlichen)\s+(?:interview|gespr(?:ä|ae)ch)\s+einladen|"
+    r"invite\s+you\s+(?:to|for)\s+a\s+technical\s+(?:interview|assessment)|"
     r"invite\s+you\s+to\s+a\s+technical\s+(?:interview|assessment)|"
     r"technical\s+interview\s+invitation",
     re.IGNORECASE,
 )
+# Codex S15 P2: a negated marker ("This is not a technical interview", "Es
+# handelt sich nicht um ein technisches Gespräch", "kein Fachgespräch") must
+# not upgrade an interview. Negation is clause-scoped: only the text between
+# the last clause boundary and the marker is inspected.
+_CLAUSE_START = re.compile(r"[.!?;,:\n]")
+_MARKER_NEGATION = re.compile(
+    r"\b(?:nicht|kein|keine[nmrs]?|ohne|not|no|never|without)\b|n't\b", re.IGNORECASE
+)
+
+
+def _affirmative_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    for match in pattern.finditer(text):
+        starts = [m.end() for m in _CLAUSE_START.finditer(text, 0, match.start())]
+        clause_lead = text[(starts[-1] if starts else 0) : match.start()]
+        if not _MARKER_NEGATION.search(clause_lead):
+            return match
+    return None
+
+
 _UNDER_REVIEW = re.compile(
     r"ihre\s+bewerbung\s+(?:befindet\s+sich|ist)\s+(?:derzeit\s+|aktuell\s+|momentan\s+|noch\s+)?"
     r"in\s+(?:der\s+)?(?:pr(?:ü|ue)fung|sichtung|bearbeitung)|"
@@ -145,7 +168,7 @@ def classify_application_response(
     text = f"{clean_subject}\n{clean_body}"
 
     if classification == R.INTERVIEW_INVITATION:
-        marker = _TECHNICAL_MARKER.search(text)
+        marker = _affirmative_match(_TECHNICAL_MARKER, text)
         if marker:
             return ResponseClassificationResult(
                 R.TECHNICAL_INTERVIEW_INVITATION,
@@ -155,7 +178,7 @@ def classify_application_response(
                 _fragment(text, marker),
             )
     if base.category in _NO_LIFECYCLE_CATEGORY:
-        technical = _TECHNICAL_INVITATION.search(text)
+        technical = _affirmative_match(_TECHNICAL_INVITATION, text)
         if technical:
             return ResponseClassificationResult(
                 R.TECHNICAL_INTERVIEW_INVITATION,

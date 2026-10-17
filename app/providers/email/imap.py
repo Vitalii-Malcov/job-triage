@@ -426,9 +426,14 @@ def _extract_content(
 
 
 def _first_html_part(part: Message, state: dict, depth: int = 0) -> str | None:
-    """The first non-attachment text/html part, with the same attachment
-    pruning and MIME bounds as `_walk_body_and_attachments`."""
-    if depth > MAX_MIME_DEPTH or _is_attachment_part(part):
+    """The first BODY text/html part, with the same attachment pruning and
+    MIME bounds as `_walk_body_and_attachments`.
+
+    Codex S15 P2: stricter than `_is_attachment_part` -- a part that carries
+    a filename is a file even when it says `Content-Disposition: inline`
+    (e.g. an attached "old-rejection.html"), so it is never read as the
+    employer's message. Only unnamed text/html parts count as the body."""
+    if depth > MAX_MIME_DEPTH or _is_attachment_part(part) or part.get_filename():
         return None
     if part.is_multipart():
         for sub_part in part.get_payload():
