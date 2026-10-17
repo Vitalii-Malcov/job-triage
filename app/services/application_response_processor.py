@@ -72,6 +72,10 @@ class ResponseTrackingResult:
     duplicate: bool
     dry_run: bool
     reason: str
+    # REJECTION/OFFER mail is only reported: the operator must confirm the
+    # outcome (CLI transition), e-mail never applies a terminal status.
+    operator_confirmation_required: bool = False
+    proposed_status: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -270,6 +274,10 @@ class ApplicationResponseProcessor:
                 **common,
                 new_status=intended,
                 action=decision.action,
+                operator_confirmation_required=decision.operator_confirmation_required,
+                proposed_status=(
+                    decision.proposed_status.value if decision.proposed_status else None
+                ),
                 transition_applied=False,
                 event_recorded=False,
                 duplicate=False,
@@ -291,6 +299,10 @@ class ApplicationResponseProcessor:
             "correlation_signals": list(correlation.signals),
             "message_id_hash": message.message_id_hash,
             "decision": decision.reason,
+            "operator_confirmation_required": decision.operator_confirmation_required,
+            "proposed_status": (
+                decision.proposed_status.value if decision.proposed_status else None
+            ),
         }
         summary = (
             f"Inbound e-mail classified {classified.classification.value} "
@@ -322,7 +334,9 @@ class ApplicationResponseProcessor:
                     origin=ApplicationEventOrigin.GMAIL,
                     actor=PROCESSOR_ACTOR,
                     reason=decision.reason,
-                    followup_required=decision.followup_required,
+                    followup_required=(
+                        decision.followup_required or decision.operator_confirmation_required
+                    ),
                     **kwargs,
                 )
         except (ApplicationConcurrencyError, InvalidApplicationTransitionError):
@@ -334,12 +348,18 @@ class ApplicationResponseProcessor:
                 event_recorded=False,
                 duplicate=False,
                 reason="CONCURRENT_CHANGE_RETRY",
+                operator_confirmation_required=decision.operator_confirmation_required,
+                proposed_status=(
+                    decision.proposed_status.value if decision.proposed_status else None
+                ),
             )
         return ResponseTrackingResult(
             **common,
             new_status=outcome.application.current_status.value,
             action=decision.action,
             transition_applied=outcome.transition_applied,
+            operator_confirmation_required=decision.operator_confirmation_required,
+            proposed_status=(decision.proposed_status.value if decision.proposed_status else None),
             event_recorded=outcome.event_recorded,
             duplicate=outcome.duplicate,
             reason=decision.reason if not outcome.duplicate else "ALREADY_PROCESSED",

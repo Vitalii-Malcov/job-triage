@@ -486,15 +486,29 @@ def test_rejection_needs_high_correlation(db):
             key="mid:rej-weak",
         ),
     )[0]
-    assert (
-        weak.classification == "REJECTION" and weak.reason == "INSUFFICIENT_EVIDENCE_FOR_TRANSITION"
-    )
+    # Codex S15 P1: e-mail never applies a terminal status, at any correlation.
+    assert weak.classification == "REJECTION" and not weak.transition_applied
+    assert weak.operator_confirmation_required and weak.proposed_status == "REJECTED"
+    assert weak.reason == "TERMINAL_EMAIL_REQUIRES_OPERATOR_CONFIRMATION"
     assert ApplicationTracker().get_application(db, ald.id).current_status == S.SUBMITTED
     strong = _process(
         db,
         _msg(subject="Ihre Bewerbung als Backend Developer", body=rejection, key="mid:rej-strong"),
     )[0]
-    assert strong.transition_applied and strong.new_status == "REJECTED"
+    assert strong.correlation_confidence == "HIGH" and strong.event_recorded
+    assert not strong.transition_applied and strong.new_status == "SUBMITTED"
+    assert strong.operator_confirmation_required
+    app = ApplicationTracker().get_application(db, ald.id)
+    assert app.current_status == S.SUBMITTED and app.followup_required is True
+    # The operator confirms through the audited path; afterwards mail is moot.
+    ApplicationTracker().transition_application(
+        db,
+        ald.id,
+        S.REJECTED,
+        origin=O.OPERATOR,
+        actor="operator",
+        reason="Rejection mail mid:rej-strong confirmed by operator",
+    )
     late_invite = _process(
         db,
         _msg(
@@ -530,7 +544,7 @@ def test_interview_and_technical_interview_invitations(db):
     assert ApplicationTracker().get_application(db, ald.id).current_status == S.TECHNICAL_INTERVIEW
 
 
-def test_offer_email(db):
+def test_offer_email_is_reported_for_operator_confirmation(db):
     ald = _app(db)
     offer = _process(
         db,
@@ -540,8 +554,10 @@ def test_offer_email(db):
             key="mid:offer",
         ),
     )[0]
-    assert offer.classification == "OFFER" and offer.new_status == "OFFER"
-    assert ApplicationTracker().get_application(db, ald.id).current_status == S.OFFER
+    assert offer.classification == "OFFER" and not offer.transition_applied
+    assert offer.operator_confirmation_required and offer.proposed_status == "OFFER"
+    assert offer.new_status == "SUBMITTED" and offer.event_recorded
+    assert ApplicationTracker().get_application(db, ald.id).current_status == S.SUBMITTED
 
 
 def test_request_for_information_sets_followup_without_status_change(db):

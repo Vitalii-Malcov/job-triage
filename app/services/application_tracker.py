@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.db import application_repository as repo
 from app.db.datetime_utils import ensure_utc
 from app.db.models import ApplicationRecord
-from app.domain.application_lifecycle import validate_transition
+from app.domain.application_lifecycle import is_terminal, validate_transition
 from app.models.application_lifecycle import (
     Application,
     ApplicationChannel,
@@ -71,6 +71,11 @@ class ApplicationConcurrencyError(RuntimeError):
 
 class ApplicationInputError(ValueError):
     pass
+
+
+class TerminalStatusNotPermittedError(ApplicationInputError):
+    """A terminal status (OFFER/REJECTED/WITHDRAWN) was requested by an
+    origin other than OPERATOR, or without a reason."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +219,8 @@ class ApplicationTracker:
     ) -> EventOutcome:
         """Create (or idempotently locate) an application. An existing
         `(source, source_reference)` is returned unchanged, never updated."""
+        if is_terminal(S(initial_status)):
+            raise TerminalStatusNotPermittedError("an application cannot start terminal")
         company = _require_text("company_name", company_name, 300)
         role = _require_text("role_title", role_title, 300)
         source_value = _require_text("source", source, 64)
@@ -347,16 +354,17 @@ class ApplicationTracker:
         *,
         actor: str,
         reason: str,
-        origin: ApplicationEventOrigin = ApplicationEventOrigin.OPERATOR,
         occurred_at: datetime | None = None,
         correlation_key: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> EventOutcome:
         """Operator correction OUTSIDE the transition table (e.g. leaving a
-        terminal status). Requires an actor and a non-empty reason; the
-        old status stays in history -- nothing is rewritten."""
+        terminal status). Always origin OPERATOR; requires an actor and a
+        non-empty reason; the old status stays in history -- nothing is
+        rewritten."""
         _require_text("reason", reason, MAX_REASON_LENGTH)
         _require_text("actor", actor, MAX_ACTOR_LENGTH)
+        origin = ApplicationEventOrigin.OPERATOR
         outcome = self._write(
             db,
             application_id,
@@ -461,6 +469,19 @@ class ApplicationTracker:
             validate_transition(current, target)
         elif event_type == ApplicationEventType.STATUS_OVERRIDDEN and target == current:
             raise ApplicationInputError("override target equals the current status")
+        if event_type == ApplicationEventType.STATUS_OVERRIDDEN and (
+            origin != ApplicationEventOrigin.OPERATOR
+        ):
+            raise TerminalStatusNotPermittedError("overrides are operator actions only")
+        if target is not None and is_terminal(target):
+            # Codex S15 P1: the single lifecycle writer refuses a terminal
+            # status from any non-operator origin -- inbound mail (GMAIL) is
+            # unauthenticated, and SYSTEM/PORTAL/IMPORT never decide outcomes.
+            if origin != ApplicationEventOrigin.OPERATOR:
+                raise TerminalStatusNotPermittedError(
+                    f"{target} may only be set by an OPERATOR (origin was {origin})"
+                )
+            _require_text("reason", reason, MAX_REASON_LENGTH)
 
         when = ensure_utc(occurred_at) if occurred_at else None
         now = _now()
