@@ -250,6 +250,10 @@ class ParsedGmailMessage:
     # matching this field's pre-S7E-011 absence.
     provider_arrival_at: datetime | None = None
     attachments: tuple[ParsedAttachment, ...] = field(default_factory=tuple)
+    # Stage 15: inert text of an HTML-only body (tags stripped lexically,
+    # see app/utils/html_text.py); "" when a text/plain part exists or
+    # there is no HTML. In memory only -- never persisted by Stage 7A.
+    body_html_text: str = ""
 
 
 @dataclass(frozen=True)
