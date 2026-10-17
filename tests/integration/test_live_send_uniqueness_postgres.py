@@ -35,6 +35,7 @@ import sqlalchemy.exc
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
 from alembic.ddl.postgresql import PostgresqlImpl
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, delete, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
@@ -481,7 +482,12 @@ class TestMigrationSecondIndexFailureOnPostgres:
             assert state() == (PREVIOUS_REVISION, set())
 
             upgrade(cfg, "head")
-            assert state() == ("a7c3e9f1b2d4", set(LIVE_SEND_INDEXES))
+            # Stage 15 moved the head past this revision; the plain retry
+            # still lands at head with both indexes present.
+            assert state() == (
+                ScriptDirectory.from_config(cfg).get_current_head(),
+                set(LIVE_SEND_INDEXES),
+            )
         finally:
             upgrade(cfg, "head")
             engine.dispose()

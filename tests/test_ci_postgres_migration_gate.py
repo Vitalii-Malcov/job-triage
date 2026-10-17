@@ -233,10 +233,11 @@ def test_required_modules_include_stage_9c_9d_and_hard008() -> None:
         assert (PROJECT_ROOT / module).exists()
 
 
-def test_repository_head_is_the_live_send_uniqueness_head() -> None:
+def test_repository_head_is_the_application_lifecycle_head() -> None:
     # Moves with the next migration on purpose: that migration must also
     # update the CI literal (see test_real_workflow_satisfies_the_gate).
-    assert _repository_head() == "a7c3e9f1b2d4"
+    # Stage 15: b5d2e8f4a1c7 (application lifecycle tables).
+    assert _repository_head() == "b5d2e8f4a1c7"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy import (
@@ -21,6 +22,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+from app.models.application_lifecycle import (
+    ApplicationChannel,
+    ApplicationEventOrigin,
+    ApplicationEventType,
+    ApplicationLifecycleStatus,
+)
 
 
 class JobRecord(Base):
@@ -2969,3 +2976,182 @@ class GmailApplicationDraftRecord(Base):
     created_in_gmail_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+def _in_list(column: str, values) -> str:
+    return f"{column} IN ({', '.join(repr(str(v)) for v in values)})"
+
+
+APPLICATION_STATUS_VALUES: tuple[str, ...] = tuple(s.value for s in ApplicationLifecycleStatus)
+APPLICATION_CHECKS: dict[str, str] = {
+    "ck_applications_current_status_valid": _in_list("current_status", APPLICATION_STATUS_VALUES),
+    "ck_applications_channel_valid": _in_list(
+        "application_channel", (c.value for c in ApplicationChannel)
+    ),
+    "ck_applications_version_positive": "version >= 1",
+    "ck_applications_submitted_before_received": (
+        "received_at IS NULL OR (submitted_at IS NOT NULL AND received_at >= submitted_at)"
+    ),
+}
+APPLICATION_EVENT_CHECKS: dict[str, str] = {
+    "ck_application_events_type_valid": _in_list(
+        "event_type", (t.value for t in ApplicationEventType)
+    ),
+    "ck_application_events_origin_valid": _in_list(
+        "origin", (o.value for o in ApplicationEventOrigin)
+    ),
+    "ck_application_events_old_status_valid": (
+        "old_status IS NULL OR " + _in_list("old_status", APPLICATION_STATUS_VALUES)
+    ),
+    "ck_application_events_new_status_valid": (
+        "new_status IS NULL OR " + _in_list("new_status", APPLICATION_STATUS_VALUES)
+    ),
+    "ck_application_events_sequence_positive": "sequence >= 1",
+    # A status event always names its target; an inbound-message event never
+    # changes status; only CREATED has no previous status.
+    "ck_application_events_shape": (
+        "(event_type = 'CREATED' AND old_status IS NULL AND new_status IS NOT NULL) OR "
+        "(event_type IN ('STATUS_CHANGED', 'STATUS_OVERRIDDEN') "
+        "AND old_status IS NOT NULL AND new_status IS NOT NULL) OR "
+        "(event_type = 'INBOUND_MESSAGE' AND new_status IS NULL)"
+    ),
+    "ck_application_events_override_reason": (
+        "event_type <> 'STATUS_OVERRIDDEN' OR (reason IS NOT NULL AND reason <> '')"
+    ),
+}
+
+
+class ApplicationRecord(Base):
+    """Stage 15: one real job application and its CURRENT lifecycle status.
+
+    The status is a cached projection of the immutable
+    `ApplicationEventRecord` history: it is only ever changed in the same
+    transaction that appends the event explaining the change, through a CAS
+    UPDATE on `(id, current_status, version)` (see
+    app/db/application_repository.py). `JobRecord.status` is never touched.
+
+    **Identity is external, not DB-local.** `(source, source_reference)` --
+    the Stage 14D stable vacancy identity, e.g. ("bundesagentur",
+    "20385-2347902-S") -- is unique; `job_id` is an optional, informational
+    pointer to a local `JobRecord` and deliberately NOT a foreign key (a
+    re-imported or rebuilt jobs table must never orphan or cascade-delete
+    an application's history).
+
+    `employer_domains_json` is the operator/evidence-confirmed list of
+    e-mail domains the employer (or its applicant-tracking provider) writes
+    from; inbound correlation treats it as a supporting signal, never as
+    authentication (inbound mail is unauthenticated -- see
+    app/services/application_correlation.py).
+    """
+
+    __tablename__ = "applications"
+    __table_args__ = (
+        UniqueConstraint("source", "source_reference", name="uq_applications_source_reference"),
+        *(CheckConstraint(body, name=name) for name, body in APPLICATION_CHECKS.items()),
+        Index("ix_applications_company_name", "company_name"),
+        Index("ix_applications_external_job_id", "external_job_id"),
+        Index("ix_applications_created_at", "created_at"),
+        Index("ix_applications_last_status_changed_at", "last_status_changed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    candidate_profile_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    company_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    role_title: Mapped[str] = mapped_column(String(300), nullable=False)
+    location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_reference: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    vacancy_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    application_channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    destination_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    employer_domains_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    review_package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_status: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_employer_contact_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_followup_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    followup_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false()
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class ApplicationEventRecord(Base):
+    """Stage 15: one immutable fact in an application's history.
+
+    **Append-only.** Rows are only ever INSERTed (the repository has no
+    update/delete path, and the ORM guards below refuse an UPDATE or DELETE
+    flush). `sequence` is the 1-based position within one application,
+    unique per application, so concurrent writers cannot interleave two
+    events at the same position.
+
+    **Idempotency.** `correlation_key` is a deterministic key derived from
+    the evidence that caused the event (an inbound Gmail message, the portal
+    submission evidence, an import step) -- never random -- and is UNIQUE
+    across the whole table (NULLs allowed for operator actions). Reprocessing
+    the same evidence therefore cannot create a second event, and because
+    the status change is committed in the same transaction as the event, it
+    cannot create a second transition either.
+
+    `metadata_json` carries bounded, non-body details (classifier rule,
+    correlation signals); full e-mail bodies are never stored here.
+    """
+
+    __tablename__ = "application_events"
+    __table_args__ = (
+        UniqueConstraint("application_id", "sequence", name="uq_application_events_sequence"),
+        UniqueConstraint("correlation_key", name="uq_application_events_correlation_key"),
+        *(CheckConstraint(body, name=name) for name, body in APPLICATION_EVENT_CHECKS.items()),
+        Index("ix_application_events_application_occurred", "application_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("applications.id", ondelete="RESTRICT"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    old_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    origin: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    source_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evidence_summary: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    correlation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
+class ApplicationEventImmutableError(RuntimeError):
+    """An UPDATE or DELETE of an ApplicationEventRecord was attempted."""
+
+
+@event.listens_for(ApplicationEventRecord, "before_update")
+def _refuse_event_update(mapper, connection, target) -> None:
+    raise ApplicationEventImmutableError("application events are append-only")
+
+
+@event.listens_for(ApplicationEventRecord, "before_delete")
+def _refuse_event_delete(mapper, connection, target) -> None:
+    raise ApplicationEventImmutableError("application events are append-only")

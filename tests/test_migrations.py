@@ -3215,7 +3215,7 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    # Stage 12 live-send uniqueness (a7c3e9f1b2d4, "enforce at most one
-    # live send per inbound message / follow-up anchor") -- update this
+    # Stage 15 application lifecycle tables (b5d2e8f4a1c7, on top of the
+    # Stage 12 live-send uniqueness head a7c3e9f1b2d4) -- update this
     # alongside every new migration's own down_revision chaining.
-    assert heads[0] == "a7c3e9f1b2d4"
+    assert heads[0] == "b5d2e8f4a1c7"
