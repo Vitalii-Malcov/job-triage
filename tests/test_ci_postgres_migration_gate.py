@@ -236,8 +236,9 @@ def test_required_modules_include_stage_9c_9d_and_hard008() -> None:
 def test_repository_head_is_the_application_lifecycle_head() -> None:
     # Moves with the next migration on purpose: that migration must also
     # update the CI literal (see test_real_workflow_satisfies_the_gate).
-    # Stage 15: b5d2e8f4a1c7 (application lifecycle tables).
-    assert _repository_head() == "b5d2e8f4a1c7"
+    # Stage 15: b5d2e8f4a1c7 (application lifecycle tables), then the
+    # remediation c8e4a2f6d1b9 (application_events append-only triggers).
+    assert _repository_head() == "c8e4a2f6d1b9"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

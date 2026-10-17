@@ -45,6 +45,7 @@ TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION = "b5d2e8f4a1c7"
 PREVIOUS = "a7c3e9f1b2d4"
+HEAD = "c8e4a2f6d1b9"
 SUBMITTED_AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
 
 pytestmark = pytest.mark.skipif(
@@ -58,12 +59,14 @@ pytestmark = pytest.mark.skipif(
 def factory():
     engine = create_engine(TEST_POSTGRES_URL, poolclass=NullPool)
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM application_events"))
-        conn.execute(text("DELETE FROM applications"))
+        # Row DELETEs are refused by the append-only trigger (c8e4a2f6d1b9);
+        # test isolation uses the privileged TRUNCATE instead.
+        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY"))
     yield sessionmaker(engine)
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM application_events"))
-        conn.execute(text("DELETE FROM applications"))
+        # Row DELETEs are refused by the append-only trigger (c8e4a2f6d1b9);
+        # test isolation uses the privileged TRUNCATE instead.
+        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY"))
     engine.dispose()
 
 
@@ -190,12 +193,14 @@ class TestApplicationLifecycleOnPostgres:
         def transition(index):
             session = factory()
             try:
+                terminal = targets[index] in (S.REJECTED, S.WITHDRAWN)
                 return ApplicationTracker().transition_application(
                     session,
                     app.id,
                     targets[index],
-                    origin=O.GMAIL,
+                    origin=O.OPERATOR if terminal else O.GMAIL,
                     actor="pg-race",
+                    reason="race test" if terminal else None,
                     correlation_key=f"gmail:race-{index}",
                 )
             finally:
@@ -234,6 +239,63 @@ class TestApplicationLifecycleOnPostgres:
         assert sequences == list(range(1, events + 1))
         check.close()
 
+    def test_events_are_append_only_in_the_database(self, factory):
+        """Codex S15 P2 (c8e4a2f6d1b9): Core UPDATE/DELETE bypass the ORM
+        guards; the PostgreSQL trigger refuses them for every client."""
+        session = factory()
+        app = _create(session)
+        for statement in (
+            "UPDATE application_events SET reason = 'rewritten'",
+            "UPDATE application_events SET new_status = 'REJECTED' WHERE application_id = :a",
+            "DELETE FROM application_events WHERE application_id = :a",
+            "DELETE FROM application_events",
+        ):
+            with pytest.raises(sqlalchemy.exc.DBAPIError, match="append-only"):
+                session.execute(text(statement), {"a": app.id})
+                session.commit()
+            session.rollback()
+        assert _counts(session, app.id) == (1, "SUBMITTED")
+        session.close()
+
+    def test_application_with_events_cannot_be_deleted(self, factory):
+        session = factory()
+        app = _create(session)
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            session.execute(text("DELETE FROM applications WHERE id = :a"), {"a": app.id})
+            session.commit()
+        session.rollback()
+        orphans = session.execute(
+            text(
+                "SELECT COUNT(*) FROM application_events e LEFT JOIN applications a "
+                "ON a.id = e.application_id WHERE a.id IS NULL"
+            )
+        ).scalar_one()
+        assert orphans == 0 and _counts(session, app.id) == (1, "SUBMITTED")
+        session.close()
+
+    def test_forged_terminal_mail_never_changes_status(self, factory):
+        session = factory()
+        app = _create(session)
+        forged = InboundMessage(
+            account_key="applicant@example.invalid",
+            message_key="mid:forged@unrelated.example",
+            message_id_header="<forged@unrelated.example>",
+            reply_to_ids=(),
+            from_address="news@unrelated.example",
+            from_display_name="Newsletter",
+            to_addresses=("applicant@example.invalid",),
+            subject="Regarding ALD Vacuum Technologies GmbH",
+            body="Reference 20385-2347902-S.\nWe regret to inform you that your application "
+            "was rejected.",
+            has_html=False,
+            occurred_at=SUBMITTED_AT + timedelta(days=1),
+        )
+        result = ApplicationResponseProcessor().process(session, [forged], apply=True)[0]
+        assert result.classification == "REJECTION" and not result.transition_applied
+        assert result.operator_confirmation_required
+        assert _counts(session, app.id) == (2, "SUBMITTED")
+        session.close()
+
     def test_one_step_downgrade_and_upgrade(self, factory):
         cfg = Config(str(PROJECT_ROOT / "alembic.ini"))
         cfg.set_main_option("sqlalchemy.url", TEST_POSTGRES_URL.replace("%", "%%"))
@@ -248,7 +310,7 @@ class TestApplicationLifecycleOnPostgres:
             with engine.connect() as conn:
                 assert conn.execute(
                     text("SELECT version_num FROM alembic_version")
-                ).scalar_one() == (REVISION)
+                ).scalar_one() == (HEAD)
         finally:
             upgrade(cfg, "head")
             engine.dispose()

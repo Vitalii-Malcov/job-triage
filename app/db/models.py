@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 
 from sqlalchemy import (
+    DDL,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -3141,6 +3142,45 @@ class ApplicationEventRecord(Base):
     evidence_summary: Mapped[str | None] = mapped_column(String(500), nullable=True)
     correlation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
+# Database-level append-only guarantee (Codex S15 P2). The migration
+# c8e4a2f6d1b9 creates exactly these objects; the listeners below make
+# `Base.metadata.create_all` (test and dev schemas) install them as well, so
+# the guarantee never depends on the ORM guards further down.
+APPLICATION_EVENT_IMMUTABILITY_DDL: dict[str, tuple[str, ...]] = {
+    "sqlite": (
+        "CREATE TRIGGER trg_application_events_no_update BEFORE UPDATE ON application_events "
+        "BEGIN SELECT RAISE(ABORT, 'application_events is append-only'); END",
+        "CREATE TRIGGER trg_application_events_no_delete BEFORE DELETE ON application_events "
+        "BEGIN SELECT RAISE(ABORT, 'application_events is append-only'); END",
+    ),
+    "postgresql": (
+        "CREATE FUNCTION application_events_append_only() RETURNS trigger LANGUAGE plpgsql AS "
+        "$$ BEGIN RAISE EXCEPTION 'application_events is append-only' "
+        "USING ERRCODE = 'restrict_violation'; END $$",
+        "CREATE TRIGGER trg_application_events_append_only BEFORE UPDATE OR DELETE "
+        "ON application_events FOR EACH ROW EXECUTE FUNCTION application_events_append_only()",
+    ),
+}
+_APPLICATION_EVENT_IMMUTABILITY_DROP: dict[str, tuple[str, ...]] = {
+    "postgresql": ("DROP FUNCTION IF EXISTS application_events_append_only()",),
+}
+
+for _dialect, _statements in APPLICATION_EVENT_IMMUTABILITY_DDL.items():
+    for _statement in _statements:
+        event.listen(
+            ApplicationEventRecord.__table__,
+            "after_create",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
+for _dialect, _statements in _APPLICATION_EVENT_IMMUTABILITY_DROP.items():
+    for _statement in _statements:
+        event.listen(
+            ApplicationEventRecord.__table__,
+            "after_drop",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
 
 
 class ApplicationEventImmutableError(RuntimeError):

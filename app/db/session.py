@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
+from app.db.session_engine import enable_sqlite_foreign_keys
 
 
 def _connect_args_for(database_url: str) -> dict:
@@ -62,7 +63,9 @@ connect_args = _connect_args_for(settings.database_url)
 # transparently detected and replaced instead of surfacing as an
 # unhandled OperationalError on the next query. A no-op for SQLite (no
 # such failure mode there), harmless to set unconditionally.
-engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+engine = enable_sqlite_foreign_keys(
+    create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]

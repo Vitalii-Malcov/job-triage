@@ -187,7 +187,9 @@ def test_tracker_refuses_invalid_and_terminal_transitions(db):
     app_id = _create(db).application.id
     with pytest.raises(InvalidApplicationTransitionError):
         tracker.transition_application(db, app_id, S.DISCOVERED, origin=O.OPERATOR, actor="op")
-    tracker.transition_application(db, app_id, S.REJECTED, origin=O.OPERATOR, actor="op")
+    tracker.transition_application(
+        db, app_id, S.REJECTED, origin=O.OPERATOR, actor="op", reason="Absage per Telefon"
+    )
     with pytest.raises(InvalidApplicationTransitionError):
         tracker.transition_application(db, app_id, S.INTERVIEW, origin=O.OPERATOR, actor="op")
     assert tracker.get_application(db, app_id).current_status == S.REJECTED
@@ -219,7 +221,9 @@ def test_full_preparation_path_is_recorded_in_order(db):
 def test_override_is_audited_and_never_rewrites_history(db):
     tracker = ApplicationTracker()
     app_id = _create(db).application.id
-    tracker.transition_application(db, app_id, S.REJECTED, origin=O.GMAIL, actor="proc")
+    tracker.transition_application(
+        db, app_id, S.REJECTED, origin=O.OPERATOR, actor="operator", reason="confirmed mail"
+    )
     with pytest.raises(ApplicationInputError):
         tracker.override_status(db, app_id, S.INTERVIEW, actor="operator", reason="  ")
     with pytest.raises(ApplicationInputError):
@@ -492,7 +496,27 @@ def test_sqlite_migration_creates_tables_constraints_and_indexes(tmp_path):
     session.close()
     engine.dispose()
 
-    downgrade(cfg, "-1")
+    def triggers() -> set[str]:
+        eng = create_engine(f"sqlite:///{db_path}")
+        with eng.connect() as conn:
+            names = set(
+                conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+                ).scalars()
+            )
+        eng.dispose()
+        return names
+
+    append_only = {"trg_application_events_no_update", "trg_application_events_no_delete"}
+    assert append_only <= triggers()
+    # One step down from head removes only the remediation triggers ...
+    downgrade(cfg, "b5d2e8f4a1c7")
+    assert not append_only & triggers()
+    engine = create_engine(f"sqlite:///{db_path}")
+    assert {"applications", "application_events"} <= set(inspect(engine).get_table_names())
+    engine.dispose()
+    # ... and the Stage 15 tables go with b5d2e8f4a1c7's own downgrade.
+    downgrade(cfg, "a7c3e9f1b2d4")
     engine = create_engine(f"sqlite:///{db_path}")
     assert not {"applications", "application_events"} & set(inspect(engine).get_table_names())
     engine.dispose()
@@ -500,6 +524,7 @@ def test_sqlite_migration_creates_tables_constraints_and_indexes(tmp_path):
     engine = create_engine(f"sqlite:///{db_path}")
     assert {"applications", "application_events"} <= set(inspect(engine).get_table_names())
     engine.dispose()
+    assert append_only <= triggers()
 
 
 def test_model_checks_match_the_frozen_migration_vocabulary():
