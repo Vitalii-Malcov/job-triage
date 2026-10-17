@@ -237,8 +237,9 @@ def test_repository_head_is_the_application_lifecycle_head() -> None:
     # Moves with the next migration on purpose: that migration must also
     # update the CI literal (see test_real_workflow_satisfies_the_gate).
     # Stage 15: b5d2e8f4a1c7 (application lifecycle tables), then the
-    # remediation c8e4a2f6d1b9 (application_events append-only triggers).
-    assert _repository_head() == "c8e4a2f6d1b9"
+    # remediation c8e4a2f6d1b9 (application_events append-only triggers);
+    # Stage 16: e3a9c5d7f2b4 (Telegram operator control tables).
+    assert _repository_head() == "e3a9c5d7f2b4"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

@@ -3215,7 +3215,7 @@ def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
-    # Stage 15 remediation: application_events append-only triggers
-    # (c8e4a2f6d1b9, on top of the Stage 15 lifecycle tables b5d2e8f4a1c7)
+    # Stage 16: Telegram operator control tables (e3a9c5d7f2b4, on top of
+    # the Stage 15 remediation c8e4a2f6d1b9)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "c8e4a2f6d1b9"
+    assert heads[0] == "e3a9c5d7f2b4"

@@ -45,7 +45,7 @@ TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION = "b5d2e8f4a1c7"
 PREVIOUS = "a7c3e9f1b2d4"
-HEAD = "c8e4a2f6d1b9"
+HEAD = "e3a9c5d7f2b4"
 SUBMITTED_AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
 
 pytestmark = pytest.mark.skipif(
@@ -60,13 +60,15 @@ def factory():
     engine = create_engine(TEST_POSTGRES_URL, poolclass=NullPool)
     with engine.begin() as conn:
         # Row DELETEs are refused by the append-only trigger (c8e4a2f6d1b9);
-        # test isolation uses the privileged TRUNCATE instead.
-        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY"))
+        # test isolation uses the privileged TRUNCATE instead (CASCADE: the
+        # Stage 16 operator tables reference both tables).
+        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY CASCADE"))
     yield sessionmaker(engine)
     with engine.begin() as conn:
         # Row DELETEs are refused by the append-only trigger (c8e4a2f6d1b9);
-        # test isolation uses the privileged TRUNCATE instead.
-        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY"))
+        # test isolation uses the privileged TRUNCATE instead (CASCADE: the
+        # Stage 16 operator tables reference both tables).
+        conn.execute(text("TRUNCATE application_events, applications RESTART IDENTITY CASCADE"))
     engine.dispose()
 
 
