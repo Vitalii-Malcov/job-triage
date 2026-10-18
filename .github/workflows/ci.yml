@@ -132,8 +132,9 @@ jobs:
       # one-step downgrade/upgrade cycle (restoring head in `finally`), so it
       # runs after the at-head modules and before HARD-008.
       #
-      # Stage 16: test_telegram_operator_control_postgres.py runs at head,
-      # before the Stage 15 module's downgrade/upgrade cycle.
+      # Stage 16: test_telegram_operator_control_postgres.py and
+      # test_stage16_stage9d_arm_race_postgres.py run at head, before the
+      # Stage 15 module's downgrade/upgrade cycle.
       #
       # Every module here skips when TEST_POSTGRES_URL is unset, so the
       # step refuses to run without it and then fails on ANY skipped test:
@@ -156,7 +157,9 @@ jobs:
             tests/integration/test_candidate_profile_transfer_postgres.py \
             tests/integration/test_gmail_mailbox_width_postgres.py \
             tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
-            tests/integration/test_telegram_operator_control_postgres.py             tests/integration/test_application_lifecycle_postgres.py \
+            tests/integration/test_telegram_operator_control_postgres.py \
+            tests/integration/test_stage16_stage9d_arm_race_postgres.py \
+            tests/integration/test_application_lifecycle_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'
           import sys
