@@ -70,6 +70,7 @@ from app.db.candidate_job_match_repository import (
 )
 from app.db.candidate_profile_repository import get_candidate_profile
 from app.db.datetime_utils import ensure_utc
+from app.db.gmail_application_draft_repository import has_armed_attempt_for_review
 from app.db.models import (
     ApplicationPackageReviewRecord,
     CompanyResearchRecord,
@@ -127,6 +128,11 @@ PRESSABLE_CARD_STATES = frozenset(
 )
 APPROVE_REASON = "Operator approved the review package via Telegram (no submission)."
 REVIEW_APPROVE_NOTE = "Approved by the operator via Stage 16 (no submission)."
+GMAIL_DRAFT_IN_FLIGHT = "GMAIL_DRAFT_IN_FLIGHT"
+GMAIL_DRAFT_IN_FLIGHT_ANSWER = (
+    "A Gmail draft for this package is being created right now. Try SKIP again "
+    "once it has finished. Nothing changed."
+)
 PREVIEW_TOKEN = "PREVIEWxxxxxxxx0"  # 16 chars: same callback size as a real token
 
 
@@ -638,6 +644,25 @@ def _lock_review_for_skip(db: Session, application: Application) -> None:
     )
 
 
+def _gmail_draft_in_flight(db: Session, application: Application) -> bool:
+    """A SKIP must not become effective while a Stage 9D attempt for this
+    package is armed and unresolved: that attempt may already be calling
+    the provider. Checked twice per SKIP -- after the review lock (the
+    PostgreSQL authority: Stage 9D arms under that same lock) and again
+    after the decision row is flushed (the SQLite authority: the write
+    lock) -- so the check and the decision commit atomically with respect
+    to the arm. UNCERTAIN does not block: it never re-appends and stays
+    UNCERTAIN until positive reconciliation."""
+    return application.review_package_id is not None and has_armed_attempt_for_review(
+        db, application.review_package_id
+    )
+
+
+def _skip_refused_in_flight(card_id: int) -> CallbackOutcome:
+    logger.warning("telegram_callback_refused reason=gmail_draft_in_flight card_id=%s", card_id)
+    return _outcome(CallbackCode.STATE_CHANGED, answer=GMAIL_DRAFT_IN_FLIGHT_ANSWER)
+
+
 def _card_after_change(
     db: Session, card: TelegramOperatorCardRecord, *, tracker: ApplicationTracker, now: datetime
 ) -> RenderedMessage:
@@ -819,7 +844,13 @@ def handle_callback(
         else:
             if decision is OperatorDecision.SKIP:
                 _lock_review_for_skip(db, application)
+                if _gmail_draft_in_flight(db, application):
+                    db.rollback()
+                    return _skip_refused_in_flight(card.id)
             record = repo.add_decision(db, **values)
+            if decision is OperatorDecision.SKIP and _gmail_draft_in_flight(db, application):
+                db.rollback()
+                return _skip_refused_in_flight(card.id)
             db.commit()
     except IntegrityError:
         db.rollback()
@@ -970,6 +1001,9 @@ def override_decision(
     try:
         if decision is OperatorDecision.SKIP:
             _lock_review_for_skip(db, application)
+            if _gmail_draft_in_flight(db, application):
+                db.rollback()
+                return OverrideResult(OverrideCode.STATE_CHANGED, GMAIL_DRAFT_IN_FLIGHT)
         record = repo.add_decision(
             db,
             application_id=application.id,
@@ -1001,6 +1035,9 @@ def override_decision(
                 reason=f"Operator override SKIP -> APPROVE: {reason.strip()}",
             )
         else:
+            if _gmail_draft_in_flight(db, application):
+                db.rollback()
+                return OverrideResult(OverrideCode.STATE_CHANGED, GMAIL_DRAFT_IN_FLIGHT)
             lifecycle = tracker.override_status(
                 db,
                 application.id,

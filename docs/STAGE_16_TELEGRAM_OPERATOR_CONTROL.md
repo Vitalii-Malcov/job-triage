@@ -179,6 +179,24 @@ APPROVE -> SKIP override) take the review row lock before inserting the
 decision, so on PostgreSQL a concurrent SKIP either committed before that
 revalidation or waits for it.
 
+**SKIP vs. an armed Gmail draft (Codex S16 P1).** The cross-stage
+synchronization point is the existing Stage 9D ledger state: a row in
+`CREATING` with the network fence set (`append_started_at`, committed by the
+arm step before the provider is called). While such an attempt exists for the
+package's review, SKIP (callback and APPROVE → SKIP override) refuses and
+records nothing (`STATE_CHANGED` / `GMAIL_DRAFT_IN_FLIGHT`); once the attempt
+resolved -- CREATED, FAILED or UNCERTAIN -- SKIP proceeds as before. UNCERTAIN
+does not block: it is sticky and never re-appends, so a SKIP after it neither
+erases it nor allows a retry. An armed attempt left behind by a crashed
+process blocks SKIP until Stage 9D classifies it UNCERTAIN (any later
+create/recheck press past its frozen deadline). The SKIP check runs after the
+review row lock and again after the decision row is flushed; Stage 9D's arm
+re-checks the operator decision after its fence write. Lock order: review
+row → (Stage 9D) ledger row; (Stage 16) decision INSERT → application row.
+Stage 9D never locks applications; Stage 16 only reads the ledger. Proven on
+SQLite (`tests/test_stage16_stage9d_arm_race.py`) and PostgreSQL
+(`tests/integration/test_stage16_stage9d_arm_race_postgres.py`).
+
 ## 6. Idempotency and conflicts
 
 | Situation | Result |
