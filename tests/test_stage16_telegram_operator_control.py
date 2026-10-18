@@ -14,6 +14,10 @@ from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
+from app.agents.review_package_builder import (
+    ReviewApplicationApprovedError,
+    ReviewNotPendingError,
+)
 from app.db.base import Base
 from app.db.models import (
     ApplicationEventRecord,
@@ -23,11 +27,17 @@ from app.db.models import (
     OperatorDecisionImmutableError,
     TelegramOperatorCardRecord,
 )
-from app.db.review_package_repository import decide_review
+from app.db.review_package_repository import (
+    ReviewCASConflict,
+    decide_review,
+    get_latest_revision,
+)
 from app.db.session_engine import enable_sqlite_foreign_keys
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
 from app.models.telegram_operator import OperatorAction, OperatorDecision
 from app.services import telegram_operator_control as control
+from app.services.application_tracker import ApplicationConcurrencyError, ApplicationTracker
+from app.services.review_package import ReviewPackageService
 from app.services.telegram import (
     TELEGRAM_MESSAGE_HARD_LIMIT,
     TelegramSendOutcome,
@@ -668,6 +678,136 @@ class TestConcurrentReviewChange:
         )
         assert result.code is control.OverrideCode.PACKAGE_NOT_READY
         assert _counts(db, target.application_id) == (1, 1, S.PACKAGE_READY.value)
+
+
+# --- Codex S16 P1 (final): review lifecycle stays consistent with the approval ----------
+
+
+def _review(db, review_id):
+    db.expire_all()
+    return db.get(ApplicationPackageReviewRecord, review_id)
+
+
+def _late_reject(factory, review_id, version):
+    """A Stage 6E rejection that read `version` BEFORE an approval committed."""
+    other = factory()
+    try:
+        decide_review(
+            other,
+            review_id=review_id,
+            expected_review_version=version,
+            new_status="REJECTED",
+            decision_note="late rejection",
+        )
+    finally:
+        other.close()
+
+
+class TestReviewLifecycleInvariant:
+    def test_approve_moves_pending_review_to_approved_pinning_the_shown_revision(
+        self, db, settings, carded
+    ):
+        target = carded["target"]
+        revision = get_latest_revision(db, target.review_id)
+        before = _review(db, target.review_id).review_version
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.APPROVED
+        review = _review(db, target.review_id)
+        assert review.status == "APPROVED"
+        assert review.approved_revision_id == revision.id
+        assert review.review_version == before
+        assert review.decided_at is not None
+        assert _counts(db, target.application_id) == (1, 2, S.APPROVED.value)
+
+    def test_codex_repro_reject_with_pre_approval_version_after_approve_commits(
+        self, factory, db, settings, carded
+    ):
+        """Codex SQLite repro: a rejection that read the review before the
+        APPROVE commits only afterwards. It must not produce REJECTED."""
+        target = carded["target"]
+        version_seen_by_reject = _review(db, target.review_id).review_version
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.APPROVED
+        with pytest.raises(ReviewCASConflict):
+            _late_reject(factory, target.review_id, version_seen_by_reject)
+        assert _review(db, target.review_id).status == "APPROVED"
+        assert _counts(db, target.application_id) == (1, 2, S.APPROVED.value)
+
+    def test_stage6e_service_reject_after_approve_is_not_pending(self, db, settings, carded):
+        target = carded["target"]
+        version = _review(db, target.review_id).review_version
+        _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        with pytest.raises(ReviewNotPendingError):
+            ReviewPackageService().reject(db, target.review_id, version, "late")
+        assert _review(db, target.review_id).status == "APPROVED"
+        assert _counts(db, target.application_id) == (1, 2, S.APPROVED.value)
+
+    def test_decide_review_refuses_reject_while_linked_application_approved(self, db, carded):
+        """Repository-boundary guard, independent of Telegram: an application
+        APPROVED for a still-PENDING_REVIEW package (e.g. approved before
+        this fix) blocks the rejection; nothing changes."""
+        target = carded["target"]
+        db.execute(
+            update(ApplicationRecord)
+            .where(ApplicationRecord.id == target.application_id)
+            .values(current_status=S.APPROVED.value)
+        )
+        db.commit()
+        version = _review(db, target.review_id).review_version
+        with pytest.raises(ReviewApplicationApprovedError) as excinfo:
+            decide_review(
+                db,
+                review_id=target.review_id,
+                expected_review_version=version,
+                new_status="REJECTED",
+                decision_note="direct",
+            )
+        assert excinfo.value.application_id == target.application_id
+        review = _review(db, target.review_id)
+        assert review.status == "PENDING_REVIEW"
+        assert review.decided_at is None
+
+    def test_reject_first_then_approve_is_refused(self, factory, db, settings, carded):
+        target = carded["target"]
+        _reject_review_concurrently(factory, target.review_id)
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.PACKAGE_NOT_READY
+        assert "REVIEW_PACKAGE_REJECTED" in outcome.answer
+        assert _review(db, target.review_id).status == "REJECTED"
+        assert _counts(db, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+
+    def test_lifecycle_failure_rolls_back_review_approval_and_decision(
+        self, db, settings, carded, monkeypatch
+    ):
+        target = carded["target"]
+
+        def fail(self, db, application_id, *args, **kwargs):
+            raise ApplicationConcurrencyError(application_id)
+
+        monkeypatch.setattr(ApplicationTracker, "transition_application", fail)
+        outcome = _press(db, settings, OperatorAction.APPROVE, carded["token"])
+        assert outcome.code is CallbackCode.STATE_CHANGED
+        review = _review(db, target.review_id)
+        assert review.status == "PENDING_REVIEW"
+        assert review.approved_revision_id is None
+        assert _counts(db, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+
+    def test_override_skip_to_approve_approves_review_and_blocks_later_reject(
+        self, factory, db, settings, carded
+    ):
+        target = carded["target"]
+        _press(db, settings, OperatorAction.SKIP, carded["token"])
+        assert _review(db, target.review_id).status == "PENDING_REVIEW"
+        version = _review(db, target.review_id).review_version
+        result = control.override_decision(
+            db, target.application_id, OperatorDecision.APPROVE, reason="retry", now=NOW
+        )
+        assert result.code is control.OverrideCode.OVERRIDDEN
+        assert _review(db, target.review_id).status == "APPROVED"
+        with pytest.raises(ReviewCASConflict):
+            _late_reject(factory, target.review_id, version)
+        assert _review(db, target.review_id).status == "APPROVED"
+        assert _counts(db, target.application_id) == (2, 2, S.APPROVED.value)
 
 
 # --- card delivery ----------------------------------------------------------------------

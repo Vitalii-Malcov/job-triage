@@ -35,12 +35,20 @@ serialized by UNIQUE(idempotency_key).
 **Approval vs. concurrent review changes (Codex S16 P1).** An APPROVE never
 trusts the readiness read by `load_target`: inside the approval
 transaction -- after the decision row is flushed, before the lifecycle
-write commits -- `_recheck_review_locked` re-reads the review row with
+write commits -- `_approve_review_locked` re-reads the review row with
 `SELECT ... FOR UPDATE` (PostgreSQL: waits for, then sees, a concurrent
-Stage 6E reject/revision; holding the lock makes later review writes wait
-for this commit) and refuses unless the package is still ready with the
-same review status, version and revision. On SQLite the flushed INSERT
-already holds the database write lock, so the re-read is final.
+Stage 6E reject/revision) and refuses unless the package is still ready
+with the same review status, version and revision. On SQLite the flushed
+INSERT already holds the database write lock, so the re-read is final.
+
+**One notion of approval.** A still-PENDING_REVIEW package is then moved
+PENDING_REVIEW -> APPROVED through the Stage 6E `decide_review` CAS (pinning
+the shown revision) in the SAME transaction as the decision row and the
+application PACKAGE_READY -> APPROVED transition: all three commit together
+or none does. An APPROVED review is terminal, so a Stage 6E rejection that
+waited on this transaction matches zero rows afterwards, and
+`decide_review` itself refuses REJECTED while a linked application is
+APPROVED. Lock order everywhere: review row, then application row.
 """
 
 import hashlib
@@ -68,7 +76,12 @@ from app.db.models import (
     JobRecord,
     TelegramOperatorCardRecord,
 )
-from app.db.review_package_repository import get_current_revision, get_review_by_id
+from app.db.review_package_repository import (
+    ReviewCASConflict,
+    decide_review,
+    get_current_revision,
+    get_review_by_id,
+)
 from app.domain.application_lifecycle import InvalidApplicationTransitionError
 from app.models.application_lifecycle import (
     Application,
@@ -113,6 +126,7 @@ PRESSABLE_CARD_STATES = frozenset(
     {TelegramDeliveryState.SENT.value, TelegramDeliveryState.UNCERTAIN.value}
 )
 APPROVE_REASON = "Operator approved the review package via Telegram (no submission)."
+REVIEW_APPROVE_NOTE = "Approved by the operator via Stage 16 (no submission)."
 PREVIEW_TOKEN = "PREVIEWxxxxxxxx0"  # 16 chars: same callback size as a real token
 
 
@@ -571,13 +585,17 @@ async def send_card(
 # --- callbacks -----------------------------------------------------------------------
 
 
-def _recheck_review_locked(
+def _approve_review_locked(
     db: Session, application: Application, pinned: PackageSummary
 ) -> tuple[str, ...]:
     """Inside the approval transaction: lock and re-read the authoritative
-    review row, then re-assess readiness. Returns refusal reasons (empty
-    means still approvable with exactly the pinned status/version/revision).
-    Must run after this transaction has written (SQLite write lock)."""
+    review row, re-assess readiness, and move a PENDING_REVIEW package to
+    APPROVED (Stage 6E CAS, uncommitted). Returns refusal reasons (empty
+    means approvable with exactly the pinned status/version/revision and
+    the review is now APPROVED in this transaction); on any reason the
+    caller rolls back. Must run after this transaction has written (SQLite
+    write lock) and before the application row is touched (lock order:
+    review, then application)."""
     if application.review_package_id is None:
         return ("NO_REVIEW_PACKAGE",)
     db.execute(
@@ -594,6 +612,19 @@ def _recheck_review_locked(
         or fresh.revision_id != pinned.revision_id
     ):
         reasons.append("REVIEW_PACKAGE_CHANGED")
+    if not reasons and fresh.review_status == "PENDING_REVIEW":
+        try:
+            decide_review(
+                db,
+                review_id=application.review_package_id,
+                expected_review_version=pinned.review_version,
+                new_status="APPROVED",
+                decision_note=REVIEW_APPROVE_NOTE,
+                approved_revision_id=pinned.revision_id,
+                commit=False,
+            )
+        except ReviewCASConflict:
+            reasons.append("REVIEW_PACKAGE_CHANGED")
     return tuple(reasons)
 
 
@@ -748,7 +779,7 @@ def handle_callback(
         if decision is OperatorDecision.APPROVE:
             correlation_key = f"s16:approve:{target.key}:g{state.generation}"
             record = repo.add_decision(db, lifecycle_correlation_key=correlation_key, **values)
-            stale = _recheck_review_locked(db, application, target.view.package)
+            stale = _approve_review_locked(db, application, target.view.package)
             if stale:
                 db.rollback()
                 reasons = ", ".join(stale)
@@ -941,7 +972,7 @@ def override_decision(
             metadata={"source": "operator_override"},
         )
         if decision is OperatorDecision.APPROVE:
-            stale = _recheck_review_locked(db, application, target.view.package)
+            stale = _approve_review_locked(db, application, target.view.package)
             if stale:
                 db.rollback()
                 return OverrideResult(OverrideCode.PACKAGE_NOT_READY, ", ".join(stale))

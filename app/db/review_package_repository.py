@@ -17,7 +17,12 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.db.models import ApplicationPackageReviewRecord, ApplicationPackageReviewRevisionRecord
+from app.agents.review_package_builder import ReviewApplicationApprovedError
+from app.db.models import (
+    ApplicationPackageReviewRecord,
+    ApplicationPackageReviewRevisionRecord,
+    ApplicationRecord,
+)
 from app.models.review_package import (
     ReviewedBewerbungContent,
     ReviewedCVContent,
@@ -248,10 +253,27 @@ def decide_review(
     new_status: str,
     decision_note: str | None,
     approved_revision_id: int | None = None,
+    commit: bool = True,
 ) -> ApplicationPackageReviewRecord:
     """Atomically transition `PENDING_REVIEW -> APPROVED|REJECTED` (CAS on
     `id` + `status='PENDING_REVIEW'` + `review_version=expected_review_version`).
     Raises `ReviewCASConflict` if the CAS UPDATE affects zero rows.
+
+    **Approved application guard (Stage 16).** A REJECTED transition is
+    refused with `ReviewApplicationApprovedError` while any Stage 15
+    application linked to this review (`review_package_id`) is APPROVED, so
+    "review REJECTED + application APPROVED" can never be committed by this
+    path. Lock order shared with the Stage 16 approval (review row, THEN
+    application row): the CAS UPDATE holds the review row, then the linked
+    applications are read `FOR NO KEY UPDATE` -- this waits for an
+    in-flight status UPDATE but not for the KEY SHARE lock an operator
+    decision INSERT takes through its FK. Stage 16 APPROVE itself moves a
+    PENDING_REVIEW review to APPROVED in its transaction, so a rejection
+    that waited on it re-evaluates the CAS and matches zero rows.
+
+    `commit=False` (Stage 16, a trusted internal caller) composes the
+    transition into the caller's transaction: no commit and no rollback --
+    the caller commits or rolls back everything together.
     """
     now = datetime.now(UTC)
     values: dict[str, object] = {
@@ -274,9 +296,28 @@ def decide_review(
     )
     result = db.execute(stmt)
     if result.rowcount == 0:
-        db.rollback()
+        if commit:
+            db.rollback()
         raise ReviewCASConflict()
 
+    if new_status == "REJECTED":
+        approved_application_id = db.scalar(
+            select(ApplicationRecord.id)
+            .where(
+                ApplicationRecord.review_package_id == review_id,
+                ApplicationRecord.current_status == "APPROVED",
+            )
+            .order_by(ApplicationRecord.id)
+            .limit(1)
+            .with_for_update(key_share=True)
+        )
+        if approved_application_id is not None:
+            if commit:
+                db.rollback()
+            raise ReviewApplicationApprovedError(review_id, approved_application_id)
+
+    if not commit:
+        return db.get(ApplicationPackageReviewRecord, review_id, populate_existing=True)
     db.commit()
     return db.get(ApplicationPackageReviewRecord, review_id)
 

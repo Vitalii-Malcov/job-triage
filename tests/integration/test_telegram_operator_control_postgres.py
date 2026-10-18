@@ -10,8 +10,13 @@
   UPDATE/DELETE refused by the trigger);
 - the notification ledger admits one row per lifecycle event;
 - Codex S16 P1: a review rejected by another session after the callback's
-  readiness read makes APPROVE refuse (nothing written), and an APPROVE
-  holding the review row lock makes a concurrent rejection wait for it.
+  readiness read makes APPROVE refuse (nothing written); a rejection that
+  waited on an APPROVE's review row lock resumes into a CAS loss (review
+  APPROVED, application APPROVED -- never REJECTED + APPROVED); a rejection
+  committed first makes APPROVE refuse; a rejection holding the review lock
+  first does not deadlock with an APPROVE whose decision INSERT holds the
+  application KEY SHARE lock; `decide_review` refuses REJECTED while a
+  linked application is APPROVED.
 
 No Telegram, IMAP or SMTP anywhere: transports are in-memory fakes.
 
@@ -26,10 +31,11 @@ import threading
 
 import pytest
 import sqlalchemy.exc
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
+from app.agents.review_package_builder import ReviewApplicationApprovedError
 from app.db import telegram_operator_repository as repo
 from app.db.models import (
     ApplicationEventRecord,
@@ -38,7 +44,7 @@ from app.db.models import (
     ApplicationRecord,
     TelegramOperatorCardRecord,
 )
-from app.db.review_package_repository import decide_review
+from app.db.review_package_repository import ReviewCASConflict, decide_review
 from app.models.application_lifecycle import ApplicationEventOrigin as O
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
 from app.models.telegram_operator import OperatorAction
@@ -320,9 +326,33 @@ def test_review_rejected_after_readiness_read_refuses_approve(factory, carded, m
         session.close()
 
 
-def test_approve_holding_review_lock_makes_concurrent_reject_wait(factory, carded):
-    """A has locked the review row (approval transaction open); B's Stage 6E
-    rejection blocks until A commits -- it can never land in between."""
+def _approved_events(session):
+    return session.scalar(
+        select(func.count())
+        .select_from(ApplicationEventRecord)
+        .where(ApplicationEventRecord.new_status == S.APPROVED.value)
+    )
+
+
+def _press_approve(factory, carded, **kwargs):
+    session = factory()
+    try:
+        return control.handle_callback(
+            session,
+            carded["settings"],
+            callback(build_callback_data(OperatorAction.APPROVE, carded["token"])),
+            now=NOW,
+            **kwargs,
+        )
+    finally:
+        session.close()
+
+
+def test_approve_first_then_waiting_reject_cannot_produce_rejected(factory, carded):
+    """A (Telegram APPROVE) has locked and revalidated the review row; B's
+    Stage 6E rejection blocks on it. A commits; B then resumes and MUST lose
+    the CAS -- final state review APPROVED + application APPROVED, never
+    review REJECTED + application APPROVED."""
     target = carded["target"]
     tracker = ApplicationTracker()
     real_transition = tracker.transition_application
@@ -331,7 +361,7 @@ def test_approve_holding_review_lock_makes_concurrent_reject_wait(factory, carde
     order = []
 
     def paused_transition(*args, **kwargs):
-        locked.set()  # review row is locked by A's transaction now
+        locked.set()  # review row locked + moved to APPROVED by A (uncommitted)
         release.wait(10)
         result = real_transition(*args, **kwargs)
         order.append("approve_committed")
@@ -341,24 +371,14 @@ def test_approve_holding_review_lock_makes_concurrent_reject_wait(factory, carde
     results = {}
 
     def operator_a():
-        session = factory()
-        try:
-            results["a"] = control.handle_callback(
-                session,
-                carded["settings"],
-                callback(build_callback_data(OperatorAction.APPROVE, carded["token"])),
-                tracker=tracker,
-                now=NOW,
-            )
-        finally:
-            session.close()
+        results["a"] = _press_approve(factory, carded, tracker=tracker)
 
     def reviewer_b():
         locked.wait(10)
         try:
             _reject_review(factory, target.review_id)
             order.append("reject_committed")
-        except Exception as exc:  # CAS loss is fine; landing first is not
+        except Exception as exc:
             order.append(f"reject_failed:{type(exc).__name__}")
 
     a = threading.Thread(target=operator_a)
@@ -371,10 +391,118 @@ def test_approve_holding_review_lock_makes_concurrent_reject_wait(factory, carde
     release.set()
     a.join(30)
     b.join(30)
+    assert not a.is_alive() and not b.is_alive()
     assert results["a"].code is control.CallbackCode.APPROVED
-    assert order[0] == "approve_committed"
+    # B was blocked until A committed (asserted above) and then did NOT
+    # produce REJECTED. (Append order is not asserted: A appends only after
+    # its commit returns, and the unblocked B may append first.)
+    assert sorted(order) == ["approve_committed", f"reject_failed:{ReviewCASConflict.__name__}"]
     session = factory()
     try:
+        review = session.get(ApplicationPackageReviewRecord, target.review_id)
+        assert review.status == "APPROVED"
+        assert review.approved_revision_id is not None
         assert _counts(session, target.application_id) == (1, 2, S.APPROVED.value)
+        assert _approved_events(session) == 1
+    finally:
+        session.close()
+
+
+def test_reject_first_then_approve_is_refused(factory, carded):
+    target = carded["target"]
+    _reject_review(factory, target.review_id)  # B commits first
+    outcome = _press_approve(factory, carded)
+    assert outcome.code is control.CallbackCode.PACKAGE_NOT_READY
+    session = factory()
+    try:
+        assert session.get(ApplicationPackageReviewRecord, target.review_id).status == "REJECTED"
+        assert _counts(session, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+        assert _approved_events(session) == 0
+    finally:
+        session.close()
+
+
+def test_reject_holding_review_lock_first_makes_approve_refuse_without_deadlock(factory, carded):
+    """Lock order is review row -> application row on both paths. B locks the
+    review first (as the Stage 9C reject does) and rejects; A's APPROVE has
+    already INSERTed its decision (KEY SHARE on the application row via the
+    FK) and waits on the review lock. B's linked-application guard uses
+    FOR NO KEY UPDATE, which does not conflict with that KEY SHARE: B
+    commits, A sees REJECTED and refuses. No deadlock."""
+    target = carded["target"]
+    b_locked = threading.Event()
+    b_go = threading.Event()
+    results = {}
+
+    def reviewer_b():
+        session = factory()
+        try:
+            review = session.scalar(
+                select(ApplicationPackageReviewRecord)
+                .where(ApplicationPackageReviewRecord.id == target.review_id)
+                .with_for_update()
+            )
+            b_locked.set()
+            b_go.wait(10)
+            decide_review(
+                session,
+                review_id=review.id,
+                expected_review_version=review.review_version,
+                new_status="REJECTED",
+                decision_note="rejected first",
+            )
+            results["b"] = "rejected"
+        except Exception as exc:
+            results["b"] = type(exc).__name__
+        finally:
+            session.close()
+
+    def operator_a():
+        results["a"] = _press_approve(factory, carded)
+
+    b = threading.Thread(target=reviewer_b)
+    b.start()
+    assert b_locked.wait(10)
+    a = threading.Thread(target=operator_a)
+    a.start()
+    a.join(1.5)
+    assert a.is_alive(), "APPROVE must wait for the rejection's review row lock"
+    b_go.set()
+    b.join(30)
+    a.join(30)
+    assert not a.is_alive() and not b.is_alive()
+    assert results["b"] == "rejected"
+    assert results["a"].code is control.CallbackCode.PACKAGE_NOT_READY
+    session = factory()
+    try:
+        assert session.get(ApplicationPackageReviewRecord, target.review_id).status == "REJECTED"
+        assert _counts(session, target.application_id) == (0, 1, S.PACKAGE_READY.value)
+        assert _approved_events(session) == 0
+    finally:
+        session.close()
+
+
+def test_decide_review_refuses_reject_while_linked_application_approved(factory, carded):
+    target = carded["target"]
+    session = factory()
+    try:
+        session.execute(
+            update(ApplicationRecord)
+            .where(ApplicationRecord.id == target.application_id)
+            .values(current_status=S.APPROVED.value)
+        )
+        session.commit()
+        version = session.get(ApplicationPackageReviewRecord, target.review_id).review_version
+        with pytest.raises(ReviewApplicationApprovedError):
+            decide_review(
+                session,
+                review_id=target.review_id,
+                expected_review_version=version,
+                new_status="REJECTED",
+                decision_note="direct",
+            )
+        session.expire_all()
+        review = session.get(ApplicationPackageReviewRecord, target.review_id)
+        assert review.status == "PENDING_REVIEW"
     finally:
         session.close()

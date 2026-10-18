@@ -138,8 +138,21 @@ seen) or waits for the approval's commit; on SQLite the flushed INSERT
 already holds the database write lock. Proven by
 `tests/integration/test_telegram_operator_control_postgres.py`.
 
-The Stage 6E review status itself is not changed by Stage 16; its own
-approve/reject flow (API, Stage 9C) is unchanged.
+**One notion of approval (review lifecycle invariant).** A successful APPROVE
+also moves a `PENDING_REVIEW` package to Stage 6E `APPROVED` through the
+existing `decide_review` CAS (pinning the shown revision as
+`approved_revision_id`) in the **same** transaction as the decision row and
+the application `PACKAGE_READY → APPROVED` event — all commit together or
+none does. `APPROVED` is terminal in Stage 6E, so a rejection that waited on
+the approval resumes into a CAS loss (`409 not pending`), never into
+"review `REJECTED` + application `APPROVED`". Independently of Telegram,
+`decide_review(REJECTED)` refuses (`ReviewApplicationApprovedError`, API 409)
+while any application linked to that package is `APPROVED`; undo the
+approval first (override APPROVE → SKIP). Lock order on every path: review
+row, then application row (the guard reads applications `FOR NO KEY UPDATE`,
+compatible with the KEY SHARE lock the decision INSERT takes via its FK).
+An APPROVE → SKIP override returns the application to `PACKAGE_READY` but
+leaves the review `APPROVED` (terminal).
 
 ## 6. Idempotency and conflicts
 

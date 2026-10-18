@@ -157,6 +157,23 @@ class ReviewNotPendingError(Exception):
         super().__init__(f"Review {review_id} is no longer PENDING_REVIEW.")
 
 
+class ReviewApplicationApprovedError(Exception):
+    """Rejection attempted while a Stage 15 application linked to this
+    exact review package is APPROVED (Stage 16 operator approval) — 409.
+    An approved application must never end up pointing at a REJECTED
+    package; the approval has to be undone first (operator override
+    APPROVE -> SKIP). Carries only ids.
+    """
+
+    def __init__(self, review_id: int, application_id: int) -> None:
+        self.review_id = review_id
+        self.application_id = application_id
+        super().__init__(
+            f"Review {review_id} cannot be rejected: application {application_id} "
+            "is APPROVED for this package."
+        )
+
+
 class ReviewVersionConflictError(Exception):
     """`expected_review_version` no longer matches the stored
     `review_version` (spec section 11/35) — 409. Carries only the two

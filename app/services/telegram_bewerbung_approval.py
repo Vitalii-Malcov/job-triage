@@ -31,6 +31,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.agents.review_package_builder import (
+    ReviewApplicationApprovedError,
     ReviewBewerbungDraftJobMismatchError,
     ReviewBewerbungDraftNotFoundError,
     ReviewCurrentJobMissingError,
@@ -1249,7 +1250,7 @@ def _reject(db: Session, link: TelegramBewerbungApprovalRecord) -> ApprovalOutco
         )
     except (ReviewNotPendingError, ReviewNotFoundError):
         return _reported_terminal(db, link)
-    except ReviewVersionConflictError:
+    except (ReviewVersionConflictError, ReviewApplicationApprovedError):
         db.rollback()
         return _outcome("REVIEW_CHANGED")
     logger.info(
