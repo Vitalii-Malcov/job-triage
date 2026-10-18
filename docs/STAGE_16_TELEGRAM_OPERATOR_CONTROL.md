@@ -170,6 +170,15 @@ APPROVE/SKIP row no other row supersedes (`supersedes_decision_id`); the
 callback/override workflow (`decision_state`) uses the same helper. No
 review status, decision or event row is rewritten.
 
+Stage 9D (Gmail draft) applies the same rule at its final locked boundary:
+`revalidate_approved_link_locked` refuses an APPROVED review whose effective
+Stage 16 decision is SKIP with the existing `NOT_APPROVED` outcome, so an old
+"Gmail-Entwurf erstellen" button cannot proceed -- also when the SKIP was
+recorded before the Stage 9C approval. Stage 16 SKIP writes (callback and
+APPROVE -> SKIP override) take the review row lock before inserting the
+decision, so on PostgreSQL a concurrent SKIP either committed before that
+revalidation or waits for it.
+
 ## 6. Idempotency and conflicts
 
 | Situation | Result |

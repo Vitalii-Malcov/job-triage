@@ -79,6 +79,7 @@ from app.db.telegram_bewerbung_repository import (
     PACKAGE_TOKEN_PATTERN,
     get_preparation_by_package_token,
 )
+from app.db.telegram_operator_repository import review_withdrawn_by_operator
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
 from app.models.cv_draft import TailoredCVDraft
 from app.models.review_package import ReviewedBewerbungContent, ReviewedCVContent
@@ -1374,7 +1375,16 @@ def revalidate_approved_link_locked(db: Session, link_id: int) -> ApprovedLinkSn
     return its detached snapshot, or the refusing outcome code.
 
     Lock order: profile -> job -> preparation -> review header, then the
-    exact immutable approved revision is read. The caller owns the
+    exact immutable approved revision is read.
+
+    **Current operator decision (Stage 16).** Under the review lock, an
+    APPROVED review whose effective Stage 16 operator decision is SKIP
+    (APPROVE -> SKIP override, or a SKIP recorded before this approval) is
+    refused as NOT_APPROVED -- the same shared rule
+    (`review_withdrawn_by_operator`) every approved-package consumer uses.
+    Stage 16 SKIP writes take the same review row lock first, so on
+    PostgreSQL a concurrent SKIP either committed before this read or waits
+    for this transaction. The caller owns the
     transaction: this never commits, rolls back, approves, rejects or
     writes anything, and the caller may lock later rows (Stage 9D's ledger
     LAST) inside the same transaction."""
@@ -1393,6 +1403,8 @@ def revalidate_approved_link_locked(db: Session, link_id: int) -> ApprovedLinkSn
         return "PACKAGE_UNAVAILABLE"
     if review.status != "APPROVED":
         return "ALREADY_REJECTED" if review.status == "REJECTED" else "NOT_APPROVED"
+    if review_withdrawn_by_operator(db, review.id):
+        return "NOT_APPROVED"
     if not _approved_revision_is_bound(db, review, link):
         return "APPROVED_ELSEWHERE"
     problem = _package_problem(

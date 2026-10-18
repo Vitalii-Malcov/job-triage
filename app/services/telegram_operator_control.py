@@ -623,6 +623,21 @@ def _approve_review_locked(
     return tuple(reasons)
 
 
+def _lock_review_for_skip(db: Session, application: Application) -> None:
+    """A SKIP withdraws the package from every approved-package consumer
+    (`review_withdrawn_by_operator`). Take the review row lock BEFORE the
+    decision row is written, so a consumer revalidating under that lock
+    (Stage 9D) is serialized with this SKIP on PostgreSQL. Lock order stays
+    review row, then application row."""
+    if application.review_package_id is None:
+        return
+    db.execute(
+        select(ApplicationPackageReviewRecord.id)
+        .where(ApplicationPackageReviewRecord.id == application.review_package_id)
+        .with_for_update()
+    )
+
+
 def _card_after_change(
     db: Session, card: TelegramOperatorCardRecord, *, tracker: ApplicationTracker, now: datetime
 ) -> RenderedMessage:
@@ -802,6 +817,8 @@ def handle_callback(
                 db.rollback()
                 return _outcome(CallbackCode.ALREADY_APPROVED)
         else:
+            if decision is OperatorDecision.SKIP:
+                _lock_review_for_skip(db, application)
             record = repo.add_decision(db, **values)
             db.commit()
     except IntegrityError:
@@ -951,6 +968,8 @@ def override_decision(
     correlation_key = f"s16:override:{target.key}:g{generation}"
     application = target.application
     try:
+        if decision is OperatorDecision.SKIP:
+            _lock_review_for_skip(db, application)
         record = repo.add_decision(
             db,
             application_id=application.id,
