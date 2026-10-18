@@ -154,6 +154,22 @@ compatible with the KEY SHARE lock the decision INSERT takes via its FK).
 An APPROVE → SKIP override returns the application to `PACKAGE_READY` but
 leaves the review `APPROVED` (terminal).
 
+**Usable approval = Stage 6E APPROVED AND not withdrawn by the operator
+(Codex S16 P1).** The review's `APPROVED` status is history; the CURRENT
+authorization is the effective Stage 16 decision. When the effective final
+decision of a target bound to the package is `SKIP` (an APPROVE → SKIP
+override, or a SKIP pressed before a Stage 6E approval),
+`get_latest_approved_review_for_job` -- the single read behind
+`GET /jobs/{id}/approved-package` (→ 404, as for "no approved package") and
+send readiness (→ `NO_APPROVED_REVIEW`) -- withholds it, with no fallback to
+an older approved review. A later SKIP → APPROVE override makes it usable
+again. A review with no Stage 16 decision (legacy/direct Stage 6E approval)
+is unaffected, and LATER is not SKIP. The effective decision has ONE
+definition, `telegram_operator_repository.effective_final_decision`: the
+APPROVE/SKIP row no other row supersedes (`supersedes_decision_id`); the
+callback/override workflow (`decision_state`) uses the same helper. No
+review status, decision or event row is rewritten.
+
 ## 6. Idempotency and conflicts
 
 | Situation | Result |
@@ -321,6 +337,12 @@ Stage 16 tables reference `applications`/`application_events`.
   filters already-notified ones afterwards, so once that many notified events
   sit in the window, newer events are overlooked; it needs pagination/keyset over
   un-notified events.
+- **Stage 17 (Codex S16 P2):** the Stage 6E reject guard
+  (`decide_review(REJECTED)`) refuses only while a linked application is
+  exactly `APPROVED`; later statuses (`SUBMITTED`, …) are not covered yet.
+- **Test hardening (Codex S16 P3):** the PostgreSQL lock-wait tests infer
+  "B is blocked" from thread timing (`join(1.5)` + `is_alive()`); they should
+  observe the wait directly (e.g. `pg_locks` / `pg_stat_activity`).
 - Card dispatch and the notification sweep are operator-driven CLI commands;
   wiring them into the scheduler is a later decision.
 - Callback tokens do not expire; every press re-validates the current state

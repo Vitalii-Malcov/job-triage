@@ -367,14 +367,9 @@ class DecisionState:
 def decision_state(db: Session, key: str) -> DecisionState:
     records = repo.list_decisions_for_target(db, key)
     generation = sum(1 for r in records if r.supersedes_decision_id is not None)
-    final = None
-    later = None
-    for record in records:
-        if OperatorDecision(record.decision) in FINAL_DECISIONS:
-            final = record
-            later = None
-        elif final is None:
-            later = record
+    final = repo.effective_final_decision(records)
+    # A LATER only counts while no final decision was ever recorded.
+    later = None if final is not None else (records[-1] if records else None)
     return DecisionState(generation=generation, effective_final=final, pending_later=later)
 
 

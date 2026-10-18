@@ -23,6 +23,7 @@ from app.db.models import (
     ApplicationPackageReviewRevisionRecord,
     ApplicationRecord,
 )
+from app.db.telegram_operator_repository import review_withdrawn_by_operator
 from app.models.review_package import (
     ReviewedBewerbungContent,
     ReviewedCVContent,
@@ -81,6 +82,14 @@ def get_latest_approved_review_for_job(
     B is approved before A is). `id.desc()` is only a deterministic
     tie-breaker for the (rare, same-instant) case of two equal
     `decided_at` values, not the primary ordering.
+
+    **Current operator decision (Stage 16).** The most recent approved
+    review is withheld (None) when its effective Stage 16 operator decision
+    is SKIP (e.g. an APPROVE -> SKIP override): the review stays APPROVED
+    as history, but it is no longer a usable approval. There is no fallback
+    to an older approved review. Reviews without any Stage 16 decision are
+    returned exactly as before. Every approved-package consumer
+    (GET /jobs/{id}/approved-package, send readiness) reads through here.
     """
     stmt = (
         select(ApplicationPackageReviewRecord)
@@ -94,7 +103,10 @@ def get_latest_approved_review_for_job(
         )
         .limit(1)
     )
-    return db.scalar(stmt)
+    record = db.scalar(stmt)
+    if record is not None and review_withdrawn_by_operator(db, record.id):
+        return None
+    return record
 
 
 def get_revision_by_id(

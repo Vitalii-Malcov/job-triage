@@ -25,6 +25,7 @@ from app.db.models import (
     TelegramOperatorCardRecord,
 )
 from app.models.telegram_operator import (
+    FINAL_DECISIONS,
     OperatorDecision,
     OperatorDecisionView,
     TelegramDeliveryState,
@@ -233,6 +234,45 @@ def get_decision_by_callback_ref(
             ApplicationOperatorDecisionRecord.callback_ref == callback_ref
         )
     )
+
+
+def effective_final_decision(
+    records: list[ApplicationOperatorDecisionRecord],
+) -> ApplicationOperatorDecisionRecord | None:
+    """The ONE rule for "the operator's current final decision" on a target
+    (records of one `target_key`, any order): the APPROVE/SKIP row that no
+    other row supersedes. Decisions are append-only; a Telegram press is
+    refused once a final decision exists, and an override always names the
+    effective final it replaces in `supersedes_decision_id` -- so in a
+    well-formed history there is exactly one such head. If there were more
+    (never expected), the newest wins. LATER is non-final and never
+    replaces or revokes a final decision."""
+    finals = [r for r in records if OperatorDecision(r.decision) in FINAL_DECISIONS]
+    superseded = {r.supersedes_decision_id for r in records if r.supersedes_decision_id}
+    heads = [r for r in finals if r.id not in superseded]
+    return max(heads, key=lambda r: r.id) if heads else None
+
+
+def review_withdrawn_by_operator(db: Session, review_package_id: int) -> bool:
+    """True when the effective final Stage 16 decision of ANY target bound
+    to this review package is SKIP (including APPROVE -> SKIP overrides).
+    Such a package must not be consumed downstream as an approval, even
+    though its Stage 6E status stays APPROVED (history). No Stage 16
+    decision at all -> False: legacy/direct Stage 6E approvals keep their
+    meaning."""
+    records = db.scalars(
+        select(ApplicationOperatorDecisionRecord)
+        .where(ApplicationOperatorDecisionRecord.review_package_id == review_package_id)
+        .order_by(ApplicationOperatorDecisionRecord.id)
+    ).all()
+    by_target: dict[str, list[ApplicationOperatorDecisionRecord]] = {}
+    for record in records:
+        by_target.setdefault(record.target_key, []).append(record)
+    for target_records in by_target.values():
+        final = effective_final_decision(target_records)
+        if final is not None and OperatorDecision(final.decision) is OperatorDecision.SKIP:
+            return True
+    return False
 
 
 def count_decisions(db: Session) -> int:
