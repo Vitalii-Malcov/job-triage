@@ -541,3 +541,39 @@ async def test_fetch_detail_reuses_retry_policy_for_5xx(monkeypatch):
 
     assert await collector.fetch_detail("10000-1-S") == "Python und Flask"
     assert attempts["count"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403, 404, 422])
+async def test_non_retryable_4xx_fails_fast_without_retrying(monkeypatch, status):
+    monkeypatch.setattr("app.collectors.bundesagentur.asyncio.sleep", _no_sleep)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(status, text="secret upstream body")
+
+    collector = _make_collector(handler, max_retries=3)
+
+    with pytest.raises(BundesagenturAPIError) as excinfo:
+        await collector.fetch()
+
+    assert len(calls) == 1
+    assert f"status={status}" in str(excinfo.value)
+    assert "secret upstream body" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_408_is_still_retried(monkeypatch):
+    monkeypatch.setattr("app.collectors.bundesagentur.asyncio.sleep", _no_sleep)
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            return httpx.Response(408)
+        return httpx.Response(200, json=_page([_posting()]))
+
+    jobs = await _make_collector(handler, max_retries=3).fetch()
+
+    assert len(jobs) == 1 and attempts["count"] == 2

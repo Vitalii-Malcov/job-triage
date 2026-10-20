@@ -80,7 +80,6 @@ You are the primary implementation agent for AI Job Search Control Center.
 
 From the Codex review of `app/collectors/bundesagentur.py` (P0/P1 items already fixed):
 - No overall timeout/circuit-breaker bounds `_collect_pages` — worst case (max_pages × max_retries × per-request timeout) can block one worker + DB session for minutes.
-- Non-401 4xx responses (e.g. a malformed query param causing 400) are retried like 429/5xx instead of failing fast.
 - `BundesagenturCollector` never closes an injected `http_client`, and no test closes one either — fine for `MockTransport`, a real leak pattern if copied for a future collector tested against a real transport.
 - Negative `maxErgebnisse` (e.g. `"-5"`) would terminate pagination after page 1 with no warning logged.
 - `if self.radius_km:` (and similar) treats an explicit `radius_km=0` as "unset", silently dropping the `umkreis` param.
