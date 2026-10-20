@@ -9,6 +9,11 @@ Read commands:   list [--status S ...] | show ID | history ID      (add --json)
 Before applying: check-job JOB_ID   (duplicate check against every application)
 Gmail:           process-gmail [--source imap|stored] [--mailbox primary|secondary|all]
                                [--since YYYY-MM-DD] [--apply]
+Record a submission the operator made by hand (portal / e-mail / job board):
+                 record-submission --company C --role R --source S --reference REF
+                     --channel CH --submitted-at ISO8601 --actor A --evidence TEXT
+                     [--job-id N] [--location L] [--destination-url U]
+                     [--employer-domain D ...] [--confirm-distinct-from ID ...] [--apply]
 State changes:   transition ID STATUS --actor A --reason R [--apply]
                  override   ID STATUS --actor A --reason R [--apply]
 
@@ -45,6 +50,7 @@ from sqlalchemy.pool import NullPool
 from app.db.session_engine import enable_sqlite_foreign_keys
 from app.domain.application_lifecycle import InvalidApplicationTransitionError
 from app.models.application_lifecycle import (
+    ApplicationChannel,
     ApplicationEventOrigin,
     ApplicationLifecycleStatus,
 )
@@ -296,6 +302,23 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("show", "history"):
         sub.add_parser(name).add_argument("application_id", type=int)
     sub.add_parser("check-job").add_argument("job_id", type=int)
+    record = sub.add_parser("record-submission")
+    for flag in ("--company", "--role", "--source", "--reference", "--actor", "--evidence"):
+        record.add_argument(flag, required=True)
+    record.add_argument("--channel", required=True, choices=[c.value for c in ApplicationChannel])
+    record.add_argument("--submitted-at", required=True, help="ISO 8601 with UTC offset")
+    record.add_argument("--job-id", type=int, default=None)
+    record.add_argument("--location", default=None)
+    record.add_argument("--destination-url", default=None)
+    record.add_argument("--employer-domain", action="append", default=[])
+    record.add_argument(
+        "--confirm-distinct-from",
+        type=int,
+        action="append",
+        default=[],
+        help="application id the operator verified is a DIFFERENT vacancy",
+    )
+    record.add_argument("--apply", action="store_true", help="write (default: dry run)")
     gmail = sub.add_parser("process-gmail")
     gmail.add_argument("--source", choices=("imap", "stored"), default="imap")
     gmail.add_argument(
@@ -359,6 +382,8 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
             _print([_event_row(e) for e in events], args.json)
         elif args.command == "check-job":
             return _check_job(session, args)
+        elif args.command == "record-submission":
+            return _record_submission(session, tracker, args)
         elif args.command == "process-gmail":
             if settings is None:
                 from app.core.config import Settings
@@ -457,6 +482,122 @@ def _check_job(session: Session, args) -> int:
                 f"{f.company} | {f.role} ({', '.join(f.signals)})"
             )
     return 3 if result == "ALREADY_APPLIED" else 0
+
+
+def _submitted_at(raw: str) -> datetime:
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        raise TargetRefusedError("--submitted-at must be ISO 8601") from None
+    if value.tzinfo is None:
+        raise TargetRefusedError("--submitted-at needs an explicit UTC offset (e.g. ...Z)")
+    value = value.astimezone(UTC)
+    from datetime import timedelta
+
+    if value > datetime.now(UTC) + timedelta(minutes=5):
+        raise TargetRefusedError("--submitted-at lies in the future")
+    return value
+
+
+def _record_submission(session: Session, tracker: ApplicationTracker, args) -> int:
+    """Record ONE submission the operator already made by hand, as
+    SUBMITTED. Never submits anything itself. Idempotent: the same
+    source + reference is reported as ALREADY_RECORDED and nothing is
+    written. Any other STRONG duplicate (same job row, same employer and
+    role, same URL ...) or PROBABLE one (identical title elsewhere: agency
+    mirror) refuses with exit 3 unless every such application id is passed
+    to --confirm-distinct-from."""
+    from app.db import application_repository as app_repo
+    from app.db.models import JobRecord
+    from app.services.application_duplicates import VacancyView, assess_vacancy
+
+    submitted_at = _submitted_at(args.submitted_at)
+    existing = tracker.find_by_source_reference(session, args.source, args.reference)
+    if existing is not None:
+        print(
+            f"ALREADY_RECORDED: application {existing.id} [{existing.current_status.value}] "
+            f"{existing.company_name} | {existing.role_title} (nothing written)"
+        )
+        return 0
+    job = None
+    if args.job_id is not None:
+        job = session.get(JobRecord, args.job_id)
+        if job is None:
+            raise ApplicationNotFoundError(f"job {args.job_id} does not exist")
+    vacancy = VacancyView(
+        job_id=args.job_id,
+        source=args.source,
+        company=args.company,
+        title=args.role,
+        url=job.url if job is not None else args.destination_url,
+        fingerprint=None,
+    )
+    applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
+    findings = assess_vacancy(vacancy, applications)
+    if args.destination_url and job is not None:
+        findings += [
+            f
+            for f in assess_vacancy(
+                VacancyView(None, args.source, "", "", args.destination_url), applications
+            )
+            if f.application_id not in {g.application_id for g in findings}
+        ]
+    for f in findings:
+        print(
+            f"{f.strength}: application {f.application_id} [{f.status}] {f.company} | "
+            f"{f.role} ({', '.join(f.signals)})"
+        )
+    unconfirmed = sorted(
+        f.application_id
+        for f in findings
+        if f.strength in ("STRONG", "PROBABLE")
+        and f.application_id not in set(args.confirm_distinct_from)
+    )
+    if unconfirmed:
+        print(
+            "REFUSED: already applied? STRONG/PROBABLE duplicate of application(s) "
+            f"{', '.join(map(str, unconfirmed))}; verify by hand, then pass "
+            "--confirm-distinct-from for each id if it is really a different vacancy",
+            file=sys.stderr,
+        )
+        return 3
+    channel = ApplicationChannel(args.channel)
+    prefix = "email-submission" if channel == ApplicationChannel.EMAIL else "portal-submission"
+    correlation_key = f"{prefix}:{args.source}:{args.reference}"
+    if not args.apply:
+        print(
+            f"DRY RUN: would record {args.company} | {args.role} ({args.source} "
+            f"{args.reference}, {channel.value}) as SUBMITTED at {submitted_at.isoformat()} "
+            "(nothing written)"
+        )
+        return 0
+    outcome = tracker.create_application(
+        session,
+        company_name=args.company,
+        role_title=args.role,
+        source=args.source,
+        source_reference=args.reference,
+        application_channel=channel,
+        initial_status=ApplicationLifecycleStatus.SUBMITTED,
+        origin=ApplicationEventOrigin.OPERATOR,
+        actor=args.actor,
+        occurred_at=submitted_at,
+        location=args.location,
+        destination_url=args.destination_url,
+        employer_domains=tuple(args.employer_domain),
+        job_id=args.job_id,
+        correlation_key=correlation_key,
+        evidence_hash=hashlib.sha256(args.evidence.encode("utf-8")).hexdigest(),
+        evidence_summary=args.evidence,
+        reason="Operator-recorded manual submission",
+    )
+    state = "ALREADY_RECORDED" if outcome.duplicate else "APPLIED"
+    print(
+        f"{state}: application {outcome.application.id} "
+        f"[{outcome.application.current_status.value}] next follow-up "
+        f"{outcome.application.next_followup_at}"
+    )
+    return 0
 
 
 def _change_status(session: Session, tracker: ApplicationTracker, args) -> int:

@@ -267,3 +267,171 @@ def test_cli_check_job_is_read_only_and_signals_by_exit_code(tmp_path, capsys):
     assert cli.run(["--database", str(path), "check-job", "404"]) == 1
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     assert counts == (1, 1)
+
+
+# --- record-submission (operator records a manual submission) ----------------------
+
+
+def _record_db(tmp_path):
+    from tests.test_stage15_response_tracking import _migrated_db
+
+    path = _migrated_db(tmp_path)
+    engine = create_engine(f"sqlite:///{path}")
+    session = sessionmaker(engine)()
+    _apply(
+        session,
+        company="ALD Vacuum Technologies GmbH",
+        role="Backend Developer (m/w/div.)",
+        ref="20385-2347902-S",
+        job_id=174,
+    )
+    session.close()
+    engine.dispose()
+    return path
+
+
+def _record(path, *extra):
+    import scripts.stage15_application_tracker as cli
+
+    return cli.run(
+        [
+            "--database",
+            str(path),
+            "record-submission",
+            "--actor",
+            "operator",
+            "--evidence",
+            "Sent once via Gmail web UI; attachments CV + Anschreiben",
+            *extra,
+        ]
+    )
+
+
+HD24_ARGS = (
+    "--company",
+    "Heizungsdiscount 24 GmbH",
+    "--role",
+    "Softwareentwickler – Business Applications & Integrationen",
+    "--source",
+    "bundesagentur",
+    "--reference",
+    "18088-k60163.1143-S",
+    "--channel",
+    "EMAIL",
+    "--submitted-at",
+    "2026-10-20T18:58:59Z",
+    "--employer-domain",
+    "heizungsdiscount24.de",
+)
+
+
+def _counts(path):
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.connect() as connection:
+        result = (
+            connection.scalar(select(func.count()).select_from(ApplicationRecord)),
+            connection.scalar(select(func.count()).select_from(ApplicationEventRecord)),
+        )
+    engine.dispose()
+    return result
+
+
+def test_record_submission_is_a_dry_run_by_default(tmp_path, capsys):
+    path = _record_db(tmp_path)
+    assert _record(path, *HD24_ARGS) == 0
+    assert "DRY RUN" in capsys.readouterr().out
+    assert _counts(path) == (1, 1)
+
+
+def test_record_submission_applies_once_and_reruns_are_idempotent(tmp_path, capsys):
+    path = _record_db(tmp_path)
+    assert _record(path, *HD24_ARGS, "--apply") == 0
+    assert "APPLIED: application 2 [SUBMITTED]" in capsys.readouterr().out
+    assert _record(path, *HD24_ARGS, "--apply") == 0
+    assert "ALREADY_RECORDED: application 2" in capsys.readouterr().out
+    assert _counts(path) == (2, 2)
+    engine = create_engine(f"sqlite:///{path}")
+    session = sessionmaker(engine)()
+    app = ApplicationTracker().get_application(session, 2)
+    history = ApplicationTracker().get_application_history(session, 2)
+    session.close()
+    engine.dispose()
+    assert app.submitted_at == datetime(2026, 10, 20, 18, 58, 59, tzinfo=UTC)
+    assert app.application_channel == C.EMAIL and app.employer_domains == ("heizungsdiscount24.de",)
+    assert history[0].origin == O.OPERATOR
+    assert history[0].correlation_key == "email-submission:bundesagentur:18088-k60163.1143-S"
+
+
+def test_record_submission_refuses_a_strong_duplicate_from_another_source(tmp_path, capsys):
+    path = _record_db(tmp_path)
+    args = (
+        "--company",
+        "ALD Vacuum Technologies GmbH",
+        "--role",
+        "Backend Developer (m/w/d)",
+        "--source",
+        "xing",
+        "--reference",
+        "xing-318",
+        "--channel",
+        "JOB_BOARD",
+        "--submitted-at",
+        "2026-10-20T12:00:00Z",
+    )
+    assert _record(path, *args, "--apply") == 3
+    assert "REFUSED" in capsys.readouterr().err
+    assert _counts(path) == (1, 1)
+    assert _record(path, *args, "--confirm-distinct-from", "1", "--apply") == 0
+    assert _counts(path) == (2, 2)
+
+
+def test_record_submission_requires_confirmation_for_an_agency_mirror(tmp_path, capsys):
+    path = _record_db(tmp_path)
+    args = (
+        "--company",
+        "N.O.C Engineering GmbH",
+        "--role",
+        "Backend Developer (m/w/div.)",
+        "--source",
+        "bundesagentur",
+        "--reference",
+        "13552-95JQ-S",
+        "--channel",
+        "EMPLOYER_PORTAL",
+        "--submitted-at",
+        "2026-10-20T12:00:00Z",
+    )
+    assert _record(path, *args, "--apply") == 3
+    assert "PROBABLE: application 1" in capsys.readouterr().out
+    assert _counts(path) == (1, 1)
+
+
+def test_record_submission_allows_a_different_role_at_the_same_employer(tmp_path, capsys):
+    path = _record_db(tmp_path)
+    args = (
+        "--company",
+        "ALD Vacuum Technologies GmbH",
+        "--role",
+        "Software Engineer (m/w/div.) im Bereich Prototyping & Data Analytics",
+        "--source",
+        "bundesagentur",
+        "--reference",
+        "20385-2352935-S",
+        "--channel",
+        "EMPLOYER_PORTAL",
+        "--submitted-at",
+        "2026-10-20T13:04:24Z",
+        "--apply",
+    )
+    assert _record(path, *args) == 0
+    assert "INFO: application 1" in capsys.readouterr().out
+    assert _counts(path) == (2, 2)
+
+
+@pytest.mark.parametrize("when", ["2026-10-20T12:00:00", "not-a-date", "2999-01-01T00:00:00Z"])
+def test_record_submission_rejects_naive_invalid_or_future_timestamps(tmp_path, when):
+    path = _record_db(tmp_path)
+    args = list(HD24_ARGS)
+    args[args.index("--submitted-at") + 1] = when
+    assert _record(path, *args, "--apply") == 2
+    assert _counts(path) == (1, 1)
