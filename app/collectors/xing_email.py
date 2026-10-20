@@ -53,6 +53,7 @@ Beyond that constraint, this collector:
 import asyncio
 import contextlib
 import email
+import html
 import imaplib
 import logging
 import re
@@ -89,13 +90,28 @@ XING_DIGEST_SENDER = "jobs@mail.xing.com"
 # indefinitely.
 IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 
-# Both observed digest subject formats. Anything else from the same sender
-# domain (e.g. "Wochencheck" from mailrobot@, industry news from news@) is
-# not a job digest and must be skipped, not parsed.
+# Every job-alert subject format observed in the live mailbox (all share the
+# same plaintext posting-block layout). Matched against the whitespace-
+# normalized subject (see `_decode_subject`): real "Entdecke ähnliche Jobs"
+# subjects arrive with a leading space, and company digests are folded
+# across lines. Anything else from jobs@ (e.g. "Erinnerung: Deine Bewerbung
+# bei ...", "Reminder: Submit your application to ...") or from other
+# senders (Wochencheck from mailrobot@, news@) is not a vacancy alert and
+# must be skipped, not parsed.
 _SUBJECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\d+\s+neue\s+Stellenangebote\s+für\b", re.IGNORECASE),
+    re.compile(r"^Ein\s+neues\s+Stellenangebot\s+für\b", re.IGNORECASE),
     re.compile(r"^Entdecke\s+ähnliche\s+Jobs\s+wie\b", re.IGNORECASE),
+    re.compile(r"\bund\s+andere\s+spannende\s+Firmen\s+suchen\b", re.IGNORECASE),
 )
+
+# Bumped whenever `_SUBJECT_PATTERNS` (i.e. what counts as a job alert)
+# changes. The persisted scan watermark may only skip a UID that was
+# confirmed "not a job digest" under the rules in force at the time, so
+# `app.services.collector_runner.run_xing` folds this into the watermark's
+# mailbox scope: a rules change starts a fresh scan of the lookback window
+# (already-acknowledged Message-IDs are still skipped).
+XING_DIGEST_RULES_VERSION = 2
 
 # Codex gate follow-up (Astra R4A HIGH): extracts a bare "Message-ID:"
 # header value from a HEADER.FIELDS-scoped FETCH response -- see
@@ -226,6 +242,8 @@ class ImapClient(Protocol):
 
 
 def _decode_subject(raw_subject: str) -> str:
+    """Decoded subject with surrounding whitespace stripped and internal
+    whitespace runs (header folding, NBSP) collapsed to single spaces."""
     if not raw_subject:
         return ""
     decoded_parts = []
@@ -234,7 +252,7 @@ def _decode_subject(raw_subject: str) -> str:
             decoded_parts.append(text.decode(encoding or "utf-8", errors="replace"))
         else:
             decoded_parts.append(text)
-    return "".join(decoded_parts)
+    return re.sub(r"\s+", " ", "".join(decoded_parts)).strip()
 
 
 def _is_job_digest_subject(subject: str) -> bool:
@@ -280,7 +298,8 @@ def _parse_block(block: str) -> Job | None:
         logger.warning("xing_email_skipped_invalid_block reason=no_title_before_tracking_line")
         return None
 
-    title = lines[tracking_index - 1]
+    # Real plaintext bodies carry HTML entities (e.g. "Cloud &amp; Web").
+    title = html.unescape(lines[tracking_index - 1])
     remaining = lines[tracking_index + 1 :]
     if len(remaining) < 2:
         logger.warning(
@@ -289,7 +308,7 @@ def _parse_block(block: str) -> Job | None:
         )
         return None
 
-    company, location = remaining[0], remaining[1]
+    company, location = html.unescape(remaining[0]), html.unescape(remaining[1])
 
     salary = None
     employment_type = None
