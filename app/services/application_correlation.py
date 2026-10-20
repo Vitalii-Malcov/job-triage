@@ -31,6 +31,13 @@ Grades:
 
 The best grade wins only if exactly one application holds it with the
 highest signal count; otherwise the result is AMBIGUOUS (never a guess).
+
+**Job-platform notifications are never employer responses.** A XING job
+alert routinely names a company and a role the candidate already applied
+to (COMPANY + ROLE = MEDIUM), so messages from the platform notification
+senders below are UNMATCHED before any signal is evaluated. The XING
+collector reads the same mailbox for exactly those senders; the two paths
+never share a message.
 """
 
 import hashlib
@@ -55,6 +62,11 @@ RESPONSE_WINDOW_SKEW = timedelta(hours=1)
 RESPONSE_WINDOW = timedelta(days=365)
 _RANK: dict[CorrelationConfidence, int] = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 _GENDER_SUFFIX = re.compile(r"\(\s*[mwfdx]\s*(?:/\s*[a-z.]+\s*){1,3}\)", re.IGNORECASE)
+# Sender domains (and their subdomains) that only ever deliver platform
+# notifications -- job alerts, digests, "new message on XING" -- never an
+# employer's own reply. Kept deliberately narrow: StepStone/BA are NOT here,
+# because their mails may relay an employer's actual status.
+PLATFORM_NOTIFICATION_SENDER_DOMAINS: frozenset[str] = frozenset({"mail.xing.com"})
 _JOB_ID_LABEL = (
     r"(?:stellen[- ]?id|job[- ]?id|kennziffer|referenz(?:nummer)?|ref\.?|stellen(?:nummer|angebot))"
 )
@@ -84,6 +96,17 @@ class InboundMessage:
     @property
     def correlation_key(self) -> str:
         return "gmail:" + stable_hash(self.account_key, self.message_key)
+
+    def correlation_keys_across(self, account_keys: Iterable[str]) -> frozenset[str]:
+        """This message's correlation key plus the key the SAME message
+        (same Message-ID) gets in each of the other monitored mailboxes, so
+        an employer mail delivered to two of the applicant's accounts is
+        recorded once."""
+        keys = {self.correlation_key}
+        for account in account_keys:
+            if account:
+                keys.add("gmail:" + stable_hash(account.strip().casefold(), self.message_key))
+        return frozenset(keys)
 
     @property
     def message_id_hash(self) -> str | None:
@@ -230,6 +253,10 @@ def correlate_message(
         return CorrelationResult("UNMATCHED", None, "NONE", (), "OUTBOUND_MESSAGE")
     if (message.from_address or "").strip().casefold() in own:
         return CorrelationResult("UNMATCHED", None, "NONE", (), "OWN_MESSAGE")
+    if _domain_matches(
+        extract_sender_domain(message.from_address), PLATFORM_NOTIFICATION_SENDER_DOMAINS
+    ):
+        return CorrelationResult("UNMATCHED", None, "NONE", (), "JOB_PLATFORM_NOTIFICATION")
     if message.occurred_at is None:
         return CorrelationResult("UNMATCHED", None, "NONE", (), "NO_TRUSTED_TIMESTAMP")
     threads = thread_hashes_by_application or {}

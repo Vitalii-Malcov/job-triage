@@ -943,6 +943,7 @@ STAGE15_MODULES = [
     "app/services/application_tracker.py",
     "app/services/application_correlation.py",
     "app/services/application_response_processor.py",
+    "app/services/application_duplicates.py",
     "app/services/application_notifications.py",
     "app/agents/application_response_classifier.py",
     "app/utils/html_text.py",

@@ -1,0 +1,269 @@
+"""Duplicate-application check before applying (read-only, deterministic).
+
+Synthetic data modelled on the real cases: the ALD Backend Developer
+vacancy exists as the employer's BA post, as agency mirrors and on XING;
+ALD also has a second, genuinely different role.
+"""
+
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
+
+from app.db.models import ApplicationEventRecord, ApplicationRecord, JobRecord
+from app.models.application_lifecycle import ApplicationChannel as C
+from app.models.application_lifecycle import ApplicationEventOrigin as O
+from app.models.application_lifecycle import ApplicationLifecycleStatus as S
+from app.services.application_duplicates import (
+    VacancyView,
+    assess_vacancy,
+    bundesagentur_reference,
+    normalize_posting_url,
+    verdict,
+)
+from app.services.application_tracker import ApplicationTracker
+
+AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
+BA = "https://www.arbeitsagentur.de/jobsuche/jobdetail/"
+
+
+@pytest.fixture()
+def db(tmp_path):
+    from app.db.base import Base
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'dups.db'}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(engine)()
+    yield session
+    session.close()
+    engine.dispose()
+
+
+def _apply(db, *, company, role, ref, job_id=None, source="bundesagentur", url=None, fp=None):
+    return (
+        ApplicationTracker()
+        .create_application(
+            db,
+            company_name=company,
+            role_title=role,
+            source=source,
+            source_reference=ref,
+            application_channel=C.EMPLOYER_PORTAL,
+            initial_status=S.SUBMITTED,
+            origin=O.OPERATOR,
+            actor="test",
+            occurred_at=AT,
+            job_id=job_id,
+            destination_url=url,
+            vacancy_fingerprint=fp,
+            correlation_key=f"submission:{source}:{ref}",
+        )
+        .application
+    )
+
+
+@pytest.fixture()
+def ald(db):
+    backend = _apply(
+        db,
+        company="ALD Vacuum Technologies GmbH",
+        role="Backend Developer (m/w/div.)",
+        ref="20385-2347902-S",
+        job_id=174,
+        url="https://karriere.ald-vt.com/Backend-Developer-mwdiv-de-f962.html",
+    )
+    prototyping = _apply(
+        db,
+        company="ALD Vacuum Technologies GmbH",
+        role="Software Engineer (m/w/div.) im Bereich Prototyping & Data Analytics",
+        ref="20385-2352935-S",
+        job_id=169,
+    )
+    return backend, prototyping
+
+
+def _apps(db):
+    return ApplicationTracker().list_applications(db, limit=500)
+
+
+def _vacancy(job_id, company, title, url, source="bundesagentur", fp=None):
+    return VacancyView(
+        job_id=job_id, source=source, company=company, title=title, url=url, fingerprint=fp
+    )
+
+
+def test_exact_duplicate_same_job_row_is_already_applied(db, ald):
+    backend, _ = ald
+    findings = assess_vacancy(
+        _vacancy(
+            174,
+            "ALD Vacuum Technologies  GmbH",
+            "Backend Developer (m/w/div.)",
+            BA + "20385-2347902-S",
+        ),
+        _apps(db),
+    )
+    assert verdict(findings) == "ALREADY_APPLIED"
+    strong = findings[0]
+    assert strong.application_id == backend.id and strong.strength == "STRONG"
+    assert {"SAME_JOB", "SAME_REFERENCE", "SAME_EMPLOYER_AND_ROLE"} <= set(strong.signals)
+
+
+def test_same_role_from_another_source_is_already_applied(db, ald):
+    """Same employer + same role collected again from XING (new job row)."""
+    findings = assess_vacancy(
+        _vacancy(
+            999,
+            "ALD Vacuum Technologies GmbH",
+            "Backend Developer (m/w/d)",
+            "https://www.xing.com/m/opaque",
+            source="xing",
+        ),
+        _apps(db),
+    )
+    assert verdict(findings) == "ALREADY_APPLIED"
+    assert findings[0].signals == ("SAME_EMPLOYER_AND_ROLE",)
+
+
+def test_two_ald_roles_are_never_one_application(db, ald):
+    backend, prototyping = ald
+    findings = assess_vacancy(
+        _vacancy(
+            169, "ALD Vacuum Technologies GmbH", prototyping.role_title, BA + "20385-2352935-S"
+        ),
+        _apps(db),
+    )
+    by_app = {f.application_id: f for f in findings}
+    assert by_app[prototyping.id].strength == "STRONG"
+    assert by_app[backend.id].strength == "INFO"
+    assert by_app[backend.id].signals == ("SAME_EMPLOYER_OTHER_ROLE",)
+
+
+def test_third_ald_role_is_not_a_duplicate(db, ald):
+    findings = assess_vacancy(
+        _vacancy(
+            177,
+            "ALD Vacuum Technologies GmbH",
+            "Prozessingenieur (m/w/div.)",
+            BA + "20385-2343000-S",
+        ),
+        _apps(db),
+    )
+    assert verdict(findings) == "NO_DUPLICATE_FOUND"
+    assert {f.strength for f in findings} == {"INFO"}
+
+
+def test_agency_mirror_with_identical_title_is_a_possible_duplicate(db, ald):
+    backend, _ = ald
+    for company in ("N.O.C Engineering GmbH", "Jobriver IT Jobbörse"):
+        findings = assess_vacancy(
+            _vacancy(31, company, "Backend Developer (m/w/div.)", BA + "13552-95JQ-S"),
+            _apps(db),
+        )
+        assert verdict(findings) == "POSSIBLE_DUPLICATE"
+        assert [(f.application_id, f.signals) for f in findings] == [
+            (backend.id, ("SAME_TITLE_OTHER_EMPLOYER",))
+        ]
+
+
+def test_similar_but_different_role_elsewhere_is_not_a_duplicate(db, ald):
+    for title in ("Backend Developer (all genders) 25185", "Senior Backend Developer (m/w/div.)"):
+        findings = assess_vacancy(_vacancy(144, "Weber GmbH", title, BA + "x-S"), _apps(db))
+        assert findings == [] and verdict(findings) == "NO_DUPLICATE_FOUND"
+
+
+def test_url_and_fingerprint_are_strong_signals(db):
+    app = _apply(
+        db,
+        company="Acadeo GmbH",
+        role="(Trainee) Python Entwickler",
+        ref="12152956",
+        source="stepstone",
+        url="https://www.stepstone.de/stellenangebote--x--12152956-inline.html?utm=1",
+        fp="f" * 64,
+    )
+    by_url = assess_vacancy(
+        _vacancy(
+            5,
+            "Other",
+            "Other",
+            "HTTPS://WWW.STEPSTONE.DE/stellenangebote--x--12152956-inline.html/",
+        ),
+        _apps(db),
+    )
+    assert by_url[0].application_id == app.id and by_url[0].signals == ("SAME_URL",)
+    by_fp = assess_vacancy(_vacancy(6, "Other", "Other", None, fp="f" * 64), _apps(db))
+    assert by_fp[0].signals == ("SAME_FINGERPRINT",)
+
+
+def test_terminal_applications_still_count(db):
+    app = _apply(db, company="Acme GmbH", role="Python Developer", ref="1-S")
+    tracker = ApplicationTracker()
+    tracker.override_status(db, app.id, S.REJECTED, actor="t", reason="Absage geprüft")
+    findings = assess_vacancy(_vacancy(1, "ACME", "Python Developer (m/w/d)", None), _apps(db))
+    assert verdict(findings) == "ALREADY_APPLIED" and findings[0].status == "REJECTED"
+
+
+def test_url_helpers_never_fetch_and_parse_conservatively():
+    assert normalize_posting_url(None) is None and normalize_posting_url("not a url") is None
+    assert normalize_posting_url("https://A.example/x/?q=1#f") == "https://a.example/x"
+    assert bundesagentur_reference(BA + "20385-2347902-S?x=1") == "20385-2347902-s"
+    assert bundesagentur_reference("https://www.xing.com/m/abc") is None
+
+
+def test_cli_check_job_is_read_only_and_signals_by_exit_code(tmp_path, capsys):
+    import hashlib
+
+    import scripts.stage15_application_tracker as cli
+    from tests.test_stage15_response_tracking import _migrated_db
+
+    path = _migrated_db(tmp_path)
+    engine = create_engine(f"sqlite:///{path}")
+    session = sessionmaker(engine)()
+    _apply(
+        session,
+        company="ALD Vacuum Technologies GmbH",
+        role="Backend Developer (m/w/div.)",
+        ref="20385-2347902-S",
+        job_id=1,
+    )
+    now = datetime(2026, 10, 20, tzinfo=UTC)
+    for job_id, company, ref in (
+        (1, "ALD Vacuum Technologies  GmbH", "20385-2347902-S"),
+        (2, "N.O.C Engineering GmbH", "13552-95JQ-S"),
+        (3, "Weber GmbH", "10001-1-S"),
+    ):
+        session.add(
+            JobRecord(
+                id=job_id,
+                fingerprint=f"{job_id:064d}",
+                source="bundesagentur",
+                title="Backend Developer (m/w/div.)" if job_id < 3 else "Backend Developer",
+                company=company,
+                url=BA + ref,
+                skills_json="[]",
+                score=0,
+                recommendation="SKIP",
+                status="NEW",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+    session.commit()
+    counts = (
+        session.scalar(select(func.count()).select_from(ApplicationRecord)),
+        session.scalar(select(func.count()).select_from(ApplicationEventRecord)),
+    )
+    session.close()
+    engine.dispose()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert cli.run(["--database", str(path), "check-job", "1"]) == 3
+    assert "VERDICT: ALREADY_APPLIED" in capsys.readouterr().out
+    assert cli.run(["--database", str(path), "check-job", "2"]) == 0
+    assert "VERDICT: POSSIBLE_DUPLICATE" in capsys.readouterr().out
+    assert cli.run(["--database", str(path), "--json", "check-job", "3"]) == 0
+    assert '"verdict": "NO_DUPLICATE_FOUND"' in capsys.readouterr().out
+    assert cli.run(["--database", str(path), "check-job", "404"]) == 1
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert counts == (1, 1)

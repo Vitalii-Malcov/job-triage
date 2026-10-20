@@ -18,13 +18,24 @@ that WOULD be applied. With `apply=True` each message is one
 
 Results never contain message bodies, addresses or Message-IDs; logs carry
 ids, classifications and reasons only.
+
+**Monitored mailboxes.** Applications go out from more than one of the
+applicant's own accounts, so `fetch_application_mailboxes` reads every
+configured one read-only: the primary `GMAIL_*` account and, when
+configured, the `XING_MAILBOX_*` account (same credentials the XING
+collector already uses; no new secret). XING platform mail in that mailbox
+is UNMATCHED by the correlator (`JOB_PLATFORM_NOTIFICATION`), and the XING
+collector accepts only its digest sender, so the two paths never share a
+message. The same Message-ID delivered to two accounts is processed once
+(fetch-time dedup plus a cross-account duplicate check).
 """
 
 import json
 import logging
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -148,9 +159,12 @@ class ApplicationResponseProcessor:
         apply: bool,
         applicant_addresses: Sequence[str] = (),
         only_application_ids: frozenset[int] | None = None,
+        monitored_account_keys: Sequence[str] = (),
     ) -> list[ResponseTrackingResult]:
         """`only_application_ids` restricts correlation candidates (e.g. a
-        one-application bootstrap); every other application is untouched."""
+        one-application bootstrap); every other application is untouched.
+        `monitored_account_keys` are all mailbox accounts being processed:
+        a message already recorded under any of them is a duplicate."""
         results: list[ResponseTrackingResult] = []
         try:
             for message in messages:
@@ -161,6 +175,7 @@ class ApplicationResponseProcessor:
                         apply=apply,
                         applicant_addresses=applicant_addresses,
                         only_application_ids=only_application_ids,
+                        monitored_account_keys=monitored_account_keys,
                     )
                 )
         finally:
@@ -176,6 +191,7 @@ class ApplicationResponseProcessor:
         apply: bool,
         applicant_addresses: Sequence[str],
         only_application_ids: frozenset[int] | None,
+        monitored_account_keys: Sequence[str] = (),
     ) -> ResponseTrackingResult:
         ref = message.correlation_key.removeprefix("gmail:")[:12]
         # Complete candidate set via a batched keyset scan (bounded memory);
@@ -244,7 +260,10 @@ class ApplicationResponseProcessor:
             classifier_confidence=classified.confidence,
             previous_status=application.current_status.value,
         )
-        if self.tracker.event_exists(db, message.correlation_key):
+        if any(
+            self.tracker.event_exists(db, key)
+            for key in sorted(message.correlation_keys_across(monitored_account_keys))
+        ):
             logger.info("gmail_duplicate message_ref=%s application_id=%s", ref, application.id)
             return ResponseTrackingResult(
                 **common,
@@ -364,6 +383,149 @@ class ApplicationResponseProcessor:
             duplicate=outcome.duplicate,
             reason=decision.reason if not outcome.duplicate else "ALREADY_PROCESSED",
         )
+
+
+MailboxSelection = Literal["primary", "secondary", "all"]
+
+
+@dataclass(frozen=True)
+class ApplicationMailbox:
+    """One of the applicant's own accounts to read replies from."""
+
+    label: str  # "primary" (GMAIL_*) | "secondary" (XING_MAILBOX_*)
+    imap_host: str
+    imap_port: int
+    username: str
+    app_password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class MailboxFetchReport:
+    """Per-mailbox fetch outcome -- counts and an error CLASS only, never a
+    credential, address or message content."""
+
+    label: str
+    fetched: int = 0
+    skipped: int = 0
+    deadline_exceeded: bool = False
+    error: str | None = None
+
+
+def application_mailboxes(
+    settings, selection: MailboxSelection = "all"
+) -> list[ApplicationMailbox]:
+    """Configured reply mailboxes. An account without both username and
+    App Password is simply not configured (never a login attempt with empty
+    credentials); the secondary is skipped when it is the primary account."""
+    from app.providers.email.base import normalize_account_key
+
+    mailboxes: list[ApplicationMailbox] = []
+    if selection in ("primary", "all") and settings.gmail_username and settings.gmail_app_password:
+        mailboxes.append(
+            ApplicationMailbox(
+                "primary",
+                settings.gmail_imap_host,
+                settings.gmail_imap_port,
+                settings.gmail_username,
+                settings.gmail_app_password,
+            )
+        )
+    secondary = settings.xing_mailbox_username
+    if (
+        selection in ("secondary", "all")
+        and secondary
+        and settings.xing_mailbox_app_password
+        and normalize_account_key(secondary) != normalize_account_key(settings.gmail_username or "")
+    ):
+        mailboxes.append(
+            ApplicationMailbox(
+                "secondary",
+                settings.xing_mailbox_imap_host,
+                settings.xing_mailbox_imap_port,
+                secondary,
+                settings.xing_mailbox_app_password,
+            )
+        )
+    return mailboxes
+
+
+def monitored_account_keys(settings) -> list[str]:
+    """Every configured applicant mailbox account (identity only)."""
+    from app.providers.email.base import normalize_account_key
+
+    return [
+        normalize_account_key(name)
+        for name in (settings.gmail_username, settings.xing_mailbox_username)
+        if name
+    ]
+
+
+def _arrival_order(message: InboundMessage) -> tuple[int, datetime]:
+    if message.occurred_at is None:
+        return (1, datetime.max.replace(tzinfo=UTC))
+    return (0, message.occurred_at)
+
+
+async def fetch_application_mailboxes(
+    settings,
+    *,
+    since: datetime,
+    selection: MailboxSelection = "all",
+    provider_factory=None,
+) -> tuple[list[InboundMessage], list[MailboxFetchReport]]:
+    """Live, read-only IMAP fetch (INBOX, readonly SELECT, `BODY.PEEK[]`) of
+    every selected applicant mailbox since `since`. One failing mailbox
+    never hides the others: its report carries the error class and the
+    caller decides the exit status. Messages are merged in arrival order and
+    a Message-ID seen in an earlier mailbox is dropped from later ones."""
+    from app.providers.email.base import GmailProviderError
+    from app.providers.email.imap import GmailImapProvider
+
+    factory = provider_factory or GmailImapProvider
+    merged: list[InboundMessage] = []
+    reports: list[MailboxFetchReport] = []
+    seen_ids: set[str] = set()
+    for mailbox in application_mailboxes(settings, selection):
+        provider = factory(
+            imap_host=mailbox.imap_host,
+            imap_port=mailbox.imap_port,
+            username=mailbox.username,
+            app_password=mailbox.app_password,
+            mailbox="INBOX",
+            lookback_days=settings.gmail_lookback_days,
+            get_known_uids=lambda _uid_validity, _candidates: set(),
+            trusted_outbound=False,
+        )
+        try:
+            fetched = await provider.fetch(since=since)
+        except (GmailProviderError, OSError, TimeoutError) as exc:
+            logger.warning(
+                "application_mailbox_fetch_failed mailbox=%s error=%s",
+                mailbox.label,
+                type(exc).__name__,
+            )
+            reports.append(MailboxFetchReport(mailbox.label, error=type(exc).__name__))
+            continue
+        count = 0
+        for parsed in fetched.messages:
+            message = inbound_from_parsed(parsed)
+            identity = message.message_id_hash
+            if identity is not None:
+                if identity in seen_ids:
+                    continue
+                seen_ids.add(identity)
+            merged.append(message)
+            count += 1
+        reports.append(
+            MailboxFetchReport(
+                mailbox.label,
+                fetched=count,
+                skipped=fetched.skipped_count,
+                deadline_exceeded=fetched.deadline_exceeded,
+            )
+        )
+    merged.sort(key=_arrival_order)
+    return merged, reports
 
 
 async def fetch_inbound_messages(settings, *, since: datetime) -> list[InboundMessage]:

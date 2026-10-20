@@ -6,15 +6,20 @@ Every command needs an explicit database:
     python scripts/stage15_application_tracker.py --database-url postgresql+psycopg://... list
 
 Read commands:   list [--status S ...] | show ID | history ID      (add --json)
-Gmail:           process-gmail [--source imap|stored] [--since YYYY-MM-DD] [--apply]
+Before applying: check-job JOB_ID   (duplicate check against every application)
+Gmail:           process-gmail [--source imap|stored] [--mailbox primary|secondary|all]
+                               [--since YYYY-MM-DD] [--apply]
 State changes:   transition ID STATUS --actor A --reason R [--apply]
                  override   ID STATUS --actor A --reason R [--apply]
 
 **Safe by default.** `process-gmail`, `transition` and `override` are DRY RUNS
-unless `--apply` is given; a dry run writes nothing. Gmail access is read-only
+unless `--apply` is given; a dry run writes nothing. `check-job` is read-only
+and exits 3 when the vacancy was already applied to. Gmail access is read-only
 IMAP (`--source imap`) or the already-synced `gmail_messages` table
-(`--source stored`, no network). Nothing here sends, drafts, replies, posts
-or notifies.
+(`--source stored`, no network). `--mailbox all` (the default) reads every
+configured applicant mailbox: the primary GMAIL_* account and the
+XING_MAILBOX_* account, from which applications have also been sent.
+Nothing here sends, drafts, replies, posts or notifies.
 
 **Target guard.** The database must be at the application's Alembic head (no
 auto-upgrade), a SQLite path must be a plain local file, and the protected
@@ -203,7 +208,9 @@ def _event_row(event) -> dict:
 
 
 def applicant_addresses(settings) -> list[str]:
-    addresses = [settings.gmail_username] if settings.gmail_username else []
+    """The applicant's own addresses: mail FROM any of them is never an
+    employer response (all monitored mailboxes plus the identity file)."""
+    addresses = [a for a in (settings.gmail_username, settings.xing_mailbox_username) if a]
     identity_path = Path(__file__).resolve().parents[1] / "application_identity.local.json"
     if identity_path.is_file():
         from app.models.application_identity import load_application_identity
@@ -214,14 +221,16 @@ def applicant_addresses(settings) -> list[str]:
     return addresses
 
 
-def _load_messages(db: Session, source: str, since: datetime, settings):
+def _load_messages(db: Session, source: str, since: datetime, settings, mailbox: str = "all"):
+    """(messages, per-mailbox fetch reports). `stored` reads the primary
+    account's synced rows only and reports nothing."""
     from app.services.application_response_processor import (
-        fetch_inbound_messages,
+        fetch_application_mailboxes,
         inbound_from_record,
     )
 
     if source == "imap":
-        return asyncio.run(fetch_inbound_messages(settings, since=since))
+        return asyncio.run(fetch_application_mailboxes(settings, since=since, selection=mailbox))
     from sqlalchemy import select
 
     from app.db.models import GmailMessageRecord
@@ -237,7 +246,7 @@ def _load_messages(db: Session, source: str, since: datetime, settings):
         )
         .order_by(GmailMessageRecord.provider_arrival_at, GmailMessageRecord.id)
     ).all()
-    return [inbound_from_record(r) for r in records]
+    return [inbound_from_record(r) for r in records], []
 
 
 def process_gmail(
@@ -248,16 +257,26 @@ def process_gmail(
     apply: bool,
     settings,
     only_application_ids: frozenset[int] | None = None,
+    mailbox: str = "all",
+    reports: list | None = None,
 ):
-    from app.services.application_response_processor import ApplicationResponseProcessor
+    """Process inbound mail; per-mailbox fetch reports are appended to
+    `reports` when given (a failed mailbox never hides the others)."""
+    from app.services.application_response_processor import (
+        ApplicationResponseProcessor,
+        monitored_account_keys,
+    )
 
-    messages = _load_messages(db, source, since, settings)
+    messages, fetch_reports = _load_messages(db, source, since, settings, mailbox)
+    if reports is not None:
+        reports.extend(fetch_reports)
     return ApplicationResponseProcessor().process(
         db,
         messages,
         apply=apply,
         applicant_addresses=applicant_addresses(settings),
         only_application_ids=only_application_ids,
+        monitored_account_keys=monitored_account_keys(settings),
     )
 
 
@@ -276,8 +295,15 @@ def build_parser() -> argparse.ArgumentParser:
     lst.add_argument("--after-id", type=int, default=None, help="continue after this id")
     for name in ("show", "history"):
         sub.add_parser(name).add_argument("application_id", type=int)
+    sub.add_parser("check-job").add_argument("job_id", type=int)
     gmail = sub.add_parser("process-gmail")
     gmail.add_argument("--source", choices=("imap", "stored"), default="imap")
+    gmail.add_argument(
+        "--mailbox",
+        choices=("primary", "secondary", "all"),
+        default="all",
+        help="imap only: primary=GMAIL_*, secondary=XING_MAILBOX_*, all=both (default)",
+    )
     gmail.add_argument("--since", default=None, help="YYYY-MM-DD (UTC); default: 30 days")
     gmail.add_argument("--apply", action="store_true", help="write results (default: dry run)")
     for name in ("transition", "override"):
@@ -331,20 +357,39 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
         elif args.command == "history":
             events = tracker.get_application_history(session, args.application_id)
             _print([_event_row(e) for e in events], args.json)
+        elif args.command == "check-job":
+            return _check_job(session, args)
         elif args.command == "process-gmail":
             if settings is None:
                 from app.core.config import Settings
 
                 settings = Settings()
+            reports: list = []
             results = process_gmail(
                 session,
                 source=args.source,
                 since=_since(args.since),
                 apply=args.apply,
                 settings=settings,
+                mailbox=args.mailbox,
+                reports=reports,
             )
             print(f"MODE: {'APPLY' if args.apply else 'DRY RUN (nothing written)'}")
+            for report in reports:
+                print(
+                    f"MAILBOX: {report.label} fetched={report.fetched} skipped={report.skipped}"
+                    f" deadline_exceeded={report.deadline_exceeded} error={report.error}",
+                    file=sys.stderr,
+                )
+            if args.source == "imap" and not reports:
+                print("WARNING: no applicant mailbox is configured", file=sys.stderr)
             _print([r.as_dict() for r in results], args.json)
+            if any(r.error or r.deadline_exceeded for r in reports):
+                print(
+                    "FAILED: at least one mailbox was not read completely; re-run later",
+                    file=sys.stderr,
+                )
+                return 1
         else:
             return _change_status(session, tracker, args)
         return 0
@@ -361,6 +406,57 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
     finally:
         session.close()
         engine.dispose()
+
+
+def _check_job(session: Session, args) -> int:
+    """Read-only duplicate check of one collected vacancy. Exit 0 when no
+    STRONG duplicate exists, 3 when the vacancy was already applied to."""
+    from app.db import application_repository as app_repo
+    from app.db.models import JobRecord
+    from app.services.application_duplicates import VacancyView, assess_vacancy, verdict
+
+    job = session.get(JobRecord, args.job_id)
+    if job is None:
+        raise ApplicationNotFoundError(f"job {args.job_id} does not exist")
+    vacancy = VacancyView(
+        job_id=job.id,
+        source=job.source,
+        company=job.company,
+        title=job.title,
+        url=job.url,
+        fingerprint=job.fingerprint,
+    )
+    applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
+    findings = assess_vacancy(vacancy, applications)
+    result = verdict(findings)
+    payload = {
+        "job_id": job.id,
+        "company": job.company,
+        "title": job.title,
+        "verdict": result,
+        "findings": [
+            {
+                "application_id": f.application_id,
+                "strength": f.strength,
+                "signals": list(f.signals),
+                "company": f.company,
+                "role": f.role,
+                "status": f.status,
+            }
+            for f in findings
+        ],
+    }
+    if args.json:
+        _print(payload, True)
+    else:
+        print(f"JOB {job.id}: {job.company} | {job.title}")
+        print(f"VERDICT: {result}")
+        for f in findings:
+            print(
+                f"  {f.strength} application {f.application_id} [{f.status}] "
+                f"{f.company} | {f.role} ({', '.join(f.signals)})"
+            )
+    return 3 if result == "ALREADY_APPLIED" else 0
 
 
 def _change_status(session: Session, tracker: ApplicationTracker, args) -> int:
