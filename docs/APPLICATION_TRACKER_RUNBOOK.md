@@ -8,6 +8,12 @@ PostgreSQL URL (`--database-url`). The tool refuses the protected Stage 14B
 canonical database, Stage 13D paths and `ai_agent-db-1`, and any database
 not at head (upgrade explicitly; there is no auto-upgrade).
 
+**Production runtime database (v1):**
+`D:\AI_agent\runtime\job_triage_runtime.db` — use it as `<db>` for daily
+work; day-to-day procedures are in [DAILY_OPERATIONS.md](DAILY_OPERATIONS.md).
+The section below describes how the original Stage 15 tracker database was
+bootstrapped and stays as history.
+
 ## Never use the canonical database
 
 `D:\AI_agent\stage14b_canonical_v12.db` is immutable. Do not upgrade it and
@@ -41,16 +47,48 @@ INBOUND_MESSAGE), `old` → `new`, `origin`, `actor`, `occurred_at` (event
 time) vs `recorded_at` (write time), `reason`, `summary`, `correlation`
 (start of the idempotency key).
 
+## Before applying: duplicate check
+
+    python scripts/stage15_application_tracker.py --database <db> check-job <job_id>
+
+Read-only. `ALREADY_APPLIED` (exit 3): a STRONG signal (same job row, BA
+reference, posting URL, vacancy fingerprint, or same employer + role).
+`POSSIBLE_DUPLICATE`: identical full title at another company (agency
+mirror) — check by hand. `INFO` lines name other roles at the same employer,
+which are NOT duplicates. Rewritten mirror titles are not detected.
+
+## Record a manual submission
+
+    python scripts/stage15_application_tracker.py --database <db> record-submission \
+        --company "Firma GmbH" --role "Python Developer (m/w/d)" --source bundesagentur \
+        --reference 12345-ABC-S --job-id 123 --channel EMPLOYER_PORTAL \
+        --submitted-at 2026-10-21T09:15:00Z --employer-domain firma.de \
+        --actor operator --evidence "Portal confirmation page; CV + Anschreiben PDFs" [--apply]
+
+Records ONE submission the operator already made by hand, as SUBMITTED
+(origin OPERATOR). Dry run without `--apply`. Idempotent on
+`--source` + `--reference` (`ALREADY_RECORDED`, nothing written). A STRONG
+or PROBABLE duplicate refuses (exit 3) until each verified-different
+application id is passed with `--confirm-distinct-from <id>`. Naive, invalid
+or future `--submitted-at` values are refused (exit 2).
+
 ## Gmail dry run (default)
 
     python scripts/stage15_application_tracker.py --database <db> process-gmail --since 2026-10-17
 
-Reads the configured mailbox read-only (IMAP `readonly` + `BODY.PEEK[]`;
-nothing is marked read). Prints, per message: correlation status/grade/
+Reads every configured applicant mailbox read-only (IMAP `readonly` +
+`BODY.PEEK[]`; nothing is marked read): `--mailbox all` (default) =
+`primary` (`GMAIL_*`) + `secondary` (`XING_MAILBOX_*`, the account that also
+receives XING alerts and from which applications have been sent);
+`--mailbox primary|secondary` restricts it. Per mailbox, stderr prints
+`MAILBOX: <label> fetched=N skipped=N deadline_exceeded=.. error=<class>`;
+exit 1 means a mailbox was not read completely (re-run later). XING platform
+mail (`mail.xing.com`) is ignored as `JOB_PLATFORM_NOTIFICATION`, and the same
+Message-ID in both mailboxes is processed once. Prints, per message: correlation status/grade/
 signals, classification + rule, `previous_status → new_status`, `action`
 (TRANSITION / RECORD_ONLY / IGNORE), `duplicate`, `reason`. **Writes nothing.**
 `--source stored` uses the already-synced `gmail_messages` table instead (no
-network).
+network; primary account only).
 
 ## Apply inbound processing
 
