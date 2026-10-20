@@ -36,7 +36,12 @@ XING_SCAN_PROGRESS_SOURCE = "xing"
 
 
 def compute_mailbox_scope(
-    imap_host: str, imap_port: int, username: str, mailbox: str = "INBOX"
+    imap_host: str,
+    imap_port: int,
+    username: str,
+    mailbox: str = "INBOX",
+    *,
+    rules_version: int | None = None,
 ) -> str:
     """Deterministic, non-secret key identifying the actual configured
     mailbox a scan-progress row belongs to (Codex gate follow-up, Astra
@@ -94,11 +99,17 @@ def compute_mailbox_scope(
     here: this key only needs to be deterministic and collision-resistant
     across distinct mailboxes, not resistant to a deliberate attacker
     trying to forge a collision.
+
+    **Digest-rules version.** `rules_version` (when given) is appended to
+    the key: a watermark only certifies "not a job digest" under the
+    subject rules that classified those UIDs, so a rules change must not
+    inherit it -- see `app.collectors.xing_email.XING_DIGEST_RULES_VERSION`.
+    `None` keeps the original four-field key unchanged.
     """
-    fingerprint = json.dumps(
-        [imap_host.strip().lower(), imap_port, username.strip(), mailbox.strip().lower()],
-        separators=(",", ":"),
-    )
+    fields: list = [imap_host.strip().lower(), imap_port, username.strip(), mailbox.strip().lower()]
+    if rules_version is not None:
+        fields.append(rules_version)
+    fingerprint = json.dumps(fields, separators=(",", ":"))
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
 
 

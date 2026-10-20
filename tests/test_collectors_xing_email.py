@@ -278,6 +278,187 @@ async def test_skips_non_job_digest_subjects_and_senders_without_crashing():
 
 
 # ---------------------------------------------------------------------------
+# Real alert formats observed in the live mailbox (2026-10-20). Fixtures
+# mirror the real plaintext structure; companies/links are placeholders.
+# ---------------------------------------------------------------------------
+
+REAL_DIGEST_BODY = """Nachricht im Browser ansehen: https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgA
+
+
+XING
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Hallo Max,
+wir haben noch andere spannende Jobs für Dich gefunden.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+Hier ein paar Vorschläge, die der Anzeige "Python Entwickler (m/w/d)
+https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgC
+" von Example Source GmbH ähnlich sind:
+
+
+----------------------------------------
+
+Bis 20% mehr Gehalt
+Junior Software Lead Cloud &amp; Web (m/w/d)
+=> https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgK
+
+Example &amp; Partner GmbH
+Frankfurt am Main
+
+45.000 € - 60.000 €bevorzugtes Tätigkeitsfeldbevorzugte IndustrieKarriere-Stufe
+Vollzeit
+
+----------------------------------------
+----------------------------------------
+
+Dringend gesucht
+Backend Integration Engineer (m/w/d)
+=> https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgL
+
+Second Example AG
+Darmstadt
+
+bevorzugtes TätigkeitsfeldKarriere-Stufe
+Vollzeit
+
+----------------------------------------
+
+
+----------------------------------------
+
+Alle Suchergebnisse anzeigen:
+=> https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgB
+
+----------------------------------------
+
+
+========================================
+Bist Du gerade auf Job-Suche?
+========================================
+
+----------------------------------------
+Ich bin aktiv auf Suche:
+=> https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgk
+----------------------------------------
+
+----------------------------------------
+Ich suche gerade nichts:
+=> https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgm
+----------------------------------------
+"""
+
+
+def _with_raw_subject(raw: bytes, raw_subject: str) -> bytes:
+    """Replaces the encoded Subject header with an exact raw header value
+    (e.g. one folded across lines, as XING sends company digests)."""
+    head, sep, body = raw.partition(b"\n\n")
+    lines = [line for line in head.split(b"\n") if not line.lower().startswith(b"subject:")]
+    lines.append(b"Subject: " + raw_subject.encode("utf-8"))
+    return b"\n".join(lines) + sep + body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subject",
+    [
+        " Entdecke ähnliche Jobs wie (Junior) Backend Engineer (m/w/d)",
+        'Ein neues Stellenangebot für "Junior Python Developer in..."',
+        '2 neue Stellenangebote für "Junior Python Developer in..."',
+        "Example GmbH, Other AG und andere spannende Firmen suchen nach Kandidaten wie Dir!",
+    ],
+)
+async def test_real_alert_subject_formats_are_processed(subject):
+    raw = _build_email(XING_SENDER, subject, REAL_DIGEST_BODY, message_id="<real@mail.xing.com>")
+    collector, _ = _make_collector([raw])
+
+    jobs = await collector.fetch()
+
+    assert [job.title for job in jobs] == [
+        "Junior Software Lead Cloud & Web (m/w/d)",
+        "Backend Integration Engineer (m/w/d)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_folded_company_digest_subject_is_processed():
+    raw = _build_email(XING_SENDER, "placeholder", REAL_DIGEST_BODY, message_id="<cd@x>")
+    raw = _with_raw_subject(
+        raw,
+        "Example GmbH, Other AG und andere\r\n spannende Firmen suchen nach Kandidaten wie Dir!",
+    )
+    collector, _ = _make_collector([raw])
+
+    jobs = await collector.fetch()
+
+    assert len(jobs) == 2
+
+
+def test_decoded_subject_is_whitespace_normalized():
+    assert (
+        xing_email_module._decode_subject("  Entdecke\xa0ähnliche Jobs\r\n wie  X ")
+        == "Entdecke ähnliche Jobs wie X"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Erinnerung: Deine Bewerbung bei Example GmbH wartet noch aufs Abschicken",
+        "Reminder: Submit your application to example gmbh",
+    ],
+)
+async def test_application_reminders_are_not_vacancy_alerts(subject):
+    # Reminders reuse the posting-block layout; they must still be skipped.
+    raw = _build_email(XING_SENDER, subject, REAL_DIGEST_BODY, message_id="<rem@mail.xing.com>")
+    collector, _ = _make_collector([raw])
+
+    assert await collector.fetch() == []
+
+
+@pytest.mark.asyncio
+async def test_html_entities_are_decoded_in_title_company_and_location():
+    block = """Data &amp; Cloud Engineer (m/w/d)
+=> https://www.xing.com/m/EEEEEEEEEEEEEEEEEEEE5
+
+M&#252;ller &amp; S&ouml;hne GmbH
+K&ouml;ln"""
+    raw = _build_email(XING_SENDER, "1 neue Stellenangebote für Daten", _digest_body(block))
+    collector, _ = _make_collector([raw])
+
+    jobs = await collector.fetch()
+
+    assert len(jobs) == 1
+    assert jobs[0].title == "Data & Cloud Engineer (m/w/d)"
+    assert jobs[0].company == "Müller & Söhne GmbH"
+    assert jobs[0].location == "Köln"
+
+
+@pytest.mark.asyncio
+async def test_each_posting_keeps_its_own_tracking_url_and_footer_links_are_not_jobs():
+    raw = _build_email(
+        XING_SENDER, "2 neue Stellenangebote für Python", REAL_DIGEST_BODY, message_id="<u@x>"
+    )
+    collector, _ = _make_collector([raw])
+
+    jobs = await collector.fetch()
+
+    urls = [str(job.url) for job in jobs]
+    assert urls == [
+        "https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgK",
+        "https://www.xing.com/m/RRRRRRRRRRRRRRRRRRRRgL",
+    ]
+    assert len(set(urls)) == len(jobs)
+    # The intro's referenced listing, "Alle Suchergebnisse" and the
+    # job-search-status links never become jobs or lend their URL.
+    assert not any(url.endswith(("gA", "gB", "gC", "gk", "gm")) for url in urls)
+
+
+# ---------------------------------------------------------------------------
 # Block parsing: variable separators, optional fields, invalid blocks.
 # ---------------------------------------------------------------------------
 

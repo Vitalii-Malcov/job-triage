@@ -50,7 +50,7 @@ from app.agents.seniority_classifier import derive_candidate_target_seniority
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
-from app.collectors.xing_email import XingEmailCollector
+from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailCollector
 from app.db.candidate_profile_repository import (
     get_candidate_profile,
     get_candidate_skills_for_scoring,
@@ -762,6 +762,7 @@ async def run_xing(
         settings.xing_mailbox_imap_host,
         settings.xing_mailbox_imap_port,
         settings.xing_mailbox_username,
+        rules_version=XING_DIGEST_RULES_VERSION,
     )
     scan_progress = get_xing_scan_progress(db, mailbox_scope=mailbox_scope)
     # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar capture):

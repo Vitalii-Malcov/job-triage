@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.collectors.xing_email import XingEmailBatch
+from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailBatch
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.models import JobRecord
@@ -147,6 +147,7 @@ def _mailbox_scope(settings: Settings) -> str:
         settings.xing_mailbox_imap_host,
         settings.xing_mailbox_imap_port,
         settings.xing_mailbox_username,
+        rules_version=XING_DIGEST_RULES_VERSION,
     )
 
 
@@ -469,6 +470,70 @@ def test_mailbox_scope_username_case_is_not_folded():
     scope_lower = compute_mailbox_scope("imap.example.com", 993, "user@example.com")
 
     assert scope_upper != scope_lower
+
+
+def test_mailbox_scope_changes_with_digest_rules_version():
+    """A watermark only certifies "not a job digest" under the subject
+    rules that classified those UIDs: a different rules version must get a
+    different scope, and `rules_version=None` keeps the legacy key."""
+    legacy = compute_mailbox_scope("imap.example.com", 993, "user@example.com")
+    assert legacy == compute_mailbox_scope(
+        "imap.example.com", 993, "user@example.com", rules_version=None
+    )
+    v1 = compute_mailbox_scope("imap.example.com", 993, "user@example.com", rules_version=1)
+    v2 = compute_mailbox_scope("imap.example.com", 993, "user@example.com", rules_version=2)
+    assert len({legacy, v1, v2}) == 3
+
+
+@pytest.mark.asyncio
+async def test_watermark_from_older_digest_rules_is_not_inherited(db, monkeypatch):
+    """Regression (real mailbox, 2026-10-20): the pre-fix run advanced the
+    watermark past alert formats it did not recognise yet. After the
+    subject rules changed, run_xing must not reuse that watermark -- the
+    lookback window is rescanned instead."""
+    monkeypatch.setattr(
+        "app.agents.job_score_evaluator.JobScorer",
+        lambda profile_skills: FakeJobScorer(profile_skills),
+    )
+    monkeypatch.setattr("app.services.collector_runner.TelegramNotifier", _NoOpNotifier)
+    monkeypatch.setattr(
+        "app.services.collector_runner.CompanyResearchService", _NoOpResearchService
+    )
+    settings = Settings(
+        xing_mailbox_imap_host="imap.example.com",
+        xing_mailbox_username="user@example.com",
+        xing_mailbox_app_password="app-password",
+        company_research_auto_enabled=False,
+        min_job_score_to_notify=50,
+    )
+    legacy_scope = compute_mailbox_scope(
+        settings.xing_mailbox_imap_host,
+        settings.xing_mailbox_imap_port,
+        settings.xing_mailbox_username,
+    )
+    assert legacy_scope != _mailbox_scope(settings)
+    advance_xing_scan_progress(
+        db,
+        uid_validity=FAKE_UID_VALIDITY,
+        confirmed_upto_uid=6,
+        mailbox_scope=legacy_scope,
+        observed_uid_validity=None,
+    )
+
+    captured: dict[str, object] = {}
+
+    class _CapturingFakeCollector(_FakeXingCollector):
+        def __init__(self, **kwargs):
+            captured["scan_from_uid"] = kwargs.get("scan_from_uid")
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("app.services.collector_runner.XingEmailCollector", _CapturingFakeCollector)
+
+    result = await run_xing(db, settings)
+
+    assert captured["scan_from_uid"] is None
+    assert result["created"] == 2
+    assert get_xing_scan_progress(db, mailbox_scope=legacy_scope).confirmed_upto_uid == 6
 
 
 @pytest.mark.asyncio
