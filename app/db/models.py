@@ -29,6 +29,7 @@ from app.models.application_lifecycle import (
     ApplicationEventType,
     ApplicationLifecycleStatus,
 )
+from app.models.telegram_operator import OperatorDecision, TelegramDeliveryState
 
 
 class JobRecord(Base):
@@ -3195,3 +3196,229 @@ def _refuse_event_update(mapper, connection, target) -> None:
 @event.listens_for(ApplicationEventRecord, "before_delete")
 def _refuse_event_delete(mapper, connection, target) -> None:
     raise ApplicationEventImmutableError("application events are append-only")
+
+
+# --- Stage 16: Telegram operator control -------------------------------------------
+
+TELEGRAM_DELIVERY_STATE_VALUES: tuple[str, ...] = tuple(s.value for s in TelegramDeliveryState)
+OPERATOR_DECISION_VALUES: tuple[str, ...] = tuple(d.value for d in OperatorDecision)
+
+OPERATOR_CARD_CHECKS: dict[str, str] = {
+    "ck_telegram_operator_cards_state_valid": _in_list(
+        "delivery_state", TELEGRAM_DELIVERY_STATE_VALUES
+    ),
+    "ck_telegram_operator_cards_attempts_nonnegative": "attempt_count >= 0",
+}
+OPERATOR_DECISION_CHECKS: dict[str, str] = {
+    "ck_application_operator_decisions_decision_valid": _in_list(
+        "decision", OPERATOR_DECISION_VALUES
+    ),
+    # An override always names the decision it supersedes and says why.
+    "ck_application_operator_decisions_override_reason": (
+        "supersedes_decision_id IS NULL OR reason IS NOT NULL"
+    ),
+}
+LIFECYCLE_NOTIFICATION_CHECKS: dict[str, str] = {
+    "ck_telegram_lifecycle_notifications_state_valid": _in_list(
+        "delivery_state", TELEGRAM_DELIVERY_STATE_VALUES
+    ),
+    "ck_telegram_lifecycle_notifications_attempts_nonnegative": "attempt_count >= 0",
+}
+
+
+class TelegramOperatorCardRecord(Base):
+    """Stage 16: one operator card for one review target -- an application
+    plus the exact review package it was rendered for.
+
+    `target_key` (`app:<id>:pkg:<id|none>`) is UNIQUE: a target gets at most
+    one card, and a provably failed send is retried on the SAME row, so the
+    operator is never sent duplicate cards. `callback_token` is the opaque
+    random capability carried in the buttons' callback_data; a callback is
+    only ever resolved through it, and the target is always re-read from
+    the database before anything is decided.
+    """
+
+    __tablename__ = "telegram_operator_cards"
+    __table_args__ = (
+        UniqueConstraint("target_key", name="uq_telegram_operator_cards_target_key"),
+        UniqueConstraint("callback_token", name="uq_telegram_operator_cards_callback_token"),
+        *(CheckConstraint(body, name=name) for name, body in OPERATOR_CARD_CHECKS.items()),
+        Index("ix_telegram_operator_cards_application_id", "application_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("applications.id", ondelete="RESTRICT"), nullable=False
+    )
+    review_package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    callback_token: Mapped[str] = mapped_column(String(32), nullable=False)
+    delivery_state: Mapped[str] = mapped_column(String(20), nullable=False)
+    approve_offered: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false()
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    card_text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApplicationOperatorDecisionRecord(Base):
+    """Stage 16: one operator decision (APPROVE / SKIP / LATER) about one
+    review target. Append-only audit: rows are only ever INSERTed (ORM
+    guards below and database triggers refuse UPDATE/DELETE); an override
+    is a NEW row whose `supersedes_decision_id` names the decision it
+    replaces, with a mandatory reason.
+
+    **Idempotency.** `idempotency_key` is deterministic and UNIQUE:
+    `<target_key>:final:<generation>` admits exactly one final decision per
+    target and override generation, `<target_key>:later:<generation>` at
+    most one LATER, and `<target_key>:override:<n>` one override per step.
+    `callback_ref` (SHA-256 of the Telegram callback-query id) is UNIQUE, so
+    a retried delivery of the same callback can never record twice.
+
+    Telegram identities are stored only as SHA-256 references
+    (`operator_ref`, `chat_ref`), never raw.
+    """
+
+    __tablename__ = "application_operator_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key", name="uq_application_operator_decisions_idempotency_key"
+        ),
+        UniqueConstraint("callback_ref", name="uq_application_operator_decisions_callback_ref"),
+        *(CheckConstraint(body, name=name) for name, body in OPERATOR_DECISION_CHECKS.items()),
+        Index("ix_application_operator_decisions_target_key", "target_key"),
+        Index("ix_application_operator_decisions_application_id", "application_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("applications.id", ondelete="RESTRICT"), nullable=False
+    )
+    card_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("telegram_operator_cards.id", ondelete="RESTRICT"), nullable=True
+    )
+    review_package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    vacancy_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    decision: Mapped[str] = mapped_column(String(10), nullable=False)
+    supersedes_decision_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("application_operator_decisions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    callback_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    actor: Mapped[str] = mapped_column(String(40), nullable=False)
+    operator_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chat_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lifecycle_correlation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+# Same append-only shape as APPLICATION_EVENT_IMMUTABILITY_DDL; the Stage 16
+# migration creates exactly these objects.
+OPERATOR_DECISION_IMMUTABILITY_DDL: dict[str, tuple[str, ...]] = {
+    "sqlite": (
+        "CREATE TRIGGER trg_application_operator_decisions_no_update BEFORE UPDATE ON "
+        "application_operator_decisions "
+        "BEGIN SELECT RAISE(ABORT, 'application_operator_decisions is append-only'); END",
+        "CREATE TRIGGER trg_application_operator_decisions_no_delete BEFORE DELETE ON "
+        "application_operator_decisions "
+        "BEGIN SELECT RAISE(ABORT, 'application_operator_decisions is append-only'); END",
+    ),
+    "postgresql": (
+        "CREATE FUNCTION application_operator_decisions_append_only() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+        "'application_operator_decisions is append-only' "
+        "USING ERRCODE = 'restrict_violation'; END $$",
+        "CREATE TRIGGER trg_application_operator_decisions_append_only BEFORE UPDATE OR DELETE "
+        "ON application_operator_decisions FOR EACH ROW "
+        "EXECUTE FUNCTION application_operator_decisions_append_only()",
+    ),
+}
+_OPERATOR_DECISION_IMMUTABILITY_DROP: dict[str, tuple[str, ...]] = {
+    "postgresql": ("DROP FUNCTION IF EXISTS application_operator_decisions_append_only()",),
+}
+
+for _dialect, _statements in OPERATOR_DECISION_IMMUTABILITY_DDL.items():
+    for _statement in _statements:
+        event.listen(
+            ApplicationOperatorDecisionRecord.__table__,
+            "after_create",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
+for _dialect, _statements in _OPERATOR_DECISION_IMMUTABILITY_DROP.items():
+    for _statement in _statements:
+        event.listen(
+            ApplicationOperatorDecisionRecord.__table__,
+            "after_drop",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
+
+
+class OperatorDecisionImmutableError(RuntimeError):
+    """An UPDATE or DELETE of an ApplicationOperatorDecisionRecord was attempted."""
+
+
+@event.listens_for(ApplicationOperatorDecisionRecord, "before_update")
+def _refuse_decision_update(mapper, connection, target) -> None:
+    raise OperatorDecisionImmutableError("operator decisions are append-only")
+
+
+@event.listens_for(ApplicationOperatorDecisionRecord, "before_delete")
+def _refuse_decision_delete(mapper, connection, target) -> None:
+    raise OperatorDecisionImmutableError("operator decisions are append-only")
+
+
+class TelegramLifecycleNotificationRecord(Base):
+    """Stage 16 delivery ledger: at most one Telegram notification per
+    Stage 15 lifecycle event (`UNIQUE(application_event_id)`).
+
+    Processing the same event again finds the row and sends nothing. A
+    provably FAILED send may be retried (bounded) on the same row; an
+    UNCERTAIN one never is. Notification delivery is bookkeeping only: it
+    never changes an application or its events.
+    """
+
+    __tablename__ = "telegram_lifecycle_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_event_id", name="uq_telegram_lifecycle_notifications_event_id"
+        ),
+        *(CheckConstraint(body, name=name) for name, body in LIFECYCLE_NOTIFICATION_CHECKS.items()),
+        Index("ix_telegram_lifecycle_notifications_application_id", "application_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_event_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("application_events.id", ondelete="RESTRICT"), nullable=False
+    )
+    application_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("applications.id", ondelete="RESTRICT"), nullable=False
+    )
+    delivery_state: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

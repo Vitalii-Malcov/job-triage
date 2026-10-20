@@ -133,6 +133,18 @@ class Settings(BaseSettings):
     # independent of outbound_sending_enabled. Keep False in production
     # until the real-Gmail production-enable gate has passed.
     telegram_gmail_draft_enabled: bool = False
+    # Stage 16 (app.services.telegram_operator_control): operator cards for
+    # Stage 15 applications with APPROVE / SKIP / DETAILS / LATER buttons,
+    # and lifecycle-status notifications. Off by default. APPROVE only
+    # records the operator's decision and moves the application
+    # PACKAGE_READY -> APPROVED locally; nothing is ever submitted or sent
+    # to an employer. Independent of every other Telegram flag.
+    telegram_operator_control_enabled: bool = False
+    # Optional numeric Telegram user id of the operator. When set, every
+    # Stage 16 callback must come from this user as well as from
+    # telegram_chat_id; when empty, Stage 16 callbacks are accepted only in
+    # a PRIVATE chat (where chat id == user id), never in a group.
+    telegram_operator_user_id: str = ""
     # The DECODED name of the Gmail Drafts mailbox (localized accounts use
     # e.g. "[Gmail]/Entwürfe"). Configured, never auto-discovered; validated
     # (and modified-UTF-7 encoded) before any claim -- see

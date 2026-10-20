@@ -21,6 +21,7 @@ SAFETY_FLAGS = (
     "telegram_bewerbung_approval_enabled",
     "telegram_vacancy_feed_enabled",
     "telegram_daily_digest_enabled",
+    "telegram_operator_control_enabled",
     "alembic_auto_upgrade",
     "automation_scheduler_enabled",
     "automation_auto_prepare_enabled",

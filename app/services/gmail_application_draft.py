@@ -61,6 +61,7 @@ from app.db.telegram_bewerbung_approval_repository import (
     APPROVAL_CAPABILITY_PATTERN,
     get_link_by_capability,
 )
+from app.db.telegram_operator_repository import review_withdrawn_by_operator
 from app.models.review_package import ReviewedBewerbungContent
 from app.providers.email.base import MAX_ADDRESS_LENGTH, normalize_account_key
 from app.providers.email.draft_base import (
@@ -732,6 +733,15 @@ def _arm_once(db: Session, claimed: _Claimed, config: _Config):
     if not armed:
         db.rollback()
         return _report(repo.get_snapshot_by_link(db, claim.link_id))
+    # Stage 16: re-check the operator decision AFTER the fence write. On
+    # PostgreSQL the review row lock (held since revalidation) already
+    # serializes a SKIP; on SQLite only this write holds the database lock,
+    # so a SKIP that committed after the revalidation read is seen here.
+    # A SKIP that comes after this commit is refused while the attempt is
+    # armed (`has_armed_attempt_for_review`).
+    if review_withdrawn_by_operator(db, fresh.review_id):
+        db.rollback()
+        return _release(db, claim, "NOT_APPROVED")
     try:
         db.commit()
     except SQLAlchemyError as exc:

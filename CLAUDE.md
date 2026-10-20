@@ -57,6 +57,18 @@ You are the primary implementation agent for AI Job Search Control Center.
 - Real-Gmail validation (separate non-production mailbox) is a production-enable gate before
   turning the flag on in production.
 
+## Stage 16 Telegram operator control — safety note
+
+- `app/services/telegram_operator_control.py`: Telegram APPROVE records an operator decision and
+  moves a Stage 15 application `PACKAGE_READY -> APPROVED` via `ApplicationTracker` (one
+  transaction). **TELEGRAM APPROVE != APPLICATION SENT.** No SMTP, Gmail, portal or employer
+  contact; the only outbound is a message to the configured operator chat. Gated by
+  `TELEGRAM_OPERATOR_CONTROL_ENABLED` (default false). SKIP is never REJECTED/WITHDRAWN.
+- `tests/test_stage16_operator_notifications.py` proves the no-employer-outbound invariant on the
+  import graph — keep employer-facing modules out of the Stage 16 import closure.
+- Final decisions are never silently replaced; changes go through the CLI override (reason
+  required). Decisions are append-only (DB triggers).
+
 ## Installed skills
 
 | Skill | Source | When to consult |

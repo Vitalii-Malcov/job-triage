@@ -22,6 +22,7 @@ from app.agents.cv_adapter import (
     CVDraftProfileChangedError,
 )
 from app.agents.review_package_builder import (
+    ReviewApplicationApprovedError,
     ReviewBewerbungDraftJobMismatchError,
     ReviewBewerbungDraftNotFoundError,
     ReviewCurrentJobMissingError,
@@ -1100,13 +1101,19 @@ def reject_review_package(
     db: Session = Depends(get_db),
 ) -> ReviewPackage:
     """PENDING_REVIEW -> REJECTED. Never mutates the source drafts, never
-    touches ApplicationStatus."""
+    touches ApplicationStatus. Refused (409) while a linked application is
+    APPROVED (Stage 16)."""
     try:
         result = ReviewPackageService().reject(
             db, review_id, body.expected_review_version, body.decision_note
         )
     except ReviewNotFoundError as exc:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ReviewApplicationApprovedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "application_id": exc.application_id},
+        ) from exc
     except ReviewNotPendingError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,

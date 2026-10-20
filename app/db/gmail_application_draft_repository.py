@@ -236,6 +236,28 @@ def lock_by_link(db: Session, link_id: int) -> LedgerSnapshot | None:
     return LedgerSnapshot.of(row) if row is not None else None
 
 
+def has_armed_attempt_for_review(db: Session, review_id: int) -> bool:
+    """Fresh read: is a Stage 9D attempt for this review ARMED and still
+    unresolved (CREATING with the network fence set)? Such an attempt may be
+    calling the provider right now; Stage 16 SKIP must not commit until it
+    resolves (CREATED / FAILED / UNCERTAIN). An unarmed CREATING claim is
+    not in flight: its arm step revalidates the operator decision first.
+    Callers hold the review row lock (PostgreSQL) or have already written in
+    this transaction (SQLite write lock), so the answer cannot go stale
+    before their commit."""
+    row_id = db.scalar(
+        select(Ledger.id)
+        .where(
+            Ledger.review_id == review_id,
+            Ledger.state == CREATING,
+            Ledger.append_started_at.is_not(None),
+        )
+        .limit(1)
+        .execution_options(populate_existing=True)
+    )
+    return row_id is not None
+
+
 # --- claims -----------------------------------------------------------------------
 
 
