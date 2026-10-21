@@ -389,27 +389,38 @@ async def _send_claimed_card(
     `DELIVERY_UNCERTAIN` (never auto-retried); lease lost before any
     request -> claim released untouched. For `manual_review` a known-unsent
     outcome is held for the operator's next explicit `/review`
-    (`manual_hold`), never returned to the automatic queue."""
+    (`manual_hold`), never returned to the automatic queue; a manual
+    failure before the request starts consumes no delivery attempt."""
     try:
         text = render_vacancy_card(
             build_vacancy_card(job, candidate_skills, manual_review=manual_review)
         )
-        reply_markup = build_card_keyboard(review.callback_token)
+        # Automatic feed: keyboard built at send time, as before /review.
+        reply_markup = build_card_keyboard(review.callback_token) if manual_review else None
     except Exception as exc:
-        # Nothing reached Telegram -- provably failed, retryable.
-        mark_send_failed(
-            db,
-            review,
-            claim_token=claim_token,
-            last_error=f"render:{type(exc).__name__}",
-            manual_hold=manual_review,
-        )
+        if manual_review:
+            # Codex aadca62 P1: nothing reached Telegram, so this is not a
+            # delivery attempt -- release the claim (attempt_count restored)
+            # to the manual hold; it can never exhaust the cap.
+            release_claim(
+                db,
+                review,
+                claim_token=claim_token,
+                reason=f"pre_send:render:{type(exc).__name__}",
+                manual_hold=True,
+            )
+        else:
+            # Nothing reached Telegram -- provably failed, retryable.
+            mark_send_failed(
+                db, review, claim_token=claim_token, last_error=f"render:{type(exc).__name__}"
+            )
         logger.warning(
-            "vacancy_feed_render_failed review_id=%s error_type=%s",
+            "vacancy_feed_render_failed review_id=%s error_type=%s manual=%s",
             review.id,
             type(exc).__name__,
+            manual_review,
         )
-        return _FAILED
+        return _RELEASED if manual_review else _FAILED
 
     # Re-check immediately before networking (Codex S9A-CODEX-002): the
     # heartbeat thread may have confirmed lease loss during the claim's
@@ -436,7 +447,7 @@ async def _send_claimed_card(
         settings.telegram_bot_token,
         settings.telegram_chat_id,
         text,
-        reply_markup=reply_markup,
+        reply_markup=reply_markup or build_card_keyboard(review.callback_token),
         timeout_seconds=settings.telegram_timeout_seconds,
     )
     if result.outcome is TelegramSendOutcome.SENT:

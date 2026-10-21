@@ -29,6 +29,7 @@ from app.db.models import (
     TelegramVacancyReviewRecord,
 )
 from app.db.telegram_vacancy_review_repository import (
+    MANUAL_HOLD_PREFIX,
     MAX_DELIVERY_ATTEMPTS,
     claim_for_sending,
     dequeue,
@@ -717,7 +718,117 @@ class TestManualFailureHasNoAutomaticRetry:
         assert _review_row(session_factory).state == "DELIVERY_UNCERTAIN"
 
 
+def _raise_runtime(*args, **kwargs):
+    raise RuntimeError("pre-send boom")
+
+
+class TestManualPreSendFailureConsumesNoAttempt:
+    """Codex aadca62 P1: any manual failure before `send_telegram_message`
+    starts releases the claim to the manual hold without consuming a
+    delivery attempt -- it can never exhaust the cap into DELIVERY_FAILED."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "target", ["render_vacancy_card", "build_vacancy_card", "build_card_keyboard"]
+    )
+    async def test_pre_send_failure_releases_to_manual_hold(
+        self, session_factory, sender, monkeypatch, target
+    ):
+        _insert_job(session_factory)
+        original = getattr(feed, target)
+        monkeypatch.setattr(feed, target, _raise_runtime)
+
+        update = await _review(str(JOB_ID))
+
+        assert sender.calls == []
+        review = _review_row(session_factory)
+        assert review.state == "DISCOVERED"
+        assert review.last_error.startswith(MANUAL_HOLD_PREFIX)
+        assert review.attempt_count == 0
+        assert review.claim_token is None
+        assert "nicht gesendet" in _reply(update)
+        _assert_verdict_unchanged(session_factory, 71, "MAYBE")
+
+        monkeypatch.setattr(feed, target, original)
+        await _review(str(JOB_ID))
+        assert len(sender.calls) == 1
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+        _assert_verdict_unchanged(session_factory, 71, "MAYBE")
+
+    @pytest.mark.asyncio
+    async def test_pre_send_failure_keeps_previous_attempt_count(
+        self, session_factory, sender, monkeypatch
+    ):
+        _insert_job(session_factory)
+        sender.outcome = TelegramSendOutcome.FAILED
+        await _review(str(JOB_ID))
+        assert _review_row(session_factory).attempt_count == 1
+        monkeypatch.setattr(feed, "build_card_keyboard", _raise_runtime)
+
+        await _review(str(JOB_ID))
+
+        review = _review_row(session_factory)
+        assert len(sender.calls) == 1
+        assert (review.state, review.attempt_count) == ("DISCOVERED", 1)
+        assert review.claim_token is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["render_vacancy_card", "build_card_keyboard"])
+    async def test_repeated_pre_send_failure_never_exhausts_cap(
+        self, session_factory, sender, settings, monkeypatch, target
+    ):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        original = getattr(feed, target)
+        monkeypatch.setattr(feed, target, _raise_runtime)
+
+        for _ in range(MAX_DELIVERY_ATTEMPTS + 2):
+            await _review(str(JOB_ID))
+            review = _review_row(session_factory)
+            assert review.state == "DISCOVERED"
+            assert review.attempt_count == 0
+        stats = await _sweep(session_factory, settings)
+        _recollect(session_factory, settings)
+        assert _review_row(session_factory).state == "DISCOVERED"
+        assert stats.sent == 0 and sender.calls == []
+
+        monkeypatch.setattr(feed, target, original)
+        await _review(str(JOB_ID))
+        assert len(sender.calls) == 1
+        review = _review_row(session_factory)
+        assert (review.state, review.attempt_count) == ("TELEGRAM_SENT", 1)
+        _assert_verdict_unchanged(session_factory, 90, "APPLY")
+
+    @pytest.mark.asyncio
+    async def test_real_telegram_failed_still_counts_an_attempt(self, session_factory, sender):
+        _insert_job(session_factory)
+        sender.outcome = TelegramSendOutcome.FAILED
+
+        await _review(str(JOB_ID))
+        await _review(str(JOB_ID))
+
+        review = _review_row(session_factory)
+        assert len(sender.calls) == 2
+        assert (review.state, review.attempt_count) == ("DISCOVERED", 2)
+        assert review.last_error == f"{MANUAL_HOLD_PREFIX}{TelegramSendOutcome.FAILED.value}"
+
+
 class TestAutomaticFeedUnchanged:
+    @pytest.mark.asyncio
+    async def test_automatic_render_failure_consumes_attempt_and_requeues(
+        self, session_factory, sender, settings, monkeypatch
+    ):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        _recollect(session_factory, settings)
+        monkeypatch.setattr(feed, "render_vacancy_card", _raise_runtime)
+
+        stats = await _sweep(session_factory, settings)
+
+        review = _review_row(session_factory)
+        assert stats.failed == 1 and sender.calls == []
+        assert (review.state, review.attempt_count) == ("QUEUED_FOR_REVIEW", 1)
+        assert review.last_error == "render:RuntimeError"
+        assert review.claim_token is None
+
     @pytest.mark.asyncio
     async def test_automatic_apply_failure_still_retried_by_next_sweep(
         self, session_factory, sender, settings
