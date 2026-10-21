@@ -30,6 +30,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app.agents.cv_public_text import (
+    public_certification_status,
+    public_description,
+    public_language_level,
+    public_period,
+    public_phrase,
+    public_proficiency,
+)
 from app.agents.review_package_builder import (
     ReviewApplicationApprovedError,
     ReviewBewerbungDraftJobMismatchError,
@@ -183,11 +191,6 @@ def _date(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _period(start: date | None, end: date | None, *, current: bool = False) -> str:
-    end_text = "heute" if current and end is None else (_date(end) or "nicht angegeben")
-    return f"{_date(start) or 'nicht angegeben'} – {end_text}"
-
-
 def _requirements(doc: _Document, title: str, requirements: list[RequirementMatch]) -> None:
     doc.line(title)
     if not requirements:
@@ -216,7 +219,7 @@ def _section_header(doc: _Document, snapshot: ReviewSnapshot) -> None:
     doc.value("Ort: ", header.location_city.value if header.location_city else None, missing="—")
     doc.value(
         "Land: ",
-        header.location_country.value if header.location_country else None,
+        public_phrase(header.location_country.value) if header.location_country else None,
         missing="—",
     )
     doc.line("Kontakt: Kontaktdaten sind nicht Teil dieses Entwurfs.")
@@ -237,9 +240,10 @@ def _section_skills(doc: _Document, snapshot: ReviewSnapshot) -> None:
     if not snapshot.cv.skills:
         doc.line("• keine")
     for skill in snapshot.cv.skills:
-        doc.value("• ", skill.text, missing="(ohne Bezeichnung)")
-        doc.value("Kategorie: ", skill.category, indent="  ")
-        doc.value("Niveau: ", skill.proficiency, indent="  ")
+        # V1 quality patch: the CV shows skills as a CV does -- no internal
+        # category enum, no UNKNOWN level (see app.agents.cv_public_text).
+        doc.value("• ", public_phrase(skill.text), missing="(ohne Bezeichnung)")
+        doc.value("Niveau: ", public_proficiency(skill.proficiency), indent="  ")
         if skill.years_experience is not None:
             doc.line(f"  Erfahrung: {skill.years_experience:g} Jahre")
 
@@ -251,11 +255,16 @@ def _section_experience(doc: _Document, snapshot: ReviewSnapshot) -> None:
     for item in snapshot.cv.experience:
         doc.value("• ", item.job_title, missing="(ohne Titel)")
         doc.value("Firma: ", item.company, indent="  ")
-        doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date, current=item.is_current)}")
+        period = public_period(
+            item.start_date, item.end_date, current=item.is_current, description=item.description
+        )
+        doc.value("Zeitraum: ", period, missing="nicht angegeben", indent="  ")
         doc.value("Ort: ", item.location, indent="  ")
-        doc.value("Beschreibung: ", item.description, multiline=True, indent="  ")
-        _list(doc, "Aufgabe: ", item.responsibilities, "  ")
-        _list(doc, "Erfolg: ", item.achievements, "  ")
+        doc.value(
+            "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
+        )
+        _list(doc, "Aufgabe: ", [public_phrase(text) for text in item.responsibilities], "  ")
+        _list(doc, "Erfolg: ", [public_phrase(text) for text in item.achievements], "  ")
         _list(doc, "Technologie: ", item.technologies, "  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")
 
@@ -267,11 +276,12 @@ def _section_projects(doc: _Document, snapshot: ReviewSnapshot) -> None:
     for item in snapshot.cv.projects:
         doc.value("• ", item.name, missing="(ohne Namen)")
         doc.value("Rolle: ", item.role, indent="  ")
-        if item.start_date or item.end_date:
-            doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date)}")
-        doc.value("Beschreibung: ", item.description, multiline=True, indent="  ")
+        doc.value("Zeitraum: ", public_period(item.start_date, item.end_date), indent="  ")
+        doc.value(
+            "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
+        )
         _list(doc, "Technologie: ", item.technologies, "  ")
-        _list(doc, "Highlight: ", item.highlights, "  ")
+        _list(doc, "Highlight: ", [public_phrase(text) for text in item.highlights], "  ")
         doc.value("Repository: ", item.repository_url, indent="  ")
         doc.value("Demo: ", item.demo_url, indent="  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")
@@ -286,7 +296,7 @@ def _section_education(doc: _Document, snapshot: ReviewSnapshot) -> None:
         doc.value("Programm: ", item.program, indent="  ")
         doc.value("Abschluss: ", item.degree, indent="  ")
         doc.value("Fachrichtung: ", item.field_of_study, indent="  ")
-        doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date)}")
+        doc.value("Zeitraum: ", public_period(item.start_date, item.end_date), indent="  ")
         doc.line(f"  Abgeschlossen: {'ja' if item.completed else 'nein'}")
         doc.value("Ort: ", item.location, indent="  ")
 
@@ -300,7 +310,7 @@ def _section_certifications(doc: _Document, snapshot: ReviewSnapshot) -> None:
         doc.value("Aussteller: ", item.issuer, indent="  ")
         doc.value("Ausgestellt: ", _date(item.issued_date), indent="  ")
         doc.value("Gültig bis: ", _date(item.expires_date), indent="  ")
-        doc.value("Status: ", item.status, indent="  ")
+        doc.value("Status: ", public_certification_status(item.status), indent="  ")
 
 
 def _section_languages(doc: _Document, snapshot: ReviewSnapshot) -> None:
@@ -308,8 +318,12 @@ def _section_languages(doc: _Document, snapshot: ReviewSnapshot) -> None:
     if not snapshot.cv.languages:
         doc.line("• keine")
     for item in snapshot.cv.languages:
-        doc.value("• ", item.language, missing="(ohne Bezeichnung)")
-        doc.value("Niveau: ", item.level, indent="  ")
+        level = public_language_level(item.level)
+        doc.value(
+            "• ",
+            f"{item.language} – {level}" if item.language and level else item.language,
+            missing="(ohne Bezeichnung)",
+        )
         doc.value("Zertifikat: ", item.certificate, indent="  ")
 
 

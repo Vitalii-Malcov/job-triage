@@ -138,7 +138,12 @@ class BewerbungService:
             cv_draft.header.professional_title.value if cv_draft.header.professional_title else None
         )
         rendered = render_draft(
-            plan, resolved_paragraphs, job.title, job.company, professional_title
+            plan,
+            resolved_paragraphs,
+            job.title,
+            job.company,
+            professional_title,
+            job_description=job.description or "",
         )
 
         signature_name = None

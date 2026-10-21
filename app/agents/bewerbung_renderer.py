@@ -58,10 +58,12 @@ number, and no template interpolates one — `years_experience` exists on
 education/certification exclusion.
 """
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
+from app.agents.cv_public_text import public_phrase
 from app.agents.language_relevance import relevant_languages
 from app.models.bewerbung import (
     AllowedClaim,
@@ -111,6 +113,10 @@ class ProjectEvidenceRecord(BaseModel):
     kind: Literal["PROJECT"] = "PROJECT"
     name: str
     technologies: list[str] = []
+    # V1 quality patch: the project's own recorded highlights. Rendered only
+    # through app.agents.cv_public_text's closed glossary (German), never as
+    # raw source text -- see `_project_fragment`.
+    highlights: list[str] = []
 
 
 class LanguageEvidenceRecord(BaseModel):
@@ -186,7 +192,9 @@ def build_evidence(
             )
         )
         registry[claim_id] = ProjectEvidenceRecord(
-            name=project.name, technologies=list(project.technologies)
+            name=project.name,
+            technologies=list(project.technologies),
+            highlights=list(project.highlights),
         )
 
     # Only match-relevant experience (matched_skills non-empty) — a cover
@@ -339,8 +347,76 @@ def _experience_fragment(record: ExperienceEvidenceRecord) -> str:
     return f"meine Erfahrung als {record.role} bei {record.company}"
 
 
-def _project_fragment(record: ProjectEvidenceRecord) -> str:
-    return f"das Projekt {record.name}"
+# V1 quality patch: the vacancy's own focus, detected from the TRUSTED job
+# title/description through a closed pattern list and rendered only as the
+# fixed German label next to it -- no job text is ever copied into the
+# letter, so adversarial description text still cannot reach it. Labels for
+# things the candidate cannot evidence (dashboards, BI tools, industry) are
+# deliberately absent.
+_VACANCY_FOCUS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, re.compile(pattern, re.IGNORECASE))
+    for label, pattern in (
+        (
+            "Datenanalyse",
+            r"datenanaly|data\s+analy|analyse\s+(?:und\s+\w+\s+)?von\s+daten|datenauswertung",
+        ),
+        ("Reporting", r"\breport"),
+        ("Datenqualität", r"datenqualit|data\s+quality"),
+        ("Datenverarbeitung", r"datenverarbeitung|data\s+processing"),
+        ("Automatisierung", r"automatisier|\bautomation\b"),
+        ("Backend-Entwicklung", r"\bback[\s-]?end"),
+        ("Schnittstellen", r"\bapis?\b|schnittstelle|\brest\b"),
+    )
+)
+_MAX_FOCUS_LABELS = 3
+_MAX_PROJECT_HIGHLIGHTS = 2
+# A highlight is cited for a data-, reporting- or automation-focused vacancy
+# only when its own wording is about that kind of work.
+_FOCUS_RELEVANT_HIGHLIGHT = re.compile(
+    r"data|daten|analy|auswert|report|statisti|sql|search|such|automat|process|verarbeit",
+    re.IGNORECASE,
+)
+# Untranslated source phrases stay out of a German letter.
+_ENGLISH_MARKERS = re.compile(
+    r"\b(?:and|of|for|with|the|tool|application|processing|analysis)\b", re.IGNORECASE
+)
+
+
+def vacancy_focus(job_title: str, job_description: str) -> list[str]:
+    text = f"{job_title}\n{job_description}"
+    labels = [label for label, pattern in _VACANCY_FOCUS if pattern.search(text)]
+    return labels[:_MAX_FOCUS_LABELS]
+
+
+def _german_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} und {items[-1]}"
+
+
+def _project_highlights(record: ProjectEvidenceRecord, focus: list[str]) -> list[str]:
+    chosen: list[str] = []
+    for highlight in record.highlights:
+        if focus and not _FOCUS_RELEVANT_HIGHLIGHT.search(highlight):
+            continue
+        german = public_phrase(highlight)
+        if german == highlight.strip() and _ENGLISH_MARKERS.search(german):
+            continue
+        if german not in chosen:
+            chosen.append(german)
+        if len(chosen) == _MAX_PROJECT_HIGHLIGHTS:
+            break
+    return chosen
+
+
+def _project_fragment(record: ProjectEvidenceRecord, focus: list[str] | None = None) -> str:
+    highlights = _project_highlights(record, focus or [])
+    if not highlights:
+        return f"das Projekt {record.name}"
+    technologies = f" ({', '.join(record.technologies[:4])})" if record.technologies else ""
+    return (
+        f"das Projekt {record.name}{technologies} mit den Schwerpunkten {_german_list(highlights)}"
+    )
 
 
 def _language_fragment(record: LanguageEvidenceRecord) -> str:
@@ -352,7 +428,9 @@ def _language_fragment(record: LanguageEvidenceRecord) -> str:
     return f"{record.language}kenntnisse auf {record.level}-Niveau"
 
 
-def _render_evidence_paragraph(records: list[EvidenceRecord]) -> str:
+def _render_evidence_paragraph(
+    records: list[EvidenceRecord], focus: list[str] | None = None
+) -> str:
     skills = [r for r in records if isinstance(r, SkillEvidenceRecord)]
     experiences = [r for r in records if isinstance(r, ExperienceEvidenceRecord)]
     projects = [r for r in records if isinstance(r, ProjectEvidenceRecord)]
@@ -364,14 +442,31 @@ def _render_evidence_paragraph(records: list[EvidenceRecord]) -> str:
         # carries no employment context -- it may be evidenced by a personal
         # project alone -- so no role, title or "bisherige Tätigkeit" is
         # attached to it. Employment is stated only by experience records.
-        names = ", ".join(skill.name for skill in skills)
-        sentences.append(
-            f"Ich bringe Kenntnisse in {names} mit, die für diese Position relevant sind."
-        )
+        if focus:
+            # V1 quality patch: name the vacancy's own focus (fixed labels,
+            # see `vacancy_focus`), then the verified skills -- a statement
+            # about the posting plus a skill claim, never a claim of
+            # experience in the focus area itself.
+            names = _german_list([skill.name for skill in skills])
+            sentences.append(
+                f"Ihre Ausschreibung nennt als Schwerpunkte {_german_list(focus)}. "
+                f"Dafür bringe ich Kenntnisse in {names} mit."
+            )
+        else:
+            names = ", ".join(skill.name for skill in skills)
+            sentences.append(
+                f"Ich bringe Kenntnisse in {names} mit, die für diese Position relevant sind."
+            )
     for experience in experiences:
         sentences.append(f"Besonders relevant ist {_experience_fragment(experience)}.")
-    for project in projects:
-        sentences.append(f"Ebenfalls relevant ist {_project_fragment(project)}.")
+    for index, project in enumerate(projects):
+        if index == 0 and not experiences and len(projects) > 1:
+            lead = "Besonders relevant ist"
+        elif index >= 2:
+            lead = "Außerdem relevant ist"
+        else:
+            lead = "Ebenfalls relevant ist"
+        sentences.append(f"{lead} {_project_fragment(project, focus)}.")
     for language in languages:
         sentences.append(f"Zudem verfüge ich über {_language_fragment(language)}.")
     return " ".join(sentences)
@@ -383,6 +478,8 @@ def render_draft(
     job_title: str,
     job_company: str,
     professional_title: str | None,
+    *,
+    job_description: str = "",
 ) -> RenderedBewerbung:
     """Build the entire final draft content from trusted inputs only:
     `plan`'s bounded enum/structure choices (already schema- and
@@ -397,6 +494,7 @@ def render_draft(
     that professional role, which a skill record cannot prove.
     """
     del professional_title
+    focus = vacancy_focus(job_title, job_description)
     subject = f"Bewerbung als {job_title}"
     has_skill_evidence = any(
         isinstance(record, SkillEvidenceRecord)
@@ -415,7 +513,7 @@ def render_draft(
         if paragraph.kind == "GENERIC":
             text = _GENERIC_PARAGRAPH_TEXT
         else:
-            text = _render_evidence_paragraph(records)
+            text = _render_evidence_paragraph(records, focus)
         body_paragraphs.append(
             BewerbungParagraph(text=text, source_claim_ids=list(paragraph.claim_ids))
         )

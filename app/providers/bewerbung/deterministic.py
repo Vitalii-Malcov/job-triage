@@ -56,13 +56,19 @@ class DeterministicBewerbungProvider(BewerbungProvider):
         # `allowed_claims` (projects precede experiences there), so a
         # trusted, match-relevant experience could be silently dropped.
         highlight_ids: list[str] = []
-        for source_entity in ("candidate_experience", "candidate_project"):
-            first = next(
-                (c.id for c in evidence.allowed_claims if c.source_entity == source_entity),
-                None,
-            )
-            if first is not None:
-                highlight_ids.append(first)
+        first_experience = next(
+            (c.id for c in evidence.allowed_claims if c.source_entity == "candidate_experience"),
+            None,
+        )
+        if first_experience is not None:
+            highlight_ids.append(first_experience)
+        # V1 quality patch: every match-relevant project the evidence packet
+        # offers (already capped and relevance-ordered by build_evidence) --
+        # one project alone made the letter generic for project-based
+        # candidates.
+        highlight_ids.extend(
+            c.id for c in evidence.allowed_claims if c.source_entity == "candidate_project"
+        )
         language_ids = [
             claim.id
             for claim in evidence.allowed_claims
