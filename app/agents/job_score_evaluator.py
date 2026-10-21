@@ -38,7 +38,10 @@ from app.agents.evidence_cardinality_classifier import (
 from app.agents.evidence_quality_classifier import classify_evidence_quality
 from app.agents.job_scorer import JobScorer, normalize_skill
 from app.agents.posting_classifier import classify_posting
-from app.agents.role_relevance_classifier import classify_title_relevance
+from app.agents.role_relevance_classifier import (
+    classify_title_relevance,
+    is_apply_eligible_title,
+)
 from app.agents.seniority_classifier import classify_title_seniority
 from app.models.job import Job, JobScore
 
@@ -282,6 +285,23 @@ def evaluate_job_score(
                 if trace is not None:
                     trace._record_final(excluded)
                 return excluded
+            # V1 quality patch: role relevance dominates keyword overlap. A
+            # title without a positive role signal (UNKNOWN) keeps its score
+            # and stays visible for human review, but technology overlap
+            # alone can no longer make it an automatic APPLY.
+            if result.recommendation == "APPLY" and not is_apply_eligible_title(job.title):
+                if trace is not None:
+                    trace.events.append(f"role_apply_cap:{title_relevance.level}")
+                logger.info(
+                    "job_recommendation_capped_role_relevance job_title=%s source=%s "
+                    "candidate_target_domain=%s title_relevance=%s score=%s",
+                    job.title,
+                    job.source,
+                    candidate_domain,
+                    title_relevance.level,
+                    result.score,
+                )
+                result = result.model_copy(update={"recommendation": "MAYBE"})
         elif trace is not None:
             trace.events.append(f"role_not_applicable:candidate_domain:{candidate_domain}")
     elif trace is not None:

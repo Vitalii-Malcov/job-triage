@@ -26,6 +26,25 @@ shows either one as a bare, unqualified "Match".
 
 VACANCY_SCORE_LABEL = "Stellen-Score (Vorauswahl)"
 CANDIDATE_MATCH_LABEL = "Kandidaten-Match (belegte Profil-Nachweise)"
+OPEN_REQUIREMENTS_QUALIFIER = "kein vollständiger Stellen-Fit"
+
+
+def candidate_match_lines(score: int, *, evidenced: int, open_count: int) -> list[str]:
+    """V1 quality patch: the Kandidaten-Match only counts CONFIRMED profile
+    evidence, so a 100/100 next to an unverified essential requirement (e.g.
+    a completed degree) read as a perfect fit. Whenever any requirement is
+    partial, missing or unclear, the score line says so and the evidence
+    coverage and open requirements are shown next to it. The score itself
+    is never altered."""
+    if open_count == 0:
+        return [f"{CANDIDATE_MATCH_LABEL}: {score}/100"]
+    return [
+        f"{CANDIDATE_MATCH_LABEL}: {score}/100 – {OPEN_REQUIREMENTS_QUALIFIER}",
+        f"Bestätigte Profil-Nachweise: {evidenced}/{evidenced + open_count} Anforderungen",
+        f"Offene Anforderungen: {open_count} (teilweise, nicht belegt oder unklar)",
+    ]
+
+
 SCORE_DIFFERENCE_NOTE = (
     "Kandidaten-Match ist nicht der Stellen-Score der Vorauswahl: er zählt nur "
     "bestätigte Profil-Nachweise (inkl. Berufserfahrung/Projekte)."

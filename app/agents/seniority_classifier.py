@@ -92,6 +92,12 @@ _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("head", r"\bhead\b"),
         ("leitung", r"\bleitung\b"),
         ("leiter", _LEITER_PATTERN),
+        # V1 quality patch: executive and expert-level titles seen in the
+        # first real run ("Director Market Intelligence", "Expert DevSecOps
+        # ...") are not junior entry points either. Whole words only.
+        ("director", r"\bdirect(?:or|eur)\b"),
+        ("direktor", r"\bdirektor(?:in)?\b"),
+        ("expert", r"\bexpert(?:e|in)?\b"),
     )
 )
 
