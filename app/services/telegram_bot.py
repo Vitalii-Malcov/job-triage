@@ -83,11 +83,12 @@ from app.services.telegram_bewerbung_approval import (
     parse_request_callback_data,
 )
 from app.services.telegram_digest import build_digest_text, resolve_digest_account_key
-from app.services.telegram_operator_control import OperatorCallback, handle_callback
+from app.services.telegram_operator_control import OperatorCallback, handle_callback, is_operator
 from app.services.telegram_vacancy_feed import (
     ACTION_APPLY,
     ACTION_DETAILS,
     ACTION_SAVE,
+    open_manual_vacancy_review,
     parse_callback_data,
     render_vacancy_details,
 )
@@ -114,6 +115,7 @@ HELP_TEXT = (
     "/status <id> <new_status> - update a job's status\n"
     "/run bundesagentur - run the Bundesagentur collector\n"
     "/run xing - run the XING mailbox collector\n"
+    "/review <job_id> - open an existing vacancy as a review card (manual review)\n"
     "/research <id> - research the hiring company for a job (cached, may refresh)\n"
     "/digest - automation summary: latest run, collector/draft/follow-up counts, "
     "pending approvals\n"
@@ -463,6 +465,59 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         db.close()
 
     await update.message.reply_text(text)
+
+
+_REVIEW_USAGE = "Usage: /review <job_id> (positive integer)"
+_REVIEW_NOT_ALLOWED = "Manuelle Prüfung nicht erlaubt - nur für den Operator."
+
+
+def _parse_review_job_id(args: list[str] | None) -> int | None:
+    """Strict `/review <positive integer>`: exactly one ASCII-digit token."""
+    if not args or len(args) != 1:
+        return None
+    raw = args[0]
+    if not (raw.isascii() and raw.isdigit()):
+        return None
+    job_id = int(raw)
+    return job_id if job_id > 0 else None
+
+
+@require_authorized
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/review <job_id>`: show ONE existing vacancy as a normal Stage 9A
+    review card although the automatic recommendation was not APPLY.
+
+    Two gates: the shared chat gate (silence for any other chat), then the
+    Stage 16 operator boundary (`is_operator`: configured operator user, or
+    a private chat whose id is the sender's). Not an approval, application,
+    Bewerbung or score override: `open_manual_vacancy_review` only writes
+    review/delivery state and sends the card to the configured chat; every
+    card button keeps its own separate gate.
+    """
+    settings = get_settings()
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_operator(
+        settings,
+        chat_id=str(chat.id) if chat is not None else "",
+        chat_type=getattr(chat, "type", None),
+        user_id=str(user.id) if user is not None else None,
+    ):
+        logger.warning("telegram_manual_review_rejected reason=not_operator")
+        await update.message.reply_text(_REVIEW_NOT_ALLOWED)
+        return
+    job_id = _parse_review_job_id(context.args)
+    if job_id is None:
+        await update.message.reply_text(_REVIEW_USAGE)
+        return
+
+    db = SessionLocal()
+    try:
+        outcome = await open_manual_vacancy_review(db, settings, job_id)
+    finally:
+        db.close()
+    logger.info("telegram_manual_review job_id=%s result=%s", job_id, outcome.code)
+    await update.message.reply_text(outcome.reply)
 
 
 _DECISION_REPLIES = {
@@ -875,6 +930,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("run", cmd_run))
     application.add_handler(CommandHandler("research", cmd_research))
     application.add_handler(CommandHandler("digest", cmd_digest))
+    application.add_handler(CommandHandler("review", cmd_review))
     application.add_handler(CallbackQueryHandler(on_vacancy_callback, pattern=r"^vf:"))
     application.add_handler(CallbackQueryHandler(on_bewerbung_preview_callback, pattern=r"^bp:"))
     application.add_handler(CallbackQueryHandler(on_review_request_callback, pattern=r"^ba:"))

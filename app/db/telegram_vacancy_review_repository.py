@@ -12,7 +12,7 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -159,9 +159,20 @@ def list_queued(db: Session, *, limit: int) -> list[TelegramVacancyReviewRecord]
     return list(db.scalars(stmt).all())
 
 
-def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> str | None:
+CLAIMABLE_STATES = ("QUEUED_FOR_REVIEW", "DISCOVERED")
+
+
+def claim_for_sending(
+    db: Session, record: TelegramVacancyReviewRecord, *, from_state: str = "QUEUED_FOR_REVIEW"
+) -> str | None:
     """CAS `QUEUED_FOR_REVIEW -> SENDING`. Exactly one concurrent caller
     wins; only the winner may call Telegram for this row.
+
+    `from_state="DISCOVERED"` is used only by the operator's explicit
+    `/review <job_id>` (`open_manual_vacancy_review`): it claims a
+    not-auto-eligible row straight into `SENDING` in one CAS, so the
+    regular sweep -- which dequeues every non-APPLY row it sees queued --
+    can never interleave between "queued" and "claimed".
 
     Returns the winner's fresh `claim_token`, or None if the claim was lost.
     The token is this claim's identity (Codex S9A-CODEX-004): every
@@ -169,18 +180,24 @@ def claim_for_sending(db: Session, record: TelegramVacancyReviewRecord) -> str |
     clause, and every such transition clears it. A stale caller holding an
     older claim's token can therefore never resolve or release a newer
     claim on the same row."""
+    if from_state not in CLAIMABLE_STATES:
+        raise ValueError(f"unsupported claim source state {from_state!r}")
     claim_token = _new_claim_token()
+    now = datetime.now(UTC)
     result = db.execute(
         update(TelegramVacancyReviewRecord)
         .where(
             TelegramVacancyReviewRecord.id == record.id,
-            TelegramVacancyReviewRecord.state == "QUEUED_FOR_REVIEW",
+            TelegramVacancyReviewRecord.state == from_state,
         )
         .values(
             state="SENDING",
+            # A manual claim from DISCOVERED gets a queue position too, so a
+            # provably-failed send returns to an ordinary queued row.
+            queued_at=func.coalesce(TelegramVacancyReviewRecord.queued_at, now),
             claim_token=claim_token,
             attempt_count=TelegramVacancyReviewRecord.attempt_count + 1,
-            updated_at=datetime.now(UTC),
+            updated_at=now,
         )
     )
     db.commit()

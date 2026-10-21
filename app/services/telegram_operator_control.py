@@ -223,16 +223,29 @@ def _now() -> datetime:
 # --- authorization -------------------------------------------------------------------
 
 
-def authorize(settings, callback: OperatorCallback) -> bool:
+def is_operator(settings, *, chat_id: str, chat_type: str | None, user_id: str | None) -> bool:
+    """The operator boundary shared by Stage 16 buttons and operator
+    commands such as `/review`: the configured chat, and the configured
+    operator user (or, if none is configured, a private chat whose id is
+    the sender's own user id)."""
     configured_chat = (settings.telegram_chat_id or "").strip()
-    if not configured_chat or callback.chat_id != configured_chat:
+    if not configured_chat or chat_id != configured_chat:
         return False
     operator_user = (settings.telegram_operator_user_id or "").strip()
     if operator_user:
-        return callback.user_id == operator_user
+        return user_id == operator_user
     # No configured operator user: only a private chat, where the chat id
     # IS the sender's user id, identifies the operator.
-    return callback.chat_type == "private" and callback.user_id == callback.chat_id
+    return chat_type == "private" and user_id == chat_id
+
+
+def authorize(settings, callback: OperatorCallback) -> bool:
+    return is_operator(
+        settings,
+        chat_id=callback.chat_id,
+        chat_type=callback.chat_type,
+        user_id=callback.user_id,
+    )
 
 
 # --- read side: view model ---------------------------------------------------------
