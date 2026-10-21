@@ -50,6 +50,7 @@ from typing import Literal
 from app.agents.application_response_classifier import normalize_body, normalize_subject
 from app.db.datetime_utils import ensure_utc
 from app.models.application_lifecycle import Application
+from app.providers.email.base import normalize_account_key
 from app.services.email_matching import extract_sender_domain, normalize_company_name
 
 CorrelationConfidence = Literal["HIGH", "MEDIUM", "LOW", "NONE"]
@@ -98,14 +99,22 @@ class InboundMessage:
         return "gmail:" + stable_hash(self.account_key, self.message_key)
 
     def correlation_keys_across(self, account_keys: Iterable[str]) -> frozenset[str]:
-        """This message's correlation key plus the key the SAME message
-        (same Message-ID) gets in each of the other monitored mailboxes, so
-        an employer mail delivered to two of the applicant's accounts is
-        recorded once."""
+        """This message's correlation key plus, for a Message-ID identity
+        only, the key the SAME message gets in each of the other monitored
+        mailboxes, so an employer mail delivered to two of the applicant's
+        accounts is recorded once.
+
+        An `imap:<mailbox>:<uidvalidity>:<uid>` fallback identity is unique
+        only inside its own account (two accounts routinely share
+        UIDVALIDITY/UID values for unrelated mail), so it is never expanded:
+        such a message is a duplicate only of itself in the same account."""
         keys = {self.correlation_key}
+        if not self.message_key.startswith("mid:"):
+            return frozenset(keys)
         for account in account_keys:
-            if account:
-                keys.add("gmail:" + stable_hash(account.strip().casefold(), self.message_key))
+            account_key = normalize_account_key(account or "")
+            if account_key:
+                keys.add("gmail:" + stable_hash(account_key, self.message_key))
         return frozenset(keys)
 
     @property

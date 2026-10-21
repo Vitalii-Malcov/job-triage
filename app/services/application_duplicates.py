@@ -34,7 +34,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.models.application_lifecycle import Application
 from app.services.application_correlation import role_phrase
@@ -44,6 +44,10 @@ Strength = Literal["STRONG", "PROBABLE", "INFO"]
 
 _BA_DETAIL = re.compile(r"/jobsuche/jobdetail/([^/?#]+)", re.IGNORECASE)
 _STRONG = ("SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT", "SAME_EMPLOYER_AND_ROLE")
+# Query parameters that only track a click, never identify a vacancy
+# (compared case-insensitively; plus every `utm_*`). Anything else -- e.g.
+# `?id=123` -- may be the vacancy identity and is kept.
+_TRACKING_PARAMS = frozenset({"trackingid", "trk", "refid", "gclid", "fbclid"})
 
 
 @dataclass(frozen=True)
@@ -68,16 +72,30 @@ class DuplicateFinding:
     status: str
 
 
+def _is_tracking_param(name: str) -> bool:
+    name = name.casefold()
+    return name.startswith("utm_") or name in _TRACKING_PARAMS
+
+
 def normalize_posting_url(url: str | None) -> str | None:
-    """Scheme/host case-folded, query and fragment dropped, trailing slash
-    removed. Never fetched -- string comparison only."""
+    """Scheme/host case-folded, trailing slash and fragment removed, known
+    tracking parameters dropped, the remaining query parameters kept (they
+    may identify the vacancy) in a stable order. Never fetched -- string
+    comparison only."""
     if not url or not url.strip():
         return None
     parts = urlsplit(url.strip())
     if not parts.netloc:
         return None
     path = parts.path.rstrip("/")
-    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), path, "", ""))
+    query = urlencode(
+        sorted(
+            (name, value)
+            for name, value in parse_qsl(parts.query, keep_blank_values=True)
+            if not _is_tracking_param(name)
+        )
+    )
+    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), path, query, ""))
 
 
 def bundesagentur_reference(url: str | None) -> str | None:
@@ -136,6 +154,41 @@ def assess_vacancy(
         )
     order = {"STRONG": 0, "PROBABLE": 1, "INFO": 2}
     return sorted(findings, key=lambda f: (order[f.strength], f.application_id))
+
+
+def job_association_mismatches(
+    job: VacancyView,
+    *,
+    company: str,
+    role: str,
+    source: str,
+    reference: str,
+    destination_url: str | None = None,
+) -> list[str]:
+    """Why a submission must NOT be linked to this collected job (empty =
+    consistent). Conservative: normalized company AND role must match (legal
+    form, case, punctuation and gender suffix ignored -- an empty
+    normalization never matches), the source must be the job's source, and
+    a Bundesagentur reference derivable from the job's URL (or from a BA
+    destination URL) must equal the submission reference."""
+    mismatches: list[str] = []
+    job_company = normalize_company_name(job.company)
+    if not job_company or job_company != normalize_company_name(company):
+        mismatches.append("COMPANY")
+    job_role = role_phrase(job.title)
+    if not job_role or job_role != role_phrase(role):
+        mismatches.append("ROLE")
+    if job.source.strip().casefold() != source.strip().casefold():
+        mismatches.append("SOURCE")
+    job_reference = bundesagentur_reference(job.url)
+    if job_reference is not None and job_reference != reference.casefold():
+        mismatches.append("REFERENCE")
+    destination_reference = bundesagentur_reference(destination_url)
+    if destination_reference is not None and destination_reference != (
+        job_reference or reference.casefold()
+    ):
+        mismatches.append("DESTINATION_URL")
+    return mismatches
 
 
 def verdict(findings: Iterable[DuplicateFinding]) -> str:

@@ -67,10 +67,16 @@ which are NOT duplicates. Rewritten mirror titles are not detected.
 
 Records ONE submission the operator already made by hand, as SUBMITTED
 (origin OPERATOR). Dry run without `--apply`. Idempotent on
-`--source` + `--reference` (`ALREADY_RECORDED`, nothing written). A STRONG
-or PROBABLE duplicate refuses (exit 3) until each verified-different
-application id is passed with `--confirm-distinct-from <id>`. Naive, invalid
-or future `--submitted-at` values are refused (exit 2).
+`--source` + `--reference` (`ALREADY_RECORDED`, nothing written); the
+event key is `submission-v2:` + SHA-256 of the JSON array
+`[source, reference]` (records created before this keep their
+`email-/portal-submission:` keys and are found by source + reference). A
+STRONG or PROBABLE duplicate refuses (exit 3) until each verified-different
+application id is passed with `--confirm-distinct-from <id>`. With
+`--job-id`, a company/role/source/BA-reference mismatch with that job refuses
+(exit 4). Empty or whitespace-padded `--source`/`--reference`, and naive,
+invalid or future (later than now) `--submitted-at` values are refused
+(exit 2). All checks run identically with and without `--apply`.
 
 ## Gmail dry run (default)
 
@@ -81,8 +87,12 @@ Reads every configured applicant mailbox read-only (IMAP `readonly` +
 `primary` (`GMAIL_*`) + `secondary` (`XING_MAILBOX_*`, the account that also
 receives XING alerts and from which applications have been sent);
 `--mailbox primary|secondary` restricts it. Per mailbox, stderr prints
-`MAILBOX: <label> fetched=N skipped=N deadline_exceeded=.. error=<class>`;
-exit 1 means a mailbox was not read completely (re-run later). XING platform
+`MAILBOX: <label> fetched=N skipped=N pages=N deadline_exceeded=..
+error=<class> complete=..`. More than 500 messages in the window are read in
+successive pages of 500 within the run (at most 10 pages), never the same
+oldest 500 again. Exit 1 (`INCOMPLETE`) means a mailbox was not read
+completely: fetch error, deadline, page limit or `skipped>0` (re-run later or
+narrow `--since`). XING platform
 mail (`mail.xing.com`) is ignored as `JOB_PLATFORM_NOTIFICATION`, and the same
 Message-ID in both mailboxes is processed once. Prints, per message: correlation status/grade/
 signals, classification + rule, `previous_status → new_status`, `action`

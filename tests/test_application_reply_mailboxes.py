@@ -475,3 +475,261 @@ def test_cli_reports_mailboxes_and_fails_on_an_unread_mailbox(tmp_path, monkeypa
     assert "MAILBOX: secondary fetched=0 skipped=0" in err
     assert "error=GmailConnectionError" in err
     assert "app-password" not in err and SECONDARY not in err
+
+
+# --- Codex P1-1: fallback (no Message-ID) identities are account-scoped -------------
+
+
+def _no_mid_msg(*, account, uid_validity=123, uid=7, **fields):
+    message = _msg(account=account, message_id="<unused@x>", **fields)
+    return InboundMessage(
+        **{
+            **message.__dict__,
+            "message_key": f"imap:INBOX:{uid_validity}:{uid}",
+            "message_id_header": None,
+        }
+    )
+
+
+HD24_HUMAN_REPLY = dict(
+    subject="Re: Bewerbung Softwareentwickler – Business Applications & Integrationen",
+    body="Hallo Herr Muster,\n\nwann hätten Sie kommende Woche Zeit für ein kurzes "
+    "Telefonat? Bitte senden Sie uns noch Ihre Zeugnisse.\n\nViele Grüße\nAnna",
+    sender="anna.beispiel@heizungsdiscount24.de",
+    display="Anna Beispiel",
+)
+
+
+def test_same_uid_tuple_in_two_accounts_without_message_id_are_two_messages(db):
+    """Codex P1-1 reproduction: imap:INBOX:123:7 in mailbox A and in mailbox B
+    are unrelated mails; the second must not be ALREADY_PROCESSED."""
+    _hd24(db)
+    receipt = _no_mid_msg(account=PRIMARY, **HD24_RECEIPT)
+    reply = _no_mid_msg(account=SECONDARY, **HD24_HUMAN_REPLY)
+    assert receipt.message_key == reply.message_key
+    first = _process(db, [receipt])[0]
+    second = _process(db, [reply])[0]
+    assert first.transition_applied and first.event_recorded
+    assert not second.duplicate and second.reason != "ALREADY_PROCESSED"
+    assert second.event_recorded and second.classification == "REQUEST_FOR_INFORMATION"
+    assert _events(db) == 3
+
+
+def test_same_account_rescan_without_message_id_stays_idempotent(db):
+    _hd24(db)
+    message = _no_mid_msg(account=SECONDARY, **HD24_RECEIPT)
+    first = _process(db, [message])[0]
+    again = _process(db, [message])[0]
+    assert first.event_recorded
+    assert again.duplicate and again.reason == "ALREADY_PROCESSED"
+    assert _events(db) == 2
+
+
+def test_fallback_identity_is_never_expanded_to_other_accounts():
+    message = _no_mid_msg(account=SECONDARY, **HD24_RECEIPT)
+    assert message.correlation_keys_across([PRIMARY, SECONDARY]) == {message.correlation_key}
+
+
+def test_message_id_keys_across_accounts_use_stable_account_normalization():
+    in_primary = _msg(account=PRIMARY, message_id="<n@hd24>", **HD24_RECEIPT)
+    in_secondary = _msg(account=SECONDARY, message_id="<n@hd24>", **HD24_RECEIPT)
+    keys = in_secondary.correlation_keys_across(["  " + PRIMARY.upper() + "\t", "", SECONDARY])
+    assert keys == {in_primary.correlation_key, in_secondary.correlation_key}
+
+
+# --- Codex P1-2: a capped scan pages forward instead of re-reading UIDs 1..cap ------
+
+
+def _imap_email(uid, *, subject="Hallo", sender="hr@employer.example", body="Text"):
+    from tests.test_providers_email_imap import _build_email as build
+
+    return build(
+        sender=sender,
+        to=SECONDARY,
+        subject=subject,
+        plaintext_body=body,
+        message_id=f"<uid{uid}@employer.example>",
+        date="Tue, 20 Oct 2026 21:00:00 +0000",
+    )
+
+
+def _real_provider_factory(clients):
+    from app.providers.email.imap import GmailImapProvider
+
+    def factory(**kwargs):
+        return GmailImapProvider(**kwargs, imap_client=clients[kwargs["username"]])
+
+    return factory
+
+
+def _body_fetches(client) -> list[int]:
+    return [
+        int(args[0])
+        for command, args in client.uid_calls
+        if command == "fetch" and "BODY.PEEK[]" in args[1]
+    ]
+
+
+@pytest.fixture()
+def tiny_cap(monkeypatch):
+    import app.providers.email.imap as imap_module
+
+    monkeypatch.setattr(imap_module, "MAX_MESSAGES_PER_SYNC", 2)
+
+
+def test_provider_alone_with_empty_known_uids_rereads_the_oldest_capped_set(tiny_cap):
+    """The starvation Codex reproduced: without forward progress every scan
+    is UIDs 1, 2 again and UIDs 3, 4 are never reached."""
+    from app.providers.email.imap import GmailImapProvider
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    client = ProviderImap(messages={uid: _imap_email(uid) for uid in (1, 2, 3, 4)})
+    provider = GmailImapProvider(
+        imap_host="imap.example.invalid",
+        imap_port=993,
+        username=SECONDARY,
+        app_password="secondary-app-password",
+        imap_client=client,
+        get_known_uids=lambda _v, _c: set(),
+    )
+    for _ in range(2):
+        result = asyncio.run(provider.fetch(since=SUBMITTED_AT))
+        assert [m.uid for m in result.messages] == [1, 2] and result.skipped_count == 2
+
+
+def test_capped_mailbox_is_read_completely_in_forward_pages(tiny_cap):
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    primary = ProviderImap(messages={})
+    secondary = ProviderImap(messages={uid: _imap_email(uid) for uid in (1, 2, 3, 4, 5)})
+    messages, reports = asyncio.run(
+        fetch_application_mailboxes(
+            _settings(),
+            since=SUBMITTED_AT,
+            provider_factory=_real_provider_factory({PRIMARY: primary, SECONDARY: secondary}),
+        )
+    )
+    assert sorted(m.message_id_header for m in messages) == [
+        f"<uid{uid}@employer.example>" for uid in (1, 2, 3, 4, 5)
+    ]
+    # Every body fetched exactly once, read-only, never the same capped set twice.
+    assert sorted(_body_fetches(secondary)) == [1, 2, 3, 4, 5]
+    assert all(readonly for _mailbox, readonly in secondary.select_calls)
+    assert [(r.label, r.fetched, r.skipped, r.pages, r.complete) for r in reports] == [
+        ("primary", 0, 0, 1, True),
+        ("secondary", 5, 0, 3, True),
+    ]
+
+
+def test_page_limit_leaves_the_scan_incomplete(tiny_cap, monkeypatch):
+    import app.services.application_response_processor as processor
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    monkeypatch.setattr(processor, "MAX_APPLICATION_SCAN_PAGES", 1)
+    secondary = ProviderImap(messages={uid: _imap_email(uid) for uid in (1, 2, 3, 4)})
+    _messages, reports = asyncio.run(
+        fetch_application_mailboxes(
+            _settings(),
+            since=SUBMITTED_AT,
+            selection="secondary",
+            provider_factory=_real_provider_factory({SECONDARY: secondary}),
+        )
+    )
+    assert [(r.fetched, r.skipped, r.complete) for r in reports] == [(2, 2, False)]
+
+
+def test_unreadable_message_stops_paging_without_looping_and_is_incomplete(tiny_cap):
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    # UID 3 is listed by SEARCH but its FETCH returns nothing (transient).
+    secondary = ProviderImap(
+        messages={uid: _imap_email(uid) for uid in (1, 2)}, search_uids=[1, 2, 3]
+    )
+    messages, reports = asyncio.run(
+        fetch_application_mailboxes(
+            _settings(),
+            since=SUBMITTED_AT,
+            selection="secondary",
+            provider_factory=_real_provider_factory({SECONDARY: secondary}),
+        )
+    )
+    assert len(messages) == 2
+    assert [(r.fetched, r.skipped, r.pages, r.complete) for r in reports] == [(2, 1, 2, False)]
+
+
+def _run_cli_with_clients(tmp_path, monkeypatch, clients, *extra):
+    import app.services.application_response_processor as processor
+    import scripts.stage15_application_tracker as cli
+    from tests.test_stage15_response_tracking import _migrated_db
+
+    path = _migrated_db(tmp_path)
+    original = processor.fetch_application_mailboxes
+
+    async def fake_fetch(settings, *, since, selection="all"):
+        return await original(
+            settings,
+            since=since,
+            selection=selection,
+            provider_factory=_real_provider_factory(clients),
+        )
+
+    monkeypatch.setattr(processor, "fetch_application_mailboxes", fake_fetch)
+    return cli.run(
+        ["--database", str(path), *extra, "process-gmail", "--since", "2026-10-20"],
+        settings=_settings(),
+    )
+
+
+def test_cli_zero_result_complete_scan_exits_zero(tmp_path, monkeypatch, capsys, tiny_cap):
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    clients = {PRIMARY: ProviderImap(messages={}), SECONDARY: ProviderImap(messages={})}
+    assert _run_cli_with_clients(tmp_path, monkeypatch, clients) == 0
+    err = capsys.readouterr().err
+    assert "MAILBOX: secondary fetched=0 skipped=0 pages=1" in err and "complete=True" in err
+    assert "INCOMPLETE" not in err
+
+
+def test_cli_healthy_primary_and_incomplete_secondary_exits_one(
+    tmp_path, monkeypatch, capsys, tiny_cap
+):
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    clients = {
+        PRIMARY: ProviderImap(messages={1: _imap_email(1)}),
+        SECONDARY: ProviderImap(messages={1: _imap_email(11)}, search_uids=[1, 2]),
+    }
+    assert _run_cli_with_clients(tmp_path, monkeypatch, clients, "--json") == 1
+    captured = capsys.readouterr()
+    assert "MAILBOX: primary fetched=1 skipped=0" in captured.err
+    assert "MAILBOX: secondary fetched=1 skipped=1" in captured.err
+    assert "complete=False" in captured.err and "INCOMPLETE" in captured.err
+    # The healthy mailbox's (and the readable part's) messages were processed.
+    assert captured.out.count('"message_ref"') == 2
+
+
+def test_paged_rescans_stay_idempotent(db, tiny_cap):
+    from tests.test_providers_email_imap import FakeImapClient as ProviderImap
+
+    _hd24(db)
+    receipt = _imap_email(
+        3,
+        subject=HD24_RECEIPT["subject"],
+        sender=HD24_RECEIPT["sender"],
+        body=HD24_RECEIPT["body"],
+    )
+    mail = {1: _imap_email(1), 2: _imap_email(2), 3: receipt}
+    for expected in (False, True):
+        secondary = ProviderImap(messages=mail)
+        messages, reports = asyncio.run(
+            fetch_application_mailboxes(
+                _settings(),
+                since=SUBMITTED_AT,
+                selection="secondary",
+                provider_factory=_real_provider_factory({SECONDARY: secondary}),
+            )
+        )
+        assert reports[0].complete and len(messages) == 3
+        matched = [r for r in _process(db, messages) if r.application_id is not None]
+        assert len(matched) == 1 and matched[0].duplicate is expected
+    assert _events(db) == 2

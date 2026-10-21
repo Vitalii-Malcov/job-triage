@@ -4,7 +4,7 @@
       -> [apply only] one transaction: event + status projection
 
 **Read-only towards Gmail, local-only towards everything else.** Messages
-come either from a live read-only IMAP fetch (`fetch_inbound_messages`:
+come either from a live read-only IMAP fetch (`fetch_application_mailboxes`:
 `SELECT ... readonly`, `BODY.PEEK[]`, nothing persisted) or from
 `GmailMessageRecord` rows a Stage 7A sync already stored. Nothing here
 sends, replies, drafts, labels, marks read, posts or notifies.
@@ -386,6 +386,9 @@ class ApplicationResponseProcessor:
 
 
 MailboxSelection = Literal["primary", "secondary", "all"]
+# Provider pages (each <= MAX_MESSAGES_PER_SYNC messages) one mailbox may
+# take per run; a window larger than this is reported incomplete.
+MAX_APPLICATION_SCAN_PAGES = 10
 
 
 @dataclass(frozen=True)
@@ -409,6 +412,13 @@ class MailboxFetchReport:
     skipped: int = 0
     deadline_exceeded: bool = False
     error: str | None = None
+    pages: int = 0
+
+    @property
+    def complete(self) -> bool:
+        """True only when every message in the window was read: no error,
+        no deadline, nothing skipped (cap, page limit, unreadable)."""
+        return self.error is None and not self.deadline_exceeded and self.skipped == 0
 
 
 def application_mailboxes(
@@ -477,7 +487,12 @@ async def fetch_application_mailboxes(
     every selected applicant mailbox since `since`. One failing mailbox
     never hides the others: its report carries the error class and the
     caller decides the exit status. Messages are merged in arrival order and
-    a Message-ID seen in an earlier mailbox is dropped from later ones."""
+    a Message-ID seen in an earlier mailbox is dropped from later ones.
+
+    A mailbox with more than MAX_MESSAGES_PER_SYNC messages in the window is
+    read in successive pages (see `known_uids` below) until nothing is left,
+    no page made progress, the deadline fired, or MAX_APPLICATION_SCAN_PAGES
+    was reached; `MailboxFetchReport.complete` says which."""
     from app.providers.email.base import GmailProviderError
     from app.providers.email.imap import GmailImapProvider
 
@@ -486,6 +501,17 @@ async def fetch_application_mailboxes(
     reports: list[MailboxFetchReport] = []
     seen_ids: set[str] = set()
     for mailbox in application_mailboxes(settings, selection):
+        # UIDs already handled IN THIS RUN, per UIDVALIDITY. The provider
+        # drops them before applying MAX_MESSAGES_PER_SYNC (oldest first),
+        # so each further page reaches the next-later UIDs instead of the
+        # same capped oldest set. Nothing is persisted: the next run pages
+        # the `since` window again, and re-processing is idempotent by
+        # correlation key.
+        handled: dict[int, set[int]] = {}
+
+        def known_uids(uid_validity: int, candidates: list[int], _handled=handled) -> set[int]:
+            return _handled.get(uid_validity, set()) & set(candidates)
+
         provider = factory(
             imap_host=mailbox.imap_host,
             imap_port=mailbox.imap_port,
@@ -493,56 +519,57 @@ async def fetch_application_mailboxes(
             app_password=mailbox.app_password,
             mailbox="INBOX",
             lookback_days=settings.gmail_lookback_days,
-            get_known_uids=lambda _uid_validity, _candidates: set(),
+            get_known_uids=known_uids,
             trusted_outbound=False,
         )
-        try:
-            fetched = await provider.fetch(since=since)
-        except (GmailProviderError, OSError, TimeoutError) as exc:
-            logger.warning(
-                "application_mailbox_fetch_failed mailbox=%s error=%s",
-                mailbox.label,
-                type(exc).__name__,
-            )
-            reports.append(MailboxFetchReport(mailbox.label, error=type(exc).__name__))
-            continue
-        count = 0
-        for parsed in fetched.messages:
-            message = inbound_from_parsed(parsed)
-            identity = message.message_id_hash
-            if identity is not None:
-                if identity in seen_ids:
+        count = pages = earlier_permanent = 0
+        last = None
+        error: str | None = None
+        while pages < MAX_APPLICATION_SCAN_PAGES:
+            try:
+                fetched = await provider.fetch(since=since)
+            except (GmailProviderError, OSError, TimeoutError) as exc:
+                logger.warning(
+                    "application_mailbox_fetch_failed mailbox=%s page=%d error=%s",
+                    mailbox.label,
+                    pages + 1,
+                    type(exc).__name__,
+                )
+                error = type(exc).__name__
+                break
+            pages += 1
+            uids = handled.setdefault(fetched.uid_validity, set())
+            before = len(uids)
+            for parsed in fetched.messages:
+                if parsed.uid in uids:
                     continue
-                seen_ids.add(identity)
-            merged.append(message)
-            count += 1
+                uids.add(parsed.uid)
+                message = inbound_from_parsed(parsed)
+                identity = message.message_id_hash
+                if identity is not None:
+                    if identity in seen_ids:
+                        continue
+                    seen_ids.add(identity)
+                merged.append(message)
+                count += 1
+            uids.update(uid for uid, _reason in fetched.permanently_skipped)
+            if last is not None:
+                earlier_permanent += len(last.permanently_skipped)
+            last = fetched
+            if fetched.deadline_exceeded or fetched.skipped_count == 0 or len(uids) == before:
+                break
         reports.append(
             MailboxFetchReport(
                 mailbox.label,
                 fetched=count,
-                skipped=fetched.skipped_count,
-                deadline_exceeded=fetched.deadline_exceeded,
+                # Messages still unread at the end of this run: whatever the
+                # last page could not reach or parse, plus earlier pages'
+                # permanently unreadable ones (never retried).
+                skipped=earlier_permanent + (last.skipped_count if last is not None else 0),
+                deadline_exceeded=last is not None and last.deadline_exceeded,
+                error=error,
+                pages=pages,
             )
         )
     merged.sort(key=_arrival_order)
     return merged, reports
-
-
-async def fetch_inbound_messages(settings, *, since: datetime) -> list[InboundMessage]:
-    """Live, read-only IMAP fetch of the configured primary mailbox since
-    `since` (bounded by the provider's own per-run limits). Nothing is
-    persisted; no flag is changed (`BODY.PEEK[]`, readonly SELECT)."""
-    from app.providers.email.imap import GmailImapProvider
-
-    provider = GmailImapProvider(
-        imap_host=settings.gmail_imap_host,
-        imap_port=settings.gmail_imap_port,
-        username=settings.gmail_username,
-        app_password=settings.gmail_app_password,
-        mailbox=settings.gmail_mailbox,
-        lookback_days=settings.gmail_lookback_days,
-        get_known_uids=lambda _uid_validity, _candidates: set(),
-        trusted_outbound=False,
-    )
-    fetched = await provider.fetch(since=since)
-    return [inbound_from_parsed(m) for m in fetched.messages]

@@ -137,9 +137,13 @@ Human approval points: review-package approval, Telegram APPROVE/SKIP
 
 Dry run by default; add `--apply` to write. `--source/--reference`
 identify the vacancy (BA reference, StepStone id, ...) and make it
-idempotent (`ALREADY_RECORDED`). A STRONG/PROBABLE duplicate refuses with
-exit 3 until you name each verified-different application id with
-`--confirm-distinct-from <id>`. Pass `--employer-domain` whenever you know the
+idempotent (`ALREADY_RECORDED`); both are stored exactly as typed, so an empty
+or whitespace-padded value is refused (exit 2). `--submitted-at` must have an
+offset and must not be later than now (exit 2). With `--job-id`, company,
+role, source and BA reference must match that job (exit 4 otherwise; omit
+`--job-id` for a submission without a collected job, e.g. StepStone). A
+STRONG/PROBABLE duplicate refuses with exit 3 until you name each
+verified-different application id with `--confirm-distinct-from <id>`. Pass `--employer-domain` whenever you know the
 employer's mail domain — it is the strongest signal for matching replies.
 
 ## 9. Employer receipts and replies
@@ -159,8 +163,13 @@ marked read):
 | `primary` | `GMAIL_*` | main application mailbox |
 | `secondary` | `XING_MAILBOX_*` | also used to send applications (e-mail, StepStone account) and receives XING alerts |
 
-stderr shows `MAILBOX: <label> fetched=.. skipped=.. error=..`; exit 1 means a
-mailbox was not read completely — re-run later (everything is idempotent).
+stderr shows `MAILBOX: <label> fetched=.. skipped=.. pages=.. error=..
+complete=..`. A mailbox with more than 500 messages in the window is read in
+pages of 500 (up to 10 per run), so later replies are always reached. Exit 1
+(`INCOMPLETE`) means at least one mailbox was not read completely — fetch
+error, deadline, page limit, or messages left unread (`skipped>0`); what was
+read is still processed. Re-run later or narrow `--since` (everything is
+idempotent).
 XING platform mail is ignored (`JOB_PLATFORM_NOTIFICATION`); the same
 Message-ID in both mailboxes is processed once.
 
