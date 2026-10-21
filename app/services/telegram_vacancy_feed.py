@@ -387,15 +387,22 @@ async def _send_claimed_card(
     handling: SENT -> `TELEGRAM_SENT`; provably FAILED (incl. a render
     error) -> back to the queue / `DELIVERY_FAILED`; UNCERTAIN ->
     `DELIVERY_UNCERTAIN` (never auto-retried); lease lost before any
-    request -> claim released untouched."""
+    request -> claim released untouched. For `manual_review` a known-unsent
+    outcome is held for the operator's next explicit `/review`
+    (`manual_hold`), never returned to the automatic queue."""
     try:
         text = render_vacancy_card(
             build_vacancy_card(job, candidate_skills, manual_review=manual_review)
         )
+        reply_markup = build_card_keyboard(review.callback_token)
     except Exception as exc:
         # Nothing reached Telegram -- provably failed, retryable.
         mark_send_failed(
-            db, review, claim_token=claim_token, last_error=f"render:{type(exc).__name__}"
+            db,
+            review,
+            claim_token=claim_token,
+            last_error=f"render:{type(exc).__name__}",
+            manual_hold=manual_review,
         )
         logger.warning(
             "vacancy_feed_render_failed review_id=%s error_type=%s",
@@ -412,7 +419,11 @@ async def _send_claimed_card(
     # never cancelled; it finishes and resolves below.
     if is_lease_lost is not None and is_lease_lost():
         released = release_claim(
-            db, review, claim_token=claim_token, reason="lease_lost_before_send"
+            db,
+            review,
+            claim_token=claim_token,
+            reason="lease_lost_before_send",
+            manual_hold=manual_review,
         )
         logger.info(
             "vacancy_feed_delivery_stopped reason=lease_lost_after_claim review_id=%s released=%s",
@@ -425,7 +436,7 @@ async def _send_claimed_card(
         settings.telegram_bot_token,
         settings.telegram_chat_id,
         text,
-        reply_markup=build_card_keyboard(review.callback_token),
+        reply_markup=reply_markup,
         timeout_seconds=settings.telegram_timeout_seconds,
     )
     if result.outcome is TelegramSendOutcome.SENT:
@@ -439,7 +450,13 @@ async def _send_claimed_card(
         )
         return _SENT
     if result.outcome is TelegramSendOutcome.FAILED:
-        mark_send_failed(db, review, claim_token=claim_token, last_error=result.outcome.value)
+        mark_send_failed(
+            db,
+            review,
+            claim_token=claim_token,
+            last_error=result.outcome.value,
+            manual_hold=manual_review,
+        )
         logger.warning(
             "vacancy_feed_card_failed review_id=%s job_id=%s attempt=%s state=%s",
             review.id,
@@ -566,6 +583,13 @@ def _manual_uncertain(job_id: int) -> ManualReviewOutcome:
     )
 
 
+def _manual_send_failed(job_id: int) -> ManualReviewOutcome:
+    return ManualReviewOutcome(
+        "SEND_FAILED",
+        f"Karte für Job #{job_id} wurde nicht gesendet. Bitte später /review {job_id} erneut.",
+    )
+
+
 def _manual_state_refusal(job_id: int, state: str) -> ManualReviewOutcome | None:
     """`/review` never re-sends a card the state machine already resolved,
     and never reopens an operator decision."""
@@ -603,6 +627,9 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
     Idempotency is the existing state machine's: only a `DISCOVERED` or
     `QUEUED_FOR_REVIEW` row is claimed (CAS), so a sent, in-flight,
     uncertain, failed or operator-decided row is never re-sent or reopened.
+    A known-unsent manual card (Telegram FAILED, or any failure before the
+    request) is held in `DISCOVERED` (`manual_hold`): the automatic sweep
+    never resends it, only another explicit `/review` (attempt cap applies).
     The single network call is the card to the configured operator chat.
     """
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
@@ -637,6 +664,29 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
             "BUSY", f"Karte für Job #{job_id} wird gerade bearbeitet - bitte später erneut prüfen."
         )
 
+    try:
+        candidate_skills = get_candidate_skills_for_scoring(db)
+    except Exception as exc:
+        # No Telegram request was started: known-unsent. Release the claim
+        # (no attempt consumed) to the manual hold so it can never become
+        # SENDING-stale -> DELIVERY_UNCERTAIN, and only another explicit
+        # /review retries it (Codex 1671ebc P1 #2). Type only, no detail.
+        db.rollback()
+        release_claim(
+            db,
+            review,
+            claim_token=claim_token,
+            reason=f"pre_send:{type(exc).__name__}",
+            manual_hold=True,
+        )
+        logger.warning(
+            "vacancy_feed_manual_review_pre_send_failed review_id=%s job_id=%s error_type=%s",
+            review.id,
+            job_id,
+            type(exc).__name__,
+        )
+        return _manual_send_failed(job_id)
+
     logger.info(
         "vacancy_feed_manual_review_opened review_id=%s job_id=%s score=%s recommendation=%s",
         review.id,
@@ -650,7 +700,7 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
         review,
         job,
         claim_token,
-        get_candidate_skills_for_scoring(db),
+        candidate_skills,
         manual_review=True,
     )
     if result == _SENT:
@@ -660,10 +710,6 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
             f"Empfehlung {job.recommendation} unverändert). Karte gesendet - nichts wurde "
             "beworben oder an Arbeitgeber gesendet.",
         )
-    if result == _FAILED:
-        return ManualReviewOutcome(
-            "SEND_FAILED",
-            f"Karte für Job #{job_id} wurde nicht gesendet (Telegram-Fehler). "
-            f"Bitte später /review {job_id} erneut.",
-        )
+    if result in (_FAILED, _RELEASED):
+        return _manual_send_failed(job_id)
     return _manual_uncertain(job_id)

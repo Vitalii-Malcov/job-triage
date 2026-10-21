@@ -29,11 +29,14 @@ from app.db.models import (
     TelegramVacancyReviewRecord,
 )
 from app.db.telegram_vacancy_review_repository import (
+    MAX_DELIVERY_ATTEMPTS,
     claim_for_sending,
+    dequeue,
     ensure_review,
     get_review_for_job,
     mark_sent,
     mark_uncertain,
+    reconcile_stale_sending,
     record_decision,
 )
 from app.services.telegram import TelegramSendOutcome, TelegramSendResult
@@ -527,33 +530,251 @@ class TestDeliveryOutcomes:
         update = await _review(str(JOB_ID))
 
         assert "nicht gesendet" in _reply(update)
-        assert _review_row(session_factory).state == "QUEUED_FOR_REVIEW"
+        assert _review_row(session_factory).state == "DISCOVERED"
 
     @pytest.mark.asyncio
-    async def test_queued_maybe_card_is_not_sent_by_regular_sweep(
+    async def test_failed_maybe_card_is_not_sent_by_regular_sweep(
         self, session_factory, sender, settings
     ):
-        """A provably failed manual send leaves the row queued; the regular
-        sweep keeps its own APPLY-only gate and dequeues it (no automatic
-        resend of a manual card) -- the operator can simply /review again."""
+        """A provably failed manual send is held out of the queue; the
+        regular sweep never sees it (no automatic resend of a manual card)
+        -- the operator can simply /review again."""
         _insert_job(session_factory)
         sender.outcome = TelegramSendOutcome.FAILED
         await _review(str(JOB_ID))
 
-        db = session_factory()
-        try:
-            stats = await feed.deliver_queued_vacancy_cards(
-                db, settings, sleep=AsyncMock(return_value=None)
-            )
-        finally:
-            db.close()
+        stats = await _sweep(session_factory, settings)
 
-        assert stats.sent == 0 and stats.dequeued == 1
+        assert stats.sent == 0 and stats.failed == 0
         assert len(sender.calls) == 1
         sender.outcome = TelegramSendOutcome.SENT
         await _review(str(JOB_ID))
         assert _review_row(session_factory).state == "TELEGRAM_SENT"
         assert len(sender.calls) == 2
+
+
+async def _sweep(session_factory, settings):
+    db = session_factory()
+    try:
+        return await feed.deliver_queued_vacancy_cards(
+            db, settings, sleep=AsyncMock(return_value=None)
+        )
+    finally:
+        db.close()
+
+
+def _recollect(session_factory, settings, job_id=JOB_ID) -> None:
+    db = session_factory()
+    try:
+        feed.record_collected_job(db, db.get(JobRecord, job_id), settings)
+    finally:
+        db.close()
+
+
+def _assert_verdict_unchanged(session_factory, score, recommendation) -> None:
+    job = _job(session_factory)
+    assert (job.score, job.recommendation, job.status) == (score, recommendation, "NEW")
+
+
+class TestManualFailureHasNoAutomaticRetry:
+    """Codex 1671ebc P1 #1 / P1 #2: a known-unsent MANUAL card may only be
+    retried by another explicit `/review`, never by the automatic sweep or
+    a re-collection; a pre-send failure never strands the claim."""
+
+    @pytest.mark.asyncio
+    async def test_maybe_manual_failed_held_for_explicit_retry(
+        self, session_factory, sender, settings
+    ):
+        _insert_job(session_factory)
+        sender.outcome = TelegramSendOutcome.FAILED
+
+        await _review(str(JOB_ID))
+
+        assert len(sender.calls) == 1
+        assert _review_row(session_factory).state == "DISCOVERED"
+        stats = await _sweep(session_factory, settings)
+        _recollect(session_factory, settings)
+        await _sweep(session_factory, settings)
+        assert stats.sent == 0
+        assert len(sender.calls) == 1
+        _assert_verdict_unchanged(session_factory, 71, "MAYBE")
+
+        sender.outcome = TelegramSendOutcome.SENT
+        await _review(str(JOB_ID))
+        assert len(sender.calls) == 2
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+        _assert_verdict_unchanged(session_factory, 71, "MAYBE")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("initial_state", ["DISCOVERED", "QUEUED_FOR_REVIEW"])
+    async def test_apply_manual_failed_not_resent_by_sweep(
+        self, session_factory, sender, settings, initial_state
+    ):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        _set_review_state(session_factory, initial_state)
+        sender.outcome = TelegramSendOutcome.FAILED
+
+        await _review(str(JOB_ID))
+
+        assert len(sender.calls) == 1
+        assert _review_row(session_factory).state == "DISCOVERED"
+        stats = await _sweep(session_factory, settings)
+        assert stats.sent == 0 and stats.failed == 0
+        # A re-collection of the still-eligible APPLY job must not re-queue it.
+        _recollect(session_factory, settings)
+        assert _review_row(session_factory).state == "DISCOVERED"
+        stats = await _sweep(session_factory, settings)
+        assert stats.sent == 0
+        assert len(sender.calls) == 1
+        _assert_verdict_unchanged(session_factory, 90, "APPLY")
+
+        sender.outcome = TelegramSendOutcome.SENT
+        await _review(str(JOB_ID))
+        assert len(sender.calls) == 2
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+        _assert_verdict_unchanged(session_factory, 90, "APPLY")
+
+    @pytest.mark.asyncio
+    async def test_explicit_retries_bounded_by_attempt_cap(self, session_factory, sender):
+        _insert_job(session_factory)
+        sender.outcome = TelegramSendOutcome.FAILED
+
+        for _ in range(MAX_DELIVERY_ATTEMPTS):
+            await _review(str(JOB_ID))
+        update = await _review(str(JOB_ID))
+
+        assert len(sender.calls) == MAX_DELIVERY_ATTEMPTS
+        assert _review_row(session_factory).state == "DELIVERY_FAILED"
+        assert "fehlgeschlagen" in _reply(update)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recommendation,score", [("MAYBE", 71), ("APPLY", 90)])
+    async def test_pre_send_skill_read_failure_releases_claim(
+        self, session_factory, sender, settings, monkeypatch, caplog, recommendation, score
+    ):
+        _insert_job(session_factory, recommendation=recommendation, score=score)
+
+        def _boom(db):
+            raise RuntimeError("secret-db-detail")
+
+        monkeypatch.setattr(feed, "get_candidate_skills_for_scoring", _boom)
+
+        update = await _review(str(JOB_ID))
+
+        assert sender.calls == []
+        review = _review_row(session_factory)
+        assert review.state not in ("SENDING", "DELIVERY_UNCERTAIN")
+        assert review.state == "DISCOVERED"
+        assert review.claim_token is None
+        assert review.attempt_count == 0
+        assert "nicht gesendet" in _reply(update)
+        assert "secret-db-detail" not in caplog.text
+        assert "secret-db-detail" not in _reply(update)
+
+        # Stale reconciliation can never turn it into DELIVERY_UNCERTAIN.
+        db = session_factory()
+        try:
+            assert reconcile_stale_sending(db, ttl_seconds=0.0) == 0
+        finally:
+            db.close()
+        monkeypatch.setattr(
+            feed, "get_candidate_skills_for_scoring", lambda db: frozenset({"python"})
+        )
+        _recollect(session_factory, settings)
+        stats = await _sweep(session_factory, settings)
+        assert stats.sent == 0 and sender.calls == []
+
+        await _review(str(JOB_ID))
+        assert len(sender.calls) == 1
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+        _assert_verdict_unchanged(session_factory, score, recommendation)
+
+    @pytest.mark.asyncio
+    async def test_telegram_sent_never_manually_resent(self, session_factory, sender, settings):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        await _review(str(JOB_ID))
+
+        await _review(str(JOB_ID))
+        await _sweep(session_factory, settings)
+
+        assert len(sender.calls) == 1
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+
+    @pytest.mark.asyncio
+    async def test_delivery_uncertain_never_manually_resent(
+        self, session_factory, sender, settings
+    ):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        sender.outcome = TelegramSendOutcome.UNCERTAIN
+        await _review(str(JOB_ID))
+
+        sender.outcome = TelegramSendOutcome.SENT
+        update = await _review(str(JOB_ID))
+        await _sweep(session_factory, settings)
+
+        assert len(sender.calls) == 1
+        assert "unsicher" in _reply(update)
+        assert _review_row(session_factory).state == "DELIVERY_UNCERTAIN"
+
+
+class TestAutomaticFeedUnchanged:
+    @pytest.mark.asyncio
+    async def test_automatic_apply_failure_still_retried_by_next_sweep(
+        self, session_factory, sender, settings
+    ):
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        _recollect(session_factory, settings)
+        assert _review_row(session_factory).state == "QUEUED_FOR_REVIEW"
+        sender.outcome = TelegramSendOutcome.FAILED
+
+        first = await _sweep(session_factory, settings)
+
+        assert first.failed == 1
+        assert _review_row(session_factory).state == "QUEUED_FOR_REVIEW"
+        sender.outcome = TelegramSendOutcome.SENT
+        second = await _sweep(session_factory, settings)
+        assert second.sent == 1
+        assert len(sender.calls) == 2
+        assert _review_row(session_factory).state == "TELEGRAM_SENT"
+        _assert_verdict_unchanged(session_factory, 90, "APPLY")
+
+    @pytest.mark.asyncio
+    async def test_automatic_dequeued_row_requeued_on_recollection(
+        self, session_factory, sender, settings
+    ):
+        """A row the sweep dequeued (not a manual failure) is still promoted
+        back to the queue when a re-collection finds it eligible."""
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        _set_review_state(session_factory, "QUEUED_FOR_REVIEW")
+        db = session_factory()
+        try:
+            assert dequeue(db, get_review_for_job(db, JOB_ID))
+        finally:
+            db.close()
+
+        _recollect(session_factory, settings)
+
+        assert _review_row(session_factory).state == "QUEUED_FOR_REVIEW"
+
+
+class TestOversizedJobId:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["9" * 40, str(2**63), "1" + "0" * 19])
+    async def test_oversized_id_safe_usage_reply(self, session_factory, sender, raw):
+        _insert_job(session_factory)
+
+        update = await _review(raw)
+
+        assert _reply(update).startswith("Usage: /review <job_id>")
+        assert sender.calls == []
+        assert _review_row(session_factory).state == "DISCOVERED"
+
+    @pytest.mark.asyncio
+    async def test_max_int64_id_is_plain_not_found(self, session_factory, sender):
+        update = await _review(str(2**63 - 1))
+
+        assert "nicht gefunden" in _reply(update)
+        assert sender.calls == []
 
 
 def test_help_lists_review_command():

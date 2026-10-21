@@ -471,15 +471,21 @@ _REVIEW_USAGE = "Usage: /review <job_id> (positive integer)"
 _REVIEW_NOT_ALLOWED = "Manuelle Prüfung nicht erlaubt - nur für den Operator."
 
 
+# Largest DB integer primary key (signed 64-bit; SQLite INTEGER / PG BIGINT).
+# A larger id cannot exist and would raise OverflowError when bound.
+_MAX_DB_JOB_ID = 2**63 - 1
+
+
 def _parse_review_job_id(args: list[str] | None) -> int | None:
-    """Strict `/review <positive integer>`: exactly one ASCII-digit token."""
+    """Strict `/review <positive integer>`: exactly one ASCII-digit token
+    within the DB integer range."""
     if not args or len(args) != 1:
         return None
     raw = args[0]
-    if not (raw.isascii() and raw.isdigit()):
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > len(str(_MAX_DB_JOB_ID)):
         return None
     job_id = int(raw)
-    return job_id if job_id > 0 else None
+    return job_id if 0 < job_id <= _MAX_DB_JOB_ID else None
 
 
 @require_authorized

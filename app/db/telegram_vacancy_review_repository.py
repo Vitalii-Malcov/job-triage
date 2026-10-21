@@ -12,7 +12,7 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -38,6 +38,12 @@ CALLBACK_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{16}")
 # also be changed (SAVED <-> SKIPPED).
 DECIDABLE_STATES = ("TELEGRAM_SENT", "DELIVERY_UNCERTAIN", "SAVED", "SKIPPED")
 DECISION_STATES = ("SAVED", "SKIPPED")
+
+# `last_error` prefix marking a known-unsent card from the operator's
+# explicit `/review`, held in `DISCOVERED` (`manual_hold=True` below): it
+# is never re-queued by a re-collection, so the automatic sweep cannot send
+# it; only another explicit `/review` claims it again. No schema change.
+MANUAL_HOLD_PREFIX = "manual_review:"
 
 
 class TelegramVacancyReviewRepositoryConsistencyError(Exception):
@@ -74,6 +80,16 @@ def get_review_by_callback_token(db: Session, token: str) -> TelegramVacancyRevi
     )
 
 
+def _not_manual_hold() -> object:
+    """A `DISCOVERED` row whose `last_error` carries MANUAL_HOLD_PREFIX is a
+    known-unsent MANUAL `/review` card: only another explicit `/review`
+    may claim it, never the automatic queue (Codex 1671ebc P1)."""
+    return or_(
+        TelegramVacancyReviewRecord.last_error.is_(None),
+        TelegramVacancyReviewRecord.last_error.not_like(f"{MANUAL_HOLD_PREFIX}%"),
+    )
+
+
 def _queue_if_discovered(db: Session, record: TelegramVacancyReviewRecord) -> bool:
     now = datetime.now(UTC)
     result = db.execute(
@@ -81,6 +97,7 @@ def _queue_if_discovered(db: Session, record: TelegramVacancyReviewRecord) -> bo
         .where(
             TelegramVacancyReviewRecord.id == record.id,
             TelegramVacancyReviewRecord.state == "DISCOVERED",
+            _not_manual_hold(),
         )
         .values(state="QUEUED_FOR_REVIEW", queued_at=now, updated_at=now)
     )
@@ -95,8 +112,9 @@ def ensure_review(db: Session, job_id: int, *, eligible: bool) -> TelegramVacanc
     sight -- `QUEUED_FOR_REVIEW` if `eligible`, else `DISCOVERED`. On a
     later sight, the only transition ever made here is `DISCOVERED ->
     QUEUED_FOR_REVIEW` (a re-score made it eligible). A row already queued,
-    sent, decided, or failed is never touched, so re-collection can never
-    re-send a card.
+    sent, decided, or failed -- or a manual `/review` card held in
+    `DISCOVERED` after a known-unsent attempt -- is never touched, so
+    re-collection can never re-send a card.
     """
     existing = get_review_for_job(db, job_id)
     if existing is None:
@@ -216,8 +234,26 @@ def _owns_claim(claim_token: str) -> tuple:
     )
 
 
+def _retry_values(*, manual_hold: bool, last_error: str) -> dict:
+    """Where a known-unsent claim goes: back to the automatic queue, or --
+    for a MANUAL `/review` card -- held in `DISCOVERED` (out of the queue,
+    never re-queued by re-collection) until the operator's next `/review`."""
+    if manual_hold:
+        return {
+            "state": "DISCOVERED",
+            "queued_at": None,
+            "last_error": f"{MANUAL_HOLD_PREFIX}{last_error}"[:200],
+        }
+    return {"state": "QUEUED_FOR_REVIEW", "last_error": last_error[:200]}
+
+
 def release_claim(
-    db: Session, record: TelegramVacancyReviewRecord, *, claim_token: str, reason: str
+    db: Session,
+    record: TelegramVacancyReviewRecord,
+    *,
+    claim_token: str,
+    reason: str,
+    manual_hold: bool = False,
 ) -> bool:
     """CAS `SENDING -> QUEUED_FOR_REVIEW` for a claim abandoned BEFORE any
     Telegram request was started (e.g. the run's lease was confirmed lost
@@ -228,7 +264,10 @@ def release_claim(
 
     Only the claim identified by `claim_token` can be released (Codex
     S9A-CODEX-004): a repeated or stale release -- even after the row was
-    re-claimed by another worker -- matches no row and changes nothing."""
+    re-claimed by another worker -- matches no row and changes nothing.
+
+    `manual_hold=True` (the operator's `/review`) releases to the manual
+    hold in `DISCOVERED` instead of the queue (see `_retry_values`)."""
     result = db.execute(
         update(TelegramVacancyReviewRecord)
         .where(
@@ -237,11 +276,10 @@ def release_claim(
             TelegramVacancyReviewRecord.attempt_count > 0,
         )
         .values(
-            state="QUEUED_FOR_REVIEW",
             claim_token=None,
             attempt_count=TelegramVacancyReviewRecord.attempt_count - 1,
-            last_error=reason[:200],
             updated_at=datetime.now(UTC),
+            **_retry_values(manual_hold=manual_hold, last_error=reason),
         )
     )
     db.commit()
@@ -285,25 +323,26 @@ def mark_send_failed(
     claim_token: str,
     last_error: str,
     max_attempts: int = MAX_DELIVERY_ATTEMPTS,
+    manual_hold: bool = False,
 ) -> bool:
     """CAS `SENDING -> QUEUED_FOR_REVIEW` (retried by the next sweep) for a
     send under claim `claim_token` that provably did NOT reach Telegram --
     or `SENDING -> DELIVERY_FAILED` once `attempt_count` reached
     `max_attempts`. The cap is evaluated by the database against the row's
-    current `attempt_count`, not the caller's ORM copy."""
-    next_state = case(
+    current `attempt_count`, not the caller's ORM copy.
+
+    `manual_hold=True` (the operator's `/review`): below the cap the row is
+    held in `DISCOVERED` instead (see `_retry_values`), so only another
+    explicit `/review` -- never the automatic sweep -- retries it."""
+    retry = _retry_values(manual_hold=manual_hold, last_error=last_error)
+    retry["state"] = case(
         (TelegramVacancyReviewRecord.attempt_count >= max_attempts, "DELIVERY_FAILED"),
-        else_="QUEUED_FOR_REVIEW",
+        else_=retry["state"],
     )
     result = db.execute(
         update(TelegramVacancyReviewRecord)
         .where(TelegramVacancyReviewRecord.id == record.id, *_owns_claim(claim_token))
-        .values(
-            state=next_state,
-            claim_token=None,
-            last_error=last_error[:200],
-            updated_at=datetime.now(UTC),
-        )
+        .values(claim_token=None, updated_at=datetime.now(UTC), **retry)
     )
     db.commit()
     won = result.rowcount == 1
