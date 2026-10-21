@@ -100,7 +100,7 @@ Full deployment architecture (topology, scheduler-placement decision, scaling li
 
 ## Project status
 
-Implemented: job collection (Bundesagentur, XING), scoring, Telegram control center, candidate profile + job matching, CV/cover-letter drafting, Gmail inbox sync + matching/classification, response-draft + follow-up generation and approval-gated sending, automation scheduler, daily digest, Docker deployment support.
+Implemented: job collection (Bundesagentur Jobsuche API, XING job-alert e-mails), application lifecycle tracking with inbound receipt/reply processing across the applicant's mailboxes and a pre-application duplicate check, scoring, Telegram control center, candidate profile + job matching, CV/cover-letter drafting, Gmail inbox sync + matching/classification, response-draft + follow-up generation and approval-gated sending, automation scheduler, daily digest, Docker deployment support.
 
 Not implemented / explicitly out of scope: automated final job-application submission to any platform, additional job sources (Indeed/StepStone/career pages), multi-worker/horizontally-scaled deployment (the in-memory rate limiter isn't multi-worker safe yet — see `docs/PRODUCTION_READINESS_AUDIT.md`), public-internet-facing deployment without further hardening.
 
@@ -110,6 +110,7 @@ Current production-readiness assessment, scored and evidenced: **`docs/PRODUCTIO
 
 | Doc | Contents |
 |---|---|
+| `docs/DAILY_OPERATIONS.md` | **Start here for daily use**: start-up, safe flags, collection, duplicate check, recording submissions, monitored mailboxes, backup/restore |
 | `docs/ARCHITECTURE.md` | Module map, dependency directions, trust/transaction/approval boundaries, Mermaid diagrams |
 | `docs/PRODUCTION_READINESS_AUDIT.md` | Evidence-based findings, priorities, readiness score |
 | `docs/DEPLOYMENT.md` | Deployment topology, scheduler strategy, scaling limits |

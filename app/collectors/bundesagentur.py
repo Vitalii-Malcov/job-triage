@@ -389,6 +389,14 @@ class BundesagenturCollector(JobCollector):
                         response.text[:200],
                     )
                     return None
+                if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
+                    # A rejected request (bad parameter, 403, 404 on a page
+                    # call, ...) is identical on every retry: fail fast
+                    # instead of sleeping through the whole retry budget.
+                    raise BundesagenturAPIError(
+                        "Bundesagentur Jobsuche API rejected the request "
+                        f"(status={response.status_code})"
+                    )
                 response.raise_for_status()
                 payload = response.json()
                 if not isinstance(payload, dict):

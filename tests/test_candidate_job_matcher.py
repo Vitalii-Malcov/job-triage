@@ -503,3 +503,46 @@ def test_algorithm_version_is_stamped():
     job = _job()
     result = compute_match(job, profile, company_research_id=None)
     assert result.algorithm_version == ALGORITHM_VERSION == "v12"
+
+
+# --- final hardening: no hallucinated matches (profile-v4-shaped) -------------------
+
+
+def _v4_like_profile() -> CandidateProfile:
+    return _profile(
+        skills=[CandidateSkill(id=1, name="Python"), CandidateSkill(id=2, name="Pytest")],
+        languages=[
+            CandidateLanguage(id=1, language="Deutsch", level="B1", notes="B2 course ongoing")
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        _job(must_have_skills=["selenium", "python"]),
+        _job(description="Erfahrung mit Selenium und Python ist erforderlich."),
+    ],
+)
+def test_technology_the_profile_lacks_is_missing_never_matched(job):
+    result = compute_match(job, _v4_like_profile(), company_research_id=None)
+    assert [m.requirement for m in result.matched_requirements] == ["python"]
+    assert [m.requirement for m in result.missing_requirements] == ["selenium"]
+
+
+def test_b1_with_a_b2_course_never_meets_a_b2_requirement():
+    for text in ("Deutsch B2 ist erforderlich.", "Deutschkenntnisse B2 wünschenswert."):
+        result = compute_match(_job(description=text), _v4_like_profile(), company_research_id=None)
+        assert result.matched_requirements == []
+        assert [m.match_status for m in result.partial_requirements] == ["PARTIAL"]
+
+
+def test_empty_description_produces_no_requirement_rows():
+    result = compute_match(_job(description=""), _v4_like_profile(), company_research_id=None)
+    rows = (
+        result.matched_requirements
+        + result.partial_requirements
+        + result.missing_requirements
+        + result.unknown_requirements
+    )
+    assert rows == []

@@ -21,6 +21,12 @@ The scheduled automation cycle (`app/services/automation_gmail.py`) only
 runs sync → analysis → draft. It never approves or sends, and it never drafts
 a reply to the user's own Sent mail.
 
+Scope: this reply/draft workflow syncs the primary `GMAIL_*` account only.
+Application *status tracking* (receipts, interview invitations, rejections
+reported for operator confirmation) reads every applicant mailbox, including
+the `XING_MAILBOX_*` account — see `scripts/stage15_application_tracker.py
+process-gmail` and [DAILY_OPERATIONS.md](DAILY_OPERATIONS.md).
+
 ## Association (message → job/application)
 
 Association is deterministic and evidence-ranked: an explicit reference in
