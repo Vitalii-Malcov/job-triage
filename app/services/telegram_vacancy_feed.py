@@ -395,8 +395,7 @@ async def _send_claimed_card(
         text = render_vacancy_card(
             build_vacancy_card(job, candidate_skills, manual_review=manual_review)
         )
-        # Automatic feed: keyboard built at send time, as before /review.
-        reply_markup = build_card_keyboard(review.callback_token) if manual_review else None
+        reply_markup = build_card_keyboard(review.callback_token)
     except Exception as exc:
         if manual_review:
             # Codex aadca62 P1: nothing reached Telegram, so this is not a
@@ -447,7 +446,7 @@ async def _send_claimed_card(
         settings.telegram_bot_token,
         settings.telegram_chat_id,
         text,
-        reply_markup=reply_markup or build_card_keyboard(review.callback_token),
+        reply_markup=reply_markup,
         timeout_seconds=settings.telegram_timeout_seconds,
     )
     if result.outcome is TelegramSendOutcome.SENT:

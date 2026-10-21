@@ -830,6 +830,38 @@ class TestAutomaticFeedUnchanged:
         assert review.claim_token is None
 
     @pytest.mark.asyncio
+    async def test_automatic_keyboard_failure_is_known_unsent_and_retried(
+        self, session_factory, sender, settings, monkeypatch
+    ):
+        """Codex 7548752 P1: a keyboard error before any HTTP request is a
+        provably-failed attempt (re-queued), never a stranded SENDING claim
+        that stale reconciliation would turn into DELIVERY_UNCERTAIN."""
+        _insert_job(session_factory, recommendation="APPLY", score=90)
+        _recollect(session_factory, settings)
+        original = feed.build_card_keyboard
+        monkeypatch.setattr(feed, "build_card_keyboard", _raise_runtime)
+
+        stats = await _sweep(session_factory, settings)
+
+        review = _review_row(session_factory)
+        assert stats.failed == 1 and sender.calls == []
+        assert (review.state, review.attempt_count) == ("QUEUED_FOR_REVIEW", 1)
+        assert review.last_error == "render:RuntimeError"
+        assert review.claim_token is None
+        db = session_factory()
+        try:
+            assert reconcile_stale_sending(db, ttl_seconds=0.0) == 0
+        finally:
+            db.close()
+
+        monkeypatch.setattr(feed, "build_card_keyboard", original)
+        stats = await _sweep(session_factory, settings)
+        review = _review_row(session_factory)
+        assert stats.sent == 1 and len(sender.calls) == 1
+        assert (review.state, review.attempt_count) == ("TELEGRAM_SENT", 2)
+        _assert_verdict_unchanged(session_factory, 90, "APPLY")
+
+    @pytest.mark.asyncio
     async def test_automatic_apply_failure_still_retried_by_next_sweep(
         self, session_factory, sender, settings
     ):
