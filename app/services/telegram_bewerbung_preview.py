@@ -23,7 +23,7 @@ or reorder the displayed text. It never modifies the persisted artifacts.
 
 import unicodedata
 
-from app.agents.score_labels import CANDIDATE_MATCH_LABEL, SCORE_DIFFERENCE_NOTE
+from app.agents.score_labels import SCORE_DIFFERENCE_NOTE, candidate_match_lines
 from app.models.bewerbung import BewerbungDraft
 from app.models.candidate_job_match import CandidateJobMatch, RequirementMatch
 from app.models.cv_draft import TailoredCVDraft
@@ -132,6 +132,19 @@ def cap_units(text: str, limit: int) -> str:
     return "".join(out).rstrip() + _ELLIPSIS
 
 
+def match_score_lines(match: CandidateJobMatch) -> list[str]:
+    """The Kandidaten-Match score line(s), qualified whenever a requirement
+    is still partial, missing or unclear (see `candidate_match_lines`)."""
+    open_count = (
+        len(match.partial_requirements)
+        + len(match.missing_requirements)
+        + len(match.unknown_requirements)
+    )
+    return candidate_match_lines(
+        match.overall_score, evidenced=len(match.matched_requirements), open_count=open_count
+    )
+
+
 def _field(value: str | None, limit: int, missing: str = "nicht angegeben") -> str:
     normalized = normalize_scalar(value)
     return cap_units(normalized, limit) if normalized else missing
@@ -215,7 +228,7 @@ def render_summary(letter: BewerbungDraft, cv: TailoredCVDraft, match: Candidate
     body: list[str] = [
         f"Position: {_field(title, _TITLE_LIMIT)}",
         f"Firma: {_field(company, _COMPANY_LIMIT)}",
-        f"{CANDIDATE_MATCH_LABEL}: {match.overall_score}/100",
+        *match_score_lines(match),
         SCORE_DIFFERENCE_NOTE,
         "",
         *_section(

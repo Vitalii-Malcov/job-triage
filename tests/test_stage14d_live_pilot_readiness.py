@@ -487,7 +487,10 @@ def test_cv_document_is_german_ordered_and_only_uses_draft_facts():
     assert "aktuell" in text  # current job without a start date: no invented date
     assert "03/2025 – 06/2025" in text
     assert "nicht abgeschlossen" in text  # unfinished education never shown as a degree
-    assert "Englisch – Niveau nicht angegeben" in text  # UNKNOWN stays unknown
+    # UNKNOWN stays unknown: the language is listed, no level is invented and
+    # no placeholder/enum text reaches the employer (V1 quality patch).
+    assert "\nEnglisch\n" in f"\n{text}\n"
+    assert "Englisch –" not in text and "Niveau nicht angegeben" not in text
     assert "Deutsch – B1" in text
     assert "Zertifikate" not in headings  # empty sections are left out
 

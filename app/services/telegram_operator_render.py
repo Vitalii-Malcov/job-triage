@@ -254,6 +254,16 @@ def _package_line(package: PackageSummary) -> str:
     return f"Package: PACKAGE_NOT_READY ({cap(reasons, 160)})"
 
 
+def _open_requirements(m: MatchSummary) -> int:
+    return len(m.missing) + len(m.partial) + m.unknown_count
+
+
+def _open_requirements_line(m: MatchSummary) -> str:
+    # V1 quality patch: the matcher percentage counts confirmed evidence
+    # only, so 100% next to an unverified requirement is not a full fit.
+    return f"Open requirements: {_open_requirements(m)} (not a full fit)"
+
+
 def render_card(view: OperatorCardView, *, now: datetime) -> str:
     header = [f"💼 {cap(view.company)} — {cap(view.role)}"]
     header.append(f"📍 {cap(view.location) if view.location else 'Location not stated'}")
@@ -263,13 +273,13 @@ def render_card(view: OperatorCardView, *, now: datetime) -> str:
     sections: list[tuple[int, str]] = []
     m = view.match
     if m is not None:
-        sections.append(
-            (
-                0,
-                f"Match: {m.overall}%\nRequired: {m.required}%\n"
-                f"Preferred: {m.preferred}%\nExperience: {m.experience}%",
-            )
+        match_text = (
+            f"Match: {m.overall}%\nRequired: {m.required}%\n"
+            f"Preferred: {m.preferred}%\nExperience: {m.experience}%"
         )
+        if _open_requirements(m):
+            match_text += "\n" + _open_requirements_line(m)
+        sections.append((0, match_text))
         if m.matched:
             sections.append((4, "Matched:\n" + _items(m.matched, CARD_ITEMS)))
         if m.missing:
@@ -333,6 +343,8 @@ def render_details(view: OperatorCardView, *, now: datetime) -> str:
         ]
         if m.unknown_count:
             breakdown.append(f"not evaluable: {m.unknown_count}")
+        if _open_requirements(m):
+            breakdown.append(_open_requirements_line(m))
         sections.append((0, "\n".join(breakdown)))
         if m.missing:
             sections.append((1, "Missing:\n" + _items(m.missing, DETAIL_ITEMS)))

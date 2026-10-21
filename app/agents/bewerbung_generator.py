@@ -22,9 +22,12 @@ v4 (Stage 14D): a language is cited only when the vacancy gives a concrete
 reason (a language requirement, the language named in the ad, or the ad's
 own language) -- see app.agents.language_relevance; a verified but unrelated
 language is no longer inserted.
+v5 (V1 quality patch): the letter names the vacancy's own focus (closed label
+list, no job text copied) next to the verified skills, cites every relevant
+project (not only the first) with its glossary-mapped German highlights.
 """
 
-BEWERBUNG_GENERATOR_VERSION = "v4"
+BEWERBUNG_GENERATOR_VERSION = "v5"
 
 
 class BewerbungCVDraftNotFoundError(Exception):

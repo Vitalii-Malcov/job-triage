@@ -213,6 +213,26 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # generic "wissenschaftlich...anything...mitarbeiter" scan that
         # could bridge two unrelated words in a longer title.
         ("wissenschaftliche-mitarbeiter", r"\bwissenschaftlich[a-z]*\b.{0,15}?\bmitarbeiter"),
+        # V1 quality patch: non-software professions that reached APPLY in
+        # the first real run purely on Python/SQL overlap.
+        ("aktuar", r"\baktuar(?:in)?\b"),
+        ("konstrukteur", r"\bkonstrukteur(?:in)?\b"),
+    )
+)
+
+# V1 quality patch: technical role families that are NOT software-
+# development titles in the strict sense above (and must stay UNKNOWN there,
+# so `derive_candidate_target_domain` keeps its conservative meaning) but are
+# genuine target roles for a Python/SQL candidate. Consulted ONLY by
+# `is_apply_eligible_title`.
+_APPLY_ELIGIBLE_ADJACENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(pattern, re.IGNORECASE))
+    for name, pattern in (
+        ("data-analyst", r"\bdata\s+analyst(?:in)?\b"),
+        ("datenanalyst", r"\bdatenanalyst(?:in)?\b"),
+        ("data-engineer", r"\bdata\s+engineer\b"),
+        ("python-engineer", r"\bpython\s+engineer\b"),
+        ("backend-engineer", r"\bback[\s-]?end\s+engineer\b"),
     )
 )
 
@@ -288,6 +308,31 @@ def classify_title_relevance(title: str) -> TitleRelevanceClassification:
     if strong_signal is not None and positive_signal is None:
         return TitleRelevanceClassification(level="IRRELEVANT", matched_signal=strong_signal)
     return TitleRelevanceClassification(level="UNKNOWN", matched_signal=None)
+
+
+def is_apply_eligible_title(title: str) -> bool:
+    """V1 quality patch: may this title carry an automatic APPLY for a
+    software-development-targeting candidate?
+
+    Keyword overlap alone must not turn an unrelated profession into APPLY
+    ("Aktuar", "Berater ...", "Business Consultant ..." all list Python and
+    SQL). A title qualifies only with a positive role signal: a RELEVANT
+    software-development title, or an explicit adjacent technical role
+    (Data Analyst, Datenanalyst, Data Engineer, Python/Backend Engineer)
+    with no irrelevant or ambiguity signal. Everything else is left for
+    human review (MAYBE) by the caller -- never excluded by this check.
+    """
+    relevance = classify_title_relevance(title)
+    if relevance.level == "RELEVANT":
+        return True
+    if relevance.level == "IRRELEVANT":
+        return False
+    text = title or ""
+    if any(pattern.search(text) for _, pattern in _IRRELEVANT_TITLE_PATTERNS):
+        return False
+    if any(pattern.search(text) for _, pattern in _WEAK_AMBIGUITY_PATTERNS):
+        return False
+    return any(pattern.search(text) for _, pattern in _APPLY_ELIGIBLE_ADJACENT_PATTERNS)
 
 
 def derive_candidate_target_domain(target_roles: list[str]) -> CandidateTargetDomain:

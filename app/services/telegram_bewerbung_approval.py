@@ -30,6 +30,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app.agents.cv_public_text import (
+    public_certification_status,
+    public_description,
+    public_language_level,
+    public_list,
+    public_period,
+    public_phrase,
+    public_proficiency,
+)
 from app.agents.review_package_builder import (
     ReviewApplicationApprovedError,
     ReviewBewerbungDraftJobMismatchError,
@@ -46,7 +55,7 @@ from app.agents.review_package_builder import (
     ReviewSourceMismatchError,
     ReviewVersionConflictError,
 )
-from app.agents.score_labels import CANDIDATE_MATCH_LABEL, SCORE_DIFFERENCE_NOTE
+from app.agents.score_labels import SCORE_DIFFERENCE_NOTE
 from app.db.bewerbung_repository import get_bewerbung_draft_by_id, to_bewerbung_draft
 from app.db.candidate_cv_draft_repository import get_draft_by_id, to_tailored_cv_draft
 from app.db.candidate_job_match_repository import get_match_by_id, to_candidate_job_match
@@ -93,6 +102,7 @@ from app.services.telegram_bewerbung import (
 )
 from app.services.telegram_bewerbung_preview import (
     TELEGRAM_UNIT_LIMIT,
+    match_score_lines,
     normalize_multiline,
     normalize_scalar,
     utf16_units,
@@ -182,11 +192,6 @@ def _date(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _period(start: date | None, end: date | None, *, current: bool = False) -> str:
-    end_text = "heute" if current and end is None else (_date(end) or "nicht angegeben")
-    return f"{_date(start) or 'nicht angegeben'} – {end_text}"
-
-
 def _requirements(doc: _Document, title: str, requirements: list[RequirementMatch]) -> None:
     doc.line(title)
     if not requirements:
@@ -215,7 +220,7 @@ def _section_header(doc: _Document, snapshot: ReviewSnapshot) -> None:
     doc.value("Ort: ", header.location_city.value if header.location_city else None, missing="—")
     doc.value(
         "Land: ",
-        header.location_country.value if header.location_country else None,
+        public_phrase(header.location_country.value) if header.location_country else None,
         missing="—",
     )
     doc.line("Kontakt: Kontaktdaten sind nicht Teil dieses Entwurfs.")
@@ -236,9 +241,13 @@ def _section_skills(doc: _Document, snapshot: ReviewSnapshot) -> None:
     if not snapshot.cv.skills:
         doc.line("• keine")
     for skill in snapshot.cv.skills:
-        doc.value("• ", skill.text, missing="(ohne Bezeichnung)")
-        doc.value("Kategorie: ", skill.category, indent="  ")
-        doc.value("Niveau: ", skill.proficiency, indent="  ")
+        # V1 quality patch: the CV shows skills as a CV does -- no internal
+        # category enum, no UNKNOWN level (see app.agents.cv_public_text).
+        text = public_phrase(skill.text)
+        if skill.text.strip() and not text:
+            continue  # internal bookkeeping only: nothing employer-facing
+        doc.value("• ", text, missing="(ohne Bezeichnung)")
+        doc.value("Niveau: ", public_proficiency(skill.proficiency), indent="  ")
         if skill.years_experience is not None:
             doc.line(f"  Erfahrung: {skill.years_experience:g} Jahre")
 
@@ -250,11 +259,16 @@ def _section_experience(doc: _Document, snapshot: ReviewSnapshot) -> None:
     for item in snapshot.cv.experience:
         doc.value("• ", item.job_title, missing="(ohne Titel)")
         doc.value("Firma: ", item.company, indent="  ")
-        doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date, current=item.is_current)}")
+        period = public_period(
+            item.start_date, item.end_date, current=item.is_current, description=item.description
+        )
+        doc.value("Zeitraum: ", period, missing="nicht angegeben", indent="  ")
         doc.value("Ort: ", item.location, indent="  ")
-        doc.value("Beschreibung: ", item.description, multiline=True, indent="  ")
-        _list(doc, "Aufgabe: ", item.responsibilities, "  ")
-        _list(doc, "Erfolg: ", item.achievements, "  ")
+        doc.value(
+            "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
+        )
+        _list(doc, "Aufgabe: ", public_list(item.responsibilities), "  ")
+        _list(doc, "Erfolg: ", public_list(item.achievements), "  ")
         _list(doc, "Technologie: ", item.technologies, "  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")
 
@@ -266,11 +280,12 @@ def _section_projects(doc: _Document, snapshot: ReviewSnapshot) -> None:
     for item in snapshot.cv.projects:
         doc.value("• ", item.name, missing="(ohne Namen)")
         doc.value("Rolle: ", item.role, indent="  ")
-        if item.start_date or item.end_date:
-            doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date)}")
-        doc.value("Beschreibung: ", item.description, multiline=True, indent="  ")
+        doc.value("Zeitraum: ", public_period(item.start_date, item.end_date), indent="  ")
+        doc.value(
+            "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
+        )
         _list(doc, "Technologie: ", item.technologies, "  ")
-        _list(doc, "Highlight: ", item.highlights, "  ")
+        _list(doc, "Highlight: ", public_list(item.highlights), "  ")
         doc.value("Repository: ", item.repository_url, indent="  ")
         doc.value("Demo: ", item.demo_url, indent="  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")
@@ -285,7 +300,7 @@ def _section_education(doc: _Document, snapshot: ReviewSnapshot) -> None:
         doc.value("Programm: ", item.program, indent="  ")
         doc.value("Abschluss: ", item.degree, indent="  ")
         doc.value("Fachrichtung: ", item.field_of_study, indent="  ")
-        doc.line(f"  Zeitraum: {_period(item.start_date, item.end_date)}")
+        doc.value("Zeitraum: ", public_period(item.start_date, item.end_date), indent="  ")
         doc.line(f"  Abgeschlossen: {'ja' if item.completed else 'nein'}")
         doc.value("Ort: ", item.location, indent="  ")
 
@@ -299,7 +314,7 @@ def _section_certifications(doc: _Document, snapshot: ReviewSnapshot) -> None:
         doc.value("Aussteller: ", item.issuer, indent="  ")
         doc.value("Ausgestellt: ", _date(item.issued_date), indent="  ")
         doc.value("Gültig bis: ", _date(item.expires_date), indent="  ")
-        doc.value("Status: ", item.status, indent="  ")
+        doc.value("Status: ", public_certification_status(item.status), indent="  ")
 
 
 def _section_languages(doc: _Document, snapshot: ReviewSnapshot) -> None:
@@ -307,8 +322,12 @@ def _section_languages(doc: _Document, snapshot: ReviewSnapshot) -> None:
     if not snapshot.cv.languages:
         doc.line("• keine")
     for item in snapshot.cv.languages:
-        doc.value("• ", item.language, missing="(ohne Bezeichnung)")
-        doc.value("Niveau: ", item.level, indent="  ")
+        level = public_language_level(item.level)
+        doc.value(
+            "• ",
+            f"{item.language} – {level}" if item.language and level else item.language,
+            missing="(ohne Bezeichnung)",
+        )
         doc.value("Zertifikat: ", item.certificate, indent="  ")
 
 
@@ -345,7 +364,8 @@ def _build_document(snapshot: ReviewSnapshot) -> _Document:
 
     match = snapshot.match
     doc.line("KANDIDATEN-MATCH (Profil vs. Stelle)")
-    doc.line(f"{CANDIDATE_MATCH_LABEL}: {match.overall_score}/100")
+    for score_line in match_score_lines(match):
+        doc.line(score_line)
     doc.line(SCORE_DIFFERENCE_NOTE)
     _requirements(doc, "Belegte Anforderungen:", match.matched_requirements)
     _requirements(doc, "Teilweise belegt:", match.partial_requirements)

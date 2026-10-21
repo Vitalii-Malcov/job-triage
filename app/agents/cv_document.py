@@ -7,8 +7,11 @@ inferred, translated, upgraded or filled in:
 
 - a missing date is left out, never estimated; an unfinished education entry
   is labelled "nicht abgeschlossen", never shown as a degree;
-- a language with level UNKNOWN is shown as "Niveau nicht angegeben";
-- free-text fields (descriptions, responsibilities) are copied verbatim;
+- a language with level UNKNOWN is listed without a level (none invented);
+- free-text fields go through app.agents.cv_public_text (V1 quality patch):
+  internal/provenance notes and raw enums never reach the document, a period
+  recorded only in such a note is shown in German, and English source
+  phrases are mapped to German via its closed glossary only;
 - without complete contact data the document carries NO contact lines and
   reports the problem codes in `warnings` (CONTACT_DATA_MISSING, ...).
 
@@ -17,9 +20,16 @@ blocks that `app.services.document_export` writes to a file.
 """
 
 from dataclasses import dataclass
-from datetime import date
 from typing import Literal
 
+from app.agents.cv_public_text import (
+    public_certification_status,
+    public_description,
+    public_language_level,
+    public_list,
+    public_period,
+    public_phrase,
+)
 from app.models.application_identity import ApplicationIdentity, contact_problems_for_names
 from app.models.cv_draft import (
     CVEducationItem,
@@ -41,13 +51,6 @@ _HEADINGS = {
     "CERTIFICATIONS": "Zertifikate",
     "LANGUAGES": "Sprachen",
 }
-_LANGUAGE_LEVELS = {"NATIVE": "Muttersprache", "UNKNOWN": "Niveau nicht angegeben"}
-_CERTIFICATION_STATUS = {
-    "COMPLETED": "abgeschlossen",
-    "IN_PROGRESS": "in Bearbeitung",
-    "PLANNED": "geplant",
-    "UNKNOWN": "Status nicht angegeben",
-}
 
 
 @dataclass(frozen=True)
@@ -62,19 +65,6 @@ class CVDocument:
     warnings: tuple[str, ...]
     first_name: str | None
     last_name: str | None
-
-
-def _month(value: date | None) -> str | None:
-    return value.strftime("%m/%Y") if value is not None else None
-
-
-def _period(start: date | None, end: date | None, current: bool) -> str | None:
-    start_text, end_text = _month(start), _month(end)
-    if current:
-        return f"seit {start_text}" if start_text else "aktuell"
-    if start_text and end_text:
-        return f"{start_text} – {end_text}"
-    return start_text or end_text
 
 
 def _join(*parts: str | None, sep: str = ", ") -> str:
@@ -100,7 +90,7 @@ def _header(cv: TailoredCVDraft, identity: ApplicationIdentity | None, contact_o
     else:
         residence = _join(
             header.location_city.value if header.location_city else None,
-            header.location_country.value if header.location_country else None,
+            public_phrase(header.location_country.value) if header.location_country else None,
         )
         if residence:
             blocks.append(Block("PARAGRAPH", f"Wohnort: {residence}"))
@@ -109,12 +99,17 @@ def _header(cv: TailoredCVDraft, identity: ApplicationIdentity | None, contact_o
 
 def _experience(item: CVExperienceItem) -> list[Block]:
     blocks = [Block("SUBHEADING", _join(item.job_title, item.company, sep=" – "))]
-    meta = _join(_period(item.start_date, item.end_date, item.is_current), item.location)
+    period = public_period(
+        item.start_date, item.end_date, current=item.is_current, description=item.description
+    )
+    meta = _join(period, item.location)
     if meta:
         blocks.append(Block("PARAGRAPH", meta))
-    if item.description:
-        blocks.append(Block("PARAGRAPH", item.description))
-    blocks += [Block("BULLET", text) for text in (*item.responsibilities, *item.achievements)]
+    description = public_description(item.description)
+    if description:
+        blocks.append(Block("PARAGRAPH", description))
+    bullets = (*item.responsibilities, *item.achievements)
+    blocks += [Block("BULLET", text) for text in public_list(bullets)]
     if item.technologies:
         blocks.append(Block("PARAGRAPH", "Technologien: " + ", ".join(item.technologies)))
     return blocks
@@ -122,12 +117,13 @@ def _experience(item: CVExperienceItem) -> list[Block]:
 
 def _project(item: CVProjectItem) -> list[Block]:
     blocks = [Block("SUBHEADING", item.name)]
-    meta = _join(item.role, _period(item.start_date, item.end_date, False))
+    meta = _join(item.role, public_period(item.start_date, item.end_date))
     if meta:
         blocks.append(Block("PARAGRAPH", meta))
-    if item.description:
-        blocks.append(Block("PARAGRAPH", item.description))
-    blocks += [Block("BULLET", text) for text in item.highlights]
+    description = public_description(item.description)
+    if description:
+        blocks.append(Block("PARAGRAPH", description))
+    blocks += [Block("BULLET", text) for text in public_list(item.highlights)]
     if item.technologies:
         blocks.append(Block("PARAGRAPH", "Technologien: " + ", ".join(item.technologies)))
     for label, url in (("Repository", item.repository_url), ("Demo", item.demo_url)):
@@ -141,7 +137,7 @@ def _education(item: CVEducationItem) -> list[Block]:
     subject = _join(item.degree, item.program, item.field_of_study)
     if subject:
         blocks.append(Block("PARAGRAPH", subject))
-    meta = _join(_period(item.start_date, item.end_date, False), item.location)
+    meta = _join(public_period(item.start_date, item.end_date), item.location)
     if meta:
         blocks.append(Block("PARAGRAPH", meta))
     if not item.completed:
@@ -153,8 +149,8 @@ def _section(cv: TailoredCVDraft, name: str) -> list[Block]:
     body: list[Block] = []
     if name == "SUMMARY" and cv.professional_summary:
         body = [Block("PARAGRAPH", cv.professional_summary.value)]
-    elif name == "SKILLS" and cv.skills:
-        body = [Block("PARAGRAPH", ", ".join(skill.text for skill in cv.skills))]
+    elif name == "SKILLS" and (skills := public_list(skill.text for skill in cv.skills)):
+        body = [Block("PARAGRAPH", ", ".join(skills))]
     elif name == "EXPERIENCE":
         body = [block for item in cv.experience for block in _experience(item)]
     elif name == "PROJECTS":
@@ -165,13 +161,13 @@ def _section(cv: TailoredCVDraft, name: str) -> list[Block]:
         body = [
             Block(
                 "BULLET",
-                _join(item.name, item.issuer, _CERTIFICATION_STATUS.get(item.status, item.status)),
+                _join(item.name, item.issuer, public_certification_status(item.status)),
             )
             for item in cv.certifications
         ]
     elif name == "LANGUAGES":
         body = [
-            Block("BULLET", f"{item.language} – {_LANGUAGE_LEVELS.get(item.level, item.level)}")
+            Block("BULLET", _join(item.language, public_language_level(item.level), sep=" – "))
             for item in cv.languages
         ]
     return [Block("HEADING", _HEADINGS[name]), *body] if body else []
