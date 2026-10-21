@@ -34,6 +34,7 @@ from app.agents.cv_public_text import (
     public_certification_status,
     public_description,
     public_language_level,
+    public_list,
     public_period,
     public_phrase,
     public_proficiency,
@@ -242,7 +243,10 @@ def _section_skills(doc: _Document, snapshot: ReviewSnapshot) -> None:
     for skill in snapshot.cv.skills:
         # V1 quality patch: the CV shows skills as a CV does -- no internal
         # category enum, no UNKNOWN level (see app.agents.cv_public_text).
-        doc.value("• ", public_phrase(skill.text), missing="(ohne Bezeichnung)")
+        text = public_phrase(skill.text)
+        if skill.text.strip() and not text:
+            continue  # internal bookkeeping only: nothing employer-facing
+        doc.value("• ", text, missing="(ohne Bezeichnung)")
         doc.value("Niveau: ", public_proficiency(skill.proficiency), indent="  ")
         if skill.years_experience is not None:
             doc.line(f"  Erfahrung: {skill.years_experience:g} Jahre")
@@ -263,8 +267,8 @@ def _section_experience(doc: _Document, snapshot: ReviewSnapshot) -> None:
         doc.value(
             "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
         )
-        _list(doc, "Aufgabe: ", [public_phrase(text) for text in item.responsibilities], "  ")
-        _list(doc, "Erfolg: ", [public_phrase(text) for text in item.achievements], "  ")
+        _list(doc, "Aufgabe: ", public_list(item.responsibilities), "  ")
+        _list(doc, "Erfolg: ", public_list(item.achievements), "  ")
         _list(doc, "Technologie: ", item.technologies, "  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")
 
@@ -281,7 +285,7 @@ def _section_projects(doc: _Document, snapshot: ReviewSnapshot) -> None:
             "Beschreibung: ", public_description(item.description), multiline=True, indent="  "
         )
         _list(doc, "Technologie: ", item.technologies, "  ")
-        _list(doc, "Highlight: ", [public_phrase(text) for text in item.highlights], "  ")
+        _list(doc, "Highlight: ", public_list(item.highlights), "  ")
         doc.value("Repository: ", item.repository_url, indent="  ")
         doc.value("Demo: ", item.demo_url, indent="  ")
         _list(doc, "Passender Skill: ", item.matched_skills, "  ")

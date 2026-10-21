@@ -9,7 +9,9 @@ an employer. Every employer-facing CV renderer (the DOCX document and the
 operator's review document of exactly that content) goes through this
 module:
 
-- internal/provenance sentences are dropped, never rewritten;
+- internal/provenance sentences are dropped, never rewritten -- from every
+  free-text field alike (descriptions, responsibilities, achievements,
+  highlights, skills): `public_phrase` / `public_list` never return them;
 - a period that the profile records only in such a note is parsed and shown
   in German ("02/2023 – heute"), structured dates always win;
 - enum values are mapped to German or hidden, never printed raw;
@@ -22,6 +24,7 @@ Pure, deterministic, no I/O.
 """
 
 import re
+from collections.abc import Iterable
 from datetime import date
 
 # --- internal notes ---------------------------------------------------------
@@ -116,17 +119,34 @@ def _key(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().rstrip(".").strip()).casefold()
 
 
+def is_internal_text(text: str) -> bool:
+    """True when `text` carries operator bookkeeping (provenance, candidate
+    confirmations, raw enums) rather than CV prose. Matches the metadata
+    patterns only -- ordinary vocabulary such as "internal systems" is not
+    internal text."""
+    return bool(_INTERNAL_SENTENCE_MARKERS.search(text))
+
+
 def public_phrase(text: str) -> str:
-    """The German rendering of one source phrase: the glossary entry when
-    the whole phrase (or each of its sentences) is listed, else verbatim."""
+    """The employer-facing rendering of one source phrase: internal sentences
+    dropped, the rest glossary-mapped (whole phrase or per sentence) or kept
+    verbatim. Empty when nothing employer-facing remains."""
     stripped = text.strip()
+    if not stripped:
+        return ""
     whole = _GLOSSARY.get(_key(stripped))
     if whole is not None:
         return whole + ("." if stripped.endswith(".") else "")
     sentences = _SENTENCE_SPLIT.split(stripped)
     if len(sentences) > 1:
-        return " ".join(public_phrase(sentence) for sentence in sentences)
-    return stripped
+        return " ".join(part for part in map(public_phrase, sentences) if part)
+    return "" if is_internal_text(stripped) else stripped
+
+
+def public_list(values: Iterable[str]) -> list[str]:
+    """`public_phrase` of every item, items with nothing employer-facing left
+    omitted (never rendered as blank bullets)."""
+    return [phrase for phrase in map(public_phrase, values) if phrase]
 
 
 def public_description(text: str | None) -> str | None:
@@ -137,11 +157,11 @@ def public_description(text: str | None) -> str | None:
     kept = [
         sentence.strip()
         for sentence in _SENTENCE_SPLIT.split(text.strip())
-        if sentence.strip() and not _INTERNAL_SENTENCE_MARKERS.search(sentence)
+        if sentence.strip() and not is_internal_text(sentence)
     ]
     if not kept:
         return None
-    return public_phrase(" ".join(kept))
+    return public_phrase(" ".join(kept)) or None
 
 
 def described_period(text: str | None) -> str | None:

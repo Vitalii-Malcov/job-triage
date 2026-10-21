@@ -400,6 +400,8 @@ def _project_highlights(record: ProjectEvidenceRecord, focus: list[str]) -> list
         if focus and not _FOCUS_RELEVANT_HIGHLIGHT.search(highlight):
             continue
         german = public_phrase(highlight)
+        if not german:
+            continue  # internal bookkeeping (app.agents.cv_public_text)
         if german == highlight.strip() and _ENGLISH_MARKERS.search(german):
             continue
         if german not in chosen:

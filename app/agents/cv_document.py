@@ -26,6 +26,7 @@ from app.agents.cv_public_text import (
     public_certification_status,
     public_description,
     public_language_level,
+    public_list,
     public_period,
     public_phrase,
 )
@@ -108,7 +109,7 @@ def _experience(item: CVExperienceItem) -> list[Block]:
     if description:
         blocks.append(Block("PARAGRAPH", description))
     bullets = (*item.responsibilities, *item.achievements)
-    blocks += [Block("BULLET", public_phrase(text)) for text in bullets]
+    blocks += [Block("BULLET", text) for text in public_list(bullets)]
     if item.technologies:
         blocks.append(Block("PARAGRAPH", "Technologien: " + ", ".join(item.technologies)))
     return blocks
@@ -122,7 +123,7 @@ def _project(item: CVProjectItem) -> list[Block]:
     description = public_description(item.description)
     if description:
         blocks.append(Block("PARAGRAPH", description))
-    blocks += [Block("BULLET", public_phrase(text)) for text in item.highlights]
+    blocks += [Block("BULLET", text) for text in public_list(item.highlights)]
     if item.technologies:
         blocks.append(Block("PARAGRAPH", "Technologien: " + ", ".join(item.technologies)))
     for label, url in (("Repository", item.repository_url), ("Demo", item.demo_url)):
@@ -148,8 +149,8 @@ def _section(cv: TailoredCVDraft, name: str) -> list[Block]:
     body: list[Block] = []
     if name == "SUMMARY" and cv.professional_summary:
         body = [Block("PARAGRAPH", cv.professional_summary.value)]
-    elif name == "SKILLS" and cv.skills:
-        body = [Block("PARAGRAPH", ", ".join(public_phrase(skill.text) for skill in cv.skills))]
+    elif name == "SKILLS" and (skills := public_list(skill.text for skill in cv.skills)):
+        body = [Block("PARAGRAPH", ", ".join(skills))]
     elif name == "EXPERIENCE":
         body = [block for item in cv.experience for block in _experience(item)]
     elif name == "PROJECTS":

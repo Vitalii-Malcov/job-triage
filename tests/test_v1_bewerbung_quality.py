@@ -11,6 +11,7 @@ vacancy. Nothing here invents candidate facts.
 """
 
 import asyncio
+import dataclasses
 from datetime import UTC, datetime
 
 from app.agents.bewerbung_renderer import build_evidence, parse_plan, render_draft, resolve_plan
@@ -544,3 +545,169 @@ class TestCoverLetterRelevance:
         text = _letter_text(_generated_letter())
         assert "Deutschkenntnisse auf B1-Niveau" in text
         assert "B2" not in text
+
+
+# --- Codex P1: internal metadata in list fields --------------------------------------
+
+INTERNAL_LIST_VALUE = "Confirmed by candidate: Datenanalyse"
+LEGITIMATE_RESPONSIBILITY = "Betreuung interner IT-Systeme"
+LEGITIMATE_HIGHLIGHT = "Python-basierte Datenverarbeitung"
+
+
+def _cv_with_internal_list_values() -> TailoredCVDraft:
+    cv = _cv()
+    experience = list(cv.experience)
+    experience[0] = experience[0].model_copy(
+        update={
+            "responsibilities": [
+                INTERNAL_LIST_VALUE,
+                *experience[0].responsibilities,
+                LEGITIMATE_RESPONSIBILITY,
+            ],
+            "achievements": ["Per candidate statement: SQL-Erfahrung"],
+        }
+    )
+    projects = list(cv.projects)
+    projects[1] = projects[1].model_copy(
+        update={"highlights": [INTERNAL_LIST_VALUE, LEGITIMATE_HIGHLIGHT]}
+    )
+    return cv.model_copy(update={"experience": experience, "projects": projects})
+
+
+def _leaky_cv_text() -> str:
+    cv = _cv_with_internal_list_values()
+    return "\n".join(block.text for block in build_cv_document(cv, None).blocks)
+
+
+def _leaky_review_text() -> str:
+    snapshot = dataclasses.replace(_snapshot(), cv=_cv_with_internal_list_values())
+    document = render_review_document(snapshot)
+    assert document.decidable
+    return "\n".join(document.bodies)
+
+
+def _leaky_letter_text() -> str:
+    cv, match = _cv_with_internal_list_values(), _match()
+    packet, registry = build_evidence(cv, match, JOB_TITLE, JOB_COMPANY, JOB_DESCRIPTION)
+    plan = parse_plan(asyncio.run(DeterministicBewerbungProvider().generate_plan(packet)))
+    rendered = render_draft(
+        plan,
+        resolve_plan(plan, registry),
+        JOB_TITLE,
+        JOB_COMPANY,
+        "Junior Python Backend Developer",
+        job_description=JOB_DESCRIPTION,
+    )
+    return _letter_text(rendered)
+
+
+class TestInternalMetadataInListFields:
+    def test_cv_document_drops_internal_responsibility_and_highlight(self):
+        text = _leaky_cv_text()
+        assert "Confirmed by candidate" not in text
+        assert "Per candidate" not in text
+        for forbidden in FORBIDDEN_EMPLOYER_FACING:
+            assert forbidden not in text, forbidden
+
+    def test_review_document_drops_internal_responsibility_and_highlight(self):
+        text = _leaky_review_text()
+        assert "Confirmed by candidate" not in text
+        assert "Per candidate" not in text
+
+    def test_letter_drops_internal_project_highlight(self):
+        text = _leaky_letter_text()
+        assert "Confirmed by candidate" not in text
+        assert INTERNAL_LIST_VALUE not in text
+
+    def test_legitimate_list_values_remain_visible(self):
+        for text in (_leaky_cv_text(), _leaky_review_text()):
+            assert LEGITIMATE_RESPONSIBILITY in text
+            assert LEGITIMATE_HIGHLIGHT in text
+            assert "Technischer Support" in text
+
+    def test_mixed_highlight_list_renders_only_legitimate_item(self):
+        cv_bullets = [
+            block.text
+            for block in build_cv_document(_cv_with_internal_list_values(), None).blocks
+            if block.kind == "BULLET"
+        ]
+        assert LEGITIMATE_HIGHLIGHT in cv_bullets
+        assert all(bullet.strip() for bullet in cv_bullets)
+        review = _leaky_review_text()
+        assert f"Highlight: {LEGITIMATE_HIGHLIGHT}" in review
+        assert "Highlight: \n" not in review and not review.rstrip().endswith("Highlight:")
+        assert "Aufgabe: \n" not in review and "Erfolg: \n" not in review
+
+    def test_no_new_candidate_claim_is_introduced(self):
+        cv_text = _leaky_cv_text()
+        baseline = _cv_document_text()
+        assert "SQL-Erfahrung" not in cv_text
+        # Only the explicitly added legitimate values are new.
+        added = set(cv_text.split("\n")) - set(baseline.split("\n"))
+        assert added == {LEGITIMATE_RESPONSIBILITY, LEGITIMATE_HIGHLIGHT}
+
+    def test_letter_highlights_skip_cleanly_when_only_internal_remain(self):
+        cv = _cv_with_internal_list_values()
+        projects = [
+            project.model_copy(update={"highlights": [INTERNAL_LIST_VALUE]})
+            for project in cv.projects
+        ]
+        cv = cv.model_copy(update={"projects": projects})
+        packet, registry = build_evidence(cv, _match(), JOB_TITLE, JOB_COMPANY, JOB_DESCRIPTION)
+        plan = parse_plan(asyncio.run(DeterministicBewerbungProvider().generate_plan(packet)))
+        rendered = render_draft(
+            plan,
+            resolve_plan(plan, registry),
+            JOB_TITLE,
+            JOB_COMPANY,
+            "Junior Python Backend Developer",
+            job_description=JOB_DESCRIPTION,
+        )
+        text = _letter_text(rendered)
+        assert "Confirmed by candidate" not in text
+        assert "mit den Schwerpunkten  " not in text and "Schwerpunkten ." not in text
+        assert "Schwerpunkten" not in text
+
+
+class TestPublicTextBoundary:
+    def test_is_internal_text_matches_metadata_not_vocabulary(self):
+        from app.agents.cv_public_text import is_internal_text
+
+        for internal in (
+            "Confirmed by candidate: Datenanalyse",
+            "Corrected by candidate 2026-10-20",
+            "Candidate said: SQL",
+            "Candidate statement only",
+            "Per candidate",
+            "Not software-related",
+            "Period per Lebenslauf: 2006–2021",
+            "Source: CV upload",
+            "from runtime profile",
+            "provenance=manual",
+            "verified_at 2026-10-20",
+            "UNKNOWN",
+        ):
+            assert is_internal_text(internal), internal
+        for legitimate in (
+            "Betreuung interner IT-Systeme",
+            "Setup, maintenance and documentation of workstations and internal systems",
+            "Participation in internal IT processes",
+            "Python-basierte Datenverarbeitung",
+            "Data source integration",
+            "Unknown-Fehler analysiert",
+        ):
+            assert not is_internal_text(legitimate), legitimate
+
+    def test_public_list_drops_internal_and_blank_items(self):
+        from app.agents.cv_public_text import public_list
+
+        assert public_list(
+            [INTERNAL_LIST_VALUE, "  ", "Technical support", LEGITIMATE_HIGHLIGHT]
+        ) == ["Technischer Support", LEGITIMATE_HIGHLIGHT]
+        assert public_list([INTERNAL_LIST_VALUE]) == []
+
+    def test_public_phrase_never_passes_internal_text(self):
+        from app.agents.cv_public_text import public_phrase
+
+        assert public_phrase(INTERNAL_LIST_VALUE) == ""
+        assert public_phrase("Technical support. Confirmed by candidate.") == "Technischer Support."
