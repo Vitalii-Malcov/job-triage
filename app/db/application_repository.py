@@ -99,6 +99,15 @@ def get_application_by_source_reference(
     ).one_or_none()
 
 
+def has_application_for_job(db: Session, job_id: int) -> bool:
+    """Whether any application row points at this local `JobRecord`
+    (`job_id` is informational, not a foreign key -- see ApplicationRecord)."""
+    return (
+        db.scalar(select(ApplicationRecord.id).where(ApplicationRecord.job_id == job_id).limit(1))
+        is not None
+    )
+
+
 MAX_PAGE_SIZE = 500
 DEFAULT_SCAN_BATCH_SIZE = 200
 
