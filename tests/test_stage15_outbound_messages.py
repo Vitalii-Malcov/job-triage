@@ -356,7 +356,19 @@ def test_cli_record_outbound_blank_actor_or_reason_refused_in_dry_run_too(
     assert _outbound_rows(path) == []
 
 
-def test_cli_record_outbound_partial_failure_is_reported_not_raised(cli_db, capsys, monkeypatch):
+@pytest.mark.parametrize(
+    ("make_error", "name"),
+    [
+        (ApplicationConcurrencyError, "ApplicationConcurrencyError"),
+        (
+            lambda app_id: sqlalchemy.exc.IntegrityError("INSERT", {}, Exception("sequence")),
+            "IntegrityError",
+        ),
+    ],
+)
+def test_cli_record_outbound_partial_failure_is_reported_not_raised(
+    cli_db, capsys, monkeypatch, make_error, name
+):
     # Codex P2: a later per-application failure must not leave an unreported
     # partial result or escape as a traceback.
     path, ids = cli_db
@@ -370,14 +382,14 @@ def test_cli_record_outbound_partial_failure_is_reported_not_raised(cli_db, caps
 
     def flaky(self, db, application_id, **kwargs):
         if application_id == ids[1]:
-            raise ApplicationConcurrencyError(application_id)
+            raise make_error(application_id)
         return original(self, db, application_id, **kwargs)
 
     monkeypatch.setattr(ApplicationTracker, "record_outbound_message", flaky)
     assert cli.run(_cli_args(path, all_ids, "--apply")) == 1
     out, err = capsys.readouterr()
     assert out.count("APPLIED:") == 1
-    assert f"FAILED: application {ids[1]}: ApplicationConcurrencyError" in err
+    assert f"FAILED: application {ids[1]}: {name}" in err
     assert f"PARTIAL: applied=[{ids[0]}] failed=[{ids[1]}] unprocessed=[{third.id}]" in err
     assert [r[0] for r in _outbound_rows(path)] == [ids[0]]
     monkeypatch.setattr(ApplicationTracker, "record_outbound_message", original)

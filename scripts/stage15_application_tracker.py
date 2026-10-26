@@ -51,6 +51,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -716,7 +717,7 @@ def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int
     application): an already recorded pair is reported and skipped.
 
     Each application is committed on its own. When a write fails part-way
-    (e.g. a concurrent update), processing stops, the already committed
+    (a concurrent update or event-sequence collision), processing stops, the already committed
     applications stay recorded, and a summary of applied / failed /
     unprocessed ids is printed with exit 1; a re-run completes the rest."""
     from app.db import application_repository as app_repo
@@ -764,6 +765,9 @@ def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int
             ApplicationConcurrencyError,
             ApplicationInputError,
             ApplicationNotFoundError,
+            # A competing write can take the same event sequence; the
+            # tracker has rolled back already (Codex P2 re-review).
+            IntegrityError,
         ) as exc:
             unprocessed = [a.id for a in applications[position + 1 :]]
             print(f"FAILED: application {app.id}: {type(exc).__name__}: {exc}", file=sys.stderr)
