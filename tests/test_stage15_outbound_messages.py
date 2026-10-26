@@ -25,6 +25,7 @@ from app.models.application_lifecycle import ApplicationLifecycleStatus as S
 from app.models.application_lifecycle import OutboundMessageKind as K
 from app.models.telegram_operator import TelegramDeliveryState
 from app.services.application_tracker import (
+    ApplicationConcurrencyError,
     ApplicationInputError,
     ApplicationTracker,
     outbound_correlation_key,
@@ -336,6 +337,55 @@ def test_cli_record_outbound_refuses_bad_input_before_any_write(cli_db, capsys):
     unknown = _cli_args(path, (*ids, 999), "--apply")
     assert cli.run(unknown) == 1
     assert _outbound_rows(path) == []
+
+
+@pytest.mark.parametrize("flag", ["--actor", "--reason"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_cli_record_outbound_blank_actor_or_reason_refused_in_dry_run_too(
+    cli_db, capsys, flag, apply
+):
+    # Codex P2: the dry run must refuse exactly what --apply refuses.
+    path, ids = cli_db
+    args = _cli_args(path, ids, *(["--apply"] if apply else []))
+    args[args.index(flag) + 1] = "   "
+    assert cli.run(args) == 1
+    out, err = capsys.readouterr()
+    assert "would record" not in out
+    assert "APPLIED" not in out
+    assert "is required" in err
+    assert _outbound_rows(path) == []
+
+
+def test_cli_record_outbound_partial_failure_is_reported_not_raised(cli_db, capsys, monkeypatch):
+    # Codex P2: a later per-application failure must not leave an unreported
+    # partial result or escape as a traceback.
+    path, ids = cli_db
+    engine = create_engine(f"sqlite:///{path}")
+    third_db = sessionmaker(engine)()
+    third = _create(third_db, ref="R3", key="portal-submission:r3", role="Third")
+    all_ids = (*ids, third.id)
+    third_db.close()
+    engine.dispose()
+    original = ApplicationTracker.record_outbound_message
+
+    def flaky(self, db, application_id, **kwargs):
+        if application_id == ids[1]:
+            raise ApplicationConcurrencyError(application_id)
+        return original(self, db, application_id, **kwargs)
+
+    monkeypatch.setattr(ApplicationTracker, "record_outbound_message", flaky)
+    assert cli.run(_cli_args(path, all_ids, "--apply")) == 1
+    out, err = capsys.readouterr()
+    assert out.count("APPLIED:") == 1
+    assert f"FAILED: application {ids[1]}: ApplicationConcurrencyError" in err
+    assert f"PARTIAL: applied=[{ids[0]}] failed=[{ids[1]}] unprocessed=[{third.id}]" in err
+    assert [r[0] for r in _outbound_rows(path)] == [ids[0]]
+    monkeypatch.setattr(ApplicationTracker, "record_outbound_message", original)
+    assert cli.run(_cli_args(path, all_ids, "--apply")) == 0
+    out = capsys.readouterr().out
+    assert out.count("ALREADY_RECORDED") == 1
+    assert out.count("APPLIED:") == 2
+    assert [r[0] for r in _outbound_rows(path)] == sorted(all_ids)
 
 
 # --- migration ------------------------------------------------------------------------

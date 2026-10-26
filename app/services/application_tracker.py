@@ -124,11 +124,16 @@ def validate_outbound_message(
     message_id: str,
     recipient: str,
     sent_at: datetime,
+    actor: str,
+    reason: str,
     sender: str | None = None,
     now: datetime | None = None,
 ) -> tuple[str, str, datetime]:
     """Normalized (message_id, recipient, sent_at UTC) of a sent message, or
-    ApplicationInputError. Shared by the tracker and the CLI dry run."""
+    ApplicationInputError. Shared by the tracker and the CLI dry run, so a
+    dry run refuses exactly what --apply would refuse."""
+    _require_text("actor", actor, MAX_ACTOR_LENGTH)
+    _require_text("reason", reason, MAX_REASON_LENGTH)
     message = _require_text("message_id", message_id, MAX_MESSAGE_ID_LENGTH)
     if not _MESSAGE_ID.match(message):
         raise ApplicationInputError("message_id must look like <local@domain>")
@@ -491,9 +496,14 @@ class ApplicationTracker:
         was recorded for (informational, stored in metadata).
         """
         message, to, when = validate_outbound_message(
-            message_id=message_id, recipient=recipient, sent_at=sent_at, sender=sender, now=now
+            message_id=message_id,
+            recipient=recipient,
+            sent_at=sent_at,
+            actor=actor,
+            reason=reason,
+            sender=sender,
+            now=now,
         )
-        _require_text("reason", reason, MAX_REASON_LENGTH)
         metadata: dict[str, Any] = {
             "direction": "OUTBOUND",
             "kind": OutboundMessageKind(kind).value,

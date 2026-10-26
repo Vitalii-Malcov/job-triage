@@ -63,6 +63,7 @@ from app.models.application_lifecycle import (
     OutboundMessageKind,
 )
 from app.services.application_tracker import (
+    ApplicationConcurrencyError,
     ApplicationInputError,
     ApplicationNotFoundError,
     ApplicationTracker,
@@ -712,7 +713,12 @@ def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int
     event on every given application. Sends nothing; never changes a status.
     Every input check and every application lookup runs for the dry run and
     --apply alike, before any write. Idempotent per (Message-ID,
-    application): an already recorded pair is reported and skipped."""
+    application): an already recorded pair is reported and skipped.
+
+    Each application is committed on its own. When a write fails part-way
+    (e.g. a concurrent update), processing stops, the already committed
+    applications stay recorded, and a summary of applied / failed /
+    unprocessed ids is printed with exit 1; a re-run completes the rest."""
     from app.db import application_repository as app_repo
 
     ids = list(dict.fromkeys(args.application_id))
@@ -720,10 +726,13 @@ def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int
         message_id=args.message_id,
         recipient=args.recipient,
         sent_at=_sent_at(args.sent_at),
+        actor=args.actor,
+        reason=args.reason,
         sender=args.sender,
     )
     applications = [tracker.get_application(session, i) for i in ids]
-    for app in applications:
+    applied: list[int] = []
+    for position, app in enumerate(applications):
         key = outbound_correlation_key(message_id, app.id)
         if app_repo.get_event_by_correlation_key(session, key) is not None:
             print(f"ALREADY_RECORDED: application {app.id} {app.company_name} (nothing written)")
@@ -735,21 +744,37 @@ def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int
                 f"{app.company_name} [{app.current_status.value} unchanged] (nothing written)"
             )
             continue
-        outcome = tracker.record_outbound_message(
-            session,
-            app.id,
-            message_id=message_id,
-            recipient=recipient,
-            channel=ApplicationChannel(args.channel),
-            sent_at=sent_at,
-            kind=OutboundMessageKind(args.kind),
-            actor=args.actor,
-            reason=args.reason,
-            sender=args.sender,
-            subject=args.subject,
-            evidence_summary=args.evidence,
-            related_application_ids=tuple(ids),
-        )
+        try:
+            outcome = tracker.record_outbound_message(
+                session,
+                app.id,
+                message_id=message_id,
+                recipient=recipient,
+                channel=ApplicationChannel(args.channel),
+                sent_at=sent_at,
+                kind=OutboundMessageKind(args.kind),
+                actor=args.actor,
+                reason=args.reason,
+                sender=args.sender,
+                subject=args.subject,
+                evidence_summary=args.evidence,
+                related_application_ids=tuple(ids),
+            )
+        except (
+            ApplicationConcurrencyError,
+            ApplicationInputError,
+            ApplicationNotFoundError,
+        ) as exc:
+            unprocessed = [a.id for a in applications[position + 1 :]]
+            print(f"FAILED: application {app.id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(
+                f"PARTIAL: applied={applied} failed=[{app.id}] unprocessed={unprocessed}"
+                " (applied rows stay recorded; re-run to complete the rest)",
+                file=sys.stderr,
+            )
+            return 1
+        if not outcome.duplicate:
+            applied.append(app.id)
         state = "DUPLICATE" if outcome.duplicate else "APPLIED"
         print(
             f"{state}: application {outcome.application.id} "
