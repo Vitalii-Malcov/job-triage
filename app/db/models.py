@@ -3010,12 +3010,14 @@ APPLICATION_EVENT_CHECKS: dict[str, str] = {
     ),
     "ck_application_events_sequence_positive": "sequence >= 1",
     # A status event always names its target; an inbound-message event never
-    # changes status; only CREATED has no previous status.
+    # changes status; an outbound-message event names no status at all; only
+    # CREATED has no previous status.
     "ck_application_events_shape": (
         "(event_type = 'CREATED' AND old_status IS NULL AND new_status IS NOT NULL) OR "
         "(event_type IN ('STATUS_CHANGED', 'STATUS_OVERRIDDEN') "
         "AND old_status IS NOT NULL AND new_status IS NOT NULL) OR "
-        "(event_type = 'INBOUND_MESSAGE' AND new_status IS NULL)"
+        "(event_type = 'INBOUND_MESSAGE' AND new_status IS NULL) OR "
+        "(event_type = 'OUTBOUND_MESSAGE' AND old_status IS NULL AND new_status IS NULL)"
     ),
     "ck_application_events_override_reason": (
         "event_type <> 'STATUS_OVERRIDDEN' OR (reason IS NOT NULL AND reason <> '')"

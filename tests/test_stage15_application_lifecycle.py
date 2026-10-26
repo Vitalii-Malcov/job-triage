@@ -536,5 +536,16 @@ def test_model_checks_match_the_frozen_migration_vocabulary():
     spec.loader.exec_module(module)
     assert module._STATUSES == tuple(s.value for s in S)
     assert module._CHANNELS == tuple(c.value for c in C)
-    assert module._EVENT_TYPES == tuple(t.value for t in T)
     assert module._ORIGINS == tuple(o.value for o in O)
+    # Event types grew in f4b8d2a6c9e1 (OUTBOUND_MESSAGE): its frozen OLD set
+    # must equal the original migration's, its NEW set the live enum, and its
+    # NEW shape the model CHECK.
+    path = PROJECT_ROOT / "alembic/versions/f4b8d2a6c9e1_application_events_outbound_message.py"
+    spec = importlib.util.spec_from_file_location("outbound_migration", path)
+    outbound = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(outbound)
+    assert outbound._OLD_EVENT_TYPES == module._EVENT_TYPES
+    assert outbound._NEW_EVENT_TYPES == tuple(t.value for t in T)
+    from app.db.models import APPLICATION_EVENT_CHECKS
+
+    assert outbound._NEW_SHAPE == APPLICATION_EVENT_CHECKS["ck_application_events_shape"]

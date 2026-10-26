@@ -3216,6 +3216,7 @@ def test_alembic_has_exactly_one_head() -> None:
     heads = ScriptDirectory.from_config(cfg).get_heads()
     assert len(heads) == 1
     # Stage 16: Telegram operator control tables (e3a9c5d7f2b4, on top of
-    # the Stage 15 remediation c8e4a2f6d1b9)
+    # the Stage 15 remediation c8e4a2f6d1b9), then OUTBOUND_MESSAGE application
+    # events (f4b8d2a6c9e1)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "e3a9c5d7f2b4"
+    assert heads[0] == "f4b8d2a6c9e1"

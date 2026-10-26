@@ -238,8 +238,9 @@ def test_repository_head_is_the_application_lifecycle_head() -> None:
     # update the CI literal (see test_real_workflow_satisfies_the_gate).
     # Stage 15: b5d2e8f4a1c7 (application lifecycle tables), then the
     # remediation c8e4a2f6d1b9 (application_events append-only triggers);
-    # Stage 16: e3a9c5d7f2b4 (Telegram operator control tables).
-    assert _repository_head() == "e3a9c5d7f2b4"
+    # Stage 16: e3a9c5d7f2b4 (Telegram operator control tables), then
+    # f4b8d2a6c9e1 (OUTBOUND_MESSAGE application events).
+    assert _repository_head() == "f4b8d2a6c9e1"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

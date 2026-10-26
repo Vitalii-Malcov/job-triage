@@ -45,7 +45,7 @@ TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION = "b5d2e8f4a1c7"
 PREVIOUS = "a7c3e9f1b2d4"
-HEAD = "e3a9c5d7f2b4"
+HEAD = "f4b8d2a6c9e1"
 SUBMITTED_AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
 
 pytestmark = pytest.mark.skipif(
