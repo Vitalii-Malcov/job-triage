@@ -286,6 +286,30 @@ def test_C_canonical_path_spellings_are_all_refused(fake_canonical, capsys, monk
         assert _refused(capsys, spelling), spelling
 
 
+def test_C_backslash_spelling_is_checked_as_a_separator_on_every_os():
+    """Linux CI baseline failure: on POSIX `\\` is a literal file-name
+    character, so `canon\\x.db` only reached "file does not exist". Both OS
+    conventions are exercised here regardless of the host OS."""
+    backslashed = Path("canon\\stage14b_canonical_v12.db")
+    # Windows convention: `\\` is already a separator, nothing to add.
+    assert cli._spellings(backslashed, sep="\\") == (backslashed,)
+    # POSIX convention: the `/` reading is checked as well.
+    posix = cli._spellings(backslashed, sep="/")
+    assert posix[0] == backslashed
+    assert posix[-1] == Path("canon/stage14b_canonical_v12.db")
+
+
+def test_C_backslash_spelling_refused_before_any_engine(fake_canonical, capsys, monkeypatch):
+    monkeypatch.chdir(fake_canonical.parent.parent)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("engine created for the protected canonical database")
+
+    monkeypatch.setattr(cli, "create_engine", _forbidden)
+    for spelling in ("canon\\stage14b_canonical_v12.db", ".\\canon\\.\\stage14b_canonical_v12.db"):
+        assert _refused(capsys, spelling), spelling
+
+
 def test_C_canonical_aliases_are_refused(fake_canonical, capsys, tmp_path):
     hard = tmp_path / "hardlink.db"
     os.link(fake_canonical, hard)

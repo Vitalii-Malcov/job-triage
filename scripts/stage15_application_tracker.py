@@ -83,13 +83,23 @@ def _identity(path: Path) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+def _spellings(path: Path, sep: str = os.sep) -> tuple[Path, ...]:
+    """`path`, plus -- where `\\` is NOT a separator (POSIX) -- the same
+    spelling with `\\` read as `/`. On POSIX `canon\\x.db` is a literal file
+    name; refusing it as well keeps the guard identical on every OS."""
+    raw = str(path)
+    if sep != "\\" and "\\" in raw:
+        return (path, Path(raw.replace("\\", "/")))
+    return (path,)
+
+
 def is_protected_database(path: Path) -> bool:
     """True when `path` names a protected database by any spelling or alias:
-    same normalized real path (relative, `..`, `/` vs `\\`, case, symlink,
-    junction), or the same file (`samefile`: hard links)."""
-    target = _identity(path)
+    same normalized real path (relative, `..`, `/` vs `\\` on every OS, case,
+    symlink, junction), or the same file (`samefile`: hard links)."""
+    targets = {_identity(spelling) for spelling in _spellings(path)}
     for protected in PROTECTED_DATABASE_PATHS:
-        if target == _identity(protected):
+        if _identity(protected) in targets:
             return True
         try:
             if path.exists() and protected.exists() and os.path.samefile(path, protected):

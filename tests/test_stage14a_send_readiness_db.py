@@ -13,6 +13,7 @@ import json
 import os
 import socket
 from datetime import UTC, datetime
+from urllib.parse import unquote
 
 import pytest
 from sqlalchemy import create_engine, event, insert, select, update
@@ -538,6 +539,35 @@ def test_cli_rejects_network_capable_or_writable_urls_before_engine(monkeypatch,
 )
 def test_cli_accepts_local_readonly_sqlite_uri(url):
     assert cli.validate_readonly_sqlite_url(url) == url
+
+
+_PERCENT_ENCODED_URLS = [
+    "sqlite:///file:pilot%2Edb?mode=ro&uri=true",
+    "sqlite:///file:%2F%2Ffileserver/share/pilot.db?mode=ro&uri=true",
+    "sqlite:///file:%5C%5Cfileserver%5Cshare%5Cpilot.db?mode=ro&uri=true",
+    "sqlite:///file:%3Amemory%3A?mode=ro&uri=true",
+    "sqlite:///file:pilot.db?mode=ro&uri=true&%76fs=unix",
+    "sqlite:///file:pilot.db?mode=%72o&uri=true",
+]
+
+
+@pytest.mark.parametrize("url", _PERCENT_ENCODED_URLS)
+def test_percent_encoded_urls_refused_whatever_sqlalchemy_decodes(monkeypatch, url):
+    """SQLAlchemy 2.0 keeps `%XX` in the database part, 2.1+ decodes it in
+    `make_url` (the Linux CI baseline failure). Refusal must not depend on
+    the installed version: run both behaviours on every OS."""
+    with pytest.raises(cli.UnsafeDatabaseUrlError):
+        cli.validate_readonly_sqlite_url(url)
+
+    real_make_url = cli.make_url
+
+    def _decoding_make_url(raw):  # SQLAlchemy 2.1+ behaviour
+        parsed = real_make_url(raw)
+        return parsed.set(database=unquote(parsed.database or ""))
+
+    monkeypatch.setattr(cli, "make_url", _decoding_make_url)
+    with pytest.raises(cli.UnsafeDatabaseUrlError):
+        cli.validate_readonly_sqlite_url(url)
 
 
 def test_cli_runs_read_only_against_a_real_db(factory, seeded, db_path, capsys, monkeypatch):
