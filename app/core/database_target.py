@@ -200,27 +200,29 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
 
 
 def requests_memory_mode(database_url: str) -> bool:
-    """True if a SQLite URL asks for `mode=memory` in any spelling: as a URL
-    query parameter, or inside the query part of a `file:` URI filename.
-    Never true for PostgreSQL or for a plain path that merely contains the
-    text (e.g. a directory named "mode=memory")."""
+    """True if a SQLite URL could make SQLite open an in-memory database.
+
+    Deliberately conservative instead of re-implementing how the dialect
+    re-assembles its URI (it writes query values back unescaped, so an
+    encoded `&` or `#` inside a value can smuggle `mode=memory` past an exact
+    key/value check): any "memory" in the URL's query -- literal or
+    percent-decoded, any key, any value -- or in the query part of a `file:`
+    URI filename counts. Never true for PostgreSQL or for a plain path that
+    merely contains the text (e.g. a directory named "mode=memory")."""
     try:
         url = make_url(database_url)
     except (ArgumentError, ValueError):
         return False
     if url.get_backend_name() != "sqlite":
         return False
-    modes = url.query.get("mode")
-    modes = modes if isinstance(modes, tuple) else (modes,)
-    if any(str(mode).casefold() == "memory" for mode in modes if mode is not None):
-        return True
+    texts = []
+    for key, value in url.query.items():
+        values = value if isinstance(value, tuple) else (value,)
+        texts += [str(key), *(str(v) for v in values)]
     database = url.database or ""
     if database.startswith("file:") and "?" in database:
-        uri_query = database.split("?", 1)[1]
-        return any(
-            part.casefold() == "mode=memory" for part in uri_query.replace(";", "&").split("&")
-        )
-    return False
+        texts.append(database.split("?", 1)[1])
+    return any("memory" in unquote(text).casefold() for text in texts)
 
 
 def parse_role(raw: str | None) -> DatabaseRole | None:

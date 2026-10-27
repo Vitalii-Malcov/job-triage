@@ -294,3 +294,20 @@ def test_a_remote_file_uri_authority_is_refused_for_every_role():
     for role in ("", "test", "production"):
         with pytest.raises(DatabaseTargetError):
             check_database_target(_settings(url, role))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "uri=true&mode=memory%26cache=shared",  # encoded separator (Codex round 8)
+        "uri=true&mode=memory%23x",  # encoded fragment
+        "uri=true&mode=%6Demory",  # encoded letters
+        "uri=true&cache=shared%26mode=memory",  # smuggled through another key
+    ],
+)
+def test_encoded_memory_mode_spellings_are_refused_for_protected_files(monkeypatch, query):
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///file:runtime/job_triage_runtime.db?{query}"
+    for role in ("", "production", "test"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))
