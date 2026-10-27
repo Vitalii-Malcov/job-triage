@@ -14,10 +14,17 @@ Record a submission the operator made by hand (portal / e-mail / job board):
                      --channel CH --submitted-at ISO8601 --actor A --evidence TEXT
                      [--job-id N] [--location L] [--destination-url U]
                      [--employer-domain D ...] [--confirm-distinct-from ID ...] [--apply]
+Record a service mail the candidate ALREADY sent (e.g. a phone correction);
+the status, follow-up date and employer-contact time never change:
+                 record-outbound --application-id ID [--application-id ID ...]
+                     --message-id "<id@host>" --recipient ADDR --channel CH
+                     --sent-at ISO8601 --kind K --actor A --reason R
+                     [--sender ADDR] [--subject S] [--evidence TEXT] [--apply]
 State changes:   transition ID STATUS --actor A --reason R [--apply]
                  override   ID STATUS --actor A --reason R [--apply]
 
-**Safe by default.** `process-gmail`, `transition` and `override` are DRY RUNS
+**Safe by default.** `process-gmail`, `record-outbound`, `transition` and
+`override` are DRY RUNS
 unless `--apply` is given; a dry run writes nothing. `check-job` is read-only
 and exits 3 when the vacancy was already applied to. Gmail access is read-only
 IMAP (`--source imap`) or the already-synced `gmail_messages` table
@@ -44,6 +51,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -53,11 +61,15 @@ from app.models.application_lifecycle import (
     ApplicationChannel,
     ApplicationEventOrigin,
     ApplicationLifecycleStatus,
+    OutboundMessageKind,
 )
 from app.services.application_tracker import (
+    ApplicationConcurrencyError,
     ApplicationInputError,
     ApplicationNotFoundError,
     ApplicationTracker,
+    outbound_correlation_key,
+    validate_outbound_message,
 )
 
 try:
@@ -220,6 +232,20 @@ def _event_row(event) -> dict:
         "reason": event.reason,
         "summary": event.evidence_summary,
         "correlation": (event.correlation_key or "")[:24] or None,
+        **_outbound_detail(event),
+    }
+
+
+def _outbound_detail(event) -> dict:
+    """Recipient, Message-ID and purpose of an OUTBOUND_MESSAGE row (only)."""
+    if event.event_type.value != "OUTBOUND_MESSAGE":
+        return {}
+    meta = event.metadata or {}
+    return {
+        "kind": meta.get("kind"),
+        "recipient": meta.get("recipient"),
+        "channel": meta.get("channel"),
+        "message_id": meta.get("message_id"),
     }
 
 
@@ -339,6 +365,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gmail.add_argument("--since", default=None, help="YYYY-MM-DD (UTC); default: 30 days")
     gmail.add_argument("--apply", action="store_true", help="write results (default: dry run)")
+    outbound = sub.add_parser("record-outbound")
+    outbound.add_argument(
+        "--application-id",
+        type=int,
+        action="append",
+        required=True,
+        help="repeat when one mail concerns several applications",
+    )
+    for flag in ("--message-id", "--recipient", "--actor", "--reason"):
+        outbound.add_argument(flag, required=True)
+    outbound.add_argument("--channel", required=True, choices=[c.value for c in ApplicationChannel])
+    outbound.add_argument("--sent-at", required=True, help="ISO 8601 with UTC offset")
+    outbound.add_argument("--kind", required=True, choices=[k.value for k in OutboundMessageKind])
+    outbound.add_argument("--sender", default=None)
+    outbound.add_argument("--subject", default=None)
+    outbound.add_argument("--evidence", default=None)
+    outbound.add_argument("--apply", action="store_true", help="write (default: dry run)")
     for name in ("transition", "override"):
         cmd = sub.add_parser(name)
         cmd.add_argument("application_id", type=int)
@@ -394,6 +437,8 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
             return _check_job(session, args)
         elif args.command == "record-submission":
             return _record_submission(session, tracker, args)
+        elif args.command == "record-outbound":
+            return _record_outbound(session, tracker, args)
         elif args.command == "process-gmail":
             if settings is None:
                 from app.core.config import Settings
@@ -661,6 +706,95 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         f"[{outcome.application.current_status.value}] next follow-up "
         f"{outcome.application.next_followup_at}"
     )
+    return 0
+
+
+def _sent_at(raw: str) -> datetime:
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        raise TargetRefusedError("--sent-at must be ISO 8601") from None
+    if value.tzinfo is None:
+        raise TargetRefusedError("--sent-at needs an explicit UTC offset (e.g. ...Z)")
+    return value
+
+
+def _record_outbound(session: Session, tracker: ApplicationTracker, args) -> int:
+    """Record ONE mail the candidate already sent as an OUTBOUND_MESSAGE
+    event on every given application. Sends nothing; never changes a status.
+    Every input check and every application lookup runs for the dry run and
+    --apply alike, before any write. Idempotent per (Message-ID,
+    application): an already recorded pair is reported and skipped.
+
+    Each application is committed on its own. When a write fails part-way
+    (a concurrent update or event-sequence collision), processing stops, the already committed
+    applications stay recorded, and a summary of applied / failed /
+    unprocessed ids is printed with exit 1; a re-run completes the rest."""
+    from app.db import application_repository as app_repo
+
+    ids = list(dict.fromkeys(args.application_id))
+    message_id, recipient, sent_at = validate_outbound_message(
+        message_id=args.message_id,
+        recipient=args.recipient,
+        sent_at=_sent_at(args.sent_at),
+        actor=args.actor,
+        reason=args.reason,
+        sender=args.sender,
+    )
+    applications = [tracker.get_application(session, i) for i in ids]
+    applied: list[int] = []
+    for position, app in enumerate(applications):
+        key = outbound_correlation_key(message_id, app.id)
+        if app_repo.get_event_by_correlation_key(session, key) is not None:
+            print(f"ALREADY_RECORDED: application {app.id} {app.company_name} (nothing written)")
+            continue
+        if not args.apply:
+            print(
+                f"DRY RUN: would record OUTBOUND_MESSAGE {args.kind} to {recipient} "
+                f"{message_id} at {sent_at.isoformat()} on application {app.id} "
+                f"{app.company_name} [{app.current_status.value} unchanged] (nothing written)"
+            )
+            continue
+        try:
+            outcome = tracker.record_outbound_message(
+                session,
+                app.id,
+                message_id=message_id,
+                recipient=recipient,
+                channel=ApplicationChannel(args.channel),
+                sent_at=sent_at,
+                kind=OutboundMessageKind(args.kind),
+                actor=args.actor,
+                reason=args.reason,
+                sender=args.sender,
+                subject=args.subject,
+                evidence_summary=args.evidence,
+                related_application_ids=tuple(ids),
+            )
+        except (
+            ApplicationConcurrencyError,
+            ApplicationInputError,
+            ApplicationNotFoundError,
+            # A competing write can take the same event sequence; the
+            # tracker has rolled back already (Codex P2 re-review).
+            IntegrityError,
+        ) as exc:
+            unprocessed = [a.id for a in applications[position + 1 :]]
+            print(f"FAILED: application {app.id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(
+                f"PARTIAL: applied={applied} failed=[{app.id}] unprocessed={unprocessed}"
+                " (applied rows stay recorded; re-run to complete the rest)",
+                file=sys.stderr,
+            )
+            return 1
+        if not outcome.duplicate:
+            applied.append(app.id)
+        state = "DUPLICATE" if outcome.duplicate else "APPLIED"
+        print(
+            f"{state}: application {outcome.application.id} "
+            f"[{outcome.application.current_status.value}] OUTBOUND_MESSAGE "
+            f"{args.kind} to {recipient}"
+        )
     return 0
 
 

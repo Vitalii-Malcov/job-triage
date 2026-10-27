@@ -26,8 +26,10 @@ asked for something (REQUEST_FOR_INFORMATION) and cleared by the next
 status change.
 """
 
+import hashlib
 import json
 import logging
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -48,6 +50,7 @@ from app.models.application_lifecycle import (
     ApplicationEventOrigin,
     ApplicationEventType,
     ApplicationLifecycleStatus,
+    OutboundMessageKind,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,10 @@ _WAITING_STATUSES = frozenset({S.SUBMITTED, S.RECEIVED, S.UNDER_REVIEW})
 MAX_ACTOR_LENGTH = 100
 MAX_REASON_LENGTH = 1000
 MAX_SUMMARY_LENGTH = 500
+MAX_MESSAGE_ID_LENGTH = 300
+MAX_SUBJECT_LENGTH = 200
+_MESSAGE_ID = re.compile(r"^<[^<>\s@]+@[^<>\s@]+>$")
+_EMAIL = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 
 
 class ApplicationNotFoundError(LookupError):
@@ -99,6 +106,48 @@ def _require_text(name: str, value: str | None, limit: int) -> str:
     if len(value) > limit:
         raise ApplicationInputError(f"{name} is longer than {limit} characters")
     return value.strip()
+
+
+def outbound_correlation_key(message_id: str, application_id: int) -> str:
+    """Deterministic idempotency key of one sent message FOR one application.
+
+    The same Message-ID may legitimately belong to several applications (one
+    mail covering two vacancies of the same employer), so the application id
+    is part of the key; recording the same message for the same application
+    twice is a duplicate."""
+    digest = hashlib.sha256(f"{message_id}|{application_id}".encode()).hexdigest()
+    return f"outbound:{digest[:40]}"
+
+
+def validate_outbound_message(
+    *,
+    message_id: str,
+    recipient: str,
+    sent_at: datetime,
+    actor: str,
+    reason: str,
+    sender: str | None = None,
+    now: datetime | None = None,
+) -> tuple[str, str, datetime]:
+    """Normalized (message_id, recipient, sent_at UTC) of a sent message, or
+    ApplicationInputError. Shared by the tracker and the CLI dry run, so a
+    dry run refuses exactly what --apply would refuse."""
+    _require_text("actor", actor, MAX_ACTOR_LENGTH)
+    _require_text("reason", reason, MAX_REASON_LENGTH)
+    message = _require_text("message_id", message_id, MAX_MESSAGE_ID_LENGTH)
+    if not _MESSAGE_ID.match(message):
+        raise ApplicationInputError("message_id must look like <local@domain>")
+    to = _require_text("recipient", recipient, 254)
+    if not _EMAIL.match(to):
+        raise ApplicationInputError("recipient must be a plain e-mail address")
+    if sender is not None and not _EMAIL.match(sender.strip()):
+        raise ApplicationInputError("sender must be a plain e-mail address")
+    if sent_at.tzinfo is None:
+        raise ApplicationInputError("sent_at needs an explicit timezone")
+    when = ensure_utc(sent_at)
+    if when > (now or _now()):
+        raise ApplicationInputError("sent_at lies in the future")
+    return message, to, when
 
 
 def _bounded(value: str | None, limit: int) -> str | None:
@@ -419,6 +468,71 @@ class ApplicationTracker:
             followup_required=followup_required,
         )
 
+    def record_outbound_message(
+        self,
+        db: Session,
+        application_id: int,
+        *,
+        message_id: str,
+        recipient: str,
+        channel: ApplicationChannel,
+        sent_at: datetime,
+        kind: OutboundMessageKind,
+        actor: str,
+        reason: str,
+        sender: str | None = None,
+        subject: str | None = None,
+        evidence_summary: str | None = None,
+        related_application_ids: tuple[int, ...] = (),
+        now: datetime | None = None,
+    ) -> EventOutcome:
+        """Record a service message the candidate ALREADY sent about an
+        existing application (e.g. a phone-number correction).
+
+        Never sends anything and never changes the status, the follow-up date
+        or `last_employer_contact_at`. Idempotent per (Message-ID,
+        application): a replay returns `duplicate=True` and writes nothing.
+        `related_application_ids` lists the other applications the same mail
+        was recorded for (informational, stored in metadata).
+        """
+        message, to, when = validate_outbound_message(
+            message_id=message_id,
+            recipient=recipient,
+            sent_at=sent_at,
+            actor=actor,
+            reason=reason,
+            sender=sender,
+            now=now,
+        )
+        metadata: dict[str, Any] = {
+            "direction": "OUTBOUND",
+            "kind": OutboundMessageKind(kind).value,
+            "message_id": message,
+            "recipient": to,
+            "channel": ApplicationChannel(channel).value,
+        }
+        if sender:
+            metadata["sender"] = sender.strip()
+        if subject:
+            metadata["subject"] = _bounded(subject.strip(), MAX_SUBJECT_LENGTH)
+        related = sorted({int(i) for i in related_application_ids} - {application_id})
+        if related:
+            metadata["related_application_ids"] = related
+        return self._write(
+            db,
+            application_id,
+            event_type=ApplicationEventType.OUTBOUND_MESSAGE,
+            target=None,
+            origin=ApplicationEventOrigin.OPERATOR,
+            actor=actor,
+            occurred_at=when,
+            correlation_key=outbound_correlation_key(message, application_id),
+            evidence_hash=hashlib.sha256(message.encode()).hexdigest(),
+            evidence_summary=evidence_summary,
+            reason=reason,
+            metadata=metadata,
+        )
+
     # --- internals -----------------------------------------------------------
 
     def _duplicate(
@@ -512,7 +626,10 @@ class ApplicationTracker:
             values["last_employer_contact_at"] = contact_at
         if followup_required:
             values["followup_required"] = True
-        values.update(_followup_values(new_status, record, contact_at))
+        if event_type != ApplicationEventType.OUTBOUND_MESSAGE:
+            # A candidate's own service mail is not employer contact and does
+            # not move the follow-up schedule.
+            values.update(_followup_values(new_status, record, contact_at))
 
         expected_version = record.version
         try:

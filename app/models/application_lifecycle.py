@@ -45,6 +45,18 @@ class ApplicationEventType(StrEnum):
     # Correlated inbound correspondence that did NOT change the status
     # (duplicate-state receipt, request for information, out-of-order mail).
     INBOUND_MESSAGE = "INBOUND_MESSAGE"
+    # A service message the CANDIDATE already sent to the employer about an
+    # existing application (e.g. a corrected phone number). Recorded after
+    # the fact; never changes the status, the follow-up date or the
+    # last-employer-contact time. Nothing in the tracker sends it.
+    OUTBOUND_MESSAGE = "OUTBOUND_MESSAGE"
+
+
+class OutboundMessageKind(StrEnum):
+    """Purpose of one recorded OUTBOUND_MESSAGE (stored in event metadata)."""
+
+    CONTACT_CORRECTION = "CONTACT_CORRECTION"
+    OTHER = "OTHER"
 
 
 class ApplicationEventOrigin(StrEnum):
