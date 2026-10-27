@@ -205,11 +205,11 @@ def test_apply_persists_everything_with_provenance_and_one_revision(db):
     assert config.contact_trust["phone"].confirmed_on == date(2026, 10, 27)
 
     profile = db.get(CandidateProfileRecord, 1)
-    assert json.loads(profile.target_roles_json) == [
-        "Junior Python Developer",
-        "Python Backend Developer",
-        "Technical Application Support",
-    ]
+    # Role priorities live in the search configuration; profile.target_roles
+    # (which drives the Stage 11A/11B collector gates) is left as it was.
+    assert json.loads(profile.target_roles_json) == ["Junior Python Developer"]
+    assert config.search.primary_roles == ["Junior Python Developer", "Python Backend Developer"]
+    assert config.search.secondary_roles == ["Technical Application Support"]
     assert json.loads(profile.field_trust_json)["location_city"]["source"] == "USER_CONFIRMED"
     # Stage 6A columns kept consistent, unrelated ones untouched
     prefs = profile.job_preferences
@@ -568,3 +568,93 @@ def test_cli_refuses_an_invalid_file_and_a_uri_path(migrated, capsys, tmp_path):
 def test_cli_refuses_the_protected_canonical_database(capsys):
     assert cli.run(["--database", str(PROJECT_ROOT / "stage14b_canonical_v12.db"), "show"]) == 2
     assert "REFUSED" in capsys.readouterr().err
+
+
+# --- Codex Stage 17 review regressions -------------------------------------------------
+
+
+def test_partial_role_file_never_touches_profile_target_roles(db):
+    partial = spec_dict(search_sources={"secondary_roles": "IMPORTED"})
+    partial["search"] = {"secondary_roles": ["Imported Role"]}
+    _apply(db, CandidateConfigSpec.model_validate(partial))
+    db.expire_all()
+    profile = db.get(CandidateProfileRecord, 1)
+    assert json.loads(profile.target_roles_json) == ["Junior Python Developer"]
+    config = load_search_config(db)
+    assert config.search.secondary_roles == ["Imported Role"]
+    assert config.search_trust["secondary_roles"].source == "IMPORTED"
+    # a confirmed role list is never replaced by imported data
+    _apply(db)
+    plan = plan_config_change(
+        db.get(CandidateProfileRecord, 1), CandidateConfigSpec.model_validate(partial)
+    )
+    assert any("search.secondary_roles" in refusal for refusal in plan.refusals)
+
+
+def test_partial_update_derives_stage6a_columns_from_the_effective_configuration(db):
+    _apply(db)
+    partial = spec_dict()
+    partial["search"] = {"home_city": "Offenbach am Main"}
+    _apply(db, CandidateConfigSpec.model_validate(partial))
+    db.expire_all()
+    prefs = db.get(CandidateProfileRecord, 1).job_preferences
+    assert json.loads(prefs.preferred_locations_json) == ["Offenbach am Main", "Hessen"]
+    assert prefs.relocation is True
+    off = spec_dict()
+    off["search"] = {"remote_work_scope": "UNKNOWN"}
+    _apply(db, CandidateConfigSpec.model_validate(off))
+    db.expire_all()
+    assert db.get(CandidateProfileRecord, 1).job_preferences.remote_preference == "UNKNOWN"
+
+
+def test_commute_limit_is_capped_inside_the_ba_radius_range():
+    with pytest.raises(ValidationError):
+        CandidateSearchSettings(max_commute_km=196, commute_measure="CAR_ROUTE")
+    CandidateSearchSettings(max_commute_km=195, commute_measure="CAR_ROUTE")
+
+
+def test_document_grade_collection_cannot_drop_a_confirmed_language(db):
+    _apply(db)
+    version = db.get(CandidateProfileRecord, 1).profile_version
+    with pytest.raises(CandidateProfileTrustDowngradeError, match="languages.Deutsch"):
+        apply_candidate_profile_patch(
+            db,
+            CandidateProfilePatchRequest(
+                expected_profile_version=version,
+                languages=[
+                    {"language": "Englisch", "level": "B2", "source": "USER_PROVIDED_DOCUMENT"}
+                ],
+            ),
+        )
+
+
+def test_document_grade_collection_cannot_inflate_a_confirmed_skill(db):
+    _apply(db)
+    version = db.get(CandidateProfileRecord, 1).profile_version
+    skills = [
+        {"name": "Pydantic", "category": "FRAMEWORK", "source": "USER_CONFIRMED"},
+        {"name": "Python", "category": "LANGUAGE", "notes": "kept as is"},
+        {"name": "AWS", "category": "CLOUD", "proficiency": "EXPERT", "source": "IMPORTED"},
+    ]
+    with pytest.raises(CandidateProfileTrustDowngradeError, match=r"skills\.AWS \(proficiency"):
+        apply_candidate_profile_patch(
+            db, CandidateProfilePatchRequest(expected_profile_version=version, skills=skills)
+        )
+    db.expire_all()
+    aws = db.scalars(select(CandidateSkillRecord).where(CandidateSkillRecord.name == "AWS")).one()
+    assert aws.proficiency == "UNKNOWN"
+
+
+def test_a_manual_collection_may_still_remove_a_confirmed_language(db):
+    _apply(db)
+    version = db.get(CandidateProfileRecord, 1).profile_version
+    apply_candidate_profile_patch(
+        db,
+        CandidateProfilePatchRequest(
+            expected_profile_version=version,
+            languages=[{"language": "Deutsch", "level": "B1", "source": "MANUAL_ENTRY"}],
+        ),
+    )
+    db.expire_all()
+    names = {lang.language for lang in db.scalars(select(CandidateLanguageRecord))}
+    assert names == {"Deutsch"}

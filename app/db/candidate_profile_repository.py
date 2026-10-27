@@ -388,19 +388,50 @@ def _trust_downgrades(
         if getattr(patch, name) != current:
             refused.append(name)
     if "languages" in provided:
-        confirmed = {
-            lang.normalized_language: lang
-            for lang in profile.languages
-            if lang.source == "USER_CONFIRMED"
-        }
-        for language in patch.languages:
-            stored = confirmed.get(normalize_text_identity(language.language))
-            if (
-                stored is not None
-                and language.source in _DOCUMENT_GRADE_SOURCES
-                and (language.level, language.certificate) != (stored.level, stored.certificate)
-            ):
-                refused.append(f"languages.{stored.language}")
+        refused += _collection_downgrades(
+            "languages",
+            [lang for lang in profile.languages if lang.source == "USER_CONFIRMED"],
+            patch.languages,
+            stored_key=lambda r: r.normalized_language,
+            item_key=lambda i: normalize_text_identity(i.language),
+            label=lambda r: r.language,
+            fields=("level", "certificate", "notes", "confidence"),
+        )
+    if "skills" in provided:
+        refused += _collection_downgrades(
+            "skills",
+            [skill for skill in profile.skills if skill.source == "USER_CONFIRMED"],
+            patch.skills,
+            stored_key=lambda r: r.normalized_name,
+            item_key=lambda i: normalize_text_identity(i.name),
+            label=lambda r: r.name,
+            fields=("category", "proficiency", "years_experience", "notes", "confidence"),
+        )
+    return refused
+
+
+def _collection_downgrades(
+    collection: str, confirmed: list, items: list, *, stored_key, item_key, label, fields
+) -> list[str]:
+    """A replaced collection may not drop or alter a USER_CONFIRMED item
+    through document-grade data: an item that carries a document-grade source
+    may not change a confirmed item, and a confirmed item may only be left out
+    when every incoming item is a direct human assertion."""
+    incoming = {item_key(item): item for item in items}
+    document_grade = any(item.source in _DOCUMENT_GRADE_SOURCES for item in items)
+    refused = []
+    for stored in confirmed:
+        item = incoming.get(stored_key(stored))
+        if item is None:
+            if document_grade:
+                refused.append(f"{collection}.{label(stored)}")
+            continue
+        # A document-grade item replacing a confirmed one changes values or at
+        # least downgrades the provenance itself: both are refused.
+        if item.source in _DOCUMENT_GRADE_SOURCES:
+            changed = [n for n in fields if getattr(item, n) != getattr(stored, n)]
+            suffix = f" ({', '.join(changed)})" if changed else " (provenance)"
+            refused.append(f"{collection}.{label(stored)}{suffix}")
     return refused
 
 

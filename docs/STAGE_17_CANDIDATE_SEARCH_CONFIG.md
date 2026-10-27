@@ -13,6 +13,8 @@ Migration `a9d3f6b2c4e8` (revises `f4b8d2a6c9e1`), additive only.
 connects): `PRODUCTION_RUNTIME` (`runtime/job_triage_runtime.db`), `PILOT`
 (`stage*_*.db` in the project root or `runtime/`), `BACKUP` (`*.pre-*`,
 `job-triage-backups\`), `OTHER_SQLITE`, `MEMORY`, `SERVER` (PostgreSQL).
+Both the literal and the percent-decoded spelling of the path are classified
+(SQLite decodes `file:` URIs) and the most sensitive kind wins.
 `DATABASE_ROLE` (`production` | `pilot` | `test` | `development`, optional)
 says what the process is for; `check_database_target` runs at web and
 scheduler startup and refuses a mismatch:
@@ -43,11 +45,14 @@ Existing tables are extended instead of adding parallel ones:
 
 `minimum_salary`, `salary_currency`, `relocation`, `preferred_locations` and
 `remote_preference` are the existing Stage 6A columns, kept consistent with
-the configuration. `profile.target_roles` = primary roles, then secondary
-roles. Including non-"Junior" and support/QA roles makes the Stage 11A/11B
-seniority and domain gates fail open (UNKNOWN) by their own design, so a
-relevant posting is no longer excluded only because it lacks the word
-"Junior"; entry level is reported separately (below).
+the configuration. The primary/secondary role priorities are stored only in
+the search configuration; `profile.target_roles` is NOT changed by Stage 17,
+because it drives the Stage 11A/11B collector gates: a non-"Junior" or
+support role there would make them fail open and let senior or unrelated
+postings reach APPLY. Those gates never exclude a posting merely for lacking
+the word "Junior" (only titles that state Senior/Lead/... or are classified
+IRRELEVANT); support, QA and IT-integration titles classify as UNKNOWN and
+pass. Entry level is reported separately (below).
 
 **Writing it.** `scripts/stage17_candidate_config.py apply --config FILE`
 reads an operator-confirmed file (`jobtriage.candidate-config/1`, kept outside
@@ -107,13 +112,15 @@ Decision: `BLOCKED` (location FAIL, remote INCOMPATIBLE, ALREADY_APPLIED),
 else `NEEDS_VERIFICATION` (distance unverified/unknown, possible duplicate,
 skills not evaluated), else `CANDIDATE`. No criterion is folded into a score.
 
-**Car routes.** Only a `job_commute_checks` row makes a distance PASS/FAIL.
+**Car routes.** Only a `job_commute_checks` row makes a distance PASS/FAIL, and only if it starts
+at the currently configured origin (otherwise it is stale: DISTANCE_UNVERIFIED).
 `record-commute` stores a route the operator measured; `check-commute` asks
 OSRM (`router.project-osrm.org`) for the driving route between the stored
 origin coordinates and the given workplace coordinates -- only the two
 coordinate pairs are sent, only on that explicit command; times are
 free-flow. A straight-line distance is printed for information and never
-stored as a car route.
+stored. If the optional home-office search fails, the commute search's
+results are still processed (logged `bundesagentur_query_failed`).
 
 **Duplicates enforced.** `BewerbungService.generate` and
 `ReviewPackageService.create` call `ensure_not_already_applied`: a STRONG

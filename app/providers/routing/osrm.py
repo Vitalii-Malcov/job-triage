@@ -70,6 +70,8 @@ class OsrmRouteProvider:
         routes = payload.get("routes")
         if payload.get("code") != "Ok" or not isinstance(routes, list) or not routes:
             raise RouteUnavailableError(f"OSRM returned no route (code={payload.get('code')})")
+        if not isinstance(routes[0], dict):
+            raise RouteUnavailableError("OSRM route entry is not an object")
         distance, duration = routes[0].get("distance"), routes[0].get("duration")
         if not isinstance(distance, int | float) or not isinstance(duration, int | float):
             raise RouteUnavailableError("OSRM route has no numeric distance/duration")

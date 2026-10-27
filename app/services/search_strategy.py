@@ -43,7 +43,11 @@ class BundesagenturQuery:
 
 def ba_radius_for(limit_km: int) -> int:
     wanted = limit_km + RADIUS_MARGIN_KM
-    return next((step for step in BA_RADIUS_STEPS if step >= wanted), BA_RADIUS_STEPS[-1])
+    for step in BA_RADIUS_STEPS:
+        if step >= wanted:
+            return step
+    # Never silently search a radius smaller than the limit.
+    raise ValueError(f"car-route limit {limit_km} km exceeds the largest BA radius")
 
 
 def bundesagentur_queries(

@@ -98,7 +98,9 @@ class CandidateSearchSettings(BaseModel):
     home_region: str | None = Field(default=None, max_length=100)
     commute_origin_label: str | None = Field(default=None, max_length=300)
     commute_origin: GeoPoint | None = None
-    max_commute_km: int | None = Field(default=None, ge=1, le=300)
+    # <= 195 so the Bundesagentur search radius (<= 200 km, limit + 5 km
+    # margin) still covers every workplace within the car-route limit.
+    max_commute_km: int | None = Field(default=None, ge=1, le=195)
     commute_measure: CommuteMeasure | None = None
     relocation_regions: list[str] = Field(default_factory=list)
     remote_work_scope: RemoteWorkScope = "UNKNOWN"

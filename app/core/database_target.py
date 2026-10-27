@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import unquote
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -126,6 +127,35 @@ def classify_path(path: Path) -> DatabaseKind:
     return DatabaseKind.OTHER_SQLITE
 
 
+# Most sensitive first: an ambiguous spelling is classified as the most
+# protected database it could name.
+_SENSITIVITY = (
+    DatabaseKind.PRODUCTION_RUNTIME,
+    DatabaseKind.PILOT,
+    DatabaseKind.BACKUP,
+    DatabaseKind.OTHER_SQLITE,
+)
+
+
+def _classify_spellings(database: str) -> tuple[DatabaseKind, str | None]:
+    """SQLite percent-decodes `file:` URI paths, and SQLAlchemy 2.1+ decodes
+    the database part itself; classify both the literal and the decoded
+    spelling and keep the most sensitive kind."""
+    spellings = {database, unquote(database)}
+    kinds: list[tuple[DatabaseKind, str | None]] = []
+    for spelling in spellings:
+        path = _sqlite_path(spelling)
+        if path is None:
+            kinds.append((DatabaseKind.MEMORY, None))
+        else:
+            kinds.append((classify_path(path), path.name))
+    for kind in _SENSITIVITY:
+        for found, name in kinds:
+            if found is kind:
+                return found, name
+    return kinds[0]
+
+
 def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
     try:
         url = make_url(database_url)
@@ -136,10 +166,7 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
         return DatabaseKind.SERVER, None
     if backend != "sqlite":
         return DatabaseKind.INVALID, None
-    path = _sqlite_path(url.database or "")
-    if path is None:
-        return DatabaseKind.MEMORY, None
-    return classify_path(path), path.name
+    return _classify_spellings(url.database or "")
 
 
 def parse_role(raw: str | None) -> DatabaseRole | None:

@@ -40,7 +40,7 @@ from app.db.candidate_search_repository import load_search_config
 from app.db.job_commute_repository import latest_commute_check
 from app.db.models import JobCommuteCheckRecord, JobRecord
 from app.models.candidate_job_match import CandidateJobMatch
-from app.models.candidate_profile import normalize_text_identity
+from app.models.candidate_profile import is_usable_for_generation, normalize_text_identity
 from app.models.candidate_search import CandidateSearchSettings
 from app.services.application_duplicates import verdict
 from app.services.application_guard import sent_duplicate, vacancy_findings
@@ -198,6 +198,13 @@ def location_criterion(
         return Criterion("location", "NOT_CONFIGURED", "no car-route commute limit configured")
     limit = settings.max_commute_km
     origin = settings.commute_origin_label or settings.home_city or "home"
+    if check is not None and check.origin_label != origin:
+        return Criterion(
+            "location",
+            "DISTANCE_UNVERIFIED",
+            f"stored car route starts at {check.origin_label}, not the current origin "
+            f"{origin}; re-check (limit {limit} km)",
+        )
     if check is not None:
         minutes = (
             f", ~{check.car_route_minutes:.0f} min free-flow" if check.car_route_minutes else ""
@@ -303,7 +310,8 @@ def _german_level(session: Session) -> str:
         return "UNKNOWN"
     for language in profile.languages:
         if normalize_text_identity(language.language) in {"deutsch", "german"}:
-            if language.confidence == "CONFIRMED":
+            # Same rule as CV generation: a directly asserted AND confirmed level.
+            if is_usable_for_generation(language.source, language.confidence):
                 return language.level
     return "UNKNOWN"
 

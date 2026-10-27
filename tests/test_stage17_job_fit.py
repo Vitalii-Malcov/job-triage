@@ -634,3 +634,90 @@ def test_runner_runs_every_query_and_processes_a_posting_once(db, monkeypatch):
     ]
     assert result["fetched"] == 2
     assert db.get(CandidateProfileRecord, 1) is not None
+
+
+# --- Codex Stage 17 review regressions -------------------------------------------------
+
+
+def test_a_route_from_another_origin_is_stale():
+    check = _check(85)
+    check.origin_label = "Frankfurt Hbf"
+    criterion = fit.location_criterion(_job(), SETTINGS, _remote(), check)
+    assert criterion.status == "DISTANCE_UNVERIFIED" and "re-check" in criterion.reason
+
+
+def test_an_imported_language_level_is_not_treated_as_confirmed(db):
+    from app.db.models import CandidateLanguageRecord
+
+    german = db.scalars(select(CandidateLanguageRecord)).one()
+    german.level, german.source = "C1", "IMPORTED"
+    db.commit()
+    assert fit.assess_job(db, 1).criterion("language").reason.endswith("confirmed level UNKNOWN")
+
+
+def test_osrm_route_entry_that_is_not_an_object():
+    response = httpx.Response(200, json={"code": "Ok", "routes": [None]})
+    with pytest.raises(RouteUnavailableError):
+        _osrm(lambda request: response).car_route(HEUSENSTAMM, HEUSENSTAMM)
+
+
+def test_the_straight_line_value_is_never_stored(migrated, capsys):
+    args = ["--database", str(migrated), "check-commute", "1", "--dest-lat", "49.87"]
+    args += ["--dest-lon", "8.65", "--destination", "Darmstadt", "--apply"]
+    assert cli.run(args, route_provider=_FakeProvider(CarRoute(km=44.0, minutes=40))) == 0
+    assert "straight line" in capsys.readouterr().out
+    engine = create_engine(f"sqlite:///{migrated.as_posix()}")
+    try:
+        with engine.connect() as conn:
+            note = conn.scalar(select(JobCommuteCheckRecord.source_note))
+    finally:
+        engine.dispose()
+    assert "straight" not in note.lower()
+
+
+def test_ba_radius_refuses_a_limit_it_cannot_cover():
+    with pytest.raises(ValueError):
+        ba_radius_for(196)
+
+
+def test_a_failing_remote_query_keeps_the_commute_results(db, monkeypatch):
+    from app.models.job import Job
+    from app.services import collector_runner
+
+    class _Fake:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.skipped_invalid_count = 0
+
+        async def fetch(self):
+            if self.kwargs["working_time"] == "ho":
+                raise RuntimeError("remote search down")
+            return [
+                Job(
+                    title="Python Developer",
+                    company="Example GmbH",
+                    location="Darmstadt",
+                    url="https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-C-S",
+                    description="Python",
+                    source="bundesagentur",
+                    source_reference="10001-C-S",
+                )
+            ]
+
+        async def fetch_detail(self, ref):
+            return None
+
+    monkeypatch.setattr(collector_runner, "BundesagenturCollector", _Fake)
+    result = asyncio.run(
+        collector_runner.run_bundesagentur(
+            db, _settings(bundesagentur_api_key="real-looking-key-123")
+        )
+    )
+    assert result["fetched"] == 1 and result["created"] == 1
+
+
+def test_configured_search_keeps_the_collector_seniority_gate(db):
+    from app.db.candidate_profile_repository import get_candidate_profile
+
+    # the configuration never writes profile.target_roles (Stage 11A/11B gates)
+    assert json.loads(get_candidate_profile(db).target_roles_json) == []

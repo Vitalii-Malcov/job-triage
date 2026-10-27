@@ -567,7 +567,7 @@ async def run_bundesagentur(
     # configuration when one exists (commute radius around the home place
     # plus a nationwide home-office search), else from the legacy settings.
     batches: list[tuple[BundesagenturCollector, list[Job]]] = []
-    for query in bundesagentur_queries(settings, _candidate_search_settings(db)):
+    for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
         query_collector = BundesagenturCollector(
             api_key=settings.bundesagentur_api_key,
             keywords=query.keywords,
@@ -576,7 +576,22 @@ async def run_bundesagentur(
             working_time=query.working_time,
             max_pages=query.max_pages,
         )
-        batches.append((query_collector, await query_collector.fetch()))
+        if index == 0:
+            # The primary search fails the run exactly as before.
+            query_jobs = await query_collector.fetch()
+        else:
+            # An additional search (the nationwide home-office one) must never
+            # cost the primary search's already-fetched results.
+            try:
+                query_jobs = await query_collector.fetch()
+            except Exception as exc:  # noqa: BLE001 -- isolated optional query
+                logger.warning(
+                    "bundesagentur_query_failed label=%s error_type=%s",
+                    query.label,
+                    type(exc).__name__,
+                )
+                continue
+        batches.append((query_collector, query_jobs))
         logger.info(
             "bundesagentur_query label=%s radius_km=%s working_time=%s jobs=%s",
             query.label,

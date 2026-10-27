@@ -208,14 +208,10 @@ def plan_config_change(profile: CandidateProfileRecord, spec: CandidateConfigSpe
                 plan.refusals.append(f"search.{name}: stored source outranks {field_source}")
                 continue
             plan.changes.append(FieldChange("search", name, _jsonable(old), _jsonable(new)))
-        roles = spec.search.target_roles
-        stored_roles = _loads(profile.target_roles_json, [])
-        if roles and roles != stored_roles:
-            stored = _field_provenance(field_trust, "target_roles")
-            if _outranked(stored, source):
-                plan.refusals.append("profile.target_roles: stored source outranks the spec")
-            else:
-                plan.changes.append(FieldChange("profile", "target_roles", stored_roles, roles))
+        # The role priorities stay in the search configuration. They are NOT
+        # copied into `profile.target_roles`: that field drives the Stage
+        # 11A/11B collector gates (a non-"Junior" or support role there makes
+        # them fail open and lets senior/unrelated postings reach APPLY).
 
     languages = {lang.normalized_language: lang for lang in profile.languages}
     for spec_language in spec.languages:
@@ -274,14 +270,19 @@ def _apply_search(
     stored = _loads(preferences.search_trust_json, {})
     stored.update({name: {**trust, "source": spec.search_source(name)} for name in changed})
     preferences.search_trust_json = json.dumps(stored)
-    # Keep the Stage 6A preference columns consistent with the configuration.
+    # Keep the Stage 6A preference columns consistent with the EFFECTIVE
+    # configuration (stored values plus this change), never with a partial
+    # file's defaults.
+    effective = stored_search_settings(preferences)
     if "relocation_regions" in changed:
-        preferences.relocation = bool(search.relocation_regions)
+        preferences.relocation = bool(effective.relocation_regions)
     if {"home_city", "relocation_regions"} & changed:
-        locations = [loc for loc in [search.home_city, *search.relocation_regions] if loc]
+        locations = [loc for loc in [effective.home_city, *effective.relocation_regions] if loc]
         preferences.preferred_locations_json = json.dumps(locations)
-    if "remote_work_scope" in changed and search.remote_work_scope == "GERMANY":
-        preferences.remote_preference = "FLEXIBLE"
+    if "remote_work_scope" in changed:
+        preferences.remote_preference = (
+            "FLEXIBLE" if effective.remote_work_scope == "GERMANY" else "UNKNOWN"
+        )
 
 
 def apply_config_plan(
@@ -325,10 +326,7 @@ def apply_config_plan(
 
         field_trust = _loads(profile.field_trust_json, {})
         for name in by_area.get("profile", set()):
-            if name == "target_roles":
-                profile.target_roles_json = json.dumps(spec.search.target_roles)
-            else:
-                setattr(profile, name, getattr(spec.profile, name))
+            setattr(profile, name, getattr(spec.profile, name))
             field_trust[name] = {"source": spec.source, "confidence": "CONFIRMED"}
         profile.field_trust_json = json.dumps(field_trust)
 

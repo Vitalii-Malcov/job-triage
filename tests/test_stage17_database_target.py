@@ -159,3 +159,25 @@ def test_scheduler_refuses_a_pilot_database_before_polling(monkeypatch, capsys):
 
 def test_module_has_no_import_time_side_effects():
     assert dt.PRODUCTION_RUNTIME_DB.name == "job_triage_runtime.db"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # SQLite percent-decodes `file:` URI paths (Codex Stage 17 P1)
+        "sqlite:///file:runtime/job_triage_runtime%2Edb?uri=true",
+        "sqlite:///file:runtime%2Fjob_triage_runtime.db?mode=ro&uri=true",
+        "sqlite:///runtime/job_triage_runtime%2Edb",
+    ],
+)
+def test_percent_encoded_production_spelling_is_still_production(monkeypatch, url):
+    monkeypatch.chdir(PROJECT_ROOT)
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError, match="PRODUCTION_RUNTIME"):
+        check_database_target(_settings(url, "test"))
+
+
+def test_percent_encoded_pilot_spelling_is_refused_without_a_role(monkeypatch):
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(DatabaseTargetError, match="DATABASE_ROLE=pilot"):
+        check_database_target(_settings("sqlite:///file:stage11_pilot%2Edb?uri=true"))

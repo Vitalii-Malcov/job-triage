@@ -146,8 +146,9 @@ def _check_commute(session: Session, args, provider: CarRouteProvider) -> int:
     except RouteUnavailableError as exc:
         print(f"FAILED: {exc}; distance stays unverified", file=sys.stderr)
         return 1
-    line = straight_line_km(origin[1], destination)
-    note = f"{provider.name} car route, free-flow time; straight line {line:.1f} km (info only)"
+    # Informational only: printed, never stored with the car route.
+    print(f"straight line {straight_line_km(origin[1], destination):.1f} km (not a car route)")
+    note = f"{provider.name} car route, free-flow travel time"
     return _store(
         session, args, km=route.km, minutes=route.minutes, method=provider.name, note=note
     )
