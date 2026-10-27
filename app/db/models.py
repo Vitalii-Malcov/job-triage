@@ -1647,6 +1647,14 @@ class CandidateProfileRecord(Base):
     professional_title: Mapped[str | None] = mapped_column(String(300), nullable=True)
     location_city: Mapped[str | None] = mapped_column(String(200), nullable=True)
     location_country: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Stage 17B: the confirmed contact details used in Bewerbungen. Kept out of
+    # `field_trust_json` (whose keys are the Stage 6A top-level fields and are
+    # mirrored by the Stage 13B transfer snapshot); their own provenance is
+    # `contact_trust_json` ({field: {"source", "confidence"}}).
+    contact_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    contact_phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    contact_website_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contact_trust_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
 
     professional_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     career_goal: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -1901,7 +1909,86 @@ class CandidateJobPreferencesRecord(Base):
     relocation: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     travel: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
+    # Stage 17B: search configuration (see app/models/candidate_search.py's
+    # CandidateSearchSettings). Every column is optional: an unset value means
+    # "never stated" and the job-fit assessment reports UNKNOWN, never a guess.
+    home_city: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    home_postal_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    home_region: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    commute_origin_label: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    commute_origin_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    commute_origin_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_commute_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    commute_measure: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    relocation_regions_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    remote_work_scope: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
+    remote_work_from_region: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    maximum_salary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    salary_negotiable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    earliest_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    primary_roles_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    secondary_roles_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # JUNIOR = only entry-level postings are targeted (feeds the Stage 11A
+    # collector seniority gate); UNKNOWN = not stated.
+    target_seniority: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
+    # Bundesagentur `was` terms; empty = BUNDESAGENTUR_SEARCH_KEYWORDS.
+    search_keywords_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    search_trust_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
     profile: Mapped["CandidateProfileRecord"] = relationship(back_populates="job_preferences")
+
+
+class CandidateProfileRevisionRecord(Base):
+    """Stage 17B: append-only audit of Candidate Profile changes made by the
+    Stage 17 configuration CLI -- who, why, which fields, and the before/after
+    snapshot of the changed values. UPDATE/DELETE are refused by database
+    triggers (migration a9d3f6b2c4e8), like application_events."""
+
+    __tablename__ = "candidate_profile_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    candidate_profile_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("candidate_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    changed_fields_json: Mapped[str] = mapped_column(Text, nullable=False)
+    before_json: Mapped[str] = mapped_column(Text, nullable=False)
+    after_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class JobCommuteCheckRecord(Base):
+    """Stage 17C: one verified car-route measurement from the candidate's
+    commute origin to a job's workplace. Only a stored check makes a job's
+    distance PASS or FAIL; without one the distance stays UNVERIFIED (a
+    straight-line estimate is never treated as the car route). Rows are only
+    ever inserted; the newest check of a job is authoritative."""
+
+    __tablename__ = "job_commute_checks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    origin_label: Mapped[str] = mapped_column(String(300), nullable=False)
+    # The origin coordinates the route was measured from: a route from other
+    # coordinates (origin moved, label unchanged) is stale.
+    origin_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_label: Mapped[str] = mapped_column(String(300), nullable=False)
+    destination_region: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    car_route_km: Mapped[float] = mapped_column(Float, nullable=False)
+    car_route_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    method: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_note: Mapped[str] = mapped_column(Text, nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
 
 
 class CandidateJobMatchRecord(Base):
@@ -3424,3 +3511,59 @@ class TelegramLifecycleNotificationRecord(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --- Stage 17B: candidate profile revisions are append-only -------------------------
+
+# The Stage 17 migration (a9d3f6b2c4e8) creates exactly these objects.
+CANDIDATE_PROFILE_REVISION_IMMUTABILITY_DDL: dict[str, tuple[str, ...]] = {
+    "sqlite": (
+        "CREATE TRIGGER trg_candidate_profile_revisions_no_update BEFORE UPDATE ON "
+        "candidate_profile_revisions "
+        "BEGIN SELECT RAISE(ABORT, 'candidate_profile_revisions is append-only'); END",
+        "CREATE TRIGGER trg_candidate_profile_revisions_no_delete BEFORE DELETE ON "
+        "candidate_profile_revisions "
+        "BEGIN SELECT RAISE(ABORT, 'candidate_profile_revisions is append-only'); END",
+    ),
+    "postgresql": (
+        "CREATE FUNCTION candidate_profile_revisions_append_only() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+        "'candidate_profile_revisions is append-only' "
+        "USING ERRCODE = 'restrict_violation'; END $$",
+        "CREATE TRIGGER trg_candidate_profile_revisions_append_only BEFORE UPDATE OR DELETE "
+        "ON candidate_profile_revisions FOR EACH ROW "
+        "EXECUTE FUNCTION candidate_profile_revisions_append_only()",
+    ),
+}
+_CANDIDATE_PROFILE_REVISION_IMMUTABILITY_DROP: dict[str, tuple[str, ...]] = {
+    "postgresql": ("DROP FUNCTION IF EXISTS candidate_profile_revisions_append_only()",),
+}
+
+for _dialect, _statements in CANDIDATE_PROFILE_REVISION_IMMUTABILITY_DDL.items():
+    for _statement in _statements:
+        event.listen(
+            CandidateProfileRevisionRecord.__table__,
+            "after_create",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
+for _dialect, _statements in _CANDIDATE_PROFILE_REVISION_IMMUTABILITY_DROP.items():
+    for _statement in _statements:
+        event.listen(
+            CandidateProfileRevisionRecord.__table__,
+            "after_drop",
+            DDL(_statement).execute_if(dialect=_dialect),
+        )
+
+
+class CandidateProfileRevisionImmutableError(RuntimeError):
+    """An UPDATE or DELETE of a CandidateProfileRevisionRecord was attempted."""
+
+
+@event.listens_for(CandidateProfileRevisionRecord, "before_update")
+def _refuse_revision_update(mapper, connection, target) -> None:
+    raise CandidateProfileRevisionImmutableError("candidate profile revisions are append-only")
+
+
+@event.listens_for(CandidateProfileRevisionRecord, "before_delete")
+def _refuse_revision_delete(mapper, connection, target) -> None:
+    raise CandidateProfileRevisionImmutableError("candidate profile revisions are append-only")

@@ -59,7 +59,13 @@ def canonical_database_url(path: Path) -> str:
 
 def canonical_environment(path: Path) -> dict[str, str]:
     """The exact per-process overrides that select the canonical runtime."""
-    overrides = {"DATABASE_URL": canonical_database_url(path), "POSTGRES_HOST": ""}
+    # Stage 17A: the canonical DB is a pilot database; say so explicitly so
+    # app.core.database_target accepts it (and nothing else) in this process.
+    overrides = {
+        "DATABASE_URL": canonical_database_url(path),
+        "DATABASE_ROLE": "pilot",
+        "POSTGRES_HOST": "",
+    }
     overrides.update({flag.upper(): "false" for flag in SAFETY_FLAGS})
     return overrides
 

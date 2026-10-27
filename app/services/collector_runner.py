@@ -57,6 +57,7 @@ from app.db.candidate_profile_repository import (
     get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
+from app.db.candidate_search_repository import load_search_config
 from app.db.models import JobRecord
 from app.db.repositories import (
     get_job_by_fingerprint,
@@ -71,9 +72,11 @@ from app.db.xing_scan_progress_repository import (
     compute_mailbox_scope,
     get_xing_scan_progress,
 )
+from app.models.candidate_search import CandidateSearchSettings
 from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
+from app.services.search_strategy import bundesagentur_queries
 from app.services.telegram import TelegramNotifier
 from app.services.telegram_vacancy_feed import (
     deliver_queued_vacancy_cards,
@@ -132,6 +135,14 @@ class TouchedJob:
     recommendation: str
 
 
+def _candidate_search_settings(db: Session) -> CandidateSearchSettings | None:
+    """Stage 17C: the persisted search configuration, read once per run
+    (pure read; never creates the profile)."""
+    with db.no_autoflush:
+        config = load_search_config(db)
+    return config.search if config is not None else None
+
+
 def _allowed_employment_types(db: Session, posting_type: str | None) -> frozenset[str]:
     """The candidate's own stated CandidateJobPreferences.employment_types
     (Stage 6A), read lazily -- only when `posting_type` is one of the
@@ -183,6 +194,10 @@ def _candidate_target_seniority(db: Session):
             return "UNKNOWN"
         profile = to_candidate_profile_response(profile_record)
 
+    # Stage 17: an explicitly configured entry-level target wins.
+    config = load_search_config(db)
+    if config is not None and config.search.target_seniority == "JUNIOR":
+        return "JUNIOR"
     return derive_candidate_target_seniority(profile.target_roles)
 
 
@@ -552,14 +567,61 @@ async def run_bundesagentur(
             "Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY."
         )
 
-    collector = BundesagenturCollector(
-        api_key=settings.bundesagentur_api_key,
-        keywords=settings.bundesagentur_search_keywords,
-        location=settings.bundesagentur_search_location,
-        radius_km=settings.bundesagentur_search_radius_km,
-    )
-
-    jobs = await collector.fetch()
+    # Stage 17C: the searches come from the persisted candidate search
+    # configuration when one exists (commute radius around the home place
+    # plus a nationwide home-office search), else from the legacy settings.
+    batches: list[tuple[BundesagenturCollector, list[Job]]] = []
+    failed_queries = 0
+    for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
+        query_collector = BundesagenturCollector(
+            api_key=settings.bundesagentur_api_key,
+            keywords=query.keywords,
+            location=query.location,
+            radius_km=query.radius_km,
+            working_time=query.working_time,
+            max_pages=query.max_pages,
+        )
+        if index == 0:
+            # The first search fails the run exactly as before.
+            query_jobs = await query_collector.fetch()
+        else:
+            # A later search (another term, or the home-office search) must
+            # never cost the results already fetched; it is reported instead
+            # (`failed_queries` in the run result, plus this log line).
+            try:
+                query_jobs = await query_collector.fetch()
+            except Exception as exc:  # noqa: BLE001 -- isolated, reported query
+                failed_queries += 1
+                logger.warning(
+                    "bundesagentur_query_failed label=%s term=%s error_type=%s",
+                    query.label,
+                    query.keywords,
+                    type(exc).__name__,
+                )
+                continue
+        batches.append((query_collector, query_jobs))
+        logger.info(
+            "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s jobs=%s",
+            query.label,
+            query.keywords,
+            query.radius_km,
+            query.working_time or "any",
+            len(batches[-1][1]),
+        )
+    # One posting can be returned by several searches; process it once. A
+    # single search is passed through untouched (legacy behaviour).
+    seen_postings: set[str] = set()
+    work: list[tuple[BundesagenturCollector, Job]] = []
+    for query_collector, query_jobs in batches:
+        batch_identities: set[str] = set()
+        for job in query_jobs:
+            identity = job.source_reference or job.url
+            if identity and identity in seen_postings:
+                continue
+            if identity:
+                batch_identities.add(identity)
+            work.append((query_collector, job))
+        seen_postings |= batch_identities
 
     # CSP-001: loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
@@ -579,7 +641,8 @@ async def run_bundesagentur(
     failed_count = 0
     notified_count = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
-    for job in jobs:
+    skipped_invalid = sum(c.skipped_invalid_count for c, _ in batches)
+    for collector, job in work:
         try:
             existing = get_job_by_fingerprint(db, job)
             description = job.description
@@ -707,18 +770,20 @@ async def run_bundesagentur(
 
     logger.info(
         "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
-        len(jobs),
+        len(work),
         created_count,
         updated_count,
-        collector.skipped_invalid_count,
+        skipped_invalid,
         failed_count,
     )
 
     return {
-        "fetched": len(jobs),
+        "fetched": len(work),
+        # Present only when a search failed (keeps the usual result shape).
+        **({"failed_queries": failed_queries} if failed_queries else {}),
         "created": created_count,
         "updated": updated_count,
-        "skipped_invalid": collector.skipped_invalid_count,
+        "skipped_invalid": skipped_invalid,
         "failed": failed_count,
     }
 

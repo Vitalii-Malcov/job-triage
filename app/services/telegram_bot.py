@@ -432,6 +432,7 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"fetched={stats['fetched']} created={stats['created']} "
         f"updated={stats['updated']} skipped_invalid={stats['skipped_invalid']} "
         f"failed={stats['failed']}"
+        + (f" failed_queries={stats['failed_queries']}" if stats.get("failed_queries") else "")
     )
 
 

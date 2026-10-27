@@ -84,7 +84,7 @@ jobs:
           python -m alembic heads | tee /tmp/alembic_heads.txt
           test "$(grep -c '(head)' /tmp/alembic_heads.txt)" -eq 1
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "f4b8d2a6c9e1 (head)" /tmp/alembic_current.txt
+          grep -q "b6c1e9a4d2f7 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       # HARD-010 (adversarial hardening r1): claim_send_attempt's
@@ -136,6 +136,9 @@ jobs:
       # test_stage16_stage9d_arm_race_postgres.py run at head, before the
       # Stage 15 module's downgrade/upgrade cycle.
       #
+      # Stage 17: test_stage17_candidate_config_postgres.py runs at head,
+      # before the Stage 15 module's downgrade/upgrade cycle.
+      #
       # Every module here skips when TEST_POSTGRES_URL is unset, so the
       # step refuses to run without it and then fails on ANY skipped test:
       # a green job must mean every PostgreSQL test actually executed.
@@ -159,6 +162,7 @@ jobs:
             tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
             tests/integration/test_telegram_operator_control_postgres.py \
             tests/integration/test_stage16_stage9d_arm_race_postgres.py \
+            tests/integration/test_stage17_candidate_config_postgres.py \
             tests/integration/test_application_lifecycle_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'

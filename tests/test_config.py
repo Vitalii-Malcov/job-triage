@@ -312,7 +312,10 @@ def test_xing_lookback_days_matches_gmail_lookback_days_bounds():
 # ---------------------------------------------------------------------------
 
 
-def test_database_url_default_is_unaffected_when_postgres_host_unset():
+def test_database_url_default_is_unaffected_when_postgres_host_unset(monkeypatch):
+    # tests/conftest.py points DATABASE_URL at an isolated test database for
+    # the whole run; the field's own default is only visible without it.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     # `_env_file=None` deliberately bypasses `Settings.model_config`'s
     # `env_file=".env"` for THIS instantiation only -- this test proves
     # the field's actual Python-level default, which must hold

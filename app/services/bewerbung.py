@@ -54,6 +54,7 @@ from app.db.models import JobRecord
 from app.models.bewerbung import BewerbungDraft, BewerbungDraftData, BewerbungJobContext
 from app.providers.bewerbung.base import BewerbungProvider
 from app.providers.bewerbung.deterministic import DeterministicBewerbungProvider
+from app.services.application_guard import ensure_not_already_applied
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class BewerbungService:
         the new row inside the caller's transaction (Stage 9B caller-owned
         publication -- see `create_bewerbung_draft`); the default is the
         unchanged commit-on-generation behavior."""
+        # Stage 17C: never a new Bewerbung for an already-applied vacancy.
+        ensure_not_already_applied(db, job)
         cv_draft_record = get_draft_by_id(db, cv_draft_id)
         if cv_draft_record is None:
             raise BewerbungCVDraftNotFoundError(cv_draft_id)

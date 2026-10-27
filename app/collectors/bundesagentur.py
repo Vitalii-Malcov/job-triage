@@ -216,6 +216,7 @@ class BundesagenturCollector(JobCollector):
         keywords: str = "",
         location: str = "",
         radius_km: int = 25,
+        working_time: str = "",
         page_size: int = 100,
         max_pages: int = 20,
         timeout_seconds: float = 10.0,
@@ -226,6 +227,8 @@ class BundesagenturCollector(JobCollector):
         self.keywords = keywords
         self.location = location
         self.radius_km = radius_km
+        # Stage 17C: BA `arbeitszeit` filter ("ho" = Heim-/Telearbeit); empty = any.
+        self.working_time = working_time
         self.page_size = page_size
         self.max_pages = max_pages
         self.timeout_seconds = timeout_seconds
@@ -307,6 +310,8 @@ class BundesagenturCollector(JobCollector):
             params["wo"] = self.location
         if self.radius_km:
             params["umkreis"] = self.radius_km
+        if self.working_time:
+            params["arbeitszeit"] = self.working_time
         if since is not None:
             now = datetime.now(since.tzinfo) if since.tzinfo is not None else datetime.now()
             days_since = max(0, (now - since).days)

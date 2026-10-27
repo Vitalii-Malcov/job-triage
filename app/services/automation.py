@@ -257,6 +257,10 @@ async def _run_step(
     # source is fully caught up when it is not.
     if status == "ok" and counters.get("deadline_exceeded", False):
         status = "partial"
+    # Stage 17C: a Bundesagentur run whose later search(es) failed is
+    # incomplete even if every fetched job persisted cleanly.
+    if status == "ok" and counters.get("failed_queries", 0):
+        status = "partial"
     return {"status": status, "counters": counters, "error_type": None}
 
 

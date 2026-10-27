@@ -338,6 +338,105 @@ def _preferences_to_record(
     )
 
 
+_STAGE6A_PREFERENCE_COLUMNS = (
+    "preferred_locations_json",
+    "remote_preference",
+    "employment_types_json",
+    "minimum_salary",
+    "salary_currency",
+    "relocation",
+    "travel",
+)
+
+# Stage 17B: sources that describe a document or an automated path. A value
+# the candidate confirmed directly (USER_CONFIRMED) is never replaced by one
+# of these -- an old CV must not overwrite a confirmed fact.
+_DOCUMENT_GRADE_SOURCES = frozenset({"USER_PROVIDED_DOCUMENT", "IMPORTED", "INFERRED", "UNKNOWN"})
+
+
+class CandidateProfileTrustDowngradeError(Exception):
+    """A PATCH would replace a USER_CONFIRMED value with a document-grade
+    one (Stage 17B). Raised before anything is written; carries only field
+    names, never values."""
+
+    def __init__(self, fields: list[str]) -> None:
+        self.fields = fields
+        super().__init__(
+            "Refusing to overwrite USER_CONFIRMED profile facts with document-grade data: "
+            + ", ".join(fields)
+        )
+
+
+def _trust_downgrades(
+    profile: CandidateProfileRecord, patch: CandidateProfilePatchRequest, provided: set[str]
+) -> list[str]:
+    refused: list[str] = []
+    stored_trust = _load_field_trust(profile.field_trust_json)
+    overrides = patch.field_trust or {}
+    for name in sorted(provided & TOP_LEVEL_TRUST_FIELDS):
+        stored = stored_trust.get(name)
+        incoming = overrides.get(name, FieldTrust())
+        if stored is None or stored.source != "USER_CONFIRMED":
+            continue
+        if incoming.source not in _DOCUMENT_GRADE_SOURCES:
+            continue
+        current = (
+            _parse_json_list(profile.target_roles_json)
+            if name == "target_roles"
+            else getattr(profile, name)
+        )
+        if getattr(patch, name) != current:
+            refused.append(name)
+    if "languages" in provided:
+        refused += _collection_downgrades(
+            "languages",
+            [lang for lang in profile.languages if lang.source == "USER_CONFIRMED"],
+            patch.languages,
+            stored_key=lambda r: r.normalized_language,
+            item_key=lambda i: normalize_text_identity(i.language),
+            label=lambda r: r.language,
+            fields=("level", "certificate", "notes", "confidence"),
+        )
+    if "skills" in provided:
+        refused += _collection_downgrades(
+            "skills",
+            [skill for skill in profile.skills if skill.source == "USER_CONFIRMED"],
+            patch.skills,
+            stored_key=lambda r: r.normalized_name,
+            item_key=lambda i: normalize_text_identity(i.name),
+            label=lambda r: r.name,
+            fields=("category", "proficiency", "years_experience", "notes", "confidence"),
+        )
+    return refused
+
+
+def _collection_downgrades(
+    collection: str, confirmed: list, items: list, *, stored_key, item_key, label, fields
+) -> list[str]:
+    """A replaced collection may not drop or alter a USER_CONFIRMED item
+    through document-grade data: an item that carries a document-grade source
+    may not change a confirmed item, and a confirmed item may only be left out
+    when every incoming item is a direct human assertion."""
+    incoming = {item_key(item): item for item in items}
+    # An empty replacement carries no human assertion at all: treat it like
+    # document-grade data (it may not wipe confirmed items).
+    document_grade = not items or any(item.source in _DOCUMENT_GRADE_SOURCES for item in items)
+    refused = []
+    for stored in confirmed:
+        item = incoming.get(stored_key(stored))
+        if item is None:
+            if document_grade:
+                refused.append(f"{collection}.{label(stored)}")
+            continue
+        # A document-grade item replacing a confirmed one changes values or at
+        # least downgrades the provenance itself: both are refused.
+        if item.source in _DOCUMENT_GRADE_SOURCES:
+            changed = [n for n in fields if getattr(item, n) != getattr(stored, n)]
+            suffix = f" ({', '.join(changed)})" if changed else " (provenance)"
+            refused.append(f"{collection}.{label(stored)}{suffix}")
+    return refused
+
+
 _SCALAR_FIELDS = (
     "first_name",
     "last_name",
@@ -419,6 +518,9 @@ def apply_candidate_profile_patch(
     profile = get_or_create_candidate_profile(db)
     expected_version = patch.expected_profile_version
     provided = patch.model_fields_set - {"expected_profile_version", "field_trust"}
+    downgrades = _trust_downgrades(profile, patch, provided)
+    if downgrades:
+        raise CandidateProfileTrustDowngradeError(downgrades)
 
     if not provided:
         noop_check_stmt = (
@@ -516,9 +618,15 @@ def apply_candidate_profile_patch(
             db.flush()
             profile.languages = [_language_to_record(language) for language in patch.languages]
         if "job_preferences" in provided:
-            profile.job_preferences = None
-            db.flush()
-            profile.job_preferences = _preferences_to_record(patch.job_preferences)
+            if profile.job_preferences is None:
+                profile.job_preferences = _preferences_to_record(patch.job_preferences)
+            else:
+                # Stage 17B: update the Stage 6A columns in place -- replacing
+                # the row would silently wipe the search configuration stored
+                # in the same row (app.db.candidate_search_repository).
+                replacement = _preferences_to_record(patch.job_preferences)
+                for column in _STAGE6A_PREFERENCE_COLUMNS:
+                    setattr(profile.job_preferences, column, getattr(replacement, column))
 
         db.add(profile)
         db.commit()

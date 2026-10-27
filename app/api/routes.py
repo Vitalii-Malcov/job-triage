@@ -58,6 +58,7 @@ from app.db.candidate_cv_draft_repository import (
 )
 from app.db.candidate_job_match_repository import get_latest_match, to_candidate_job_match
 from app.db.candidate_profile_repository import (
+    CandidateProfileTrustDowngradeError,
     CandidateProfileVersionConflictError,
     apply_candidate_profile_patch,
     get_candidate_skills_for_scoring,
@@ -190,6 +191,7 @@ from app.security.rate_limit import (
     enforce_review_write_rate_limit,
     enforce_xing_rate_limit,
 )
+from app.services.application_guard import AlreadyAppliedError
 from app.services.application_tracker import ApplicationNotFoundError, ApplicationTracker
 from app.services.automation import (
     AutomationRunAlreadyInProgressError,
@@ -566,6 +568,11 @@ def patch_candidate_profile(
                 "current_profile_version": exc.current_version,
             },
         ) from exc
+    except CandidateProfileTrustDowngradeError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "fields": exc.fields},
+        ) from exc
     return to_candidate_profile_response(record)
 
 
@@ -785,6 +792,10 @@ async def run_bewerbung_draft(
     """
     try:
         result = await _run_bewerbung_draft(db, job_id, body.cv_draft_id)
+    except AlreadyAppliedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT, detail=_already_applied_detail(exc)
+        ) from exc
     except BewerbungCVDraftNotFoundError as exc:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except BewerbungCVDraftJobMismatchError as exc:
@@ -870,6 +881,14 @@ def get_bewerbung_draft_snapshot(draft_id: int, db: Session = Depends(get_db)) -
     return to_bewerbung_draft(record)
 
 
+def _already_applied_detail(exc: AlreadyAppliedError) -> dict:
+    return {
+        "message": str(exc),
+        "application_id": exc.application_id,
+        "application_status": exc.application_status,
+    }
+
+
 def _run_create_review_package(
     db: Session, job_id: int, cv_draft_id: int, bewerbung_draft_id: int
 ) -> ReviewPackage | None:
@@ -901,6 +920,10 @@ def create_review_package(
     """
     try:
         result = _run_create_review_package(db, job_id, body.cv_draft_id, body.bewerbung_draft_id)
+    except AlreadyAppliedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT, detail=_already_applied_detail(exc)
+        ) from exc
     except ReviewCVDraftNotFoundError as exc:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ReviewBewerbungDraftNotFoundError as exc:

@@ -1,0 +1,313 @@
+"""Stage 17A: explicit, fail-closed database selection."""
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core import database_target as dt
+from app.core.canonical_runtime import canonical_environment
+from app.core.config import Settings
+from app.core.database_target import (
+    PRODUCTION_RUNTIME_DB,
+    PROJECT_ROOT,
+    DatabaseKind,
+    DatabaseTargetError,
+    check_database_target,
+    classify_database_url,
+)
+
+
+def _url(path) -> str:
+    return f"sqlite:///{path.as_posix()}"
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        (_url(PRODUCTION_RUNTIME_DB), DatabaseKind.PRODUCTION_RUNTIME),
+        (
+            _url(PROJECT_ROOT / "runtime" / "." / "job_triage_runtime.db"),
+            DatabaseKind.PRODUCTION_RUNTIME,
+        ),
+        (
+            f"sqlite:///file:{PRODUCTION_RUNTIME_DB.as_posix()}?mode=ro&uri=true",
+            DatabaseKind.PRODUCTION_RUNTIME,
+        ),
+        (_url(PROJECT_ROOT / "stage11_pilot.db"), DatabaseKind.PILOT),
+        (_url(PROJECT_ROOT / "stage14b_canonical_v12.db"), DatabaseKind.PILOT),
+        (_url(PROJECT_ROOT / "runtime" / "stage16_pilot_scratch.db"), DatabaseKind.PILOT),
+        (
+            _url(PROJECT_ROOT / "runtime" / "job_triage_runtime.pre-f4b8d2a6c9e1.db"),
+            DatabaseKind.BACKUP,
+        ),
+        (_url(PROJECT_ROOT / "job_search.db"), DatabaseKind.OTHER_SQLITE),
+        ("sqlite://", DatabaseKind.MEMORY),
+        ("sqlite:///:memory:", DatabaseKind.MEMORY),
+        ("postgresql+psycopg://u:secret@db:5432/jobtriage", DatabaseKind.SERVER),
+        ("mysql://u:p@h/db", DatabaseKind.INVALID),
+        ("not a url", DatabaseKind.INVALID),
+    ],
+)
+def test_classify_database_url(url, kind):
+    assert classify_database_url(url)[0] is kind
+
+
+def test_relative_pilot_url_resolves_against_the_working_directory(monkeypatch):
+    monkeypatch.chdir(PROJECT_ROOT)
+    assert classify_database_url("sqlite:///./stage11_pilot.db")[0] is DatabaseKind.PILOT
+    assert classify_database_url("sqlite:///runtime/job_triage_runtime.db")[0] is (
+        DatabaseKind.PRODUCTION_RUNTIME
+    )
+
+
+def test_pilot_name_outside_the_project_is_an_ordinary_file(tmp_path):
+    assert (
+        classify_database_url(_url(tmp_path / "stage11_pilot.db"))[0] is DatabaseKind.OTHER_SQLITE
+    )
+
+
+def test_backup_directory_is_a_backup(tmp_path):
+    path = tmp_path / "job-triage-backups" / "job_triage_runtime.db"
+    assert classify_database_url(_url(path))[0] is DatabaseKind.BACKUP
+
+
+def _settings(url: str, role: str = "") -> Settings:
+    return Settings(_env_file=None, database_url=url, database_role=role, postgres_host="")
+
+
+@pytest.mark.parametrize(
+    ("url", "role"),
+    [
+        (_url(PRODUCTION_RUNTIME_DB), ""),
+        (_url(PRODUCTION_RUNTIME_DB), "production"),
+        ("postgresql+psycopg://u:p@db/jobtriage", "production"),
+        (_url(PROJECT_ROOT / "stage11_pilot.db"), "pilot"),
+        (_url(PROJECT_ROOT / "job_search.db"), ""),
+        (_url(PROJECT_ROOT / "job_search.db"), "development"),
+        ("sqlite://", "test"),
+    ],
+)
+def test_accepted_combinations(url, role):
+    target = check_database_target(_settings(url, role))
+    assert "secret" not in target.describe()
+
+
+@pytest.mark.parametrize(
+    ("url", "role", "message"),
+    [
+        # the incident class: .env pilot without an explicit role
+        (_url(PROJECT_ROOT / "stage11_pilot.db"), "", "DATABASE_ROLE=pilot"),
+        (_url(PROJECT_ROOT / "stage11_pilot.db"), "production", "PILOT"),
+        (_url(PROJECT_ROOT / "stage11_pilot.db"), "test", "PILOT"),
+        (_url(PRODUCTION_RUNTIME_DB), "pilot", "PRODUCTION_RUNTIME"),
+        (_url(PRODUCTION_RUNTIME_DB), "test", "PRODUCTION_RUNTIME"),
+        (_url(PRODUCTION_RUNTIME_DB), "development", "PRODUCTION_RUNTIME"),
+        (_url(PROJECT_ROOT / "job_search.db"), "production", "OTHER_SQLITE"),
+        (_url(PROJECT_ROOT / "runtime" / "x.pre-migration.db"), "", "BACKUP"),
+        (_url(PROJECT_ROOT / "runtime" / "x.pre-migration.db"), "production", "BACKUP"),
+        ("mysql://u:p@h/db", "", "supported"),
+    ],
+)
+def test_refused_combinations(url, role, message):
+    with pytest.raises(DatabaseTargetError, match=message):
+        check_database_target(_settings(url, role))
+
+
+def test_unknown_role_is_refused():
+    with pytest.raises(DatabaseTargetError, match="DATABASE_ROLE must be one of"):
+        check_database_target(_settings("sqlite://", "prod"))
+
+
+def test_refusal_never_echoes_a_password():
+    with pytest.raises(DatabaseTargetError) as exc:
+        check_database_target(_settings("postgresql+psycopg://u:hunter2@db/x", "pilot"))
+    assert "hunter2" not in str(exc.value)
+
+
+def test_canonical_runtime_declares_the_pilot_role(tmp_path):
+    assert canonical_environment(tmp_path / "x.db")["DATABASE_ROLE"] == "pilot"
+
+
+def test_test_suite_runs_on_an_isolated_database():
+    import os
+
+    assert os.environ["DATABASE_ROLE"] == "test"
+    kind, _ = classify_database_url(os.environ["DATABASE_URL"])
+    assert kind is DatabaseKind.OTHER_SQLITE
+
+
+def test_web_startup_refuses_an_implicit_pilot_database(monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(
+        main, "get_settings", lambda: _settings(_url(PROJECT_ROOT / "stage11_pilot.db"))
+    )
+    with pytest.raises(DatabaseTargetError):
+        with TestClient(main.app):
+            pass
+
+
+def test_scheduler_refuses_a_pilot_database_before_polling(monkeypatch, capsys):
+    import app.scheduler as scheduler
+
+    monkeypatch.setattr(
+        scheduler, "get_settings", lambda: _settings(_url(PROJECT_ROOT / "stage11_pilot.db"))
+    )
+    monkeypatch.setattr(scheduler.signal, "signal", lambda *a: None)
+    assert scheduler.main() == 1
+    assert "DATABASE_ROLE=pilot" in capsys.readouterr().err
+
+
+def test_module_has_no_import_time_side_effects():
+    assert dt.PRODUCTION_RUNTIME_DB.name == "job_triage_runtime.db"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # SQLite percent-decodes `file:` URI paths (Codex Stage 17 P1)
+        "sqlite:///file:runtime/job_triage_runtime%2Edb?uri=true",
+        "sqlite:///file:runtime%2Fjob_triage_runtime.db?mode=ro&uri=true",
+        "sqlite:///runtime/job_triage_runtime%2Edb",
+    ],
+)
+def test_percent_encoded_production_spelling_is_still_production(monkeypatch, url):
+    monkeypatch.chdir(PROJECT_ROOT)
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError, match="PRODUCTION_RUNTIME"):
+        check_database_target(_settings(url, "test"))
+
+
+def test_percent_encoded_pilot_spelling_is_refused_without_a_role(monkeypatch):
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(DatabaseTargetError, match="DATABASE_ROLE=pilot"):
+        check_database_target(_settings("sqlite:///file:stage11_pilot%2Edb?uri=true"))
+
+
+# --- Codex Stage 17 re-review regressions ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("postgresql+psycopg://u:p@db/jobtriage_pilot", DatabaseKind.PILOT),
+        ("postgresql+psycopg://u:p@db/stage11", DatabaseKind.PILOT),
+        ("postgresql+psycopg://u:p@db/jobtriage_backup_2026", DatabaseKind.BACKUP),
+        ("postgresql+psycopg://u:p@db/jobtriage", DatabaseKind.SERVER),
+    ],
+)
+def test_postgres_database_names_are_classified(url, kind):
+    assert classify_database_url(url)[0] is kind
+
+
+def test_postgres_pilot_is_refused_for_production_and_unset_roles():
+    url = "postgresql+psycopg://u:p@db/jobtriage_pilot"
+    for role in ("", "production"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))
+    check_database_target(_settings(url, "pilot"))
+
+
+def test_the_query_never_changes_the_classification():
+    # without uri the dialect opens the FILE; the named file always decides
+    for url in (
+        "sqlite:///scratch_test.db?mode=memory",
+        "sqlite:///file:scratch_test.db?mode=memory&cache=shared&uri=true",
+    ):
+        assert classify_database_url(url)[0] is DatabaseKind.OTHER_SQLITE
+        check_database_target(_settings(url, "test"))  # allowed for tests
+
+
+@pytest.mark.parametrize("query", ["mode=memory&uri=TRUE", "mode=MEMORY&uri=true", "mode=memory"])
+def test_production_and_pilot_refuse_any_memory_mode(monkeypatch, query):
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(
+            _settings(f"sqlite:///file:runtime/job_triage_runtime.db?{query}", "production")
+        )
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(_settings(f"sqlite:///file:stage11_pilot.db?{query}", "pilot"))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "mode=memory&cache=shared&uri=true",
+        "mode=memory&uri=TRUE",
+        "mode=memory&uri=yes",
+        "mode=memory&uri=true&uri=true",
+        "mode=memory",
+    ],
+)
+def test_a_protected_file_name_is_never_hidden_by_mode_or_uri_spellings(monkeypatch, query):
+    # whatever the dialect's notion of URI mode, the protected name decides
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///file:runtime/job_triage_runtime.db?{query}"
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError):
+        check_database_target(_settings(url, "test"))
+
+
+def test_mode_memory_without_uri_opens_the_named_file(monkeypatch):
+    # SQLite ignores `mode=memory` unless the filename is a URI (uri=true)
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///{PRODUCTION_RUNTIME_DB.as_posix()}?mode=memory"
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError, match="PRODUCTION_RUNTIME"):
+        check_database_target(_settings(url, "test"))
+
+
+@pytest.mark.parametrize("role", ["", "development"])
+def test_a_protected_name_with_memory_mode_is_refused_for_every_role(monkeypatch, role):
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = "sqlite:///file:runtime/job_triage_runtime.db?mode=memory&uri=TRUE"
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(_settings(url, role))
+
+
+def test_memory_mode_detection_is_limited_to_sqlite_uri_syntax(tmp_path):
+    from app.core.database_target import requests_memory_mode
+
+    assert not requests_memory_mode("postgresql+psycopg://u:p@db/mode=memory")
+    assert not requests_memory_mode(f"sqlite:///{(tmp_path / 'mode=memory' / 'x.db').as_posix()}")
+    assert requests_memory_mode("sqlite:///file:x.db?mode=memory&uri=true")
+    check_database_target(_settings("postgresql+psycopg://u:p@db/mode=memory", "production"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"sqlite:///file://localhost/{PRODUCTION_RUNTIME_DB.as_posix()}?uri=true",
+        f"sqlite:///file://LOCALHOST/{PRODUCTION_RUNTIME_DB.as_posix()}?mode=ro&uri=true",
+        f"sqlite:///file:///{PRODUCTION_RUNTIME_DB.as_posix()}?uri=true",
+    ],
+)
+def test_file_uri_authority_forms_still_name_the_production_file(url):
+    # SQLite drops an empty or "localhost" authority (Codex Stage 17 round 7)
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError):
+        check_database_target(_settings(url, "test"))
+
+
+def test_a_remote_file_uri_authority_is_refused_for_every_role():
+    url = "sqlite:///file://fileserver/share/job_triage_runtime.db?uri=true"
+    assert classify_database_url(url)[0] is DatabaseKind.INVALID
+    for role in ("", "test", "production"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "uri=true&mode=memory%26cache=shared",  # encoded separator (Codex round 8)
+        "uri=true&mode=memory%23x",  # encoded fragment
+        "uri=true&mode=%6Demory",  # encoded letters
+        "uri=true&cache=shared%26mode=memory",  # smuggled through another key
+    ],
+)
+def test_encoded_memory_mode_spellings_are_refused_for_protected_files(monkeypatch, query):
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///file:runtime/job_triage_runtime.db?{query}"
+    for role in ("", "production", "test"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))

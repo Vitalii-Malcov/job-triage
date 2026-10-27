@@ -239,8 +239,10 @@ def test_repository_head_is_the_application_lifecycle_head() -> None:
     # Stage 15: b5d2e8f4a1c7 (application lifecycle tables), then the
     # remediation c8e4a2f6d1b9 (application_events append-only triggers);
     # Stage 16: e3a9c5d7f2b4 (Telegram operator control tables), then
-    # f4b8d2a6c9e1 (OUTBOUND_MESSAGE application events).
-    assert _repository_head() == "f4b8d2a6c9e1"
+    # f4b8d2a6c9e1 (OUTBOUND_MESSAGE application events); Stage 17:
+    # a9d3f6b2c4e8 (candidate search configuration), then b6c1e9a4d2f7
+    # (search targets + car-route origin coordinates).
+    assert _repository_head() == "b6c1e9a4d2f7"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # `repr=False` only changes what Pydantic's own `__repr__`/`__str__`
     # print, never validation, assignment, or attribute access.
     database_url: str = Field(default="sqlite:///./job_search.db", repr=False)
+    # Stage 17A: what this process is for (production | pilot | test |
+    # development; empty = unset). Checked against `database_url` at
+    # startup by app.core.database_target.check_database_target -- a pilot
+    # or backup database is refused unless the role says pilot.
+    database_role: str = ""
     # DEPLOY-001 (Codex master review): an operator-supplied discrete-parts
     # alternative to `database_url` above, built into a PostgreSQL URL by
     # `_build_database_url_from_postgres_parts` below via
