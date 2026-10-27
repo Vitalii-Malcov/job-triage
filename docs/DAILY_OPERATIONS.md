@@ -37,7 +37,7 @@ set (operator chat only). To start without the bot, set
 ## 2. Which database is production
 
 `D:\AI_agent\runtime\job_triage_runtime.db` (SQLite, Alembic head
-`a9d3f6b2c4e8`). Everything else in the repository root (`job_search.db`,
+`b6c1e9a4d2f7`). Everything else in the repository root (`job_search.db`,
 `stage11_pilot.db`, `stage14b_*.db`, `runtime/*pre-*.db`,
 `runtime/stage16_pilot_scratch.db`) is historical, a pilot or a backup. The
 tracker CLIs refuse the frozen `stage14b_canonical_v12.db` by path and hash.

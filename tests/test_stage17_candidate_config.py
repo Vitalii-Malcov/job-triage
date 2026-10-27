@@ -741,3 +741,21 @@ def test_upgrading_a_database_already_at_a9d3f6b2c4e8_adds_the_new_columns(tmp_p
     with sqlite3.connect(path) as conn:
         prefs = {row[1] for row in conn.execute("PRAGMA table_info(candidate_job_preferences)")}
     assert "target_seniority" not in prefs and "home_city" in prefs
+
+
+def test_b6c1_downgrade_refuses_to_discard_populated_values(tmp_path):
+    path = tmp_path / "populated.db"
+    upgrade(_alembic(path), "head")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO candidate_profiles (id, profile_version, professional_summary, "
+            "career_goal, target_roles_json, field_trust_json, contact_trust_json, created_at, "
+            "updated_at) VALUES (1, 1, '', '', '[]', '{}', '{}', '2026-10-27', '2026-10-27')"
+        )
+        conn.execute(
+            "INSERT INTO candidate_job_preferences (candidate_profile_id, "
+            "preferred_locations_json, remote_preference, employment_types_json, "
+            "target_seniority) VALUES (1, '[]', 'UNKNOWN', '[]', 'JUNIOR')"
+        )
+    with pytest.raises(RuntimeError, match="candidate_job_preferences holds 1 row"):
+        downgrade(_alembic(path), "a9d3f6b2c4e8")

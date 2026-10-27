@@ -177,11 +177,17 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
         return DatabaseKind.SERVER, None
     if backend != "sqlite":
         return DatabaseKind.INVALID, None
-    # SQLite honours `mode=memory` only for a URI filename (`uri=true`); without
-    # it the dialect opens the named FILE, so the path is classified.
-    if url.query.get("mode") == "memory" and url.query.get("uri") in ("true", "1"):
+    kind, name = _classify_spellings(url.database or "")
+    # `mode=memory` opens an in-memory database only in URI mode, and the
+    # dialect's notion of "URI mode" (true/TRUE/yes/on/1, repeated keys) is
+    # not re-implemented here: a URL naming a protected file is ALWAYS
+    # classified as that file, whatever its query says. Only an otherwise
+    # ordinary name with mode=memory counts as in-memory.
+    modes = url.query.get("mode")
+    modes = modes if isinstance(modes, tuple) else (modes,)
+    if kind is DatabaseKind.OTHER_SQLITE and "memory" in modes:
         return DatabaseKind.MEMORY, None
-    return _classify_spellings(url.database or "")
+    return kind, name
 
 
 def parse_role(raw: str | None) -> DatabaseRole | None:

@@ -207,10 +207,28 @@ def test_postgres_pilot_is_refused_for_production_and_unset_roles():
     check_database_target(_settings(url, "pilot"))
 
 
-def test_a_named_memory_uri_is_memory(monkeypatch):
-    monkeypatch.chdir(PROJECT_ROOT)
-    url = "sqlite:///file:runtime/job_triage_runtime.db?mode=memory&cache=shared&uri=true"
+def test_a_named_memory_uri_with_an_ordinary_name_is_memory():
+    url = "sqlite:///file:scratch_test.db?mode=memory&cache=shared&uri=true"
     assert classify_database_url(url)[0] is DatabaseKind.MEMORY
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "mode=memory&cache=shared&uri=true",
+        "mode=memory&uri=TRUE",
+        "mode=memory&uri=yes",
+        "mode=memory&uri=true&uri=true",
+        "mode=memory",
+    ],
+)
+def test_a_protected_file_name_is_never_hidden_by_mode_or_uri_spellings(monkeypatch, query):
+    # whatever the dialect's notion of URI mode, the protected name decides
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///file:runtime/job_triage_runtime.db?{query}"
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError):
+        check_database_target(_settings(url, "test"))
 
 
 def test_mode_memory_without_uri_opens_the_named_file(monkeypatch):

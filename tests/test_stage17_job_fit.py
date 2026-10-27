@@ -840,3 +840,22 @@ def test_role_priority_is_informational(title, status):
     assessment = fit.FitAssessment(job_id=1, company="x", title=title)
     assessment.criteria = [fit.role_criterion(title, settings)]
     assert assessment.decision == "CANDIDATE"
+
+
+def test_failed_queries_make_the_automation_step_partial(monkeypatch):
+    from app.services import automation
+
+    async def _step(db, settings, *, touched_jobs=None, is_lease_lost=None):
+        return {
+            "fetched": 3,
+            "created": 3,
+            "updated": 0,
+            "skipped_invalid": 0,
+            "failed": 0,
+            "failed_queries": 1,
+        }
+
+    result = asyncio.run(
+        automation._run_step(None, "bundesagentur", _step, None, [], is_lease_lost=lambda: False)
+    )
+    assert result["status"] == "partial"
