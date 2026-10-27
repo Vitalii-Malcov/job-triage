@@ -25,6 +25,7 @@ from app.models.candidate_profile import (
 )
 
 CommuteMeasure = Literal["CAR_ROUTE"]
+TargetSeniority = Literal["JUNIOR", "UNKNOWN"]
 RemoteWorkScope = Literal["GERMANY", "UNKNOWN"]
 
 # Higher = more authoritative. A stored value may only be replaced by a value
@@ -98,9 +99,10 @@ class CandidateSearchSettings(BaseModel):
     home_region: str | None = Field(default=None, max_length=100)
     commute_origin_label: str | None = Field(default=None, max_length=300)
     commute_origin: GeoPoint | None = None
-    # <= 195 so the Bundesagentur search radius (<= 200 km, limit + 5 km
-    # margin) still covers every workplace within the car-route limit.
-    max_commute_km: int | None = Field(default=None, ge=1, le=195)
+    # <= 175 so the Bundesagentur search radius (<= 200 km, limit + 25 km
+    # margin for the distance between the BA place centre and the commute
+    # origin) still covers every workplace within the car-route limit.
+    max_commute_km: int | None = Field(default=None, ge=1, le=175)
     commute_measure: CommuteMeasure | None = None
     relocation_regions: list[str] = Field(default_factory=list)
     remote_work_scope: RemoteWorkScope = "UNKNOWN"
@@ -112,6 +114,16 @@ class CandidateSearchSettings(BaseModel):
     earliest_start_date: date | None = None
     primary_roles: list[str] = Field(default_factory=list)
     secondary_roles: list[str] = Field(default_factory=list)
+    target_seniority: TargetSeniority = "UNKNOWN"
+    search_keywords: list[str] = Field(default_factory=list, max_length=6)
+
+    @field_validator("search_keywords")
+    @classmethod
+    def _keywords(cls, value: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in value]
+        if any(not v or len(v) > 80 for v in cleaned):
+            raise ValueError("search_keywords must be non-empty terms of at most 80 characters")
+        return cleaned
 
     @field_validator("home_postal_code")
     @classmethod

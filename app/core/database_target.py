@@ -59,6 +59,7 @@ class DatabaseRole(StrEnum):
 
 _ALLOWED: dict[DatabaseRole | None, frozenset[DatabaseKind]] = {
     DatabaseRole.PRODUCTION: frozenset({DatabaseKind.PRODUCTION_RUNTIME, DatabaseKind.SERVER}),
+    # A pilot may also live on a PostgreSQL server (database name says so).
     DatabaseRole.PILOT: frozenset({DatabaseKind.PILOT}),
     DatabaseRole.TEST: frozenset(
         {DatabaseKind.OTHER_SQLITE, DatabaseKind.MEMORY, DatabaseKind.SERVER}
@@ -102,13 +103,20 @@ def _sqlite_path(database: str) -> Path | None:
     """The filesystem path a SQLite `database` part names, or None for an
     in-memory database. Relative paths resolve against the working
     directory, exactly as SQLite opens them."""
+    if "mode=memory" in database:
+        return None
     if database.startswith("file:"):
         database = database[len("file:") :].split("?", 1)[0]
         if database.startswith("/") and re.match(r"^/[A-Za-z]:", database):
             database = database[1:]
-    if not database or database == ":memory:" or "mode=memory" in database:
+    if not database or database == ":memory:":
         return None
     return Path(database)
+
+
+# A PostgreSQL database whose NAME says pilot/backup is treated like the file.
+_SERVER_PILOT_NAME = re.compile(r"pilot|stage\d+|scratch", re.IGNORECASE)
+_SERVER_BACKUP_NAME = re.compile(r"backup|\bbak\b|_bak|pre[-_]", re.IGNORECASE)
 
 
 def classify_path(path: Path) -> DatabaseKind:
@@ -163,9 +171,16 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
         return DatabaseKind.INVALID, None
     backend = url.get_backend_name()
     if backend == "postgresql":
+        name = url.database or ""
+        if _SERVER_BACKUP_NAME.search(name):
+            return DatabaseKind.BACKUP, None
+        if _SERVER_PILOT_NAME.search(name):
+            return DatabaseKind.PILOT, None
         return DatabaseKind.SERVER, None
     if backend != "sqlite":
         return DatabaseKind.INVALID, None
+    if url.query.get("mode") == "memory":
+        return DatabaseKind.MEMORY, None
     return _classify_spellings(url.database or "")
 
 

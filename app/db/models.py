@@ -1928,6 +1928,11 @@ class CandidateJobPreferencesRecord(Base):
     earliest_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     primary_roles_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     secondary_roles_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # JUNIOR = only entry-level postings are targeted (feeds the Stage 11A
+    # collector seniority gate); UNKNOWN = not stated.
+    target_seniority: Mapped[str] = mapped_column(String(20), default="UNKNOWN", nullable=False)
+    # Bundesagentur `was` terms; empty = BUNDESAGENTUR_SEARCH_KEYWORDS.
+    search_keywords_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     search_trust_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
 
     profile: Mapped["CandidateProfileRecord"] = relationship(back_populates="job_preferences")
@@ -1971,6 +1976,10 @@ class JobCommuteCheckRecord(Base):
         Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     origin_label: Mapped[str] = mapped_column(String(300), nullable=False)
+    # The origin coordinates the route was measured from: a route from other
+    # coordinates (origin moved, label unchanged) is stale.
+    origin_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
     destination_label: Mapped[str] = mapped_column(String(300), nullable=False)
     destination_region: Mapped[str | None] = mapped_column(String(100), nullable=True)
     car_route_km: Mapped[float] = mapped_column(Float, nullable=False)

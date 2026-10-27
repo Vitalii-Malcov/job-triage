@@ -80,7 +80,7 @@ uvicorn, check the `startup_safety_state` line. See also
 
 | Source | How | Notes |
 |---|---|---|
-| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Keywords from `BUNDESAGENTUR_SEARCH_KEYWORDS`. With a stored candidate search configuration (section 5a) the place and radius come from it: `63150 Heusenstamm` with a 150 km straight-line radius (a superset of everything within 100 km by car) plus a nationwide home-office search (`arbeitszeit=ho`). Without one, `BUNDESAGENTUR_SEARCH_LOCATION/RADIUS_KM` as before. Re-runs update existing rows by fingerprint (no duplicates). |
+| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Keywords from `BUNDESAGENTUR_SEARCH_KEYWORDS`. With a stored candidate search configuration (section 5a) the place and radius come from it: the home postal code + city with a 150 km straight-line radius (a superset of everything within 100 km by car) plus a nationwide home-office search (`arbeitszeit=ho`), once per configured search term. Without one, `BUNDESAGENTUR_SEARCH_LOCATION/RADIUS_KM` as before. Re-runs update existing rows by fingerprint (no duplicates). |
 | XING job-alert e-mails | `POST /api/v1/collectors/xing/run` | Reads the `XING_MAILBOX_*` inbox read-only, only sender `jobs@mail.xing.com`. Tracking links are stored, **never opened**. |
 
 ```powershell
@@ -112,7 +112,7 @@ applied to and *tracked* (section 8).
 ## 5a. Candidate search configuration and fit criteria (Stage 17)
 
 The search constraints live in the runtime database, not in anyone's
-memory: home place and commute origin (Heusenstamm Bahnhof), the 100 km
+memory: home place and commute origin (Musterstadt Bahnhof), the 100 km
 **car-route** limit, relocation regions (Hessen), remote work (whole
 Germany if work from Hessen is allowed), salary range, earliest start date,
 primary/secondary roles, languages, skills and the confirmed contact data.

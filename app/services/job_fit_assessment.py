@@ -186,6 +186,20 @@ def remote_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
     )
 
 
+def _same_origin(check: JobCommuteCheckRecord, settings: CandidateSearchSettings, label) -> bool:
+    if check.origin_label != label:
+        return False
+    current = settings.commute_origin
+    if current is None and check.origin_lat is None:
+        return True
+    if current is None or check.origin_lat is None or check.origin_lon is None:
+        return False
+    return (round(check.origin_lat, 5), round(check.origin_lon, 5)) == (
+        round(current.lat, 5),
+        round(current.lon, 5),
+    )
+
+
 def location_criterion(
     job: JobRecord,
     settings: CandidateSearchSettings,
@@ -198,12 +212,12 @@ def location_criterion(
         return Criterion("location", "NOT_CONFIGURED", "no car-route commute limit configured")
     limit = settings.max_commute_km
     origin = settings.commute_origin_label or settings.home_city or "home"
-    if check is not None and check.origin_label != origin:
+    if check is not None and not _same_origin(check, settings, origin):
         return Criterion(
             "location",
             "DISTANCE_UNVERIFIED",
-            f"stored car route starts at {check.origin_label}, not the current origin "
-            f"{origin}; re-check (limit {limit} km)",
+            f"stored car route was measured from another origin ({check.origin_label}); "
+            f"re-check from {origin} (limit {limit} km)",
         )
     if check is not None:
         minutes = (

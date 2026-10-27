@@ -56,18 +56,18 @@ def spec_dict(**overrides) -> dict:
         "schema": "jobtriage.candidate-config/1",
         "source": "USER_CONFIRMED",
         "confirmed_on": "2026-10-27",
-        "profile": {"location_city": "Heusenstamm", "location_country": "Germany"},
+        "profile": {"location_city": "Musterstadt", "location_country": "Germany"},
         "contact": {
             "email": "candidate@example.org",
             "phone": "+49 170 0000000",
             "website_url": "https://example.org/portfolio",
         },
         "search": {
-            "home_city": "Heusenstamm",
-            "home_postal_code": "63150",
+            "home_city": "Musterstadt",
+            "home_postal_code": "12345",
             "home_region": "Hessen",
-            "commute_origin_label": "Heusenstamm Bahnhof",
-            "commute_origin": {"lat": 50.06, "lon": 8.80},
+            "commute_origin_label": "Musterstadt Bahnhof",
+            "commute_origin": {"lat": 50.1, "lon": 8.75},
             "max_commute_km": 100,
             "commute_measure": "CAR_ROUTE",
             "relocation_regions": ["Hessen"],
@@ -77,7 +77,7 @@ def spec_dict(**overrides) -> dict:
             "maximum_salary": 50000,
             "salary_currency": "EUR",
             "salary_negotiable": True,
-            "earliest_start_date": "2027-01-01",
+            "earliest_start_date": "2027-03-01",
             "primary_roles": ["Junior Python Developer", "Python Backend Developer"],
             "secondary_roles": ["Technical Application Support"],
         },
@@ -193,11 +193,11 @@ def test_apply_persists_everything_with_provenance_and_one_revision(db):
     assert version == 3 and not plan.refusals
     db.expire_all()
     config = load_search_config(db)
-    assert config.location_city == "Heusenstamm"
+    assert config.location_city == "Musterstadt"
     assert config.search.max_commute_km == 100
     assert config.search.commute_measure == "CAR_ROUTE"
     assert config.search.remote_work_from_region == "Hessen"
-    assert config.search.earliest_start_date == date(2027, 1, 1)
+    assert config.search.earliest_start_date == date(2027, 3, 1)
     assert (config.search.minimum_salary, config.search.maximum_salary) == (45000, 50000)
     assert config.contact.phone == "+49 170 0000000"
     assert config.search_trust["home_city"].source == "USER_CONFIRMED"
@@ -331,7 +331,7 @@ def test_patching_job_preferences_keeps_the_search_configuration(db):
     db.expire_all()
     config = load_search_config(db)
     assert config.search.max_commute_km == 100
-    assert config.search.home_city == "Heusenstamm"
+    assert config.search.home_city == "Musterstadt"
 
 
 def test_patch_cannot_replace_a_confirmed_fact_with_document_data(db):
@@ -347,7 +347,7 @@ def test_patch_cannot_replace_a_confirmed_fact_with_document_data(db):
     assert exc.value.fields == ["location_city"]
     db.expire_all()
     profile = db.get(CandidateProfileRecord, 1)
-    assert (profile.location_city, profile.profile_version) == ("Heusenstamm", version)
+    assert (profile.location_city, profile.profile_version) == ("Musterstadt", version)
 
 
 def test_patch_cannot_downgrade_a_confirmed_language_from_a_document(db):
@@ -404,7 +404,7 @@ def test_patch_endpoint_maps_a_trust_downgrade_to_409(db, monkeypatch):
     assert response.status_code == 409
     assert response.json()["detail"]["fields"] == ["location_city"]
     db.expire_all()
-    assert db.get(CandidateProfileRecord, 1).location_city == "Heusenstamm"
+    assert db.get(CandidateProfileRecord, 1).location_city == "Musterstadt"
 
 
 # --- applications are never touched ----------------------------------------------------
@@ -609,8 +609,8 @@ def test_partial_update_derives_stage6a_columns_from_the_effective_configuration
 
 def test_commute_limit_is_capped_inside_the_ba_radius_range():
     with pytest.raises(ValidationError):
-        CandidateSearchSettings(max_commute_km=196, commute_measure="CAR_ROUTE")
-    CandidateSearchSettings(max_commute_km=195, commute_measure="CAR_ROUTE")
+        CandidateSearchSettings(max_commute_km=176, commute_measure="CAR_ROUTE")
+    CandidateSearchSettings(max_commute_km=175, commute_measure="CAR_ROUTE")
 
 
 def test_document_grade_collection_cannot_drop_a_confirmed_language(db):
@@ -658,3 +658,56 @@ def test_a_manual_collection_may_still_remove_a_confirmed_language(db):
     db.expire_all()
     names = {lang.language for lang in db.scalars(select(CandidateLanguageRecord))}
     assert names == {"Deutsch"}
+
+
+def test_a_partial_file_may_not_leave_an_invalid_combined_configuration(db):
+    _apply(db)
+    drop_measure = spec_dict()
+    drop_measure["search"] = {"commute_measure": None}
+    plan = plan_config_change(
+        db.get(CandidateProfileRecord, 1), CandidateConfigSpec.model_validate(drop_measure)
+    )
+    assert any("combined configuration is invalid" in r for r in plan.refusals)
+    inverted = spec_dict()
+    inverted["search"] = {"maximum_salary": 30000}
+    plan = plan_config_change(
+        db.get(CandidateProfileRecord, 1), CandidateConfigSpec.model_validate(inverted)
+    )
+    assert any("maximum_salary is below minimum_salary" in r for r in plan.refusals)
+
+
+def test_an_empty_collection_cannot_wipe_confirmed_items(db):
+    _apply(db)
+    version = db.get(CandidateProfileRecord, 1).profile_version
+    for collection in ("languages", "skills"):
+        with pytest.raises(CandidateProfileTrustDowngradeError, match=collection):
+            apply_candidate_profile_patch(
+                db,
+                CandidateProfilePatchRequest(expected_profile_version=version, **{collection: []}),
+            )
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(CandidateLanguageRecord)) == 2
+
+
+def test_configured_entry_level_target_feeds_the_collector_seniority_gate(tmp_path):
+    from app.services.collector_runner import _candidate_target_seniority
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'gate.db'}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(engine)()
+    try:
+        get_or_create_candidate_profile(session)  # empty target_roles
+        assert _candidate_target_seniority(session) == "UNKNOWN"
+        data = spec_dict()
+        data["search"] = {"target_seniority": "JUNIOR"}
+        profile = session.get(CandidateProfileRecord, 1)
+        apply_config_plan(
+            session,
+            plan_config_change(profile, CandidateConfigSpec.model_validate(data)),
+            actor="t",
+            reason="r",
+        )
+        assert _candidate_target_seniority(session) == "JUNIOR"
+    finally:
+        session.close()
+        engine.dispose()

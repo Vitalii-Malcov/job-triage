@@ -194,6 +194,10 @@ def _candidate_target_seniority(db: Session):
             return "UNKNOWN"
         profile = to_candidate_profile_response(profile_record)
 
+    # Stage 17: an explicitly configured entry-level target wins.
+    config = load_search_config(db)
+    if config is not None and config.search.target_seniority == "JUNIOR":
+        return "JUNIOR"
     return derive_candidate_target_seniority(profile.target_roles)
 
 

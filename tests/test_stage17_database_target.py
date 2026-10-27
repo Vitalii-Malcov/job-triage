@@ -181,3 +181,33 @@ def test_percent_encoded_pilot_spelling_is_refused_without_a_role(monkeypatch):
     monkeypatch.chdir(PROJECT_ROOT)
     with pytest.raises(DatabaseTargetError, match="DATABASE_ROLE=pilot"):
         check_database_target(_settings("sqlite:///file:stage11_pilot%2Edb?uri=true"))
+
+
+# --- Codex Stage 17 re-review regressions ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("postgresql+psycopg://u:p@db/jobtriage_pilot", DatabaseKind.PILOT),
+        ("postgresql+psycopg://u:p@db/stage11", DatabaseKind.PILOT),
+        ("postgresql+psycopg://u:p@db/jobtriage_backup_2026", DatabaseKind.BACKUP),
+        ("postgresql+psycopg://u:p@db/jobtriage", DatabaseKind.SERVER),
+    ],
+)
+def test_postgres_database_names_are_classified(url, kind):
+    assert classify_database_url(url)[0] is kind
+
+
+def test_postgres_pilot_is_refused_for_production_and_unset_roles():
+    url = "postgresql+psycopg://u:p@db/jobtriage_pilot"
+    for role in ("", "production"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))
+    check_database_target(_settings(url, "pilot"))
+
+
+def test_a_named_memory_uri_is_memory(monkeypatch):
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = "sqlite:///file:runtime/job_triage_runtime.db?mode=memory&cache=shared&uri=true"
+    assert classify_database_url(url)[0] is DatabaseKind.MEMORY

@@ -14,7 +14,9 @@ connects): `PRODUCTION_RUNTIME` (`runtime/job_triage_runtime.db`), `PILOT`
 (`stage*_*.db` in the project root or `runtime/`), `BACKUP` (`*.pre-*`,
 `job-triage-backups\`), `OTHER_SQLITE`, `MEMORY`, `SERVER` (PostgreSQL).
 Both the literal and the percent-decoded spelling of the path are classified
-(SQLite decodes `file:` URIs) and the most sensitive kind wins.
+(SQLite decodes `file:` URIs) and the most sensitive kind wins. A PostgreSQL
+database whose name says pilot/stage/scratch or backup is classified like
+the corresponding file.
 `DATABASE_ROLE` (`production` | `pilot` | `test` | `development`, optional)
 says what the process is for; `check_database_target` runs at web and
 scheduler startup and refuses a mismatch:
@@ -39,9 +41,9 @@ Existing tables are extended instead of adding parallel ones:
 | Table | New columns | Meaning |
 |---|---|---|
 | `candidate_profiles` | `contact_email`, `contact_phone`, `contact_website_url`, `contact_trust_json` | confirmed contact data for Bewerbungen + provenance |
-| `candidate_job_preferences` | `home_city/_postal_code/_region`, `commute_origin_label/_lat/_lon`, `max_commute_km`, `commute_measure` (`CAR_ROUTE`), `relocation_regions_json`, `remote_work_scope` (`GERMANY`/`UNKNOWN`), `remote_work_from_region`, `maximum_salary`, `salary_negotiable`, `earliest_start_date`, `primary_roles_json`, `secondary_roles_json`, `search_trust_json` | search configuration + per-field provenance |
+| `candidate_job_preferences` | `home_city/_postal_code/_region`, `commute_origin_label/_lat/_lon`, `max_commute_km`, `commute_measure` (`CAR_ROUTE`), `relocation_regions_json`, `remote_work_scope` (`GERMANY`/`UNKNOWN`), `remote_work_from_region`, `maximum_salary`, `salary_negotiable`, `earliest_start_date`, `primary_roles_json`, `secondary_roles_json`, `target_seniority`, `search_keywords_json`, `search_trust_json` | search configuration + per-field provenance |
 | `candidate_profile_revisions` (new) | actor, reason, source, changed fields, before/after values | append-only audit (UPDATE/DELETE refused by triggers on SQLite and PostgreSQL) |
-| `job_commute_checks` (new) | job, origin, destination, region, car km, minutes, method (`MANUAL`/`OSRM`), source note | verified car routes |
+| `job_commute_checks` (new) | job, origin label + coordinates, destination, region, car km, minutes, method (`MANUAL`/`OSRM`), source note | verified car routes |
 
 `minimum_salary`, `salary_currency`, `relocation`, `preferred_locations` and
 `remote_preference` are the existing Stage 6A columns, kept consistent with
@@ -52,7 +54,9 @@ support role there would make them fail open and let senior or unrelated
 postings reach APPLY. Those gates never exclude a posting merely for lacking
 the word "Junior" (only titles that state Senior/Lead/... or are classified
 IRRELEVANT); support, QA and IT-integration titles classify as UNKNOWN and
-pass. Entry level is reported separately (below).
+pass. The collector seniority gate instead reads the explicit
+`target_seniority` (`JUNIOR` = entry-level target) when it is configured.
+Entry level is reported separately (below).
 
 **Writing it.** `scripts/stage17_candidate_config.py apply --config FILE`
 reads an operator-confirmed file (`jobtriage.candidate-config/1`, kept outside
@@ -60,23 +64,27 @@ the repository because it holds contact data) and prints a plan. `--apply
 --expected-version N` writes exactly that plan in one transaction (atomic
 compare-and-swap on `profile_version`, one revision row). Protections:
 
-- only keys the file states are changed (an omitted key is untouched);
+- only keys the file states are changed (an omitted key is untouched), and
+  the COMBINED result must still be a valid configuration (e.g. a partial
+  file cannot drop the commute measure under a stored limit);
 - a stored value whose source ranks higher (`USER_CONFIRMED` >
   `MANUAL_ENTRY` > `USER_PROVIDED_DOCUMENT` > `IMPORTED` > `INFERRED`) is never
   overwritten -- the plan shows `REFUSED` and nothing is written;
 - a language level may only rise from a `USER_CONFIRMED` source; levels are
-  never inferred (German stays B1; the B2 course is a note, not a level);
+  never inferred (an ongoing course is a note, not a level);
 - skills and languages are only added/updated, never removed; existing
   skills are never modified; learning/project experience stays labelled as
   such in the skill notes;
 - `search_sources` lowers the provenance of individual values that did not
-  come from the candidate (the Heusenstamm Bahnhof coordinates are
+  come from the candidate (the Musterstadt Bahnhof coordinates are
   OpenStreetMap data: `IMPORTED`).
 
 The Stage 6A PATCH endpoint now updates `candidate_job_preferences` in place
 (replacing the row would wipe the search configuration) and refuses (409) to
 replace a `USER_CONFIRMED` fact with document-grade data (`USER_PROVIDED_DOCUMENT`,
-`IMPORTED`, `INFERRED`, `UNKNOWN`). A direct manual PATCH is still allowed.
+`IMPORTED`, `INFERRED`, `UNKNOWN`); a replaced language/skill collection may
+not drop or alter a confirmed item through document-grade or empty data. A
+direct manual PATCH is still allowed.
 
 Known limitation: the Stage 13B transfer snapshot (SQLite -> PostgreSQL
 rehearsal tool) covers the Stage 6A facts only; it does not carry the
@@ -85,10 +93,14 @@ Stage 17 columns.
 ## 17C — Search and assessment
 
 **Discovery** (`app/services/search_strategy.py`): with a configuration the
-Bundesagentur run performs a commute search (`wo=63150 Heusenstamm`,
-`umkreis` = the smallest BA radius step >= limit + 5 km, i.e. 150 km for a
-100 km limit) and, if remote work across Germany is configured, a nationwide
-home-office search (`arbeitszeit=ho`, 5 pages). The BA radius is a
+Bundesagentur run performs a commute search (`wo=12345 Musterstadt`,
+`umkreis` = the smallest BA radius step >= limit + 25 km, i.e. 150 km for a
+100 km limit; the limit is capped at 175 km so a step always exists; the
+25 km margin covers the distance between the BA place centre and the
+commute origin, which must lie within it) and, if remote work across Germany is configured, a nationwide
+home-office search (`arbeitszeit=ho`, 5 pages). With `search_keywords`
+configured (at most 6) each term gets its own commute and remote search;
+otherwise `BUNDESAGENTUR_SEARCH_KEYWORDS` is the single term. The BA radius is a
 straight-line distance; every workplace within 100 km by car is within it,
 so the search discovers a superset and never decides anything. A posting
 returned by both searches is processed once.
@@ -105,7 +117,7 @@ returned by both searches is processed once.
 | remote | posting text | COMPATIBLE, INCOMPATIBLE (restricted to another state), PARTIAL_REMOTE ("bis zu 100%"), HYBRID, ONSITE, UNKNOWN |
 | salary | stated amount (monthly x12) vs expectation | MATCH, BELOW (informational; negotiable), TARIFF, UNKNOWN |
 | entry_level | title/text signals | ENTRY_LEVEL, OPEN (no seniority stated -- not negative), MIXED, EXPERIENCED |
-| start_date | "ab sofort" vs 01.01.2027 | OK, EARLIER_REQUESTED |
+| start_date | "ab sofort" vs the configured earliest start date | OK, EARLIER_REQUESTED |
 | duplicate | Stage 15 duplicate check | ALREADY_APPLIED, IN_PREPARATION, POSSIBLE_DUPLICATE, CLEAR |
 
 Decision: `BLOCKED` (location FAIL, remote INCOMPATIBLE, ALREADY_APPLIED),
@@ -113,7 +125,8 @@ else `NEEDS_VERIFICATION` (distance unverified/unknown, possible duplicate,
 skills not evaluated), else `CANDIDATE`. No criterion is folded into a score.
 
 **Car routes.** Only a `job_commute_checks` row makes a distance PASS/FAIL, and only if it starts
-at the currently configured origin (otherwise it is stale: DISTANCE_UNVERIFIED).
+at the currently configured origin -- same label AND same coordinates
+(otherwise it is stale: DISTANCE_UNVERIFIED).
 `record-commute` stores a route the operator measured; `check-commute` asks
 OSRM (`router.project-osrm.org`) for the driving route between the stored
 origin coordinates and the given workplace coordinates -- only the two

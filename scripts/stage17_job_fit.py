@@ -108,6 +108,8 @@ def _store(session: Session, args, *, km: float, minutes, method: str, note: str
             origin_label=origin[0],
             destination_label=args.destination,
             destination_region=args.region,
+            origin_lat=origin[1].lat if origin[1] else None,
+            origin_lon=origin[1].lon if origin[1] else None,
             car_route_km=km,
             car_route_minutes=minutes,
             method=method,

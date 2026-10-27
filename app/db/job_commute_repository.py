@@ -25,6 +25,8 @@ def record_commute_check(
     source_note: str,
     car_route_minutes: float | None = None,
     destination_region: str | None = None,
+    origin_lat: float | None = None,
+    origin_lon: float | None = None,
     now: datetime | None = None,
 ) -> JobCommuteCheckRecord:
     if db.get(JobRecord, job_id) is None:
@@ -43,6 +45,8 @@ def record_commute_check(
     record = JobCommuteCheckRecord(
         job_id=job_id,
         origin_label=origin_label.strip()[:300],
+        origin_lat=origin_lat,
+        origin_lon=origin_lon,
         destination_label=destination_label.strip()[:300],
         destination_region=(destination_region or None),
         car_route_km=float(car_route_km),

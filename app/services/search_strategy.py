@@ -5,14 +5,19 @@ With a configured candidate search (app/models/candidate_search.py):
 1. **commute search** -- `wo` = the home postal code + city, `umkreis` = the
    smallest BA radius step that is at least the car-route limit plus a
    margin. The BA radius is a straight-line distance from the place's
-   centre; every workplace whose CAR route is within the limit is also
-   within that straight-line radius, so this discovers a superset. Being
+   centre; every workplace whose CAR route from the commute origin is
+   within the limit lies within limit + (origin-to-centre distance) in a
+   straight line, so with the commute origin within RADIUS_MARGIN_KM of the
+   home place this discovers a superset. Being
    inside the radius never makes a job "close enough": only a verified car
    route (job_commute_checks) does. Frankfurt, Offenbach, Hanau, Darmstadt,
    Mainz, Wiesbaden and places in neighbouring states are all inside it.
 2. **remote search** (only if remote work across Germany is configured) --
    no `wo`, `arbeitszeit=ho` (BA: Heim-/Telearbeit), fewer pages. A hit is
    still assessed for "fully remote, work from the home region allowed".
+
+`search_keywords` (configured) gives one commute and one remote search
+per term; otherwise BUNDESAGENTUR_SEARCH_KEYWORDS is the single term.
 
 Without a configured search the single legacy query from
 BUNDESAGENTUR_SEARCH_KEYWORDS/LOCATION/RADIUS_KM is used unchanged.
@@ -25,7 +30,7 @@ from app.models.candidate_search import CandidateSearchSettings
 # Radius steps offered by the BA job search; the API documents `umkreis` in km.
 BA_RADIUS_STEPS = (10, 15, 20, 25, 50, 100, 150, 200)
 # Straight-line margin between the BA place centre and the commute origin.
-RADIUS_MARGIN_KM = 5
+RADIUS_MARGIN_KM = 25
 DEFAULT_MAX_PAGES = 20
 REMOTE_MAX_PAGES = 5
 HOME_OFFICE = "ho"
@@ -70,23 +75,22 @@ def bundesagentur_queries(
             )
         ]
     location = " ".join(part for part in (search.home_postal_code, search.home_city) if part)
+    terms = search.search_keywords or [keywords]
+    radius = ba_radius_for(search.max_commute_km)
     queries = [
-        BundesagenturQuery(
-            label="commute",
-            keywords=keywords,
-            location=location,
-            radius_km=ba_radius_for(search.max_commute_km),
-        )
+        BundesagenturQuery(label="commute", keywords=term, location=location, radius_km=radius)
+        for term in terms
     ]
     if search.remote_work_scope == "GERMANY":
-        queries.append(
+        queries += [
             BundesagenturQuery(
                 label="remote",
-                keywords=keywords,
+                keywords=term,
                 location="",
                 radius_km=0,
                 working_time=HOME_OFFICE,
                 max_pages=REMOTE_MAX_PAGES,
             )
-        )
+            for term in terms
+        ]
     return queries

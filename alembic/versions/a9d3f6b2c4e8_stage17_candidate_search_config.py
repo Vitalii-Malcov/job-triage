@@ -62,6 +62,8 @@ def _preference_columns() -> tuple[sa.Column, ...]:
         sa.Column("earliest_start_date", sa.Date(), nullable=True),
         sa.Column("primary_roles_json", sa.Text(), nullable=False, server_default="[]"),
         sa.Column("secondary_roles_json", sa.Text(), nullable=False, server_default="[]"),
+        sa.Column("target_seniority", sa.String(20), nullable=False, server_default="UNKNOWN"),
+        sa.Column("search_keywords_json", sa.Text(), nullable=False, server_default="[]"),
         sa.Column("search_trust_json", sa.Text(), nullable=False, server_default="{}"),
     )
 
@@ -142,6 +144,8 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("origin_label", sa.String(300), nullable=False),
+        sa.Column("origin_lat", sa.Float(), nullable=True),
+        sa.Column("origin_lon", sa.Float(), nullable=True),
         sa.Column("destination_label", sa.String(300), nullable=False),
         sa.Column("destination_region", sa.String(100), nullable=True),
         sa.Column("car_route_km", sa.Float(), nullable=False),

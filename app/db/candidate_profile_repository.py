@@ -418,7 +418,9 @@ def _collection_downgrades(
     may not change a confirmed item, and a confirmed item may only be left out
     when every incoming item is a direct human assertion."""
     incoming = {item_key(item): item for item in items}
-    document_grade = any(item.source in _DOCUMENT_GRADE_SOURCES for item in items)
+    # An empty replacement carries no human assertion at all: treat it like
+    # document-grade data (it may not wipe confirmed items).
+    document_grade = not items or any(item.source in _DOCUMENT_GRADE_SOURCES for item in items)
     refused = []
     for stored in confirmed:
         item = incoming.get(stored_key(stored))

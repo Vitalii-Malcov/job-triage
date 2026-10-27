@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -67,11 +68,13 @@ _SEARCH_COLUMNS: dict[str, str] = {
     "salary_currency": "salary_currency",
     "salary_negotiable": "salary_negotiable",
     "earliest_start_date": "earliest_start_date",
+    "target_seniority": "target_seniority",
 }
 _SEARCH_LIST_COLUMNS: dict[str, str] = {
     "relocation_regions": "relocation_regions_json",
     "primary_roles": "primary_roles_json",
     "secondary_roles": "secondary_roles_json",
+    "search_keywords": "search_keywords_json",
 }
 _CONTACT_COLUMNS = {
     "email": "contact_email",
@@ -133,6 +136,7 @@ def stored_search_settings(record: CandidateJobPreferencesRecord | None) -> Cand
     )
     values["commute_origin"] = origin
     values["remote_work_scope"] = values["remote_work_scope"] or "UNKNOWN"
+    values["target_seniority"] = values["target_seniority"] or "UNKNOWN"
     return CandidateSearchSettings.model_construct(**values)
 
 
@@ -199,6 +203,15 @@ def plan_config_change(profile: CandidateProfileRecord, spec: CandidateConfigSpe
         trust = _trust_map(preferences.search_trust_json if preferences else None)
         # Only what the file states explicitly; an omitted key is untouched.
         stated = spec.search.model_fields_set
+        # The COMBINED result (stored values + this file) must itself be a
+        # valid configuration -- a partial file must not, e.g., drop the
+        # commute measure under a stored limit or invert the salary range.
+        combined = {**current.model_dump(), **{n: getattr(spec.search, n) for n in stated}}
+        try:
+            CandidateSearchSettings.model_validate(combined)
+        except ValidationError as exc:
+            reasons = "; ".join(error["msg"] for error in exc.errors())
+            plan.refusals.append(f"search: the combined configuration is invalid ({reasons})")
         for name in [*_SEARCH_COLUMNS, *_SEARCH_LIST_COLUMNS, "commute_origin"]:
             new, old = getattr(spec.search, name), getattr(current, name)
             if name not in stated or new == old:

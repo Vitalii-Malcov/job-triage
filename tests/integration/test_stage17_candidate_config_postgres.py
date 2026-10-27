@@ -48,9 +48,9 @@ SPEC = CandidateConfigSpec.model_validate(
         "schema": "jobtriage.candidate-config/1",
         "source": "USER_CONFIRMED",
         "confirmed_on": "2026-10-27",
-        "profile": {"location_city": "Heusenstamm"},
+        "profile": {"location_city": "Musterstadt"},
         "search": {
-            "home_city": "Heusenstamm",
+            "home_city": "Musterstadt",
             "max_commute_km": 100,
             "commute_measure": "CAR_ROUTE",
             "remote_work_scope": "GERMANY",
@@ -84,7 +84,7 @@ def test_configuration_is_applied_with_one_revision(factory):
         session.expire_all()
         config = load_search_config(session)
         assert version == profile.profile_version
-        assert (config.location_city, config.search.max_commute_km) == ("Heusenstamm", 100)
+        assert (config.location_city, config.search.max_commute_km) == ("Musterstadt", 100)
         assert session.scalar(select(func.count()).select_from(CandidateProfileRevisionRecord)) == 1
         assert plan_config_change(session.get(type(profile), 1), SPEC).is_noop
     finally:
@@ -126,7 +126,7 @@ def test_commute_checks_follow_their_job(factory):
         record_commute_check(
             session,
             job_id=job.id,
-            origin_label="Heusenstamm Bahnhof",
+            origin_label="Musterstadt Bahnhof",
             destination_label="Darmstadt",
             car_route_km=41.2,
             method="MANUAL",

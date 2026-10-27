@@ -46,13 +46,13 @@ from scripts import stage17_job_fit as cli
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 10, 27, 9, 0, tzinfo=UTC)
-HEUSENSTAMM = GeoPoint(lat=50.0601176, lon=8.8021509)
+ORIGIN = GeoPoint(lat=50.1, lon=8.75)
 
 SETTINGS = CandidateSearchSettings(
-    home_city="Heusenstamm",
-    home_postal_code="63150",
-    commute_origin_label="Heusenstamm Bahnhof",
-    commute_origin=HEUSENSTAMM,
+    home_city="Musterstadt",
+    home_postal_code="12345",
+    commute_origin_label="Musterstadt Bahnhof",
+    commute_origin=ORIGIN,
     max_commute_km=100,
     commute_measure="CAR_ROUTE",
     relocation_regions=["Hessen"],
@@ -61,7 +61,7 @@ SETTINGS = CandidateSearchSettings(
     minimum_salary=45000,
     maximum_salary=50000,
     salary_negotiable=True,
-    earliest_start_date=date(2027, 1, 1),
+    earliest_start_date=date(2027, 3, 1),
 )
 
 
@@ -154,7 +154,9 @@ def _job(**overrides) -> JobRecord:
 def _check(km: float, region: str | None = None) -> JobCommuteCheckRecord:
     return JobCommuteCheckRecord(
         job_id=1,
-        origin_label="Heusenstamm Bahnhof",
+        origin_label="Musterstadt Bahnhof",
+        origin_lat=ORIGIN.lat,
+        origin_lon=ORIGIN.lon,
         destination_label="Darmstadt, Rheinstr. 1",
         destination_region=region,
         car_route_km=km,
@@ -344,7 +346,9 @@ def test_assess_job_uses_a_stored_car_route(db):
     record_commute_check(
         db,
         job_id=1,
-        origin_label="Heusenstamm Bahnhof",
+        origin_label="Musterstadt Bahnhof",
+        origin_lat=ORIGIN.lat,
+        origin_lon=ORIGIN.lon,
         destination_label="Darmstadt",
         car_route_km=41.2,
         car_route_minutes=38,
@@ -428,9 +432,9 @@ def test_osrm_returns_km_and_minutes_and_sends_only_coordinates():
             200, json={"code": "Ok", "routes": [{"distance": 41234.0, "duration": 2280.0}]}
         )
 
-    route = _osrm(handler).car_route(HEUSENSTAMM, GeoPoint(lat=49.87, lon=8.65))
+    route = _osrm(handler).car_route(ORIGIN, GeoPoint(lat=49.87, lon=8.65))
     assert route == CarRoute(km=41.2, minutes=38.0)
-    assert seen[0].path == "/route/v1/driving/8.802151,50.060118;8.650000,49.870000"
+    assert seen[0].path == "/route/v1/driving/8.750000,50.100000;8.650000,49.870000"
 
 
 @pytest.mark.parametrize(
@@ -444,11 +448,11 @@ def test_osrm_returns_km_and_minutes_and_sends_only_coordinates():
 )
 def test_osrm_failures_never_produce_a_distance(response):
     with pytest.raises(RouteUnavailableError):
-        _osrm(lambda request: response).car_route(HEUSENSTAMM, HEUSENSTAMM)
+        _osrm(lambda request: response).car_route(ORIGIN, ORIGIN)
 
 
 def test_straight_line_is_only_a_lower_bound_helper():
-    assert 20 < straight_line_km(HEUSENSTAMM, GeoPoint(lat=49.87, lon=8.65)) < 30
+    assert 20 < straight_line_km(ORIGIN, GeoPoint(lat=49.87, lon=8.65)) < 30
 
 
 # --- CLI --------------------------------------------------------------------------------
@@ -563,10 +567,10 @@ def test_legacy_settings_query_without_a_configuration():
     ]
 
 
-def test_configured_search_uses_heusenstamm_and_a_superset_radius_plus_remote():
+def test_configured_search_uses_the_home_place_and_a_superset_radius_plus_remote():
     commute, remote = bundesagentur_queries(_settings(), SETTINGS)
     assert (commute.location, commute.radius_km, commute.working_time) == (
-        "63150 Heusenstamm",
+        "12345 Musterstadt",
         150,
         "",
     )
@@ -575,7 +579,7 @@ def test_configured_search_uses_heusenstamm_and_a_superset_radius_plus_remote():
 
 
 def test_radius_is_never_below_the_car_route_limit():
-    for limit in (10, 25, 50, 95, 100, 145, 195):
+    for limit in (10, 25, 50, 95, 100, 125, 175):
         assert ba_radius_for(limit) >= limit
     assert ba_radius_for(100) == 150
 
@@ -629,7 +633,7 @@ def test_runner_runs_every_query_and_processes_a_posting_once(db, monkeypatch):
         )
     )
     assert [(m.kwargs["location"], m.kwargs["working_time"]) for m in made] == [
-        ("63150 Heusenstamm", ""),
+        ("12345 Musterstadt", ""),
         ("", "ho"),
     ]
     assert result["fetched"] == 2
@@ -658,7 +662,7 @@ def test_an_imported_language_level_is_not_treated_as_confirmed(db):
 def test_osrm_route_entry_that_is_not_an_object():
     response = httpx.Response(200, json={"code": "Ok", "routes": [None]})
     with pytest.raises(RouteUnavailableError):
-        _osrm(lambda request: response).car_route(HEUSENSTAMM, HEUSENSTAMM)
+        _osrm(lambda request: response).car_route(ORIGIN, ORIGIN)
 
 
 def test_the_straight_line_value_is_never_stored(migrated, capsys):
@@ -677,7 +681,7 @@ def test_the_straight_line_value_is_never_stored(migrated, capsys):
 
 def test_ba_radius_refuses_a_limit_it_cannot_cover():
     with pytest.raises(ValueError):
-        ba_radius_for(196)
+        ba_radius_for(176)
 
 
 def test_a_failing_remote_query_keeps_the_commute_results(db, monkeypatch):
@@ -721,3 +725,37 @@ def test_configured_search_keeps_the_collector_seniority_gate(db):
 
     # the configuration never writes profile.target_roles (Stage 11A/11B gates)
     assert json.loads(get_candidate_profile(db).target_roles_json) == []
+
+
+def test_a_route_from_moved_origin_coordinates_is_stale():
+    check = _check(85)
+    check.origin_lat = 49.0
+    assert fit.location_criterion(_job(), SETTINGS, _remote(), check).status == (
+        "DISTANCE_UNVERIFIED"
+    )
+
+
+def test_one_commute_and_one_remote_search_per_configured_term():
+    configured = SETTINGS.model_copy(update={"search_keywords": ["Python", "Softwaretester"]})
+    queries = bundesagentur_queries(_settings(), configured)
+    assert [(q.label, q.keywords) for q in queries] == [
+        ("commute", "Python"),
+        ("commute", "Softwaretester"),
+        ("remote", "Python"),
+        ("remote", "Softwaretester"),
+    ]
+
+
+def test_check_commute_stores_the_origin_coordinates(migrated):
+    args = ["--database", str(migrated), "check-commute", "1", "--dest-lat", "49.87"]
+    args += ["--dest-lon", "8.65", "--destination", "Darmstadt", "--apply"]
+    assert cli.run(args, route_provider=_FakeProvider(CarRoute(km=44.0, minutes=40))) == 0
+    engine = create_engine(f"sqlite:///{migrated.as_posix()}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(JobCommuteCheckRecord.origin_lat, JobCommuteCheckRecord.origin_lon)
+            ).one()
+    finally:
+        engine.dispose()
+    assert tuple(row) == (ORIGIN.lat, ORIGIN.lon)
