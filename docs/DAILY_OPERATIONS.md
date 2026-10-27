@@ -112,10 +112,10 @@ applied to and *tracked* (section 8).
 ## 5a. Candidate search configuration and fit criteria (Stage 17)
 
 The search constraints live in the runtime database, not in anyone's
-memory: home place and commute origin (Musterstadt Bahnhof), the 100 km
-**car-route** limit, relocation regions (Hessen), remote work (whole
-Germany if work from Hessen is allowed), salary range, earliest start date,
-primary/secondary roles, languages, skills and the confirmed contact data.
+memory: home place and commute origin, the **car-route** commute limit,
+relocation regions, the remote-work rule, salary range, earliest start date,
+target seniority, search terms, primary/secondary roles, languages, skills
+and the confirmed contact data.
 
 ```powershell
 $db = "D:/AI_agent/runtime/job_triage_runtime.db"

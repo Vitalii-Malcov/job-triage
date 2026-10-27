@@ -66,13 +66,15 @@ def bundesagentur_queries(
         and search.commute_measure == "CAR_ROUTE"
     )
     if not configured:
+        terms = (search.search_keywords if search is not None else []) or [keywords]
         return [
             BundesagenturQuery(
                 label="settings",
-                keywords=keywords,
+                keywords=term,
                 location=settings.bundesagentur_search_location,
                 radius_km=settings.bundesagentur_search_radius_km,
             )
+            for term in terms
         ]
     location = " ".join(part for part in (search.home_postal_code, search.home_city) if part)
     terms = search.search_keywords or [keywords]

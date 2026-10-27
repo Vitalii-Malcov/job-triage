@@ -51,6 +51,7 @@ SPEC = CandidateConfigSpec.model_validate(
         "profile": {"location_city": "Musterstadt"},
         "search": {
             "home_city": "Musterstadt",
+            "commute_origin_label": "Musterstadt Bahnhof",
             "max_commute_km": 100,
             "commute_measure": "CAR_ROUTE",
             "remote_work_scope": "GERMANY",

@@ -84,7 +84,7 @@ jobs:
           python -m alembic heads | tee /tmp/alembic_heads.txt
           test "$(grep -c '(head)' /tmp/alembic_heads.txt)" -eq 1
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "a9d3f6b2c4e8 (head)" /tmp/alembic_current.txt
+          grep -q "b6c1e9a4d2f7 (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
       # HARD-010 (adversarial hardening r1): claim_send_attempt's

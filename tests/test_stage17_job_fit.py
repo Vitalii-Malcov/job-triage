@@ -330,6 +330,7 @@ def test_assess_job_end_to_end(db):
     statuses = {c.name: c.status for c in assessment.criteria}
     assert statuses == {
         "skills": "NOT_EVALUATED",
+        "role": "NOT_CONFIGURED",
         "experience": "UNKNOWN",
         "language": "MAJOR_GAP",
         "location": "DISTANCE_UNVERIFIED",
@@ -759,3 +760,83 @@ def test_check_commute_stores_the_origin_coordinates(migrated):
     finally:
         engine.dispose()
     assert tuple(row) == (ORIGIN.lat, ORIGIN.lon)
+
+
+def test_configured_terms_are_used_even_without_a_commute_configuration():
+    terms_only = CandidateSearchSettings(search_keywords=["Python", "Softwaretester"])
+    queries = bundesagentur_queries(_settings(), terms_only)
+    assert [(q.label, q.keywords, q.location) for q in queries] == [
+        ("settings", "Python", "Frankfurt am Main"),
+        ("settings", "Softwaretester", "Frankfurt am Main"),
+    ]
+
+
+def test_a_failing_later_term_is_reported_and_keeps_other_results(db, monkeypatch):
+    from app.models.job import Job
+    from app.services import collector_runner
+
+    configured = json.loads(SETTINGS.model_dump_json())
+    configured["search_keywords"] = ["Python", "Softwaretester"]
+    spec = {**SPEC, "search": {"search_keywords": ["Python", "Softwaretester"]}}
+    profile = db.get(CandidateProfileRecord, 1)
+    apply_config_plan(
+        db,
+        plan_config_change(profile, CandidateConfigSpec.model_validate(spec)),
+        actor="t",
+        reason="r",
+    )
+
+    class _Fake:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.skipped_invalid_count = 0
+
+        async def fetch(self):
+            if self.kwargs["keywords"] == "Softwaretester":
+                raise RuntimeError("term search down")
+            ref = f"10001-{self.kwargs['keywords']}-{self.kwargs['working_time'] or 'x'}-S"
+            return [
+                Job(
+                    title="Python Developer",
+                    company="Example GmbH",
+                    location="Darmstadt",
+                    url=f"https://www.arbeitsagentur.de/jobsuche/jobdetail/{ref}",
+                    description="Python",
+                    source="bundesagentur",
+                    source_reference=ref,
+                )
+            ]
+
+        async def fetch_detail(self, ref):
+            return None
+
+    monkeypatch.setattr(collector_runner, "BundesagenturCollector", _Fake)
+    result = asyncio.run(
+        collector_runner.run_bundesagentur(
+            db, _settings(bundesagentur_api_key="real-looking-key-123")
+        )
+    )
+    # Python commute + Python remote processed; both Softwaretester searches failed
+    assert result["fetched"] == 2 and result["failed_queries"] == 2
+
+
+@pytest.mark.parametrize(
+    ("title", "status"),
+    [
+        ("Python Backend Developer (m/w/d)", "PRIMARY"),
+        ("Junior Python Developer", "PRIMARY"),
+        ("Second Level Support / Technical Application Support (m/w/d)", "SECONDARY"),
+        ("Lagerist (m/w/d)", "OTHER"),
+    ],
+)
+def test_role_priority_is_informational(title, status):
+    settings = SETTINGS.model_copy(
+        update={
+            "primary_roles": ["Junior Python Developer", "Python Backend Developer"],
+            "secondary_roles": ["Application Support / Technical Application Support"],
+        }
+    )
+    assert fit.role_criterion(title, settings).status == status
+    assessment = fit.FitAssessment(job_id=1, company="x", title=title)
+    assessment.criteria = [fit.role_criterion(title, settings)]
+    assert assessment.decision == "CANDIDATE"

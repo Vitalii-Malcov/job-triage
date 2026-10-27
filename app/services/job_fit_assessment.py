@@ -22,6 +22,7 @@ good result elsewhere:
 label, not a ranking, and never an instruction to apply.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -121,6 +122,33 @@ def skills_criterion(match: CandidateJobMatch | None) -> Criterion:
     if missing:
         reason += "; missing required: " + ", ".join(missing[:6])
     return Criterion("skills", status, reason)
+
+
+_WORD = re.compile(r"[a-z0-9äöüß+#]+")
+_ROLE_FILLER = frozenset({"junior", "trainee", "m", "w", "d", "und", "and", "mit", "with"})
+
+
+def _role_words(text: str) -> set[str]:
+    return set(_WORD.findall(text.casefold())) - _ROLE_FILLER
+
+
+def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
+    """Which configured role priority the title matches (informational: it
+    never blocks, and no "Junior" wording is required). A role matches when
+    every significant word of one of its "/"-alternatives is in the title."""
+    if not settings.primary_roles and not settings.secondary_roles:
+        return Criterion("role", "NOT_CONFIGURED", "no role priorities configured")
+    title_words = set(_WORD.findall(title.casefold()))
+    for tier, roles in (
+        ("PRIMARY", settings.primary_roles),
+        ("SECONDARY", settings.secondary_roles),
+    ):
+        for role in roles:
+            for alternative in role.split("/"):
+                words = _role_words(alternative)
+                if words and words <= title_words:
+                    return Criterion("role", tier, f"title matches '{role}'")
+    return Criterion("role", "OTHER", "title matches no configured role")
 
 
 def experience_criterion(match: CandidateJobMatch | None, title: str, text: str) -> Criterion:
@@ -345,6 +373,7 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
     assessment = FitAssessment(job_id=job.id, company=job.company, title=job.title)
     assessment.criteria = [
         skills_criterion(match),
+        role_criterion(job.title, settings),
         experience_criterion(match, job.title, job.description or ""),
         language_criterion(text, _german_level(session)),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),

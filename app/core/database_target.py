@@ -103,8 +103,6 @@ def _sqlite_path(database: str) -> Path | None:
     """The filesystem path a SQLite `database` part names, or None for an
     in-memory database. Relative paths resolve against the working
     directory, exactly as SQLite opens them."""
-    if "mode=memory" in database:
-        return None
     if database.startswith("file:"):
         database = database[len("file:") :].split("?", 1)[0]
         if database.startswith("/") and re.match(r"^/[A-Za-z]:", database):
@@ -179,7 +177,9 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
         return DatabaseKind.SERVER, None
     if backend != "sqlite":
         return DatabaseKind.INVALID, None
-    if url.query.get("mode") == "memory":
+    # SQLite honours `mode=memory` only for a URI filename (`uri=true`); without
+    # it the dialect opens the named FILE, so the path is classified.
+    if url.query.get("mode") == "memory" and url.query.get("uri") in ("true", "1"):
         return DatabaseKind.MEMORY, None
     return _classify_spellings(url.database or "")
 

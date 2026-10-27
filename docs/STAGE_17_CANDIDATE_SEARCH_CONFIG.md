@@ -5,7 +5,8 @@ roles, languages, salary, start date, already-sent applications) are stored
 and applied by JobTriage itself, so a search never depends on an operator's
 or an assistant's memory.
 
-Migration `a9d3f6b2c4e8` (revises `f4b8d2a6c9e1`), additive only.
+Migrations `a9d3f6b2c4e8` (revises `f4b8d2a6c9e1`) and `b6c1e9a4d2f7` (search
+targets, car-route origin coordinates), both additive only.
 
 ## 17A — Explicit database selection
 
@@ -16,7 +17,8 @@ connects): `PRODUCTION_RUNTIME` (`runtime/job_triage_runtime.db`), `PILOT`
 Both the literal and the percent-decoded spelling of the path are classified
 (SQLite decodes `file:` URIs) and the most sensitive kind wins. A PostgreSQL
 database whose name says pilot/stage/scratch or backup is classified like
-the corresponding file.
+the corresponding file. `mode=memory` counts as in-memory only together with
+`uri=true` (without it SQLite opens the named file, which is classified).
 `DATABASE_ROLE` (`production` | `pilot` | `test` | `development`, optional)
 says what the process is for; `check_database_target` runs at web and
 scheduler startup and refuses a mismatch:
@@ -97,10 +99,15 @@ Bundesagentur run performs a commute search (`wo=12345 Musterstadt`,
 `umkreis` = the smallest BA radius step >= limit + 25 km, i.e. 150 km for a
 100 km limit; the limit is capped at 175 km so a step always exists; the
 25 km margin covers the distance between the BA place centre and the
-commute origin, which must lie within it) and, if remote work across Germany is configured, a nationwide
+commute origin, which is enforced to lie inside the home place: the origin
+label must name `home_city`) and, if remote work across Germany is configured, a nationwide
 home-office search (`arbeitszeit=ho`, 5 pages). With `search_keywords`
 configured (at most 6) each term gets its own commute and remote search;
-otherwise `BUNDESAGENTUR_SEARCH_KEYWORDS` is the single term. The BA radius is a
+otherwise `BUNDESAGENTUR_SEARCH_KEYWORDS` is the single term (configured
+terms are also used with the legacy place/radius). The first search fails
+the run as before; a later search that fails is logged with its term and
+counted as `failed_queries` in the run result, and everything else is
+still processed. The BA radius is a
 straight-line distance; every workplace within 100 km by car is within it,
 so the search discovers a superset and never decides anything. A posting
 returned by both searches is processed once.
@@ -111,6 +118,7 @@ returned by both searches is processed once.
 | Criterion | Source | Statuses |
 |---|---|---|
 | skills | persisted matcher v12 analysis (unchanged) | STRONG, PARTIAL, WEAK, NOT_EVALUATED |
+| role | title vs configured primary/secondary roles (informational) | PRIMARY, SECONDARY, OTHER, NOT_CONFIGURED |
 | experience | matcher experience requirements, stated years | OK, PARTIAL, GAP, UNKNOWN |
 | language | posting's German requirement vs the confirmed level | OK, MINOR_GAP (preferred), GAP, MAJOR_GAP (mandatory, >= 2 levels), NO_REQUIREMENT |
 | location | stored car route vs the limit | PASS, FAIL (+ relocation note), DISTANCE_UNVERIFIED, UNKNOWN, REMOTE_OK, NOT_CONFIGURED |

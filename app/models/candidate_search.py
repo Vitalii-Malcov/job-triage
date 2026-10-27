@@ -142,6 +142,12 @@ class CandidateSearchSettings(BaseModel):
             raise ValueError("maximum_salary is below minimum_salary")
         if self.max_commute_km is not None and self.commute_measure is None:
             raise ValueError("max_commute_km needs commute_measure (CAR_ROUTE)")
+        if self.max_commute_km is not None and self.home_city:
+            # The BA commute search is centred on the home place; its radius
+            # margin only covers an origin inside that place.
+            label = (self.commute_origin_label or "").casefold()
+            if self.home_city.casefold() not in label:
+                raise ValueError("commute_origin_label must name a place inside home_city")
         if self.remote_work_scope != "UNKNOWN" and not self.remote_work_from_region:
             raise ValueError("remote_work_scope needs remote_work_from_region")
         return self

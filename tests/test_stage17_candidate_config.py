@@ -594,7 +594,10 @@ def test_partial_role_file_never_touches_profile_target_roles(db):
 def test_partial_update_derives_stage6a_columns_from_the_effective_configuration(db):
     _apply(db)
     partial = spec_dict()
-    partial["search"] = {"home_city": "Offenbach am Main"}
+    partial["search"] = {
+        "home_city": "Offenbach am Main",
+        "commute_origin_label": "Offenbach am Main Hbf",
+    }
     _apply(db, CandidateConfigSpec.model_validate(partial))
     db.expire_all()
     prefs = db.get(CandidateProfileRecord, 1).job_preferences
@@ -711,3 +714,30 @@ def test_configured_entry_level_target_feeds_the_collector_seniority_gate(tmp_pa
     finally:
         session.close()
         engine.dispose()
+
+
+def test_commute_origin_must_lie_inside_the_home_place():
+    with pytest.raises(ValidationError, match="inside home_city"):
+        CandidateSearchSettings(
+            home_city="Musterstadt",
+            commute_origin_label="Nachbarstadt Hbf",
+            max_commute_km=100,
+            commute_measure="CAR_ROUTE",
+        )
+
+
+def test_upgrading_a_database_already_at_a9d3f6b2c4e8_adds_the_new_columns(tmp_path):
+    path = tmp_path / "published.db"
+    upgrade(_alembic(path), "a9d3f6b2c4e8")
+    upgrade(_alembic(path), "head")
+    with sqlite3.connect(path) as conn:
+        prefs = {row[1] for row in conn.execute("PRAGMA table_info(candidate_job_preferences)")}
+        checks = {row[1] for row in conn.execute("PRAGMA table_info(job_commute_checks)")}
+        head = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert {"target_seniority", "search_keywords_json"} <= prefs
+    assert {"origin_lat", "origin_lon"} <= checks
+    assert head == ("b6c1e9a4d2f7",)
+    downgrade(_alembic(path), "a9d3f6b2c4e8")
+    with sqlite3.connect(path) as conn:
+        prefs = {row[1] for row in conn.execute("PRAGMA table_info(candidate_job_preferences)")}
+    assert "target_seniority" not in prefs and "home_city" in prefs

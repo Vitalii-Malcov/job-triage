@@ -3223,6 +3223,6 @@ def test_alembic_has_exactly_one_head() -> None:
     # Stage 16: Telegram operator control tables (e3a9c5d7f2b4, on top of
     # the Stage 15 remediation c8e4a2f6d1b9), then OUTBOUND_MESSAGE application
     # events (f4b8d2a6c9e1), then the Stage 17 candidate search configuration
-    # (a9d3f6b2c4e8)
+    # (a9d3f6b2c4e8), then search targets + car-route origin (b6c1e9a4d2f7)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "a9d3f6b2c4e8"
+    assert heads[0] == "b6c1e9a4d2f7"

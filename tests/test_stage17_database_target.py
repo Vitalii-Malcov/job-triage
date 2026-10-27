@@ -211,3 +211,12 @@ def test_a_named_memory_uri_is_memory(monkeypatch):
     monkeypatch.chdir(PROJECT_ROOT)
     url = "sqlite:///file:runtime/job_triage_runtime.db?mode=memory&cache=shared&uri=true"
     assert classify_database_url(url)[0] is DatabaseKind.MEMORY
+
+
+def test_mode_memory_without_uri_opens_the_named_file(monkeypatch):
+    # SQLite ignores `mode=memory` unless the filename is a URI (uri=true)
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = f"sqlite:///{PRODUCTION_RUNTIME_DB.as_posix()}?mode=memory"
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError, match="PRODUCTION_RUNTIME"):
+        check_database_target(_settings(url, "test"))

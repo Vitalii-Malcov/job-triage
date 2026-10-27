@@ -571,6 +571,7 @@ async def run_bundesagentur(
     # configuration when one exists (commute radius around the home place
     # plus a nationwide home-office search), else from the legacy settings.
     batches: list[tuple[BundesagenturCollector, list[Job]]] = []
+    failed_queries = 0
     for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
         query_collector = BundesagenturCollector(
             api_key=settings.bundesagentur_api_key,
@@ -581,24 +582,28 @@ async def run_bundesagentur(
             max_pages=query.max_pages,
         )
         if index == 0:
-            # The primary search fails the run exactly as before.
+            # The first search fails the run exactly as before.
             query_jobs = await query_collector.fetch()
         else:
-            # An additional search (the nationwide home-office one) must never
-            # cost the primary search's already-fetched results.
+            # A later search (another term, or the home-office search) must
+            # never cost the results already fetched; it is reported instead
+            # (`failed_queries` in the run result, plus this log line).
             try:
                 query_jobs = await query_collector.fetch()
-            except Exception as exc:  # noqa: BLE001 -- isolated optional query
+            except Exception as exc:  # noqa: BLE001 -- isolated, reported query
+                failed_queries += 1
                 logger.warning(
-                    "bundesagentur_query_failed label=%s error_type=%s",
+                    "bundesagentur_query_failed label=%s term=%s error_type=%s",
                     query.label,
+                    query.keywords,
                     type(exc).__name__,
                 )
                 continue
         batches.append((query_collector, query_jobs))
         logger.info(
-            "bundesagentur_query label=%s radius_km=%s working_time=%s jobs=%s",
+            "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s jobs=%s",
             query.label,
+            query.keywords,
             query.radius_km,
             query.working_time or "any",
             len(batches[-1][1]),
@@ -774,6 +779,8 @@ async def run_bundesagentur(
 
     return {
         "fetched": len(work),
+        # Present only when a search failed (keeps the usual result shape).
+        **({"failed_queries": failed_queries} if failed_queries else {}),
         "created": created_count,
         "updated": updated_count,
         "skipped_invalid": skipped_invalid,
