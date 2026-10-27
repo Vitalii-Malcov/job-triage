@@ -65,6 +65,7 @@ from app.models.review_package import (
     ReviewedCVContent,
     ReviewPackage,
 )
+from app.services.application_guard import ensure_not_already_applied
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,10 @@ class ReviewPackageService:
         (flush only; see `create_review`). Stage 9C uses it to commit the
         review, its revision and its Telegram link atomically. The default
         is unchanged, and duplicate creation stays legal for API callers.
+        Stage 17C: refused (AlreadyAppliedError) for an already-applied
+        vacancy.
         """
+        ensure_not_already_applied(db, job)
         cv_record = get_draft_by_id(db, cv_draft_id)
         if cv_record is None:
             raise ReviewCVDraftNotFoundError(cv_draft_id)

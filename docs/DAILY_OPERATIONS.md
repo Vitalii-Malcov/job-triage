@@ -14,6 +14,7 @@ From a fresh PowerShell in `D:\AI_agent`:
 
 ```powershell
 $env:DATABASE_URL = "sqlite:///D:/AI_agent/runtime/job_triage_runtime.db"
+$env:DATABASE_ROLE = "production"
 $env:ALEMBIC_AUTO_UPGRADE = "false"
 $env:OUTBOUND_SENDING_ENABLED = "false"
 $env:TELEGRAM_GMAIL_DRAFT_ENABLED = "false"
@@ -36,10 +37,29 @@ set (operator chat only). To start without the bot, set
 ## 2. Which database is production
 
 `D:\AI_agent\runtime\job_triage_runtime.db` (SQLite, Alembic head
-`e3a9c5d7f2b4`). Everything else in the repository root (`job_search.db`,
+`a9d3f6b2c4e8`). Everything else in the repository root (`job_search.db`,
 `stage11_pilot.db`, `stage14b_*.db`, `runtime/*pre-*.db`,
 `runtime/stage16_pilot_scratch.db`) is historical, a pilot or a backup. The
 tracker CLIs refuse the frozen `stage14b_canonical_v12.db` by path and hash.
+
+**Explicit selection (Stage 17A).** The web process and the scheduler
+classify `DATABASE_URL` at startup (`app/core/database_target.py`) and
+refuse to start on a mismatch with `DATABASE_ROLE`:
+
+| `DATABASE_ROLE` | Accepted databases |
+|---|---|
+| `production` | `runtime/job_triage_runtime.db`, PostgreSQL |
+| `pilot` | pilot files only (`stage*_*.db` in the project root or `runtime/`) |
+| `test` / `development` | any other SQLite file, in-memory, PostgreSQL |
+| unset | production runtime, other SQLite, PostgreSQL -- **never a pilot** |
+
+A backup (`*.pre-*`, `job-triage-backups\`) is refused for every role. So a
+shell that forgot the `DATABASE_URL` override no longer starts silently on
+`.env`'s pilot database (`stage11_pilot.db`, kept for the Stage 14A/13B
+pilot tools, which take an explicit `--database-url`); it stops with a
+message naming the database kind. `.env` itself is not rewritten. The test
+suite (`tests/conftest.py`) always runs on a temporary database with
+`DATABASE_ROLE=test`.
 
 ## 3. Flags that keep it safe
 
@@ -60,7 +80,7 @@ uvicorn, check the `startup_safety_state` line. See also
 
 | Source | How | Notes |
 |---|---|---|
-| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Query from `BUNDESAGENTUR_SEARCH_KEYWORDS/LOCATION/RADIUS_KM`. Re-runs update existing rows by fingerprint (no duplicates). |
+| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Keywords from `BUNDESAGENTUR_SEARCH_KEYWORDS`. With a stored candidate search configuration (section 5a) the place and radius come from it: `63150 Heusenstamm` with a 150 km straight-line radius (a superset of everything within 100 km by car) plus a nationwide home-office search (`arbeitszeit=ho`). Without one, `BUNDESAGENTUR_SEARCH_LOCATION/RADIUS_KM` as before. Re-runs update existing rows by fingerprint (no duplicates). |
 | XING job-alert e-mails | `POST /api/v1/collectors/xing/run` | Reads the `XING_MAILBOX_*` inbox read-only, only sender `jobs@mail.xing.com`. Tracking links are stored, **never opened**. |
 
 ```powershell
@@ -89,6 +109,45 @@ applied to and *tracked* (section 8).
 - Inspect: `GET /api/v1/jobs?limit=200`, `GET /api/v1/jobs/{id}`; Telegram
   digest/vacancy feed if enabled.
 
+## 5a. Candidate search configuration and fit criteria (Stage 17)
+
+The search constraints live in the runtime database, not in anyone's
+memory: home place and commute origin (Heusenstamm Bahnhof), the 100 km
+**car-route** limit, relocation regions (Hessen), remote work (whole
+Germany if work from Hessen is allowed), salary range, earliest start date,
+primary/secondary roles, languages, skills and the confirmed contact data.
+
+```powershell
+$db = "D:/AI_agent/runtime/job_triage_runtime.db"
+.\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db show
+.\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db history
+# change it: edit the operator file (outside the repo), dry run, then apply
+.\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db apply `
+  --config C:\Users\BOSS\AppData\Local\job-triage-config\candidate_config_2026-10-27.json `
+  --actor operator --reason "..."            # add --expected-version N --apply
+```
+
+Every write is versioned and recorded in the append-only
+`candidate_profile_revisions`; a value from a less authoritative source
+(an old CV) never replaces a confirmed one; skills/languages are never
+removed. Details: [STAGE_17_CANDIDATE_SEARCH_CONFIG.md](STAGE_17_CANDIDATE_SEARCH_CONFIG.md).
+
+Per vacancy (read-only, independent criteria, no overall score):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\stage17_job_fit.py --database $db assess <job_id>
+# store a car route you measured, or let OSRM compute it from coordinates
+.\.venv\Scripts\python.exe scripts\stage17_job_fit.py --database $db record-commute <job_id> `
+  --car-km 85 --destination "Darmstadt, ..." --region Hessen --source-note "Google Maps 27.10." --apply
+.\.venv\Scripts\python.exe scripts\stage17_job_fit.py --database $db check-commute <job_id> `
+  --dest-lat 49.87 --dest-lon 8.65 --destination "Darmstadt, ..." --apply
+```
+
+Location is `PASS`/`FAIL` only from a stored car route; a known workplace
+without one is `DISTANCE_UNVERIFIED`, an unknown one `UNKNOWN`. The decision
+is `BLOCKED`, `NEEDS_VERIFICATION` or `CANDIDATE` -- triage, never an
+instruction to apply.
+
 ## 6. Before applying: duplicate check (mandatory)
 
 One vacancy often exists several times (employer BA post, XING copy, agency
@@ -103,6 +162,12 @@ mirror). Always run, for the job row you intend to apply to:
 | `ALREADY_APPLIED` | 3 | STRONG: same job row, BA reference, URL, fingerprint, or same employer + role. Do not apply. |
 | `POSSIBLE_DUPLICATE` | 0 | PROBABLE: identical full title at another company (typical anonymized agency mirror). Check by hand. |
 | `NO_DUPLICATE_FOUND` | 0 | No deterministic signal. INFO lines list other roles at the same employer (a different role is a legitimate application). |
+
+**Enforced (Stage 17C):** creating a Bewerbung draft or a review package
+for a vacancy whose STRONG duplicate was already SENT (SUBMITTED or later)
+is refused (HTTP 409 / `AlreadyAppliedError`) on every path -- API,
+automation shortlist and Telegram. An application still being prepared
+(PACKAGE_READY/APPROVED) is not refused.
 
 Limitation: a mirror that *rewrites* the title (e.g. "Backend Developer (all
 genders) 25185" at a staffing agency for the ALD vacancy) is not detectable

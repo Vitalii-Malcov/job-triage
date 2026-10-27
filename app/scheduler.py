@@ -39,6 +39,7 @@ import sys
 from pydantic import ValidationError
 
 from app.core.config import get_settings
+from app.core.database_target import DatabaseTargetError, check_database_target
 from app.core.logging import configure_logging
 from app.core.startup_diagnostics import log_startup_safety_state
 from app.services.scheduler import (
@@ -236,6 +237,13 @@ def main() -> int:
         # stage's own account_key.
         logger.error("automation_scheduler_configuration_error error_type=%s", type(exc).__name__)
         print(_CONFIGURATION_ERROR_MESSAGE, file=sys.stderr)
+        return 1
+    try:
+        check_database_target(settings)
+    except DatabaseTargetError as exc:
+        # Stage 17A: the message names the database kind/file, never the URL.
+        logger.error("automation_scheduler_database_target_refused")
+        print(str(exc), file=sys.stderr)
         return 1
 
     # S8E: the worker starts its poll loop if EITHER the automation
