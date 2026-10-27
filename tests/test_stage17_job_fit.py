@@ -580,8 +580,8 @@ def test_configured_search_uses_the_home_place_and_a_superset_radius_plus_remote
 
 
 def test_radius_is_never_below_the_car_route_limit():
-    for limit in (10, 25, 50, 95, 100, 125, 175):
-        assert ba_radius_for(limit) >= limit
+    for limit in (10, 25, 50, 95, 100, 125, 150):
+        assert ba_radius_for(limit) >= limit + 50  # 50 km origin-to-centre margin
     assert ba_radius_for(100) == 150
 
 
@@ -682,7 +682,7 @@ def test_the_straight_line_value_is_never_stored(migrated, capsys):
 
 def test_ba_radius_refuses_a_limit_it_cannot_cover():
     with pytest.raises(ValueError):
-        ba_radius_for(176)
+        ba_radius_for(151)
 
 
 def test_a_failing_remote_query_keeps_the_commute_results(db, monkeypatch):

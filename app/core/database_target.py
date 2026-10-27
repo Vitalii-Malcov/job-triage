@@ -177,17 +177,25 @@ def classify_database_url(database_url: str) -> tuple[DatabaseKind, str | None]:
         return DatabaseKind.SERVER, None
     if backend != "sqlite":
         return DatabaseKind.INVALID, None
-    kind, name = _classify_spellings(url.database or "")
-    # `mode=memory` opens an in-memory database only in URI mode, and the
-    # dialect's notion of "URI mode" (true/TRUE/yes/on/1, repeated keys) is
-    # not re-implemented here: a URL naming a protected file is ALWAYS
-    # classified as that file, whatever its query says. Only an otherwise
-    # ordinary name with mode=memory counts as in-memory.
+    # The query (mode=memory, uri=...) never changes the classification: the
+    # dialect's notion of "URI mode" (true/TRUE/yes/on/1, repeated keys) is not
+    # re-implemented here, so the NAMED file decides. Whether such a URL may
+    # open an in-memory database instead is checked separately
+    # (`requests_memory_mode`), and refused for roles that need the real file.
+    return _classify_spellings(url.database or "")
+
+
+def requests_memory_mode(database_url: str) -> bool:
+    """True if the URL asks SQLite for `mode=memory` in any spelling."""
+    try:
+        url = make_url(database_url)
+    except (ArgumentError, ValueError):
+        return False
     modes = url.query.get("mode")
     modes = modes if isinstance(modes, tuple) else (modes,)
-    if kind is DatabaseKind.OTHER_SQLITE and "memory" in modes:
-        return DatabaseKind.MEMORY, None
-    return kind, name
+    return any(str(mode).casefold() == "memory" for mode in modes if mode is not None) or (
+        "mode=memory" in (url.database or "").casefold()
+    )
 
 
 def parse_role(raw: str | None) -> DatabaseRole | None:
@@ -212,6 +220,13 @@ def check_database_target(settings) -> DatabaseTarget:
     target = resolve_database_target(settings.database_url, settings.database_role)
     if target.kind is DatabaseKind.INVALID:
         raise DatabaseTargetError("DATABASE_URL is not a supported SQLite/PostgreSQL URL")
+    if target.role in (DatabaseRole.PRODUCTION, DatabaseRole.PILOT) and requests_memory_mode(
+        settings.database_url
+    ):
+        raise DatabaseTargetError(
+            f"refusing {target.describe()}: a {target.role.value} process must open the real "
+            "database file, not mode=memory"
+        )
     if target.kind not in _ALLOWED[target.role]:
         hint = (
             " A pilot database needs the explicit DATABASE_ROLE=pilot."

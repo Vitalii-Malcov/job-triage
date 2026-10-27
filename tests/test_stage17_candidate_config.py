@@ -612,8 +612,8 @@ def test_partial_update_derives_stage6a_columns_from_the_effective_configuration
 
 def test_commute_limit_is_capped_inside_the_ba_radius_range():
     with pytest.raises(ValidationError):
-        CandidateSearchSettings(max_commute_km=176, commute_measure="CAR_ROUTE")
-    CandidateSearchSettings(max_commute_km=175, commute_measure="CAR_ROUTE")
+        CandidateSearchSettings(max_commute_km=151, commute_measure="CAR_ROUTE")
+    CandidateSearchSettings(max_commute_km=150, commute_measure="CAR_ROUTE")
 
 
 def test_document_grade_collection_cannot_drop_a_confirmed_language(db):

@@ -7,8 +7,13 @@ With a configured candidate search (app/models/candidate_search.py):
    margin. The BA radius is a straight-line distance from the place's
    centre; every workplace whose CAR route from the commute origin is
    within the limit lies within limit + (origin-to-centre distance) in a
-   straight line, so with the commute origin within RADIUS_MARGIN_KM of the
-   home place this discovers a superset. Being
+   straight line. The configuration requires the origin label to name a
+   place inside `home_city`, i.e. the origin lies in the home municipality;
+   no German municipality reaches RADIUS_MARGIN_KM (50 km) from its centre
+   (Berlin: about 25 km), so this discovers a superset. That bound rests on
+   the operator-confirmed origin really lying in the named place -- it is
+   not re-derived from the coordinates (that would need geocoding the home
+   place). Being
    inside the radius never makes a job "close enough": only a verified car
    route (job_commute_checks) does. Frankfurt, Offenbach, Hanau, Darmstadt,
    Mainz, Wiesbaden and places in neighbouring states are all inside it.
@@ -30,7 +35,7 @@ from app.models.candidate_search import CandidateSearchSettings
 # Radius steps offered by the BA job search; the API documents `umkreis` in km.
 BA_RADIUS_STEPS = (10, 15, 20, 25, 50, 100, 150, 200)
 # Straight-line margin between the BA place centre and the commute origin.
-RADIUS_MARGIN_KM = 25
+RADIUS_MARGIN_KM = 50
 DEFAULT_MAX_PAGES = 20
 REMOTE_MAX_PAGES = 5
 HOME_OFFICE = "ho"

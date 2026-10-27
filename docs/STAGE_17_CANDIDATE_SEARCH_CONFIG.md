@@ -17,8 +17,9 @@ connects): `PRODUCTION_RUNTIME` (`runtime/job_triage_runtime.db`), `PILOT`
 Both the literal and the percent-decoded spelling of the path are classified
 (SQLite decodes `file:` URIs) and the most sensitive kind wins. A PostgreSQL
 database whose name says pilot/stage/scratch or backup is classified like
-the corresponding file. `mode=memory` counts as in-memory only together with
-`uri=true` (without it SQLite opens the named file, which is classified).
+the corresponding file. The query never changes the classification (the
+named file decides), and a `production`/`pilot` process is refused if the
+URL asks for `mode=memory` in any spelling (it must open the real file).
 `DATABASE_ROLE` (`production` | `pilot` | `test` | `development`, optional)
 says what the process is for; `check_database_target` runs at web and
 scheduler startup and refuses a mismatch:
@@ -96,11 +97,14 @@ Stage 17 columns.
 
 **Discovery** (`app/services/search_strategy.py`): with a configuration the
 Bundesagentur run performs a commute search (`wo=12345 Musterstadt`,
-`umkreis` = the smallest BA radius step >= limit + 25 km, i.e. 150 km for a
-100 km limit; the limit is capped at 175 km so a step always exists; the
-25 km margin covers the distance between the BA place centre and the
-commute origin, which is enforced to lie inside the home place: the origin
-label must name `home_city`) and, if remote work across Germany is configured, a nationwide
+`umkreis` = the smallest BA radius step >= limit + 50 km, i.e. 150 km for a
+100 km limit; the limit is capped at 150 km so a step always exists. The
+50 km margin covers the distance between the BA place centre and the
+commute origin. The configuration requires the origin label to name a
+place inside `home_city`; no German municipality extends 50 km from its
+centre, so the superset holds as long as the operator-confirmed origin
+really lies in that place. The coordinates themselves are not
+cross-checked (that would need geocoding the home place)) and, if remote work across Germany is configured, a nationwide
 home-office search (`arbeitszeit=ho`, 5 pages). With `search_keywords`
 configured (at most 6) each term gets its own commute and remote search;
 otherwise `BUNDESAGENTUR_SEARCH_KEYWORDS` is the single term (configured

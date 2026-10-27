@@ -207,9 +207,25 @@ def test_postgres_pilot_is_refused_for_production_and_unset_roles():
     check_database_target(_settings(url, "pilot"))
 
 
-def test_a_named_memory_uri_with_an_ordinary_name_is_memory():
-    url = "sqlite:///file:scratch_test.db?mode=memory&cache=shared&uri=true"
-    assert classify_database_url(url)[0] is DatabaseKind.MEMORY
+def test_the_query_never_changes_the_classification():
+    # without uri the dialect opens the FILE; the named file always decides
+    for url in (
+        "sqlite:///scratch_test.db?mode=memory",
+        "sqlite:///file:scratch_test.db?mode=memory&cache=shared&uri=true",
+    ):
+        assert classify_database_url(url)[0] is DatabaseKind.OTHER_SQLITE
+        check_database_target(_settings(url, "test"))  # allowed for tests
+
+
+@pytest.mark.parametrize("query", ["mode=memory&uri=TRUE", "mode=MEMORY&uri=true", "mode=memory"])
+def test_production_and_pilot_refuse_any_memory_mode(monkeypatch, query):
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(
+            _settings(f"sqlite:///file:runtime/job_triage_runtime.db?{query}", "production")
+        )
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(_settings(f"sqlite:///file:stage11_pilot.db?{query}", "pilot"))
 
 
 @pytest.mark.parametrize(
