@@ -163,6 +163,11 @@ def validate_readonly_sqlite_url(raw: str) -> str:
         raise UnsafeDatabaseUrlError(f"database URL must start with {_PREFIX!r}")
     if any(ch in raw for ch in ("\r", "\n", "\x00", "#")):
         raise UnsafeDatabaseUrlError("database URL contains forbidden characters")
+    # Checked on the RAW string: SQLAlchemy 2.1+ percent-decodes the database
+    # part in `make_url` (2.0 keeps it verbatim), so a check on the parsed
+    # path alone lets `%2E`/`%2F`-style escapes through on newer versions.
+    if "%" in raw:
+        raise UnsafeDatabaseUrlError("percent-encoded database URLs are not allowed")
     try:
         url = make_url(raw)
     except ArgumentError as exc:
