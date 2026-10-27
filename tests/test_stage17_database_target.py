@@ -254,3 +254,20 @@ def test_mode_memory_without_uri_opens_the_named_file(monkeypatch):
     assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
     with pytest.raises(DatabaseTargetError, match="PRODUCTION_RUNTIME"):
         check_database_target(_settings(url, "test"))
+
+
+@pytest.mark.parametrize("role", ["", "development"])
+def test_a_protected_name_with_memory_mode_is_refused_for_every_role(monkeypatch, role):
+    monkeypatch.chdir(PROJECT_ROOT)
+    url = "sqlite:///file:runtime/job_triage_runtime.db?mode=memory&uri=TRUE"
+    with pytest.raises(DatabaseTargetError, match="real database file"):
+        check_database_target(_settings(url, role))
+
+
+def test_memory_mode_detection_is_limited_to_sqlite_uri_syntax(tmp_path):
+    from app.core.database_target import requests_memory_mode
+
+    assert not requests_memory_mode("postgresql+psycopg://u:p@db/mode=memory")
+    assert not requests_memory_mode(f"sqlite:///{(tmp_path / 'mode=memory' / 'x.db').as_posix()}")
+    assert requests_memory_mode("sqlite:///file:x.db?mode=memory&uri=true")
+    check_database_target(_settings("postgresql+psycopg://u:p@db/mode=memory", "production"))
