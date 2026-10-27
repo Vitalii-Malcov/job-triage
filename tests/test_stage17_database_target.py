@@ -271,3 +271,26 @@ def test_memory_mode_detection_is_limited_to_sqlite_uri_syntax(tmp_path):
     assert not requests_memory_mode(f"sqlite:///{(tmp_path / 'mode=memory' / 'x.db').as_posix()}")
     assert requests_memory_mode("sqlite:///file:x.db?mode=memory&uri=true")
     check_database_target(_settings("postgresql+psycopg://u:p@db/mode=memory", "production"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"sqlite:///file://localhost/{PRODUCTION_RUNTIME_DB.as_posix()}?uri=true",
+        f"sqlite:///file://LOCALHOST/{PRODUCTION_RUNTIME_DB.as_posix()}?mode=ro&uri=true",
+        f"sqlite:///file:///{PRODUCTION_RUNTIME_DB.as_posix()}?uri=true",
+    ],
+)
+def test_file_uri_authority_forms_still_name_the_production_file(url):
+    # SQLite drops an empty or "localhost" authority (Codex Stage 17 round 7)
+    assert classify_database_url(url)[0] is DatabaseKind.PRODUCTION_RUNTIME
+    with pytest.raises(DatabaseTargetError):
+        check_database_target(_settings(url, "test"))
+
+
+def test_a_remote_file_uri_authority_is_refused_for_every_role():
+    url = "sqlite:///file://fileserver/share/job_triage_runtime.db?uri=true"
+    assert classify_database_url(url)[0] is DatabaseKind.INVALID
+    for role in ("", "test", "production"):
+        with pytest.raises(DatabaseTargetError):
+            check_database_target(_settings(url, role))

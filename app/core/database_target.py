@@ -99,13 +99,24 @@ def _identity(path: Path) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+class _UnsupportedSqliteUri(ValueError):
+    """A `file:` URI with a non-local authority."""
+
+
 def _sqlite_path(database: str) -> Path | None:
     """The filesystem path a SQLite `database` part names, or None for an
     in-memory database. Relative paths resolve against the working
     directory, exactly as SQLite opens them."""
     if database.startswith("file:"):
-        database = database[len("file:") :].split("?", 1)[0]
-        if database.startswith("/") and re.match(r"^/[A-Za-z]:", database):
+        database = database[len("file:") :].split("?", 1)[0].split("#", 1)[0]
+        if database.startswith("//"):
+            # SQLite URI authority: only empty or "localhost" is opened (it is
+            # dropped, the rest is the path); anything else is not a local file.
+            authority, _, tail = database[2:].partition("/")
+            if authority.casefold() not in ("", "localhost"):
+                raise _UnsupportedSqliteUri(authority)
+            database = "/" + tail
+        if re.match(r"^/[A-Za-z]:", database):
             database = database[1:]
     if not database or database == ":memory:":
         return None
@@ -150,7 +161,10 @@ def _classify_spellings(database: str) -> tuple[DatabaseKind, str | None]:
     spellings = {database, unquote(database)}
     kinds: list[tuple[DatabaseKind, str | None]] = []
     for spelling in spellings:
-        path = _sqlite_path(spelling)
+        try:
+            path = _sqlite_path(spelling)
+        except _UnsupportedSqliteUri:
+            return DatabaseKind.INVALID, None  # refused for every role
         if path is None:
             kinds.append((DatabaseKind.MEMORY, None))
         else:
