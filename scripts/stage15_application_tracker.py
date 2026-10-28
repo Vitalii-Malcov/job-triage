@@ -201,9 +201,12 @@ def resolve_engine(
             raise TargetRefusedError("refusing the protected Stage 14B canonical database")
         if _PROTECTED_PATH.search(_identity(path)) or _PROTECTED_PATH.search(str(path)):
             raise TargetRefusedError("Stage 13D databases are out of scope for this tool")
+        # Role guard by path identity before the existence check, so the
+        # production runtime database is refused for its role on every
+        # machine, whether or not the file exists there (CI has none).
+        _refuse_kind_for_cli(path, writes=writes)
         if not path.is_file():
             raise TargetRefusedError("database file does not exist")
-        _refuse_kind_for_cli(path, writes=writes)
         if _sha256(path) in PROTECTED_DATABASE_SHA256:
             raise TargetRefusedError("refusing the protected Stage 14B canonical database")
         engine = create_engine(f"sqlite:///{path.as_posix()}", poolclass=NullPool)
