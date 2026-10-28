@@ -53,6 +53,7 @@ from app.providers.email.base import ParsedGmailMessage
 from app.services.application_correlation import (
     InboundMessage,
     correlate_message,
+    in_response_window,
     message_key_for,
     needs_sender,
     normalize_occurred_at,
@@ -105,6 +106,9 @@ class ResponseTrackingResult:
     operator_confirmation_required: bool = False
     proposed_status: str | None = None
     operator_review: str | None = None
+    # Stage 19: applications an unmatched lifecycle mail may belong to (its
+    # sender already wrote about them); shown to the operator, never written.
+    review_candidates: tuple[int, ...] = ()
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -186,6 +190,56 @@ def _sender_lookup(db: Session, message: InboundMessage):
     return seen
 
 
+def _applications_seen_from_sender(applications, sender_seen, message) -> tuple[int, ...]:
+    """Applications (still in their response window) whose earlier mail came
+    from this exact sender."""
+    if sender_seen is None or message.occurred_at is None:
+        return ()
+    return tuple(
+        sorted(
+            app.id
+            for app in applications
+            if in_response_window(app, message.occurred_at) and sender_seen(app.id)
+        )
+    )
+
+
+_OPERATOR_DECISIONS = frozenset({"STATUS_CHANGED", "STATUS_OVERRIDDEN"})
+# Codex Stage 19 review round 2: only a status that answers THIS mail (or a
+# terminal one) counts as handling it; an unrelated change never hides it.
+_TERMINAL = frozenset({"REJECTED", "WITHDRAWN", "OFFER"})
+_ANSWERS = {
+    "RECEIPT_CONFIRMATION": frozenset({"RECEIVED", "UNDER_REVIEW"}),
+    "UNDER_REVIEW_NOTICE": frozenset({"UNDER_REVIEW"}),
+    "INTERVIEW_INVITATION": frozenset({"INTERVIEW", "TECHNICAL_INTERVIEW"}),
+    "TECHNICAL_INTERVIEW_INVITATION": frozenset({"TECHNICAL_INTERVIEW"}),
+    "REJECTION": frozenset({"REJECTED"}),
+    "OFFER": frozenset({"OFFER"}),
+}
+
+
+def _operator_acted_since(db: Session, application_ids, occurred_at, classification) -> bool:
+    """The operator moved one of these applications, after the mail, to a
+    status that answers it (or to a terminal status)."""
+    since = normalize_occurred_at(occurred_at)
+    if since is None:
+        return False
+    answers = _ANSWERS.get(classification, frozenset()) | _TERMINAL
+    for application_id in application_ids:
+        for event in repo.list_events(db, application_id):
+            recorded = normalize_occurred_at(event.recorded_at)
+            if (
+                event.origin == ApplicationEventOrigin.OPERATOR.value
+                # a status decision, not the creation of the record itself
+                and event.event_type in _OPERATOR_DECISIONS
+                and event.new_status in answers
+                and recorded is not None
+                and recorded >= since
+            ):
+                return True
+    return False
+
+
 def _review_flag(classification: str | None, *, needs_confirmation: bool) -> str | None:
     if needs_confirmation:
         return NEEDS_OPERATOR_REVIEW
@@ -241,12 +295,13 @@ class ApplicationResponseProcessor:
         ref = message.correlation_key.removeprefix("gmail:")[:12]
         # Complete candidate set via a batched keyset scan (bounded memory);
         # never a single page that could silently drop application #201+.
+        sender_seen = _sender_lookup(db, message)
         correlation = correlate_message(
             message,
             self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
             applicant_addresses=applicant_addresses,
             thread_hashes_by_application=_thread_hashes(db, message),
-            sender_seen=_sender_lookup(db, message),
+            sender_seen=sender_seen,
         )
         base = dict(
             message_ref=ref,
@@ -265,12 +320,38 @@ class ApplicationResponseProcessor:
             )
             # An AMBIGUOUS message concerns one of several applications; if it
             # reads like a lifecycle event the operator must pick the one.
+            # Stage 19: so does a mail that names no employer/role at all
+            # ("Wir laden Sie gerne zu einem Vorstellungsgespräch ein.") but
+            # comes from a sender that already wrote about an application --
+            # it was silently dropped before. Still nothing is written.
+            known = (
+                _applications_seen_from_sender(
+                    self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
+                    sender_seen,
+                    message,
+                )
+                if correlation.reason == "NO_SIGNAL"
+                else ()
+            )
             ambiguous = (
                 classify_application_response(
                     message.subject, message.body, message.from_address, has_html=message.has_html
                 )
-                if correlation.status == "AMBIGUOUS"
+                if correlation.status == "AMBIGUOUS" or known
                 else None
+            )
+            # Codex Stage 19 review: once the operator acted on a candidate
+            # application after this mail arrived, it no longer asks for a
+            # decision on every scan.
+            # Codex round 3 (design rethink): cleared automatically only when
+            # exactly ONE application can be meant; with several the operator
+            # decides, and the mail keeps asking until its window passes.
+            handled = (
+                len(known) == 1
+                and ambiguous is not None
+                and _operator_acted_since(
+                    db, known, message.occurred_at, ambiguous.classification.value
+                )
             )
             return ResponseTrackingResult(
                 **base,
@@ -282,7 +363,7 @@ class ApplicationResponseProcessor:
                 classifier_confidence=ambiguous.confidence if ambiguous else None,
                 operator_review=(
                     _review_flag(ambiguous.classification.value, needs_confirmation=False)
-                    if ambiguous
+                    if ambiguous and not handled
                     else None
                 ),
                 previous_status=None,
@@ -291,7 +372,16 @@ class ApplicationResponseProcessor:
                 transition_applied=False,
                 event_recorded=False,
                 duplicate=False,
-                reason=correlation.reason,
+                reason=(
+                    (
+                        "UNMATCHED_FROM_KNOWN_SENDER_HANDLED"
+                        if handled
+                        else "UNMATCHED_FROM_KNOWN_SENDER"
+                    )
+                    if known and ambiguous is not None
+                    else correlation.reason
+                ),
+                review_candidates=known,
             )
         application: Application = self.tracker.get_application(db, correlation.application_id)
         logger.info(

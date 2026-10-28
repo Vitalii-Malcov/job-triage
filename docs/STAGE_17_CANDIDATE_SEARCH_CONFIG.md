@@ -136,6 +136,10 @@ Decision: `BLOCKED` (location FAIL, remote INCOMPATIBLE, ALREADY_APPLIED),
 else `NEEDS_VERIFICATION` (distance unverified/unknown, possible duplicate,
 skills not evaluated), else `CANDIDATE`. No criterion is folded into a score.
 
+Stage 19 adds `fit_tier` (`NOT_SUITABLE` / `NEEDS_OPERATOR` /
+`PARTIAL_MATCH` / `GOOD_MATCH`, with `tier_reasons`) on top of the decision,
+which stays as above; see `docs/DAILY_OPERATIONS.md` section 5a.
+
 **Car routes.** Only a `job_commute_checks` row makes a distance PASS/FAIL, and only if it starts
 at the currently configured origin -- same label AND same coordinates
 (otherwise it is stale: DISTANCE_UNVERIFIED).

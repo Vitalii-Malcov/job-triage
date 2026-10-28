@@ -344,6 +344,12 @@ _SALARY = re.compile(
     _AMOUNT + r"(?:\s*(?:€|EUR|Euro))?(?:\s*(?:-|–|bis)\s*" + _AMOUNT + r")?\s*(?:€|EUR|Euro)",
     re.IGNORECASE,
 )
+# Stage 19: "zwischen 42.000 und 48.000 €" is a range (both bounds), not
+# two amounts of which only the second one was kept.
+_SALARY_BETWEEN = re.compile(
+    r"zwischen\s+" + _AMOUNT + r"(?:\s*(?:€|EUR|Euro))?\s+und\s+" + _AMOUNT + r"\s*(?:€|EUR|Euro)",
+    re.IGNORECASE,
+)
 _SALARY_PREFIX = re.compile(
     r"(?:€|EUR)\s*" + _AMOUNT + r"(?:\s*(?:-|–|bis)\s*(?:€|EUR)?\s*" + _AMOUNT + r")?",
     re.IGNORECASE,
@@ -385,7 +391,7 @@ _LEAD_BOUNDARY = re.compile(r"[.;:!?\n•]|,\s|\s[-–]\s|\b(?:und|sowie|plus|zz
 _UP_TO = re.compile(r"(?:bis\s+zu|maximal|max\.|höchstens)\s*$", re.IGNORECASE)
 _ESTIMATE = re.compile(
     r"gesch(?:ä|ae)tzt|sch(?:ä|ae)tzung|estimate|prognose|gehaltsspanne\s+laut|"
-    r"laut\s+(?:xing|stepstone|indeed|kununu|glassdoor)",
+    r"laut\s+(?:xing|stepstone|indeed|kununu|glassdoor)|gehaltsrechner|gehaltsvergleich",
     re.IGNORECASE,
 )
 _SALARIES_PER_YEAR = re.compile(
@@ -468,7 +474,7 @@ def _component(lead: str, trail: str) -> str | None:
 
 def _salary_matches(text: str) -> list[re.Match[str]]:
     found: list[re.Match[str]] = []
-    for pattern in (_SALARY, _SALARY_PREFIX):
+    for pattern in (_SALARY_BETWEEN, _SALARY, _SALARY_PREFIX):
         for match in pattern.finditer(text):
             if not any(m.start() < match.end() and match.start() < m.end() for m in found):
                 found.append(match)

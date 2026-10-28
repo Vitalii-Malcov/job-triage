@@ -84,6 +84,8 @@ def _assess(session: Session, args) -> int:
                     "company": assessment.company,
                     "title": assessment.title,
                     "decision": assessment.decision,
+                    "fit_tier": assessment.fit_tier,
+                    "tier_reasons": assessment.tier_reasons,
                     "criteria": [c.__dict__ for c in assessment.criteria],
                 },
                 ensure_ascii=False,
@@ -97,6 +99,9 @@ def _assess(session: Session, args) -> int:
         if criterion.evidence:
             print(f"  {'':<12} {'':<20} evidence: {criterion.evidence}")
     print(f"DECISION: {assessment.decision}")
+    print(f"FIT TIER: {assessment.fit_tier}")
+    for reason in assessment.tier_reasons:
+        print(f"  - {reason}")
     for blocker in assessment.blockers:
         print(f"  BLOCKER {blocker.name}: {blocker.status}")
     for check in assessment.verifications:

@@ -42,7 +42,11 @@ from app.agents.workplace_address import (
     city_key,
     city_qualifiers,
 )
-from app.db.candidate_job_match_repository import get_latest_match, to_candidate_job_match
+from app.db.candidate_job_match_repository import (
+    compute_job_snapshot_fingerprint,
+    get_latest_match,
+    to_candidate_job_match,
+)
 from app.db.candidate_profile_repository import get_candidate_profile
 from app.db.candidate_search_repository import load_search_config
 from app.db.job_commute_repository import is_approximate, latest_commute_check
@@ -54,6 +58,12 @@ from app.services.application_duplicates import is_intermediary, verdict
 from app.services.application_guard import sent_duplicate, vacancy_findings
 
 Decision = Literal["BLOCKED", "NEEDS_VERIFICATION", "CANDIDATE"]
+# Stage 19: a triage tier on top of `decision` (which stays the Stage 17
+# contract). `decision` blocks only on hard facts (route, remote region,
+# already applied); the tier also weighs language, experience, skills, role
+# and salary so an operator sees which vacancies are worth the time. It
+# never blocks anything and is never an instruction to apply.
+FitTier = Literal["NOT_SUITABLE", "NEEDS_OPERATOR", "PARTIAL_MATCH", "GOOD_MATCH"]
 
 _LEVEL = {"UNKNOWN": 0, "A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
 
@@ -96,6 +106,17 @@ class FitAssessment:
     company: str
     title: str
     criteria: list[Criterion] = field(default_factory=list)
+    # Facts the tier needs beyond the criteria's status (Codex Stage 19 plan
+    # review): a language gap counts as a barrier only when the posting states
+    # the level explicitly and the candidate's level is actually confirmed.
+    german_requirement_basis: str | None = None
+    german_level_confirmed: bool = False
+    # Codex Stage 19 review rounds 1-4 (rule redesigned): an experience gap
+    # is a barrier only with positive evidence -- a CURRENT matcher analysis
+    # that lists a stated experience requirement as MISSING from the
+    # profile. "N Jahre" wording alone, UNKNOWN, a confirmed match or an
+    # out-of-date analysis go to the operator instead.
+    experience_missing_in_profile: bool = False
 
     def criterion(self, name: str) -> Criterion:
         return next(c for c in self.criteria if c.name == name)
@@ -115,6 +136,75 @@ class FitAssessment:
         if self.verifications:
             return "NEEDS_VERIFICATION"
         return "CANDIDATE"
+
+    @property
+    def fit_tier(self) -> FitTier:
+        return self._tier()[0]
+
+    @property
+    def tier_reasons(self) -> list[str]:
+        return self._tier()[1]
+
+    def _tier(self) -> tuple[FitTier, list[str]]:
+        by_name = {c.name: c for c in self.criteria}
+
+        def why(c: Criterion) -> str:
+            evidence = f' (evidence: "{c.evidence}")' if c.evidence else ""
+            return f"{c.name} {c.status}: {c.reason}{evidence}"
+
+        language = by_name.get("language")
+        experience = by_name.get("experience")
+        entry = by_name.get("entry_level")
+        barriers = [why(c) for c in self.blockers]
+        if (
+            language is not None
+            and language.status == "MAJOR_GAP"
+            and self.german_level_confirmed
+            and self.german_requirement_basis == "EXPLICIT_REQUIREMENT"
+        ):
+            barriers.append(why(language))
+        if (
+            experience is not None
+            and experience.status == "GAP"
+            and entry is not None
+            and entry.status == "EXPERIENCED"
+            and self.experience_missing_in_profile
+        ):
+            barriers.append(why(experience))
+        if barriers:
+            return "NOT_SUITABLE", barriers
+        checks = [why(c) for c in self.verifications]
+        if language is not None and language.status in {"MAJOR_GAP", "GAP", "GAP_TO_VERIFY"}:
+            checks.append(why(language))
+        if experience is not None and experience.status == "GAP":
+            checks.append(why(experience))
+        if entry is not None and entry.status == "EXPERIENCED":
+            checks.append(why(entry))
+        if checks:
+            return "NEEDS_OPERATOR", checks
+        weaker = [
+            why(c)
+            for c in self.criteria
+            if (c.name, c.status)
+            in {
+                ("skills", "PARTIAL"),
+                ("skills", "WEAK"),
+                ("role", "OTHER"),
+                ("experience", "PARTIAL"),
+                ("language", "MINOR_GAP"),
+                ("salary", "BELOW"),
+                ("entry_level", "MIXED"),
+            }
+        ]
+        skills = by_name.get("skills")
+        if weaker or skills is None or skills.status != "STRONG":
+            return "PARTIAL_MATCH", weaker or ([why(skills)] if skills else [])
+        strengths = [
+            why(c)
+            for c in self.criteria
+            if c.name in {"skills", "role", "language", "location", "entry_level"}
+        ]
+        return "GOOD_MATCH", strengths
 
 
 # --- individual criteria (pure) ------------------------------------------------
@@ -504,6 +594,17 @@ def confirmed_german_level(session: Session) -> str:
     return "UNKNOWN"
 
 
+def _experience_missing(match: CandidateJobMatch | None) -> bool:
+    """The (current) matcher analysis lists a stated experience requirement
+    as MISSING from the profile."""
+    if match is None:
+        return False
+    return any(
+        r.requirement_type == "EXPERIENCE" and r.match_status == "MISSING"
+        for r in match.missing_requirements
+    )
+
+
 def assess_job(session: Session, job_id: int) -> FitAssessment:
     """Read-only: computes every criterion; writes nothing."""
     job = session.get(JobRecord, job_id)
@@ -513,15 +614,40 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
     settings = config.search if config else CandidateSearchSettings()
     text = f"{job.title}\n{job.location or ''}\n{job.description or ''}"
     match_record = get_latest_match(session, job_id)
-    match = to_candidate_job_match(match_record) if match_record else None
+    profile = get_candidate_profile(session)
+    # Codex Stage 19 review: the latest analysis may predate a changed
+    # posting or profile; an out-of-date analysis is not evidence.
+    stale = match_record is not None and (
+        match_record.job_snapshot_fingerprint != compute_job_snapshot_fingerprint(job)
+        or profile is None
+        or match_record.candidate_profile_version != profile.profile_version
+    )
+    match = to_candidate_job_match(match_record) if match_record and not stale else None
 
     remote = remote_criterion(text, settings)
-    assessment = FitAssessment(job_id=job.id, company=job.company, title=job.title)
+    german_level = confirmed_german_level(session)
+    assessment = FitAssessment(
+        job_id=job.id,
+        company=job.company,
+        title=job.title,
+        german_requirement_basis=extract_german_requirement(text).basis,
+        german_level_confirmed=german_level != "UNKNOWN",
+        experience_missing_in_profile=_experience_missing(match),
+    )
     assessment.criteria = [
-        skills_criterion(match),
+        (
+            Criterion(
+                "skills",
+                "NOT_EVALUATED",
+                "stored matcher analysis is out of date (posting or profile changed); "
+                "run the match again",
+            )
+            if stale
+            else skills_criterion(match)
+        ),
         role_criterion(job.title, settings),
         experience_criterion(match, job.title, job.description or ""),
-        language_criterion(text, confirmed_german_level(session)),
+        language_criterion(text, german_level),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
         remote,
         salary_criterion(text, settings),
