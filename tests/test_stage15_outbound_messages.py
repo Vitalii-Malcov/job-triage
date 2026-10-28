@@ -96,7 +96,7 @@ def _outbound(db, app_id, *, message_id=MESSAGE_ID, related=(), **overrides):
         kind=K.CONTACT_CORRECTION,
         actor="operator",
         reason="Telefonnummer korrigiert",
-        sender="vitalii.malcov.dev@gmail.com",
+        sender="applicant@example.invalid",
         subject="Korrektur meiner Telefonnummer",
         evidence_summary="Gesendet-Ordner verifiziert",
         related_application_ids=related,
@@ -162,7 +162,7 @@ def test_outbound_message_never_changes_status_followup_or_employer_contact(db):
         "message_id": MESSAGE_ID,
         "recipient": "karriere@ald-vt.de",
         "channel": "EMAIL",
-        "sender": "vitalii.malcov.dev@gmail.com",
+        "sender": "applicant@example.invalid",
         "subject": "Korrektur meiner Telefonnummer",
     }
 

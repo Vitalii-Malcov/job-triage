@@ -78,6 +78,12 @@ _ALLOWED: dict[DatabaseRole | None, frozenset[DatabaseKind]] = {
 }
 
 
+def allowed_kinds(role: "DatabaseRole | None") -> frozenset["DatabaseKind"]:
+    """The database kinds a process with this role may use (same table as
+    the web/scheduler startup check)."""
+    return _ALLOWED[role]
+
+
 class DatabaseTargetError(ValueError):
     """The configured database does not fit the process's role."""
 
@@ -128,9 +134,18 @@ _SERVER_PILOT_NAME = re.compile(r"pilot|stage\d+|scratch", re.IGNORECASE)
 _SERVER_BACKUP_NAME = re.compile(r"backup|\bbak\b|_bak|pre[-_]", re.IGNORECASE)
 
 
+def _same_file(path: Path, other: Path) -> bool:
+    """Same file on disk (catches a hard link under another name, which a
+    path comparison cannot -- Codex night-audit review)."""
+    try:
+        return path.exists() and other.exists() and os.path.samefile(path, other)
+    except OSError:
+        return False
+
+
 def classify_path(path: Path) -> DatabaseKind:
     identity = _identity(path)
-    if identity == _identity(PRODUCTION_RUNTIME_DB):
+    if identity == _identity(PRODUCTION_RUNTIME_DB) or _same_file(path, PRODUCTION_RUNTIME_DB):
         return DatabaseKind.PRODUCTION_RUNTIME
     resolved = Path(os.path.realpath(os.path.abspath(path)))
     if _BACKUP_DIR in {part.lower() for part in resolved.parts} or _BACKUP_NAME.search(

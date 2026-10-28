@@ -157,7 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        engine = resolve_engine(args.database, args.database_url)
+        engine = resolve_engine(
+            args.database, args.database_url, writes=bool(getattr(args, "apply", False))
+        )
     except TargetRefusedError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

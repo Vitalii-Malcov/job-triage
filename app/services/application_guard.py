@@ -47,7 +47,9 @@ class AlreadyAppliedError(Exception):
 
 def vacancy_findings(db: Session, job: JobRecord) -> list[DuplicateFinding]:
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(db)]
-    view = VacancyView(job.id, job.source, job.company, job.title, job.url, job.fingerprint)
+    view = VacancyView(
+        job.id, job.source, job.company, job.title, job.url, job.fingerprint, job.location
+    )
     return assess_vacancy(view, applications)
 
 

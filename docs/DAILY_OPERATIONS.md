@@ -61,6 +61,23 @@ message naming the database kind. `.env` itself is not rewritten. The test
 suite (`tests/conftest.py`) always runs on a temporary database with
 `DATABASE_ROLE=test`.
 
+**CLI tools too (night audit 2026-10-27).** Every `scripts/stage15_*`,
+`stage16_*` and `stage17_*` tool takes its database explicitly
+(`--database` / `--database-url`) and applies the same roles: a write
+(`--apply` / `--live`) to a backup is refused, a write to a pilot needs
+`DATABASE_ROLE=pilot`, and under `DATABASE_ROLE=test` or `development` the
+production runtime database is refused even for reading. Read-only commands
+may still inspect a backup.
+
+Safe production start (PowerShell, one shell, nothing written to `.env`):
+
+```powershell
+$env:DATABASE_URL  = "sqlite:///D:/AI_agent/runtime/job_triage_runtime.db"
+$env:DATABASE_ROLE = "production"
+# CLI: always name the database explicitly; dry run first, --apply second
+.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database D:/AI_agent/runtime/job_triage_runtime.db list
+```
+
 ## 3. Flags that keep it safe
 
 | Flag | Safe value | Effect |
@@ -160,8 +177,16 @@ mirror). Always run, for the job row you intend to apply to:
 | Verdict | Exit | Meaning |
 |---|---|---|
 | `ALREADY_APPLIED` | 3 | STRONG: same job row, BA reference, URL, fingerprint, or same employer + role. Do not apply. |
-| `POSSIBLE_DUPLICATE` | 0 | PROBABLE: identical full title at another company (typical anonymized agency mirror). Check by hand. |
+| `POSSIBLE_DUPLICATE` | 0 | PROBABLE: identical full title at another company (typical anonymized agency mirror), or an agency posting in the same city whose title shares the distinctive words of an applied role. Check by hand. |
 | `NO_DUPLICATE_FOUND` | 0 | No deterministic signal. INFO lines list other roles at the same employer (a different role is a legitimate application). |
+
+The second line, `CLASSIFICATION:`, grades how sure the match is:
+`EXACT_DUPLICATE` (job row, reference, URL or fingerprint identical),
+`PROBABLE_DUPLICATE` (same employer and role, no identifier proof -- still
+blocked, verify), `POSSIBLE_DUPLICATE`, `NOT_DUPLICATE`, or
+`INSUFFICIENT_EVIDENCE` (the row has no usable company/title, e.g. a broken
+alert parse). Employer names are compared with umlauts, "e.G."/"eG", dotted
+abbreviations and "Standort ..." folded.
 
 **Enforced (Stage 17C):** creating a Bewerbung draft or a review package
 for a vacancy whose STRONG duplicate was already SENT (SUBMITTED or later)
@@ -169,9 +194,9 @@ is refused (HTTP 409 / `AlreadyAppliedError`) on every path -- API,
 automation shortlist and Telegram. An application still being prepared
 (PACKAGE_READY/APPROVED) is not refused.
 
-Limitation: a mirror that *rewrites* the title (e.g. "Backend Developer (all
-genders) 25185" at a staffing agency for the ALD vacancy) is not detectable
-deterministically — the operator's judgement remains the last guard.
+Limitation: a mirror that rewrites the title AND hides the city, or a direct
+re-post under a new employer name, is not detectable deterministically —
+the operator's judgement remains the last guard.
 
 ## 7. Preparing a Bewerbung — where human approval is required
 
@@ -184,11 +209,60 @@ deterministically — the operator's judgement remains the last guard.
    folders live outside the repository
    (`C:\Users\BOSS\AppData\Local\job-triage-packages\`). Never reuse another
    application's folder.
-4. **The operator submits by hand.** No code path submits to a portal.
+4. **Pre-submit check (mandatory, §7a):** `scripts/presubmit_check.py` on the
+   package and the exact upload copies, after uploading and before the final
+   click. `READY` (exit 0) may go on to submission with the operator's
+   approval; `NEEDS_OPERATOR` (exit 3) only after the operator has seen and
+   approved every WARN; `BLOCKED` (exit 4) and a refused run (exit 2) never
+   go out. This applies to a browser agent filling the form exactly
+   as to a human (`CLAUDE.md`, "Browser submission gate").
+5. **The operator submits by hand.** No code path submits to a portal.
 
 Human approval points: review-package approval, Telegram APPROVE/SKIP
 (decision only), response-draft decision + separate send, follow-up decision
 + separate send, and every real submission.
+
+### 7a. Pre-submit check (mandatory before the final click)
+
+Every package uses the same file names (`..._Lebenslauf.pdf`), so a file
+from another vacancy can end up in a form (it happened on StepStone). Check
+the package and the exact copy you are about to upload:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\presubmit_check.py --database D:/AI_agent/runtime/job_triage_runtime.db `
+  --package "C:\Users\BOSS\AppData\Local\job-triage-packages\<day>_LiveHunt\ApplicationPrep\Final\<pkg>" `
+  --company "<employer>" --role "<exact title>" `
+  --attach cv=.playwright-mcp/upload/<pkg>/<file>.pdf [--attach letter=...] [--no-letter] `
+  [--missing-field "Zeugnisnote"]
+```
+
+| Exit | Outcome | Meaning |
+|---|---|---|
+| 0 | `READY` | PDFs complete and within page limits; the PDFs' own text (pypdf) has the profile's contacts, the letter names company and role, no over-claimed German; the upload copy is byte-identical to this package's original. Still not an instruction to submit. |
+| 3 | `NEEDS_OPERATOR` | something could not be verified automatically (PDF text unreadable, no `--attach`, PDF identical to another package's, profile version not recorded, no letter field). |
+| 4 | `BLOCKED` | wrong package's file, changed copy, wrong contact data, over-claim, stale profile version, or a required portal field the candidate has no confirmed value for. |
+| 2 | refused | the check could not run (missing package, bad `--attach`, database refused). Treat like `BLOCKED`. |
+
+Right after rendering a package (and looking at the PDFs), bind each PDF to
+its source text once: same command with `--bind` (writes `_manifest.json`
+into the package: SHA-256 of PDF and source + profile version; the
+documents are not touched); a PDF or source changed after binding is
+`BLOCKED`.
+
+Read-only otherwise; contact values are compared, never printed.
+
+**Portal lessons (27.10.2026).**
+- A portal form may require more than the posting (one employer portal: "Zeugnisnote"
+  and "Letzter Notenauszug" for a DevOps role). Never invent a value: pass
+  the field as `--missing-field` (BLOCKED) and ask the candidate.
+- CHECK-IN bank application portal: "Vorschau" ends the form session. Do not
+  re-submit the browser's "Confirm Form Resubmission"; resume with
+  "Bewerbung fortsetzen" and the access data the portal issued (keep it out
+  of reports), re-check the fields and uploads, then "Abschicken".
+- StepStone keeps a per-application copy of the CV; "Lebenslauf ersetzen"
+  swaps the main CV without deleting the sent copies.
+- Upload copies live only in `.playwright-mcp\upload` (never committed);
+  delete them after the submission once their SHA-256 matched the original.
 
 ## 8. Record a submission (after sending it by hand)
 
@@ -199,6 +273,9 @@ Human approval points: review-package approval, Telegram APPROVE/SKIP
   --submitted-at 2026-10-21T09:15:00Z --employer-domain firma.de `
   --actor operator --evidence "Portal confirmation 'Vielen Dank'; CV+Anschreiben PDFs"
 ```
+
+Put the §7a pre-submit outcome (`presubmit READY`, or the operator's
+approval of each WARN) into `--evidence`.
 
 Dry run by default; add `--apply` to write. `--source/--reference`
 identify the vacancy (BA reference, StepStone id, ...) and make it
@@ -247,10 +324,16 @@ mail:
 ... transition <id> REJECTED --actor operator --reason "Absage vom 2026-11-02, im Postfach geprüft" --apply
 ```
 
-A receipt that the processor leaves LOW/AMBIGUOUS (generic text, shared ATS
-sender such as join.com, two applications at one employer) changes nothing;
-record it by hand with `transition <id> RECEIVED ... --apply` once you have
-read it. Full details: [APPLICATION_TRACKER_RUNBOOK.md](APPLICATION_TRACKER_RUNBOOK.md).
+A message that reads like a lifecycle event but may not or could not be
+applied carries `operator_review=NEEDS_OPERATOR_REVIEW`: a rejection/offer to
+confirm, or a receipt/rejection/invitation whose correlation is LOW or
+AMBIGUOUS (generic text, two applications at one employer). Such LOW or
+AMBIGUOUS mail changes nothing and records nothing; read it and record it
+by hand (`transition <id> RECEIVED|REJECTED ... --apply`). A reply from the
+same ATS address as an earlier correlated mail (e.g.
+`<company>+applicantreply-<token>@...`) is shown as evidence (SENDER) and
+names the likely application, but a correlation that needs it never writes
+anything: it is reported as `SENDER_ONLY_CORRELATION_NEEDS_OPERATOR`. Full details: [APPLICATION_TRACKER_RUNBOOK.md](APPLICATION_TRACKER_RUNBOOK.md).
 
 Status overview: `... list`, `... show <id>`, `... history <id>`.
 

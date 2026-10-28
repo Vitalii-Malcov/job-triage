@@ -329,7 +329,7 @@ class TestStartupLoggingPrivacy:
             "app.scheduler.run_due_cycle_if_claimed", _fake_run_due_cycle_if_claimed
         )
 
-        secret_account_key = "vitalikmalkov003@example.com"
+        secret_account_key = "applicant-secondary@example.com"
 
         async def _drive():
             task = asyncio.create_task(

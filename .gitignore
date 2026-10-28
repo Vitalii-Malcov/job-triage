@@ -22,3 +22,7 @@ htmlcov/
 # project config. .claude/skills/ and other tracked .claude/ project files
 # are intentionally NOT excluded here.
 .claude/settings.local.json
+
+# Browser-automation workspace: upload copies of personal application
+# documents, page snapshots and screenshots (night audit 2026-10-27).
+.playwright-mcp/

@@ -7,7 +7,23 @@ from sqlalchemy.orm import Session
 
 from app.db.models import JobCommuteCheckRecord, JobRecord
 
-COMMUTE_METHODS = frozenset({"MANUAL", "OSRM"})
+COMMUTE_METHODS = frozenset({"MANUAL", "OSRM", "MANUAL_APPROX", "OSRM_APPROX"})
+# Night audit 2026-10-27: a route measured only to a city centre, postcode or
+# street (not the building) is stored with an `_APPROX` method and never
+# counts as the verified workplace route (no schema change: `method` carries
+# it).
+APPROXIMATE_METHODS = frozenset({"MANUAL_APPROX", "OSRM_APPROX"})
+ROUTE_CACHE_MARKER = "dest="
+
+
+def is_approximate(method: str | None) -> bool:
+    return method in APPROXIMATE_METHODS
+
+
+def destination_marker(lat: float, lon: float) -> str:
+    """Stable text written into an OSRM check's source note so the same
+    coordinate pair is never routed twice (see `find_cached_route`)."""
+    return f"{ROUTE_CACHE_MARKER}{lat:.5f},{lon:.5f}"
 
 
 class CommuteCheckInputError(ValueError):
@@ -59,6 +75,25 @@ def record_commute_check(
     db.commit()
     db.refresh(record)
     return record
+
+
+def find_cached_route(
+    db: Session, *, origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float
+) -> JobCommuteCheckRecord | None:
+    """A stored OSRM route between exactly these coordinates (any job), so a
+    repeated check needs no network request."""
+    marker = destination_marker(dest_lat, dest_lon)
+    return db.scalars(
+        select(JobCommuteCheckRecord)
+        .where(
+            JobCommuteCheckRecord.method.in_(("OSRM", "OSRM_APPROX")),
+            JobCommuteCheckRecord.origin_lat == origin_lat,
+            JobCommuteCheckRecord.origin_lon == origin_lon,
+            JobCommuteCheckRecord.source_note.contains(marker),
+        )
+        .order_by(JobCommuteCheckRecord.checked_at.desc(), JobCommuteCheckRecord.id.desc())
+        .limit(1)
+    ).first()
 
 
 def latest_commute_check(db: Session, job_id: int) -> JobCommuteCheckRecord | None:

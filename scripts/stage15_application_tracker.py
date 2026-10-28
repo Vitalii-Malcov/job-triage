@@ -137,7 +137,57 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def resolve_engine(database: str | None, database_url: str | None) -> Engine:
+def _refuse_kind_for_cli(path: Path | None, *, writes: bool, kind=None) -> None:
+    """Stage 17A's database roles, applied to the CLI tools too (night audit
+    2026-10-27: web/scheduler refused backups and pilots, but every CLI
+    opened any SQLite file, so an `--apply` against a backup copy wrote into
+    it silently). A backup is never written; a pilot is written only under
+    DATABASE_ROLE=pilot; a test/development process never opens the
+    production runtime database, not even to read it."""
+    from app.core.database_target import (
+        DatabaseKind,
+        DatabaseRole,
+        DatabaseTargetError,
+        allowed_kinds,
+        classify_path,
+        parse_role,
+    )
+
+    try:
+        role = parse_role(os.environ.get("DATABASE_ROLE"))
+    except DatabaseTargetError as exc:
+        raise TargetRefusedError(str(exc)) from None
+    # `kind` is given for a server URL (Codex review: a PostgreSQL database
+    # named *_backup / *pilot* bypassed the guard); a file is classified here.
+    kind = kind if kind is not None else classify_path(path)
+    if kind is DatabaseKind.PRODUCTION_RUNTIME and role in (
+        DatabaseRole.TEST,
+        DatabaseRole.DEVELOPMENT,
+    ):
+        raise TargetRefusedError(
+            f"refusing the production runtime database under DATABASE_ROLE={role.value}"
+        )
+    if not writes:
+        return
+    if kind is DatabaseKind.BACKUP:
+        raise TargetRefusedError(
+            "refusing to write to a backup database (a backup is never a live database)"
+        )
+    if kind is DatabaseKind.PILOT and role is not DatabaseRole.PILOT:
+        raise TargetRefusedError("writing to a pilot database needs DATABASE_ROLE=pilot")
+    # Codex round 4: a stated role binds writes exactly like the web/scheduler
+    # startup (production -> runtime file or PostgreSQL, pilot -> pilot only).
+    if role is not None and kind not in allowed_kinds(role):
+        raise TargetRefusedError(
+            f"refusing to write a {kind.value} database under DATABASE_ROLE={role.value}"
+        )
+
+
+def resolve_engine(
+    database: str | None, database_url: str | None, *, writes: bool = True
+) -> Engine:
+    """`writes` (fail-closed default True) is False only for invocations
+    that never write (no --apply / --live)."""
     if bool(database) == bool(database_url):
         raise TargetRefusedError("give exactly one of --database or --database-url")
     if database:
@@ -153,6 +203,7 @@ def resolve_engine(database: str | None, database_url: str | None) -> Engine:
             raise TargetRefusedError("Stage 13D databases are out of scope for this tool")
         if not path.is_file():
             raise TargetRefusedError("database file does not exist")
+        _refuse_kind_for_cli(path, writes=writes)
         if _sha256(path) in PROTECTED_DATABASE_SHA256:
             raise TargetRefusedError("refusing the protected Stage 14B canonical database")
         engine = create_engine(f"sqlite:///{path.as_posix()}", poolclass=NullPool)
@@ -163,6 +214,10 @@ def resolve_engine(database: str | None, database_url: str | None) -> Engine:
             raise TargetRefusedError("--database-url must be a PostgreSQL URL")
         if _PROTECTED_URL.search(database_url) or _PROTECTED_PATH.search(database_url):
             raise TargetRefusedError("this database is out of scope for this tool")
+        from app.core.database_target import classify_database_url
+
+        server_kind, _ = classify_database_url(database_url)
+        _refuse_kind_for_cli(None, writes=writes, kind=server_kind)
         engine = create_engine(url, poolclass=NullPool)
     _require_head(engine)
     return engine
@@ -406,7 +461,9 @@ def _since(raw: str | None) -> datetime:
 def run(argv: list[str] | None = None, *, settings=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        engine = resolve_engine(args.database, args.database_url)
+        engine = resolve_engine(
+            args.database, args.database_url, writes=bool(getattr(args, "apply", False))
+        )
     except TargetRefusedError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
@@ -499,7 +556,12 @@ def _check_job(session: Session, args) -> int:
     STRONG duplicate exists, 3 when the vacancy was already applied to."""
     from app.db import application_repository as app_repo
     from app.db.models import JobRecord
-    from app.services.application_duplicates import VacancyView, assess_vacancy, verdict
+    from app.services.application_duplicates import (
+        VacancyView,
+        assess_vacancy,
+        classify_duplicate,
+        verdict,
+    )
 
     job = session.get(JobRecord, args.job_id)
     if job is None:
@@ -511,15 +573,18 @@ def _check_job(session: Session, args) -> int:
         title=job.title,
         url=job.url,
         fingerprint=job.fingerprint,
+        location=job.location,
     )
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
     findings = assess_vacancy(vacancy, applications)
     result = verdict(findings)
+    grade = classify_duplicate(vacancy, findings)
     payload = {
         "job_id": job.id,
         "company": job.company,
         "title": job.title,
         "verdict": result,
+        "classification": grade,
         "findings": [
             {
                 "application_id": f.application_id,
@@ -537,6 +602,7 @@ def _check_job(session: Session, args) -> int:
     else:
         print(f"JOB {job.id}: {job.company} | {job.title}")
         print(f"VERDICT: {result}")
+        print(f"CLASSIFICATION: {grade}")
         for f in findings:
             print(
                 f"  {f.strength} application {f.application_id} [{f.status}] "
