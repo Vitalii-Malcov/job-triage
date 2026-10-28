@@ -146,7 +146,7 @@ def run(argv: list[str] | None = None, *, settings=None, transport=None) -> int:
 
         settings = Settings()
     try:
-        engine = resolve_engine(args.database, args.database_url)
+        engine = resolve_engine(args.database, args.database_url, writes=_is_live(args))
     except TargetRefusedError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

@@ -54,6 +54,7 @@ from app.services.application_correlation import (
     InboundMessage,
     correlate_message,
     message_key_for,
+    needs_sender,
     normalize_occurred_at,
     stable_hash,
 )
@@ -61,6 +62,22 @@ from app.services.application_tracker import ApplicationConcurrencyError, Applic
 
 logger = logging.getLogger(__name__)
 PROCESSOR_ACTOR = "stage15_response_processor"
+# Report-only marker (nothing is written for it): the message looks like a
+# lifecycle event, but this pipeline may not or could not act on it -- an
+# outcome the operator must confirm, or a lifecycle message whose
+# correlation is too weak / ambiguous to record.
+NEEDS_OPERATOR_REVIEW = "NEEDS_OPERATOR_REVIEW"
+_REVIEWABLE_CLASSIFICATIONS = frozenset(
+    {
+        "RECEIPT_CONFIRMATION",
+        "UNDER_REVIEW_NOTICE",
+        "INTERVIEW_INVITATION",
+        "TECHNICAL_INTERVIEW_INVITATION",
+        "REQUEST_FOR_INFORMATION",
+        "OFFER",
+        "REJECTION",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +104,7 @@ class ResponseTrackingResult:
     # outcome (CLI transition), e-mail never applies a terminal status.
     operator_confirmation_required: bool = False
     proposed_status: str | None = None
+    operator_review: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -147,6 +165,33 @@ def _thread_hashes(db: Session, message: InboundMessage) -> dict[int, frozenset[
     return {app_id: frozenset(values) for app_id, values in by_app.items()}
 
 
+def _sender_lookup(db: Session, message: InboundMessage):
+    """SENDER signal: has this exact sender already had a message correlated
+    to the application? Called only for candidates that already match on
+    COMPANY; each call is one indexed per-application event read, cached."""
+    sender_hash = message.sender_address_hash
+    if sender_hash is None:
+        return None
+    cache: dict[int, bool] = {}
+
+    def seen(application_id: int) -> bool:
+        if application_id not in cache:
+            cache[application_id] = any(
+                json.loads(event.metadata_json or "{}").get("sender_address_hash") == sender_hash
+                for event in repo.list_events(db, application_id)
+                if event.origin == ApplicationEventOrigin.GMAIL.value
+            )
+        return cache[application_id]
+
+    return seen
+
+
+def _review_flag(classification: str | None, *, needs_confirmation: bool) -> str | None:
+    if needs_confirmation:
+        return NEEDS_OPERATOR_REVIEW
+    return NEEDS_OPERATOR_REVIEW if classification in _REVIEWABLE_CLASSIFICATIONS else None
+
+
 class ApplicationResponseProcessor:
     def __init__(self, tracker: ApplicationTracker | None = None) -> None:
         self.tracker = tracker or ApplicationTracker()
@@ -201,6 +246,7 @@ class ApplicationResponseProcessor:
             self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
             applicant_addresses=applicant_addresses,
             thread_hashes_by_application=_thread_hashes(db, message),
+            sender_seen=_sender_lookup(db, message),
         )
         base = dict(
             message_ref=ref,
@@ -217,14 +263,28 @@ class ApplicationResponseProcessor:
                 correlation.reason,
                 len(correlation.candidates),
             )
+            # An AMBIGUOUS message concerns one of several applications; if it
+            # reads like a lifecycle event the operator must pick the one.
+            ambiguous = (
+                classify_application_response(
+                    message.subject, message.body, message.from_address, has_html=message.has_html
+                )
+                if correlation.status == "AMBIGUOUS"
+                else None
+            )
             return ResponseTrackingResult(
                 **base,
                 application_id=None,
                 company=None,
                 role=None,
-                classification=None,
-                rule=None,
-                classifier_confidence=None,
+                classification=ambiguous.classification.value if ambiguous else None,
+                rule=ambiguous.rule if ambiguous else None,
+                classifier_confidence=ambiguous.confidence if ambiguous else None,
+                operator_review=(
+                    _review_flag(ambiguous.classification.value, needs_confirmation=False)
+                    if ambiguous
+                    else None
+                ),
                 previous_status=None,
                 new_status=None,
                 action="IGNORE",
@@ -280,6 +340,22 @@ class ApplicationResponseProcessor:
             correlation_confidence=correlation.confidence,
             classifier_confidence=classified.confidence,
         )
+        if decision.action != "IGNORE" and needs_sender(correlation.signals):
+            # Night audit (Codex round 3): the sender only POINTS to an
+            # application; it may be another vacancy of the same employer
+            # under an alias. Nothing is written; the operator decides.
+            proposed = decision.target or decision.proposed_status
+            return ResponseTrackingResult(
+                **common,
+                new_status=application.current_status.value,
+                action="IGNORE",
+                operator_review=NEEDS_OPERATOR_REVIEW,
+                proposed_status=proposed.value if proposed else None,
+                transition_applied=False,
+                event_recorded=False,
+                duplicate=False,
+                reason="SENDER_ONLY_CORRELATION_NEEDS_OPERATOR",
+            )
         intended = (decision.target or application.current_status).value
         if decision.action != "TRANSITION":
             logger.info(
@@ -288,9 +364,14 @@ class ApplicationResponseProcessor:
                 application.id,
                 decision.reason,
             )
+        review = _review_flag(
+            classified.classification.value if decision.reason == "CORRELATION_TOO_WEAK" else None,
+            needs_confirmation=decision.operator_confirmation_required,
+        )
         if decision.action == "IGNORE" or not apply:
             return ResponseTrackingResult(
                 **common,
+                operator_review=review,
                 new_status=intended,
                 action=decision.action,
                 operator_confirmation_required=decision.operator_confirmation_required,
@@ -317,6 +398,7 @@ class ApplicationResponseProcessor:
             "correlation_confidence": correlation.confidence,
             "correlation_signals": list(correlation.signals),
             "message_id_hash": message.message_id_hash,
+            "sender_address_hash": message.sender_address_hash,
             "decision": decision.reason,
             "operator_confirmation_required": decision.operator_confirmation_required,
             "proposed_status": (
@@ -367,6 +449,7 @@ class ApplicationResponseProcessor:
                 event_recorded=False,
                 duplicate=False,
                 reason="CONCURRENT_CHANGE_RETRY",
+                operator_review=review,
                 operator_confirmation_required=decision.operator_confirmation_required,
                 proposed_status=(
                     decision.proposed_status.value if decision.proposed_status else None
@@ -382,6 +465,7 @@ class ApplicationResponseProcessor:
             event_recorded=outcome.event_recorded,
             duplicate=outcome.duplicate,
             reason=decision.reason if not outcome.duplicate else "ALREADY_PROCESSED",
+            operator_review=review,
         )
 
 

@@ -22,9 +22,30 @@ network, no writes. Each finding names the exact signals that produced it:
   included, at a different company name. This is how anonymized agency
   mirrors look ("Backend Developer (m/w/div.)" from a staffing agency), but
   common titles collide too, so it only ever asks for a human look.
+  SIMILAR_ROLE_VIA_INTERMEDIARY -- the vacancy is posted by a staffing
+  agency / job board, in the same city as the application, and its title
+  shares the distinctive words of the application's role (night audit
+  2026-10-27: "IT-Spezialist Produktions-IT & Systemintegration" at an agency
+  vs. the applied "IT-Systemintegrator Produktions-IT / Shopfloor", same
+  city, was NO_DUPLICATE_FOUND). The agency hides the real employer, so
+  this can only ever ask for a human look.
 - SAME_EMPLOYER_OTHER_ROLE is informational only: a different role at the
   same employer is a genuinely different application (e.g. ALD Backend
   Developer vs. ALD Software Engineer Prototyping).
+
+Company identity for these checks folds what the shared
+`normalize_company_name` keeps apart on purpose (it also feeds stored
+keys): umlaut transliteration, "e.G."/"eG" and dotted abbreviations
+("N.O.C" = "NOC"). A branch suffix ("... Standort Frankfurt") is NOT
+folded: "Example Standort Berlin GmbH" and "Example GmbH" may be different
+employers, and SAME_EMPLOYER_AND_ROLE blocks (Codex night-audit review).
+
+`classify_duplicate` grades the findings for the operator:
+EXACT_DUPLICATE (job row, reference, URL or fingerprint identical),
+PROBABLE_DUPLICATE (same employer AND role, no identifier proof),
+POSSIBLE_DUPLICATE (agency/mirror signals only), NOT_DUPLICATE, or
+INSUFFICIENT_EVIDENCE (the vacancy has no usable company or title and no
+identifier matched).
 
 Terminal applications (REJECTED/WITHDRAWN/OFFER) still count: a second
 application after a rejection is exactly what the operator must notice.
@@ -41,6 +62,14 @@ from app.services.application_correlation import role_phrase
 from app.services.email_matching import normalize_company_name
 
 Strength = Literal["STRONG", "PROBABLE", "INFO"]
+DuplicateClass = Literal[
+    "EXACT_DUPLICATE",
+    "PROBABLE_DUPLICATE",
+    "POSSIBLE_DUPLICATE",
+    "NOT_DUPLICATE",
+    "INSUFFICIENT_EVIDENCE",
+]
+_EXACT = frozenset({"SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT"})
 
 _BA_DETAIL = re.compile(r"/jobsuche/jobdetail/([^/?#]+)", re.IGNORECASE)
 _STRONG = ("SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT", "SAME_EMPLOYER_AND_ROLE")
@@ -60,6 +89,7 @@ class VacancyView:
     title: str
     url: str | None
     fingerprint: str | None = None
+    location: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,11 +137,66 @@ def _title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
+_UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"})
+_DOTTED_ABBREVIATION = re.compile(r"\b(?:[a-z0-9]\.)+[a-z0-9]\b\.?")
+_EG_SUFFIX = re.compile(r"\be\.?\s?g\.?(?=\s|$)")
+
+
+def company_identity(name: str | None) -> str:
+    """Comparison key for "is this the same employer?" (duplicates only)."""
+    value = (name or "").casefold().translate(_UMLAUTS)
+    value = _DOTTED_ABBREVIATION.sub(lambda m: m.group(0).replace(".", ""), value)
+    value = _EG_SUFFIX.sub(" ", value)
+    return normalize_company_name(value)
+
+
+# Staffing agencies and job boards: their postings hide (or mirror) the
+# actual employer. Whole words of the company identity.
+_INTERMEDIARY = re.compile(
+    r"\b(?:personal\w*|zeitarbeit|arbeitnehmerueberlassung|recruit\w*|jobboerse|"
+    r"jobriver|stellenmarkt|akkodis|hays|adecco|randstad|manpower|gulp|brunel|ferchau|"
+    r"orizon|experis|amadeus fire|modis|solcom|etengo|piening|puro|allgeier|"
+    r"gi group|tempton|timepartner|jobactive|bindan|trenkwalder|noc engineering)\b"
+)
+
+
+def is_intermediary(company: str | None) -> bool:
+    return bool(_INTERMEDIARY.search(company_identity(company)))
+
+
+# Title words that say nothing about WHICH job it is.
+_GENERIC_TITLE_WORDS = frozenset(
+    (
+        "div divers genders innen fuer bei zur zum der die das als oder junior senior lead "
+        "mitarbeiter mitarbeiterin spezialist specialist engineer ingenieur manager fachkraft "
+        "bereich schwerpunkt vollzeit teilzeit remote hybrid with from"
+    ).split()
+)
+
+
+def _title_stems(title: str) -> frozenset[str]:
+    words = re.findall(r"[a-z0-9]+", role_phrase(title).translate(_UMLAUTS))
+    return frozenset(w[:10] for w in words if len(w) >= 4 and w not in _GENERIC_TITLE_WORDS)
+
+
+def _city(location: str | None) -> str:
+    value = (location or "").casefold().translate(_UMLAUTS).split(",")[0]
+    return re.sub(r"\s+", " ", re.sub(r"\d+", " ", value)).strip()
+
+
+def _similar_role(a: str, b: str) -> bool:
+    left, right = _title_stems(a), _title_stems(b)
+    shared = left & right
+    return len(shared) >= 2 or (len(shared) == 1 and min(len(left), len(right)) == 1)
+
+
 def assess_vacancy(
     vacancy: VacancyView, applications: Iterable[Application]
 ) -> list[DuplicateFinding]:
     """Every application this vacancy may duplicate, strongest first."""
-    company = normalize_company_name(vacancy.company)
+    company = company_identity(vacancy.company)
+    via_intermediary = is_intermediary(vacancy.company)
+    city = _city(vacancy.location)
     role = role_phrase(vacancy.title)
     title = _title(vacancy.title)
     url = normalize_posting_url(vacancy.url)
@@ -128,7 +213,7 @@ def assess_vacancy(
             signals.append("SAME_URL")
         if vacancy.fingerprint and app.vacancy_fingerprint == vacancy.fingerprint:
             signals.append("SAME_FINGERPRINT")
-        same_company = bool(company) and normalize_company_name(app.company_name) == company
+        same_company = bool(company) and company_identity(app.company_name) == company
         same_role = bool(role) and role_phrase(app.role_title) == role
         if same_company and same_role:
             signals.append("SAME_EMPLOYER_AND_ROLE")
@@ -136,6 +221,15 @@ def assess_vacancy(
             strength: Strength = "STRONG"
         elif not same_company and title and _title(app.role_title) == title:
             signals.append("SAME_TITLE_OTHER_EMPLOYER")
+            strength = "PROBABLE"
+        elif (
+            not same_company
+            and via_intermediary
+            and city
+            and _city(app.location) == city
+            and _similar_role(vacancy.title, app.role_title)
+        ):
+            signals.append("SIMILAR_ROLE_VIA_INTERMEDIARY")
             strength = "PROBABLE"
         elif same_company:
             signals.append("SAME_EMPLOYER_OTHER_ROLE")
@@ -189,6 +283,25 @@ def job_association_mismatches(
     ):
         mismatches.append("DESTINATION_URL")
     return mismatches
+
+
+def classify_duplicate(
+    vacancy: VacancyView, findings: Iterable[DuplicateFinding]
+) -> DuplicateClass:
+    """Operator-facing grade of `assess_vacancy` findings (see module doc).
+    Only EXACT_DUPLICATE is proven; everything else asks for a human look
+    before applying, and NOT_DUPLICATE never claims more than "no signal"."""
+    findings = list(findings)
+    signals = {s for f in findings for s in f.signals}
+    if signals & _EXACT:
+        return "EXACT_DUPLICATE"
+    if "SAME_EMPLOYER_AND_ROLE" in signals:
+        return "PROBABLE_DUPLICATE"
+    if not company_identity(vacancy.company) or not role_phrase(vacancy.title):
+        return "INSUFFICIENT_EVIDENCE"
+    if any(f.strength == "PROBABLE" for f in findings):
+        return "POSSIBLE_DUPLICATE"
+    return "NOT_DUPLICATE"
 
 
 def verdict(findings: Iterable[DuplicateFinding]) -> str:

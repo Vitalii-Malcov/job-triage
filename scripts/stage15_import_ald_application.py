@@ -95,7 +95,9 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     try:
-        engine = resolve_engine(args.database, args.database_url)
+        engine = resolve_engine(
+            args.database, args.database_url, writes=bool(getattr(args, "apply", False))
+        )
         evidence_file_sha = (
             verify_submission_evidence(args.submission_evidence)
             if args.submission_evidence

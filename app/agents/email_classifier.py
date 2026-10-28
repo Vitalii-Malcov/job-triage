@@ -81,6 +81,8 @@ _NEGATION_PATTERN = re.compile(
     r"\bdas\s+ist\s+keine?\b|"
     r"\bthis\s+is\s+not\s+a\b|"
     r"\bnot\s+a\s+rejection\b|"
+    # Codex round 7: "es liegt keine Absage vor" states the opposite.
+    r"\bkeine\s+(?:absage|ablehnung)\b|"
     r"\bnicht\s+(?:erforderlich|notwendig|zwingend)\b|"
     r"\bnot\s+(?:required|necessary|mandatory)\b|"
     r"\b(?:isn|aren)'?t\s+(?:required|necessary|mandatory)\b|"
@@ -101,6 +103,17 @@ _AUTOMATED_PHRASE_PATTERN = re.compile(
     r"automatically\s+generated",
     re.IGNORECASE,
 )
+
+# Codex night-audit review: "Wir können Ihnen derzeit (leider) keine positive
+# Nachricht geben; die Entscheidung fällt nächste Woche" is a pending
+# decision. The open-ended "keine positive ..." phrase only counts as a
+# rejection in a sentence without such a marker.
+_PENDING_DECISION = re.compile(
+    r"\b(?:derzeit|noch|momentan|aktuell|zurzeit|bisher|vorerst|zun(?:ä|ae)chst)\b|"
+    r"entscheidung\s+f(?:ä|ae)llt|sobald\s+wir|melden\s+uns",
+    re.IGNORECASE,
+)
+_OPEN_ENDED_REJECTION = re.compile(r"^keine\s+positiv", re.IGNORECASE)
 
 _GENERAL_RECRUITER_SIGNAL_PATTERN = re.compile(
     r"bewerbung|stelle|position|vacancy|application|recruiting|karriere|career",
@@ -127,11 +140,32 @@ _CATEGORY_PATTERNS: dict[EmailCategory, re.Pattern[str]] = {
     ),
     "REJECTION": re.compile(
         r"\babsage\b|"
-        r"leider\s+(?:k(?:ö|oe)nnen|m(?:ü|ue)ssen)\s+wir\s+ihre\s+bewerbung|"
+        r"leider\s+(?:k(?:ö|oe)nnen|m(?:ü|ue)ssen)\s+wir\s+(?:ihre|deine)\s+bewerbung|"
         r"wir\s+haben\s+uns\s+(?:leider\s+)?f(?:ü|ue)r\s+eine[nr]?\s+anderen?\s+kandidat|"
         r"nicht\s+(?:weiter\s+)?ber(?:ü|ue)cksichtigen|"
         r"(?:leider\s+)?keine\s+zusage|"
-        r"entscheidung\s+gegen\s+ihre\s+bewerbung|"
+        r"entscheidung\s+gegen\s+(?:ihre|deine)\s+bewerbung|"
+        # Night audit 2026-10-27: real portal rejection "... keine positive
+        # Nachricht ... geben zu können, da wir uns anderweitig entschieden
+        # haben" was missed. Each entry is a completed decision; a pending
+        # "sobald wir uns entschieden haben" or a receipt's conditional
+        # "passte ein*e andere*r Bewerber*in besser" never matches.
+        r"uns\s+(?:leider\s+)?anderweitig\s+entschieden|"
+        # A pending "derzeit (leider) keine positive Nachricht" is excluded by
+        # _PENDING_DECISION (sentence-level, see _matched_categories).
+        r"keine\s+positiven?\s+(?:nachricht|r(?:ü|ue)ckmeldung|antwort|entscheidung)|"
+        # Informal / direct refusals ("Leider können wir Dir die Stelle nicht
+        # anbieten") -- they also say "Danke für Deine Bewerbung", and
+        # REJECTION outranks the receipt.
+        r"leider\s+(?:k(?:ö|oe)nnen|m(?:ü|ue)ssen)\s+wir\s+(?:ihnen|dir|euch)\s+"
+        r"(?:(?!derzeit|noch|momentan|aktuell|zurzeit)\S+\s+){0,4}?"
+        r"(?:nicht|keine)\s+(?:\S+\s+){0,2}?(?:anbieten|zusagen|ber(?:ü|ue)cksichtigen)|"
+        r"(?:stelle|position)\s+(?:leider\s+)?nicht\s+(?:anbieten|vergeben|besetzen\s+mit)|"
+        r"f(?:ü|ue)r\s+(?:ein\S*\s+)?andere\S*\s+(?:bewerber|kandidat)\S*\s+(?:\S+\s+){0,3}?"
+        r"entschieden|"
+        r"gegen\s+(?:ihre|deine)\s+bewerbung\s+entschieden|"
+        r"nicht\s+in\s+die\s+engere\s+auswahl|"
+        r"decided\s+to\s+(?:pursue|proceed\s+with|move\s+forward\s+with)\s+other\s+candidates|"
         r"unfortunately[, ]+.{0,20}(?:will\s+not|won't|cannot|decided\s+not\s+to)"
         r"\s+(?:move\s+forward|proceed)|"
         r"we\s+have\s+decided\s+to\s+move\s+forward\s+with\s+other\s+candidates|"
@@ -190,9 +224,12 @@ _CATEGORY_PATTERNS: dict[EmailCategory, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "APPLICATION_RECEIVED": re.compile(
-        r"wir\s+haben\s+ihre\s+bewerbung\s+erhalten|"
-        r"vielen\s+dank\s+f(?:ü|ue)r\s+ihre\s+bewerbung|"
-        r"ihre\s+bewerbung\s+ist\s+bei\s+uns\s+eingegangen|"
+        # Night audit 2026-10-27: the informal "Du" form ("vielen Dank für
+        # Deine Bewerbung als ...", JOIN and other start-up ATS) is a receipt
+        # too; it was classified AUTOMATED_SIGNAL and never reached RECEIVED.
+        r"wir\s+haben\s+(?:ihre|deine)\s+bewerbung\s+erhalten|"
+        r"(?:vielen\s+)?dank(?:e)?\s+f(?:ü|ue)r\s+(?:ihre|deine)\s+bewerbung|"
+        r"(?:ihre|deine)\s+bewerbung\s+ist\s+bei\s+uns\s+eingegangen|"
         r"bewerbungseingang|"
         # Stage 15: receipt wording seen in real employer mail, e.g.
         # "...die Zusendung Ihrer Bewerbung, deren Eingang wir hiermit
@@ -347,14 +384,23 @@ def _matched_categories(text: str) -> dict[EmailCategory, str]:
         for category, pattern in _CATEGORY_PATTERNS.items():
             if category in matches:
                 continue
-            mention = pattern.search(sentence)
-            if mention is None:
-                continue
-            clause_start, clause_end = _clause_span(sentence, mention)
-            clause = sentence[clause_start:clause_end]
-            if _NEGATION_PATTERN.search(clause):
-                continue
-            matches[category] = sentence
+            # Every mention in the sentence is examined (Codex round 6): a
+            # suppressed first phrase ("derzeit ... keine positive
+            # Nachricht") must not hide a definitive later one ("da wir uns
+            # anderweitig entschieden haben").
+            for mention in pattern.finditer(sentence):
+                clause_start, clause_end = _clause_span(sentence, mention)
+                clause = sentence[clause_start:clause_end]
+                if _NEGATION_PATTERN.search(clause):
+                    continue
+                if (
+                    category == "REJECTION"
+                    and _OPEN_ENDED_REJECTION.match(mention.group(0))
+                    and _PENDING_DECISION.search(sentence)
+                ):
+                    continue
+                matches[category] = sentence
+                break
     return matches
 
 

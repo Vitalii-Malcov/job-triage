@@ -35,15 +35,22 @@ from app.agents.job_fit_signals import (
     extract_german_requirement,
     extract_salary,
 )
+from app.agents.workplace_address import (
+    WorkplaceAddress,
+    address_words,
+    best_workplace,
+    city_key,
+    city_qualifiers,
+)
 from app.db.candidate_job_match_repository import get_latest_match, to_candidate_job_match
 from app.db.candidate_profile_repository import get_candidate_profile
 from app.db.candidate_search_repository import load_search_config
-from app.db.job_commute_repository import latest_commute_check
+from app.db.job_commute_repository import is_approximate, latest_commute_check
 from app.db.models import JobCommuteCheckRecord, JobRecord
 from app.models.candidate_job_match import CandidateJobMatch
 from app.models.candidate_profile import is_usable_for_generation, normalize_text_identity
 from app.models.candidate_search import CandidateSearchSettings
-from app.services.application_duplicates import verdict
+from app.services.application_duplicates import is_intermediary, verdict
 from app.services.application_guard import sent_duplicate, vacancy_findings
 
 Decision = Literal["BLOCKED", "NEEDS_VERIFICATION", "CANDIDATE"]
@@ -56,8 +63,18 @@ _BLOCKING = {
     ("remote", "INCOMPATIBLE"),
     ("duplicate", "ALREADY_APPLIED"),
 }
+# Night audit 2026-10-27: an approximate route (city centre / postcode)
+# decides only with this margin; an exact route this close to the limit is
+# flagged in the reason.
+APPROXIMATE_MARGIN_KM = 15
+NEAR_LIMIT_KM = 5
+
 _VERIFY = {
     ("location", "DISTANCE_UNVERIFIED"),
+    ("location", "APPROXIMATE_NEAR_LIMIT"),
+    # Codex review: a workplace can lie further than the margin from the
+    # city centre; an approximate PASS is never enough on its own.
+    ("location", "PASS_APPROXIMATE"),
     ("location", "UNKNOWN"),
     ("location", "NOT_CONFIGURED"),
     ("duplicate", "POSSIBLE_DUPLICATE"),
@@ -178,12 +195,21 @@ def language_criterion(text: str, german_level: str) -> Criterion:
     if requirement.level is None:
         return Criterion("language", "NO_REQUIREMENT", "no German level stated")
     asked, held = _LEVEL[requirement.level], _LEVEL.get(german_level, 0)
-    label = f"German {requirement.level} {'required' if requirement.mandatory else 'preferred'}"
+    if requirement.basis == "INFERRED_REQUIREMENT":
+        label = (
+            f"German ~{requirement.level} required (inferred from wording, no CEFR level stated)"
+        )
+    else:
+        label = f"German {requirement.level} {'required' if requirement.mandatory else 'preferred'}"
     reason = f"{label}; confirmed level {german_level}"
     if held >= asked:
         return Criterion("language", "OK", reason, requirement.evidence)
     if not requirement.mandatory:
         return Criterion("language", "MINOR_GAP", reason, requirement.evidence)
+    if requirement.basis == "INFERRED_REQUIREMENT":
+        # "sehr gute Deutschkenntnisse" is not a C1 certificate: a gap to
+        # verify (ask / read the whole posting), never a stated MAJOR_GAP.
+        return Criterion("language", "GAP_TO_VERIFY", reason, requirement.evidence)
     status = "MAJOR_GAP" if asked - held >= 2 else "GAP"
     return Criterion("language", status, reason, requirement.evidence)
 
@@ -228,6 +254,40 @@ def _same_origin(check: JobCommuteCheckRecord, settings: CandidateSearchSettings
     )
 
 
+def _route_names_address(measured_to: str, posted: WorkplaceAddress) -> bool:
+    """True when the stored route names the posted street, its complete
+    house number and the postcode (Codex rounds 5-6)."""
+    street_and_number = address_words(posted.text.split(",", 1)[0])
+    pattern = (
+        r"(?<![0-9a-zäöü])"
+        + re.escape(street_and_number).replace(r"\ ", r"\s*")
+        + r"(?![0-9a-zäöü])"
+    )
+    target = address_words(measured_to)
+    return bool(re.search(pattern, target)) and bool(
+        re.search(rf"(?<!\d){posted.postcode}(?!\d)", target)
+    )
+
+
+def _route_elsewhere(label: str, job_location: str | None) -> bool:
+    """True when a tool-measured route's destination label does not name
+    the posting's city (Codex rounds 11-12: "Frankfurt, Hauptstraße 5" or
+    "60311 Frankfurt" for a Hanau posting). A label without any city
+    cannot be confirmed either, so it counts as elsewhere."""
+    city = city_key(job_location)
+    if not city:
+        return False
+    words = address_words(label)
+    for umlaut, plain in (("ä", "ae"), ("ö", "oe"), ("ü", "ue")):
+        words = words.replace(umlaut, plain)
+    present = set(words.split())
+    if not all(part in present for part in city.split()):
+        return True
+    # Same name, other town: "Frankfurt (Oder)" for "Frankfurt am Main".
+    wanted, named = city_qualifiers(job_location), city_qualifiers(label)
+    return bool(wanted and named and not wanted & named)
+
+
 def location_criterion(
     job: JobRecord,
     settings: CandidateSearchSettings,
@@ -248,6 +308,39 @@ def location_criterion(
             f"re-check from {origin} (limit {limit} km)",
         )
     if check is not None:
+        # Codex rounds 4-5: the posting may have changed since the route was
+        # measured (same job id, new description). A workplace address now in
+        # the posting that the stored route does not name (street, number
+        # and postcode) makes the route stale.
+        posted = best_workplace(
+            job.description or "",
+            posted_by_agency=is_intermediary(job.company),
+            job_location=job.location,
+        )
+        # Only the destination label names the point routed to; the note may
+        # carry an operator's own wording (Codex round 11).
+        if posted is not None and not _route_names_address(check.destination_label, posted):
+            return Criterion(
+                "location",
+                "DISTANCE_UNVERIFIED",
+                f"stored route to {check.destination_label} does not match the workplace the "
+                f"posting now states ({posted.text}); re-check (limit {limit} km)",
+            )
+        measured_by_tool = not check.method.startswith("MANUAL")
+        if (
+            posted is None
+            and measured_by_tool
+            and _route_elsewhere(check.destination_label, job.location)
+        ):
+            # No street address in the posting: a route the tool measured
+            # must at least end in the posting's city (round 11). A route the
+            # operator recorded by hand stays the operator's statement.
+            return Criterion(
+                "location",
+                "DISTANCE_UNVERIFIED",
+                f"stored route to {check.destination_label} is not in the posting's location "
+                f"({job.location}); re-check (limit {limit} km)",
+            )
         minutes = (
             f", ~{check.car_route_minutes:.0f} min free-flow" if check.car_route_minutes else ""
         )
@@ -255,34 +348,87 @@ def location_criterion(
             f"{check.car_route_km:.1f} km by car from {check.origin_label} to "
             f"{check.destination_label}{minutes} ({check.method})"
         )
-        if check.car_route_km <= limit:
-            return Criterion("location", "PASS", f"{detail} <= {limit} km")
         relocation = ""
         if check.destination_region and check.destination_region in settings.relocation_regions:
             relocation = f"; relocation within {check.destination_region} would be possible"
+        if is_approximate(check.method):
+            # Measured to a city centre / postcode / street only: decisive
+            # only with a clear margin, never "verified".
+            if check.car_route_km > limit + APPROXIMATE_MARGIN_KM:
+                return Criterion(
+                    "location",
+                    "FAIL",
+                    f"{detail} > {limit} km even allowing for the approximate "
+                    f"destination{relocation}",
+                )
+            if check.car_route_km < limit - APPROXIMATE_MARGIN_KM:
+                return Criterion(
+                    "location",
+                    "PASS_APPROXIMATE",
+                    f"{detail} < {limit} km (approximate destination; not verified)",
+                )
+            return Criterion(
+                "location",
+                "APPROXIMATE_NEAR_LIMIT",
+                f"{detail}: approximate destination within {APPROXIMATE_MARGIN_KM} km of the "
+                f"{limit} km limit; measure to the exact workplace address",
+            )
+        if check.car_route_km <= limit:
+            near = (
+                f" (within {NEAR_LIMIT_KM} km of the limit)"
+                if check.car_route_km > limit - NEAR_LIMIT_KM
+                else ""
+            )
+            return Criterion("location", "PASS", f"{detail} <= {limit} km{near}")
         return Criterion("location", "FAIL", f"{detail} > {limit} km{relocation}")
     if (job.location or "").strip():
+        address = best_workplace(
+            job.description or "",
+            posted_by_agency=is_intermediary(job.company),
+            job_location=job.location,
+        )
+        hint = f"; posting states {address.text} ({address.kind.lower()})" if address else ""
         return Criterion(
             "location",
             "DISTANCE_UNVERIFIED",
             f"workplace '{job.location}' known; car route from {origin} not yet checked "
-            f"(limit {limit} km)",
+            f"(limit {limit} km){hint}",
         )
     return Criterion("location", "UNKNOWN", "workplace address unknown")
 
 
 def salary_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
     info = extract_salary(text)
+    extras = "".join(
+        f"; {c.kind.lower().replace('_', ' ')} stated separately (not base pay)"
+        for c in info.components[:2]
+    )
     if info.yearly_max is None:
         if info.tariff:
             return Criterion(
-                "salary", "TARIFF", "collective pay scale; amount not stated", info.evidence
+                "salary",
+                "TARIFF",
+                "collective pay scale; amount not stated" + extras,
+                info.evidence,
             )
-        return Criterion("salary", "UNKNOWN", "no salary stated")
+        if info.hourly_max is not None:
+            return Criterion(
+                "salary",
+                "HOURLY",
+                f"hourly rate {info.hourly_max:,.2f} EUR; no yearly figure assumed" + extras,
+                info.evidence,
+            )
+        if info.negotiable:
+            return Criterion("salary", "NEGOTIABLE", "salary by agreement" + extras)
+        return Criterion("salary", "UNKNOWN", "no base salary stated" + extras)
     if settings.minimum_salary is None:
         return Criterion("salary", "NOT_CONFIGURED", "no salary expectation configured")
-    period = " (monthly x12)" if info.period == "MONTH" else ""
-    stated = f"{info.yearly_min:,.0f}-{info.yearly_max:,.0f} EUR/year{period}"
+    period = f" (monthly x{info.salaries_per_year})" if info.period == "MONTH" else ""
+    low = "up to " if info.yearly_min is None else f"{info.yearly_min:,.0f}-"
+    stated = f"{low}{info.yearly_max:,.0f} EUR/year{period}"
+    if info.provenance == "JOB_BOARD_ESTIMATE":
+        stated += " [job-board estimate, not stated by the employer]"
+    stated += extras
     if info.yearly_max >= settings.minimum_salary:
         return Criterion("salary", "MATCH", f"{stated} reaches the expectation", info.evidence)
     negotiable = " (expectation negotiable)" if settings.salary_negotiable else ""
@@ -346,7 +492,7 @@ def duplicate_criterion(session: Session, job: JobRecord) -> Criterion:
 # --- composition --------------------------------------------------------------
 
 
-def _german_level(session: Session) -> str:
+def confirmed_german_level(session: Session) -> str:
     profile = get_candidate_profile(session)
     if profile is None:
         return "UNKNOWN"
@@ -375,7 +521,7 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         skills_criterion(match),
         role_criterion(job.title, settings),
         experience_criterion(match, job.title, job.description or ""),
-        language_criterion(text, _german_level(session)),
+        language_criterion(text, confirmed_german_level(session)),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
         remote,
         salary_criterion(text, settings),

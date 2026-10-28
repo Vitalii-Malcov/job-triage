@@ -69,6 +69,22 @@ You are the primary implementation agent for AI Job Search Control Center.
 - Final decisions are never silently replaced; changes go through the CLI override (reason
   required). Decisions are append-only (DB triggers).
 
+## Browser submission gate — mandatory pre-submit check
+
+When a browser agent (Playwright/Chrome DevTools) fills an employer portal, job-board form or
+e-mail for a Bewerbung, `scripts/presubmit_check.py` is a mandatory step, not optional
+documentation (procedure: `docs/DAILY_OPERATIONS.md` §7a):
+1. Run it after the files are uploaded/attached and before the final submit click, with
+   `--attach` pointing at the exact upload copies, and `--missing-field` for every required form
+   field the candidate has no confirmed value for.
+2. Exit 4 `BLOCKED` (or 2 refused): do not submit. Report the findings to the operator.
+3. Exit 3 `NEEDS_OPERATOR`: do not submit until the operator has seen and approved every WARN
+   (same rule as `docs/DAILY_OPERATIONS.md` step 7.4).
+4. Exit 0 `READY` is still not an instruction to submit: the operator's explicit approval for this
+   one Bewerbung is required. Record the outcome in the submission evidence.
+Never press "Vorschau"/preview-type buttons that can end a portal session, and never re-submit
+a browser "Confirm Form Resubmission" dialog.
+
 ## Installed skills
 
 | Skill | Source | When to consult |

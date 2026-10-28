@@ -120,21 +120,131 @@ _OPTIONAL = re.compile(
 )
 
 
+RequirementBasis = Literal[
+    "EXPLICIT_REQUIREMENT", "INFERRED_REQUIREMENT", "PREFERRED_REQUIREMENT", "UNKNOWN"
+]
+
+
 @dataclass(frozen=True)
 class LanguageRequirement:
     level: Cefr | None
     # False when the posting softens it (von Vorteil, wünschenswert, ...).
     mandatory: bool | None
     evidence: str | None = None
+    # Night audit 2026-10-27: "sehr gute Deutschkenntnisse" names no CEFR
+    # level or certificate; the C1 read from it is an interpretation
+    # (INFERRED_REQUIREMENT), unlike a stated "C1" (EXPLICIT_REQUIREMENT).
+    basis: RequirementBasis = "UNKNOWN"
 
 
-_CLAUSE_SEPARATORS = (". ", "\n", ";", "•")
+_CLAUSE_BREAK = re.compile(r"\.\s|\n|;|•")
+# "(mind. B2)", "z. B.": a period after these does not end the statement.
+_ABBREVIATIONS = frozenset(
+    {"mind", "min", "max", "bzw", "ca", "inkl", "ggf", "evtl", "bspw", "etc", "vgl", "sog", "nr"}
+    | {"z", "b", "u", "a", "d", "h", "usw"}
+)
+_OTHER_LANGUAGE = re.compile(
+    r"englisch|english|französisch|franzoesisch|french|spanisch|spanish|italienisch"
+    r"|polnisch|russisch|türkisch|tuerkisch|niederländisch|niederlaendisch|chinesisch|arabisch",
+    re.IGNORECASE,
+)
+
+
+# Parts of a German requirement scope: split at commas and conjunctions, so
+# "B2 zwingend erforderlich und C1 wünschenswert" are two statements.
+_PART_BOUNDARY = re.compile(r",|\s(?:und|sowie|oder|bzw\.?)\s", re.IGNORECASE)
+# A following part that is nothing but a softener ("..., von Vorteil")
+# applies to the part before it; any other content starts a new statement.
+_BARE_SOFTENER = re.compile(
+    r"^\W*(?:(?:ist|sind|wäre|waere|wären|waeren)\s+)?(?:" + _OPTIONAL.pattern + r")\W*$",
+    re.IGNORECASE,
+)
+# A CEFR level this far after the German mention still belongs to it.
+# Codex round 9: "Deutschkenntnisse für die ... Kommunikation mit Kunden auf
+# mindestens B2-Niveau" states the level well after the mention.
+_LEVEL_REACH = 140
+# "Führerschein Klasse C1" is a driving licence, not a language level.
+_LICENCE = re.compile(r"(?:f(?:ü|ue)hrerschein|fahrerlaubnis|klasse)\W*$", re.IGNORECASE)
+# "C1/C2", "B2–C1", "C1, C2 oder Muttersprache": alternatives or a range;
+# the lowest one is the minimum asked.
+_ALTERNATIVE_JOIN = re.compile(r"\s*(?:[/,–-]|oder|bis)\s*", re.IGNORECASE)
+# "Deutsch- und Englischkenntnisse", "Deutsch und Englisch auf B2-Niveau":
+# languages joined directly by und/sowie/oder share what follows them (Codex
+# round 9); a comma list ("Deutsch, Englisch von Vorteil") stays separate.
+_COMPOUND_CONTINUES = re.compile(r"-?\s(?:und|sowie|oder)\s+", re.IGNORECASE)
+
+
+def _parts(text: str, lo: int, hi: int) -> list[tuple[int, int]]:
+    bounds, begin = [], lo
+    for boundary in _PART_BOUNDARY.finditer(text, lo, hi):
+        bounds.append((begin, boundary.start()))
+        begin = boundary.end()
+    bounds.append((begin, hi))
+    return bounds
+
+
+def _part_optional(text: str, parts: list[tuple[int, int]], index: int) -> bool:
+    begin, end = parts[index]
+    if _OPTIONAL.search(text, begin, end):
+        return True
+    following = parts[index + 1] if index + 1 < len(parts) else None
+    return following is not None and bool(_BARE_SOFTENER.match(text[following[0] : following[1]]))
+
+
+def _part_index(parts: list[tuple[int, int]], offset: int) -> int:
+    return max(i for i, (begin, _) in enumerate(parts) if begin <= offset)
+
+
+def _german_scope(text: str, mention: re.Match[str], clause: tuple[int, int]) -> tuple[int, int]:
+    """The span that can state this German mention's level: never across
+    another language mention or another German mention (Codex rounds 7-8:
+    "Deutsch B2 zwingend erforderlich und Englisch C1 wünschenswert")."""
+    lo = max(clause[0], mention.start() - 30)
+    for other in _OTHER_LANGUAGE.finditer(text, lo, mention.start()):
+        lo = other.end()
+    hi = clause[1]
+    begin = mention.end()
+    compound = _COMPOUND_CONTINUES.match(text, mention.end())
+    if compound is not None:
+        # The shared ending and anything after it (a softener) belong to
+        # German too; a word between them ("idealerweise auch") does not.
+        partner = _OTHER_LANGUAGE.match(text, compound.end())
+        if partner is not None:
+            begin = partner.end()
+    for pattern in (_OTHER_LANGUAGE, _GERMAN):
+        following = pattern.search(text, begin, hi)
+        if following is not None:
+            hi = following.start()
+    return lo, hi
+
+
+def _merge_compound(
+    text: str, mention: re.Match[str], parts: list[tuple[int, int]], own: int
+) -> list[tuple[int, int]]:
+    """Join "Deutsch-" with the "und Englischkenntnisse ..." part it shares."""
+    if _COMPOUND_CONTINUES.match(text, mention.end()) is None or own + 1 >= len(parts):
+        return parts
+    nxt = parts[own + 1]
+    piece = text[nxt[0] : nxt[1]]
+    partner = _OTHER_LANGUAGE.match(text, nxt[0] + len(piece) - len(piece.lstrip()))
+    if partner is None:
+        return parts
+    return [*parts[:own], (parts[own][0], nxt[1]), *parts[own + 2 :]]
 
 
 def _clause_bounds(text: str, match: re.Match[str]) -> tuple[int, int]:
-    start = max(text.rfind(sep, 0, match.start()) for sep in _CLAUSE_SEPARATORS) + 1
-    ends = [text.find(sep, match.end()) for sep in _CLAUSE_SEPARATORS]
-    return start, min([e for e in ends if e != -1], default=len(text))
+    start, end = 0, len(text)
+    for brk in _CLAUSE_BREAK.finditer(text):
+        if brk.group().startswith("."):
+            word = re.search(r"(\w+)$", text[max(0, brk.start() - 12) : brk.start()])
+            if word is not None and word.group(1).casefold() in _ABBREVIATIONS:
+                continue
+        if brk.end() <= match.start():
+            start = brk.end()
+        elif brk.start() >= match.end():
+            end = brk.start()
+            break
+    return start, end
 
 
 def _nearest_descriptor(
@@ -161,33 +271,72 @@ def _nearest_descriptor(
 
 
 def extract_german_requirement(text: str) -> LanguageRequirement:
-    """The strongest German level the posting asks for, or level None. The
+    """The strongest mandatory German level the posting asks for (an
+    optional level only when none is mandatory), or level None. The
     level is read from a narrow window around each German mention, so
     "sehr gute Englisch- und gute Deutschkenntnisse" yields B2, not C1."""
     order = {"A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6}
-    best: tuple[int, Cefr, bool, str] | None = None
+    best: tuple[int, int, int, Cefr, str] | None = None
     for mention in _GERMAN.finditer(text):
         clause_start, clause_end = _clause_bounds(text, mention)
-        window = text[max(clause_start, mention.start() - 30) : min(clause_end, mention.end() + 25)]
-        level: Cefr | None = None
-        cefr = _CEFR.search(window)
-        if cefr:
-            level = cefr.group(1)  # type: ignore[assignment]
-        else:
-            level = _nearest_descriptor(text, mention, clause_start, clause_end)
-        if level is None:
-            continue
-        clause = text[clause_start:clause_end]
-        mandatory = not _OPTIONAL.search(clause)
-        candidate = (order[level], level, mandatory, " ".join(clause.split())[:160])
-        if best is None or candidate[0] > best[0]:
-            best = candidate
+        lo, hi = _german_scope(text, mention, (clause_start, clause_end))
+        parts = _parts(text, lo, hi)
+        own = _part_index(parts, mention.start())
+        parts = _merge_compound(text, mention, parts, own)
+        evidence = " ".join(text[clause_start:clause_end].split())[:160]
+        # Every stated CEFR level is judged in its own part (Codex round 8:
+        # "Deutsch C1 wünschenswert, B2 zwingend erforderlich" states a
+        # mandatory B2). A level before the mention counts only in the
+        # mention's own part ("C1 Deutsch", not "Englisch C1, Deutsch").
+        levels: list[tuple[Cefr, bool, bool]] = []
+        previous: re.Match[str] | None = None
+        for cefr in _CEFR.finditer(text, lo, min(hi, mention.end() + _LEVEL_REACH)):
+            index = _part_index(parts, cefr.start())
+            if cefr.end() <= mention.start() and index != own:
+                continue
+            if _LICENCE.search(text, max(0, cefr.start() - 25), cefr.start()):
+                continue
+            level: Cefr = cefr.group(1)  # type: ignore[assignment]
+            if previous is not None and _ALTERNATIVE_JOIN.fullmatch(
+                text, previous.end(), cefr.start()
+            ):
+                # Same statement: keep the lower level of the alternatives.
+                last_level, last_mandatory, _ = levels[-1]
+                levels[-1] = (min(last_level, level, key=order.__getitem__), last_mandatory, True)
+                previous = cefr
+                continue
+            levels.append((level, not _part_optional(text, parts, index), True))
+            previous = cefr
+        if not levels:
+            descriptor = _nearest_descriptor(text, mention, clause_start, clause_end)
+            if descriptor is not None:
+                levels.append((descriptor, not _part_optional(text, parts, own), False))
+        for level, mandatory, explicit in levels:
+            # A mandatory level beats any optional one (Codex round 6), then
+            # the higher level; an explicit level beats the same inferred.
+            candidate = (1 if mandatory else 0, order[level], 1 if explicit else 0, level, evidence)
+            if best is None or candidate[:3] > best[:3]:
+                best = candidate
     if best is None:
         return LanguageRequirement(level=None, mandatory=None)
-    return LanguageRequirement(level=best[1], mandatory=best[2], evidence=best[3])
+    mandatory_rank, _, explicit, level, evidence = best
+    mandatory = bool(mandatory_rank)
+    if not mandatory:
+        basis: RequirementBasis = "PREFERRED_REQUIREMENT"
+    else:
+        basis = "EXPLICIT_REQUIREMENT" if explicit else "INFERRED_REQUIREMENT"
+    return LanguageRequirement(level=level, mandatory=mandatory, evidence=evidence, basis=basis)
 
 
 # --- salary ------------------------------------------------------------------
+#
+# Night audit 2026-10-27: "IT-Zulage 1.500 € mtl." was read as the base pay
+# (18,000 EUR/year), "Weihnachtsgeld 1.000 €" as 12,000 EUR/year and
+# "Jahresbonus bis 5.000 €" as 60,000 EUR/year; "x 13 Gehälter" was counted
+# x12. Every amount is now read together with the words just before it: an
+# allowance/bonus is reported as a component and never becomes the salary,
+# an hourly rate stays hourly, and an estimate shown by a job board is
+# labelled as such instead of passing for the employer's figure.
 
 _TARIFF = re.compile(r"\bTV-?L\b|\bTVöD\b|\bTVoeD\b|tarifvertrag|tarifliche|\bE\s?\d{1,2}\b")
 _AMOUNT = r"(\d{1,3}(?:[.\s]\d{3})+|\d{4,6}|\d{2,3}\s?[kK])"
@@ -200,17 +349,81 @@ _SALARY_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _MONTH = re.compile(r"monat|/\s*m\b|mtl|month", re.IGNORECASE)
+_MONTHS_COUNT = re.compile(r"monatsgeh(?:ä|ae)lter|monatsgehalt", re.IGNORECASE)
 _YEAR = re.compile(r"jahr|p\.\s?a\.|jährlich|jaehrlich|annual|year", re.IGNORECASE)
+_HOURLY_AMOUNT = r"(\d{1,3}(?:,\d{1,2})?)"
+_HOURLY = re.compile(
+    r"stundenlohn\D{0,20}?"
+    + _HOURLY_AMOUNT
+    + r"\s*(?:€|EUR|Euro)|"
+    + _HOURLY_AMOUNT
+    + r"\s*(?:€|EUR|Euro)\s*(?:/|pro|je)\s*(?:std\.?|stunde|h)\b",
+    re.IGNORECASE,
+)
+# Pay components that are NOT the base salary, by the word naming them.
+_COMPONENTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ALLOWANCE",
+        re.compile(
+            r"zulage|zuschuss|zuschlag|pauschale|budget|jobticket|gutschein|"
+            r"fahrtkosten|erstattung|inflationsausgleich|einmalzahlung|allowance",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "BONUS",
+        re.compile(
+            r"bonus|prämie|praemie|provision|tantieme|gewinnbeteiligung|"
+            r"erfolgsbeteiligung|variable[nr]?\s+(?:anteil|vergütung|gehalt)",
+            re.IGNORECASE,
+        ),
+    ),
+    ("CHRISTMAS_BONUS", re.compile(r"weihnachtsgeld", re.IGNORECASE)),
+    ("HOLIDAY_PAY", re.compile(r"urlaubsgeld", re.IGNORECASE)),
+)
+_LEAD_BOUNDARY = re.compile(r"[.;:!?\n•]|,\s|\s[-–]\s|\b(?:und|sowie|plus|zzgl\.?|zuzüglich)\b")
+_UP_TO = re.compile(r"(?:bis\s+zu|maximal|max\.|höchstens)\s*$", re.IGNORECASE)
+_ESTIMATE = re.compile(
+    r"gesch(?:ä|ae)tzt|sch(?:ä|ae)tzung|estimate|prognose|gehaltsspanne\s+laut|"
+    r"laut\s+(?:xing|stepstone|indeed|kununu|glassdoor)",
+    re.IGNORECASE,
+)
+_SALARIES_PER_YEAR = re.compile(
+    r"(?:x|×|\*)\s*(1[34])\b|\b(1[34])\s*(?:monats)?geh(?:ä|ae)lter|\b(1[34])\.\s*monatsgehalt",
+    re.IGNORECASE,
+)
+_NEGOTIABLE = re.compile(
+    r"gehalt\w*\s+(?:nach|n\.)\s+(?:vereinbarung|absprache)|nach\s+vereinbarung|"
+    r"verhandlungssache|verhandelbar|\bVB\b",
+    re.IGNORECASE,
+)
+
+SalaryProvenance = Literal["EMPLOYER_STATED", "JOB_BOARD_ESTIMATE"]
+
+
+@dataclass(frozen=True)
+class SalaryComponent:
+    kind: str  # ALLOWANCE | BONUS | CHRISTMAS_BONUS | HOLIDAY_PAY
+    evidence: str
 
 
 @dataclass(frozen=True)
 class SalaryInfo:
+    # Base salary per year. `yearly_min` is None for an upper bound only
+    # ("bis zu 55.000 €"); both None when no base salary is stated.
     yearly_min: float | None = None
     yearly_max: float | None = None
-    # MONTH = the posting gave a monthly figure; yearly values are x12.
+    # MONTH = the posting gave a monthly figure; yearly values are
+    # x `salaries_per_year` (12 unless the posting states 13/14).
     period: SalaryPeriod | None = None
     tariff: bool = False
     evidence: str | None = None
+    provenance: SalaryProvenance | None = None
+    salaries_per_year: int | None = None
+    hourly_min: float | None = None
+    hourly_max: float | None = None
+    negotiable: bool = False
+    components: tuple[SalaryComponent, ...] = ()
 
 
 def _amount(raw: str) -> float:
@@ -220,24 +433,107 @@ def _amount(raw: str) -> float:
     return float(re.sub(r"[.\s]", "", raw))
 
 
-def extract_salary(text: str) -> SalaryInfo:
+def _lead(text: str, start: int, width: int = 60) -> str:
+    """The words before an amount, back to the nearest clause boundary."""
+    window = text[max(0, start - width) : start]
+    boundaries = list(_LEAD_BOUNDARY.finditer(window))
+    return window[boundaries[-1].end() :] if boundaries else window
+
+
+def _trail(text: str, end: int) -> str:
+    """The noun right after an amount ("1.500 € IT-Zulage"): at most two
+    words, never across "+", "(" or a clause boundary, so "€150000 (EUR) +
+    20% bonus" keeps the salary."""
+    window = re.split(r"[+(]", text[end : end + 40], maxsplit=1)[0]
+    boundary = _LEAD_BOUNDARY.search(window)
+    window = window[: boundary.start()] if boundary else window
+    return " ".join(re.findall(r"[\w-]+", window)[:2])
+
+
+_SENTENCE_END = re.compile(r"[!?\n]|\.\s")
+
+
+def _sentence(text: str, match: re.Match[str]) -> str:
+    starts = [m.end() for m in _SENTENCE_END.finditer(text, 0, match.start())]
+    end = _SENTENCE_END.search(text, match.end())
+    return text[(starts[-1] if starts else 0) : end.start() if end else len(text)]
+
+
+def _component(lead: str, trail: str) -> str | None:
+    for kind, pattern in _COMPONENTS:
+        if pattern.search(lead) or pattern.search(trail):
+            return kind
+    return None
+
+
+def _salary_matches(text: str) -> list[re.Match[str]]:
+    found: list[re.Match[str]] = []
     for pattern in (_SALARY, _SALARY_PREFIX):
         for match in pattern.finditer(text):
-            low = _amount(match.group(1))
-            high = _amount(match.group(2)) if match.group(2) else low
-            context = text[match.end() : match.end() + 40]
-            if _MONTH.search(context) or (1000 <= high < 10000 and not _YEAR.search(context)):
-                period: SalaryPeriod = "MONTH"
-                factor = 12
-            elif high >= 20000:
-                period, factor = "YEAR", 1
-            else:
-                continue  # an hourly rate or an unrelated number
-            return SalaryInfo(low * factor, high * factor, period, False, _snippet(text, match))
+            if not any(m.start() < match.end() and match.start() < m.end() for m in found):
+                found.append(match)
+    return sorted(found, key=lambda m: m.start())
+
+
+def extract_salary(text: str) -> SalaryInfo:
+    components: list[SalaryComponent] = []
+    candidates: list[SalaryInfo] = []
+    per_year = _SALARIES_PER_YEAR.search(text)
+    months = int(next(g for g in per_year.groups() if g)) if per_year else 12
+    for match in _salary_matches(text):
+        lead = _lead(text, match.start())
+        trail = text[match.end() : match.end() + 40]
+        kind = _component(lead, _trail(text, match.end()))
+        if kind is not None:
+            components.append(SalaryComponent(kind, _snippet(text, match)))
+            continue
+        low = _amount(match.group(1))
+        high = _amount(match.group(2)) if match.group(2) else low
+        # "59.724 Euro (14 Monatsgehälter)" is a yearly figure: the word
+        # "Monatsgehälter" counts salaries, it is not a period, and no
+        # monthly salary reaches 15,000.
+        monthly_word = _MONTH.search(_MONTHS_COUNT.sub(" ", trail))
+        if (monthly_word and high < 15000) or (1000 <= high < 10000 and not _YEAR.search(trail)):
+            period: SalaryPeriod = "MONTH"
+            factor = months
+        elif high >= 20000:
+            period, factor = "YEAR", 1
+        else:
+            continue  # an hourly rate or an unrelated number
+        candidates.append(
+            SalaryInfo(
+                yearly_min=None if _UP_TO.search(lead) else low * factor,
+                yearly_max=high * factor,
+                period=period,
+                evidence=_snippet(text, match),
+                provenance=(
+                    "JOB_BOARD_ESTIMATE"
+                    if _ESTIMATE.search(_sentence(text, match))
+                    else "EMPLOYER_STATED"
+                ),
+                salaries_per_year=factor if period == "MONTH" else None,
+            )
+        )
+    hourly = _HOURLY.search(text)
+    hourly_value = float((hourly.group(1) or hourly.group(2)).replace(",", ".")) if hourly else None
+    extras = dict(
+        hourly_min=hourly_value,
+        hourly_max=hourly_value,
+        negotiable=bool(_NEGOTIABLE.search(text)),
+        components=tuple(components),
+    )
+    # The employer's own figure wins over a job board's estimate.
+    chosen = next((c for c in candidates if c.provenance == "EMPLOYER_STATED"), None) or (
+        candidates[0] if candidates else None
+    )
+    if chosen is not None:
+        return SalaryInfo(**{**chosen.__dict__, **extras})
     tariff = _TARIFF.search(text)
     if tariff:
-        return SalaryInfo(tariff=True, evidence=_snippet(text, tariff))
-    return SalaryInfo()
+        return SalaryInfo(tariff=True, evidence=_snippet(text, tariff), **extras)
+    if hourly:
+        return SalaryInfo(evidence=_snippet(text, hourly), **extras)
+    return SalaryInfo(**extras)
 
 
 # --- entry level ---------------------------------------------------------------

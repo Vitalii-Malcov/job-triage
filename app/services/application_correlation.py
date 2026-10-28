@@ -22,11 +22,30 @@ and only for messages inside the application's response window):
   ("Stellen-ID 962", "Job-ID: 962", "Kennziffer 962", ...).
 - THREAD: the message replies to a message already correlated to this
   application (supporting only -- thread headers are forgeable).
+- SENDER: the exact sender address (compared as a hash, never stored in
+  clear) already sent a message that was correlated to this application.
+  EVIDENCE ONLY (Codex night-audit review round 3): no string key can
+  tell aliases of one employer apart ("IBM" vs "International Business
+  Machines"), so a correlation that reaches MEDIUM only because of SENDER
+  never writes anything -- the processor reports it for operator review
+  with the named application (see `needs_sender`). Applicant tracking systems often reply from a
+  per-application address
+  ("<company>+applicantreply-<token>@..."), which then identifies the
+  application even when the employer's reply omits the role (night audit
+  2026-10-27: a role-less rejection was correlated LOW on company alone and
+  ignored). Supporting only, like THREAD -- a sender is forgeable -- and
+  added only when exactly ONE candidate carries COMPANY, that one has seen
+  the sender, and no other application in the window belongs to the same
+  employer (first word of the normalized name, so "... Standort Berlin" is
+  a peer). With several applications at the employer the sender
+  never decides between them (an ATS may reuse one address, even a
+  plus-token one, across applications): the message stays AMBIGUOUS and is
+  surfaced for operator review.
 
 Grades:
 
 - HIGH: DOMAIN + (ROLE or REFERENCE), or REFERENCE + COMPANY.
-- MEDIUM: DOMAIN + (COMPANY or THREAD), or COMPANY + ROLE.
+- MEDIUM: DOMAIN + (COMPANY or THREAD), or COMPANY + (ROLE or SENDER).
 - LOW: anything else with at least one signal.
 
 The best grade wins only if exactly one application holds it with the
@@ -42,7 +61,7 @@ never share a message.
 
 import hashlib
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -55,7 +74,10 @@ from app.services.email_matching import extract_sender_domain, normalize_company
 
 CorrelationConfidence = Literal["HIGH", "MEDIUM", "LOW", "NONE"]
 CorrelationStatus = Literal["MATCHED", "AMBIGUOUS", "UNMATCHED"]
-Signal = Literal["DOMAIN", "COMPANY", "ROLE", "REFERENCE", "THREAD"]
+Signal = Literal["DOMAIN", "COMPANY", "ROLE", "REFERENCE", "THREAD", "SENDER"]
+# application_id -> "has a message from this exact sender already been
+# correlated to it?" (see the SENDER signal).
+SenderLookup = Callable[[int], bool]
 
 # A response may legitimately be dated slightly before our recorded
 # submission time (clock skew, Date header set by the employer's system).
@@ -120,6 +142,13 @@ class InboundMessage:
     @property
     def message_id_hash(self) -> str | None:
         return stable_hash(_norm_id(self.message_id_header)) if self.message_id_header else None
+
+    @property
+    def sender_address_hash(self) -> str | None:
+        """Hash of the full, case-folded sender address (plus-token kept:
+        it is what makes a per-application ATS address unique)."""
+        address = (self.from_address or "").strip().casefold()
+        return stable_hash("sender", address) if address else None
 
     @property
     def reply_correlation_keys(self) -> frozenset[str]:
@@ -201,7 +230,7 @@ def _grade(signals: set[Signal]) -> CorrelationConfidence:
         return "HIGH"
     if "DOMAIN" in signals and ({"COMPANY", "THREAD"} & signals):
         return "MEDIUM"
-    if {"COMPANY", "ROLE"} <= signals:
+    if "COMPANY" in signals and ({"ROLE", "SENDER"} & signals):
         return "MEDIUM"
     return "LOW" if signals else "NONE"
 
@@ -246,8 +275,56 @@ def evaluate_candidate(
         signals.add("REFERENCE")
     if thread_hashes and message.reply_to_hashes & thread_hashes:
         signals.add("THREAD")
-    ordered = tuple(s for s in ("DOMAIN", "COMPANY", "ROLE", "REFERENCE", "THREAD") if s in signals)
-    return CandidateEvaluation(application.id, _grade(signals), ordered)
+    return _evaluation(application.id, signals)
+
+
+def _evaluation(application_id: int, signals: set[Signal]) -> CandidateEvaluation:
+    ordered = tuple(
+        s for s in ("DOMAIN", "COMPANY", "ROLE", "REFERENCE", "THREAD", "SENDER") if s in signals
+    )
+    return CandidateEvaluation(application_id, _grade(signals), ordered)
+
+
+def needs_sender(signals: Iterable[str]) -> bool:
+    """True when the grade is MEDIUM+ only thanks to SENDER."""
+    present = set(signals)
+    if "SENDER" not in present:
+        return False
+    return _RANK[_grade(present - {"SENDER"})] < _RANK["MEDIUM"]  # type: ignore[arg-type]
+
+
+def _employer_key(company_name: str) -> str:
+    """Deliberately coarse: the first word of the normalized company name, so
+    "ExampleCorp GmbH" and "ExampleCorp GmbH Standort Berlin" (and, harmlessly,
+    "Volksbank A" and "Volksbank B") count as the same employer here."""
+    words = normalize_company_name(company_name).split()
+    return words[0] if words else ""
+
+
+def _with_sender_signal(
+    message: InboundMessage,
+    evaluations: list[CandidateEvaluation],
+    employer_keys: Mapping[int, str],
+    sender_seen: SenderLookup | None,
+) -> list[CandidateEvaluation]:
+    if sender_seen is None:
+        return evaluations
+    by_company = [e for e in evaluations if "COMPANY" in e.signals]
+    seen = [e for e in by_company if sender_seen(e.application_id)]
+    # Codex night-audit review P1: an address that merely LOOKS unique per
+    # application (plus-token) may be shared by an ATS across applications,
+    # so the sender never decides between two applications at one employer
+    # -- counting EVERY in-window application of that employer, also those
+    # whose recorded name the message does not contain (round 2).
+    if len(by_company) != 1 or len(seen) != 1:
+        return evaluations
+    winner = seen[0]
+    key = employer_keys.get(winner.application_id, "")
+    peers = [i for i, k in employer_keys.items() if k == key and i != winner.application_id]
+    if not key or peers:
+        return evaluations
+    upgraded = _evaluation(winner.application_id, {*winner.signals, "SENDER"})
+    return [upgraded if e is winner else e for e in evaluations]
 
 
 def correlate_message(
@@ -256,6 +333,7 @@ def correlate_message(
     *,
     applicant_addresses: Iterable[str] = (),
     thread_hashes_by_application: Mapping[int, frozenset[str]] | None = None,
+    sender_seen: SenderLookup | None = None,
 ) -> CorrelationResult:
     own = {a.strip().casefold() for a in applicant_addresses if a}
     if message.direction != "INBOUND":
@@ -269,11 +347,16 @@ def correlate_message(
     if message.occurred_at is None:
         return CorrelationResult("UNMATCHED", None, "NONE", (), "NO_TRUSTED_TIMESTAMP")
     threads = thread_hashes_by_application or {}
-    evaluations = [
-        evaluate_candidate(message, app, thread_hashes=threads.get(app.id, frozenset()))
-        for app in applications
-        if in_response_window(app, message.occurred_at)
-    ]
+    evaluations: list[CandidateEvaluation] = []
+    employer_keys: dict[int, str] = {}
+    for app in applications:
+        if not in_response_window(app, message.occurred_at):
+            continue
+        employer_keys[app.id] = _employer_key(app.company_name)
+        evaluations.append(
+            evaluate_candidate(message, app, thread_hashes=threads.get(app.id, frozenset()))
+        )
+    evaluations = _with_sender_signal(message, evaluations, employer_keys, sender_seen)
     evaluations = [e for e in evaluations if e.confidence != "NONE"]
     if not evaluations:
         return CorrelationResult("UNMATCHED", None, "NONE", (), "NO_SIGNAL")
