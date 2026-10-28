@@ -261,6 +261,45 @@ def _print(payload, as_json: bool) -> None:
             print(f"{key}: {_json_default(value)}")
 
 
+def decision_summary(results, describe) -> list[str]:
+    """Stage 19: the mails that need the operator, each with the next allowed
+    step. The result lines above carry every field; this block is what an
+    operator reads first. `describe(application_id)` -> "Company | Role"."""
+    lines: list[str] = []
+    for result in results:
+        if result.operator_review is None:
+            continue
+        what = result.classification or "UNCLASSIFIED"
+        if result.application_id is not None and result.proposed_status:
+            lines.append(
+                f"  mail {result.message_ref}: {what} for application {result.application_id} "
+                f"({describe(result.application_id)}) -> proposed {result.proposed_status}"
+            )
+            lines.append(
+                f"    next: transition {result.application_id} {result.proposed_status} "
+                '--actor operator --reason "..." (dry run), then add --apply'
+            )
+        elif result.review_candidates:
+            ids = ", ".join(f"{app_id} ({describe(app_id)})" for app_id in result.review_candidates)
+            lines.append(
+                f"  mail {result.message_ref}: {what}; names no vacancy, same sender as "
+                f"application(s) {ids}"
+            )
+            lines.append("    next: read the mail, then record it on the right application")
+        else:
+            lines.append(
+                f"  mail {result.message_ref}: {what}; correlation {result.correlation_status} "
+                f"({result.reason})"
+            )
+            lines.append("    next: read the mail and decide which application it concerns")
+    if lines:
+        count = sum(1 for result in results if result.operator_review is not None)
+        lines.insert(0, f"NEEDS YOUR DECISION ({count}):")
+    else:
+        lines.append("NEEDS YOUR DECISION: nothing")
+    return lines
+
+
 def _application_row(app) -> dict:
     return {
         "id": app.id,
@@ -525,6 +564,14 @@ def run(argv: list[str] | None = None, *, settings=None) -> int:
             if args.source == "imap" and not reports:
                 print("WARNING: no applicant mailbox is configured", file=sys.stderr)
             _print([r.as_dict() for r in results], args.json)
+            if not args.json:
+
+                def describe(application_id: int) -> str:
+                    app = tracker.get_application(session, application_id)
+                    return f"{app.company_name} | {app.role_title}"
+
+                for line in decision_summary(results, describe):
+                    print(line)
             # Exit 1 = at least one mailbox was NOT read completely (fetch
             # error, deadline, or messages left unread by the per-run cap,
             # page limit or as unreadable); results above are still valid
@@ -760,7 +807,9 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         origin=ApplicationEventOrigin.OPERATOR,
         actor=args.actor,
         occurred_at=submitted_at,
-        location=args.location,
+        # Stage 19: the job's location when none is given, so the duplicate
+        # guard's same-city agency-mirror check works for CLI submissions.
+        location=args.location or (job.location if job is not None else None),
         destination_url=args.destination_url,
         employer_domains=tuple(args.employer_domain),
         job_id=args.job_id,

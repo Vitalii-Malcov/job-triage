@@ -165,6 +165,19 @@ without one is `DISTANCE_UNVERIFIED`, an unknown one `UNKNOWN`. The decision
 is `BLOCKED`, `NEEDS_VERIFICATION` or `CANDIDATE` -- triage, never an
 instruction to apply.
 
+**Fit tier (Stage 19)** -- the line `FIT TIER:` (and `fit_tier` /
+`tier_reasons` in `--json`), on top of the unchanged decision, with the
+reasons and the posting's evidence:
+
+| Tier | Meaning | Next step |
+|---|---|---|
+| `NOT_SUITABLE` | a blocker, an explicitly stated mandatory German level 2+ above your *confirmed* level, or a senior/architect title with an unmet experience requirement | skip it |
+| `NEEDS_OPERATOR` | something to check first: distance not measured, possible duplicate, skills not evaluated, inferred or unconfirmed language gap, years asked without a senior title | check the listed point, then re-run `assess` |
+| `PARTIAL_MATCH` | fits, but weaker: partial skills, other role, salary below the expectation, preferred German level, mixed seniority | decide yourself |
+| `GOOD_MATCH` | strong skills, fitting role, language and route, entry level | prepare the package (section 7) |
+
+The tier never blocks anything and is never an instruction to apply.
+
 ## 6. Before applying: duplicate check (mandatory)
 
 One vacancy often exists several times (employer BA post, XING copy, agency
@@ -205,7 +218,9 @@ the operator's judgement remains the last guard.
 2. Review package `POST /api/v1/jobs/{id}/review-package` →
    **human review/approve** `POST /api/v1/review-packages/{id}/approve`
    (or Telegram APPROVE, Stage 16 — a local decision, never a submission).
-3. Final documents (DOCX/PDF) are produced locally for the human; package
+3. Final documents (DOCX/PDF) are produced locally for the human -- the code
+   produces the structured CV/Bewerbung drafts (every statement bound to a
+   confirmed profile fact), not the PDF itself; package
    folders live outside the repository
    (`C:\Users\BOSS\AppData\Local\job-triage-packages\`). Never reuse another
    application's folder.
@@ -277,6 +292,9 @@ Read-only otherwise; contact values are compared, never printed.
 Put the §7a pre-submit outcome (`presubmit READY`, or the operator's
 approval of each WARN) into `--evidence`.
 
+With `--job-id` and no `--location`, the job's location is stored (needed by
+the same-city agency-mirror duplicate check).
+
 Dry run by default; add `--apply` to write. `--source/--reference`
 identify the vacancy (BA reference, StepStone id, ...) and make it
 idempotent (`ALREADY_RECORDED`); both are stored exactly as typed, so an empty
@@ -334,6 +352,15 @@ same ATS address as an earlier correlated mail (e.g.
 `<company>+applicantreply-<token>@...`) is shown as evidence (SENDER) and
 names the likely application, but a correlation that needs it never writes
 anything: it is reported as `SENDER_ONLY_CORRELATION_NEEDS_OPERATOR`. Full details: [APPLICATION_TRACKER_RUNBOOK.md](APPLICATION_TRACKER_RUNBOOK.md).
+
+The text output ends with **`NEEDS YOUR DECISION (n)`**: every flagged mail
+with its application and the next allowed step (the `transition` command
+to dry-run, or "read the mail" when it names no vacancy). Stage 19: a mail
+that names no employer or role (e.g. only "Wir laden Sie gerne zu einem
+Vorstellungsgespräch ein.") but comes from a sender that already wrote about
+one of your applications is no longer dropped: it is classified, flagged
+(`UNMATCHED_FROM_KNOWN_SENDER`) and lists `review_candidates`; nothing is
+written.
 
 Status overview: `... list`, `... show <id>`, `... history <id>`.
 
