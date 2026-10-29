@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     # No default on purpose: an empty/unset key means require_api_key()
     # rejects every request instead of accepting a predictable value.
     api_key: str = ""
+    # Stage 20: the read-only browser UI under /ui (docs/STAGE20_UI_ARCHITECTURE.md).
+    # Off by default: every /ui route answers 404 while False. Login uses
+    # api_key above; the session cookie expires after ui_session_hours.
+    ui_enabled: bool = False
+    ui_session_hours: int = Field(default=12, ge=1, le=168)
+    # False only for plain-HTTP access from a non-localhost host.
+    ui_cookie_secure: bool = True
+    # Optional exact browser origin (e.g. "https://jobs.example.org") accepted
+    # on login/logout when a reverse proxy rewrites the Host header.
+    ui_public_origin: str = ""
     # HARD-006: ge=1 on both -- an unvalidated 0/negative
     # rate_limit_requests made _RateLimiter.check's `len(bucket) >=
     # max_requests` always true (every request 429s, total self-lockout);

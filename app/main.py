@@ -9,6 +9,7 @@ from app.core.logging import configure_logging
 from app.core.startup_diagnostics import log_startup_safety_state
 from app.db.session import run_migrations_if_enabled
 from app.services.telegram_bot import start_bot, stop_bot
+from app.ui.routes import install_ui
 
 
 @asynccontextmanager
@@ -32,3 +33,5 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(router, prefix="/api/v1")
+# Stage 20: read-only operator UI; every /ui route is a 404 unless UI_ENABLED.
+install_ui(app)

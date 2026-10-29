@@ -163,6 +163,7 @@ jobs:
             tests/integration/test_telegram_operator_control_postgres.py \
             tests/integration/test_stage16_stage9d_arm_race_postgres.py \
             tests/integration/test_stage17_candidate_config_postgres.py \
+            tests/integration/test_stage20_ui_readonly_postgres.py \
             tests/integration/test_application_lifecycle_postgres.py \
             tests/integration/test_hard008_legacy_pending_migration_postgres.py
           python - /tmp/postgres-junit.xml <<'PY'

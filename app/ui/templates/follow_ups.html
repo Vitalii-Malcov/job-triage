@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% macro bucket(title, items, empty) %}
+<h2>{{ title }} ({{ items|length }})</h2>
+<table class="stack">
+  <thead><tr><th>Due</th><th>Application</th><th>Status</th><th>Submitted</th><th>Last employer contact</th></tr></thead>
+  <tbody>
+  {% for item in items %}
+    {% set a = item.application %}
+    <tr>
+      <td data-label="Due">{{ item.due_on.strftime("%d.%m.%Y") if item.due_on else "—" }}</td>
+      <td data-label="Application"><a href="/ui/applications/{{ a.id }}">#{{ a.id }} {{ a.company_name }}</a><br><small>{{ a.role_title }}</small></td>
+      <td data-label="Status">{{ badge(a.current_status.value) }}</td>
+      <td data-label="Submitted">{{ a.submitted_at|local }}</td>
+      <td data-label="Last employer contact">{{ a.last_employer_contact_at|local }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">{{ empty }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+{% block title %}Follow-ups{% endblock %}
+{% block content %}
+<h1>Follow-up center</h1>
+<p class="muted">Today is {{ f.today.strftime("%d.%m.%Y") }} (operator time zone). Dates are the tracker's stored follow-up dates (14 days after submission or the last employer contact while waiting). Sending a follow-up stays a manual, approved step.</p>
+{{ bucket("Overdue", f.overdue, "Nothing overdue.") }}
+{{ bucket("Due today", f.due_today, "Nothing due today.") }}
+{{ bucket("Next 7 days", f.next_7_days, "Nothing in the next 7 days.") }}
+{{ bucket("Later", f.later, "Nothing later.") }}
+{{ bucket("Waiting without a follow-up date", f.undated, "Every waiting application has a follow-up date.") }}
+{% endblock %}

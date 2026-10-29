@@ -347,17 +347,13 @@ def _outbound_detail(event) -> dict:
 
 
 def applicant_addresses(settings) -> list[str]:
-    """The applicant's own addresses: mail FROM any of them is never an
-    employer response (all monitored mailboxes plus the identity file)."""
-    addresses = [a for a in (settings.gmail_username, settings.xing_mailbox_username) if a]
-    identity_path = Path(__file__).resolve().parents[1] / "application_identity.local.json"
-    if identity_path.is_file():
-        from app.models.application_identity import load_application_identity
+    from app.services.application_response_processor import (
+        applicant_addresses as service_applicant_addresses,
+    )
 
-        identity = load_application_identity(identity_path)
-        if identity and identity.email:
-            addresses.append(identity.email)
-    return addresses
+    return service_applicant_addresses(
+        settings, Path(__file__).resolve().parents[1] / "application_identity.local.json"
+    )
 
 
 def _load_messages(db: Session, source: str, since: datetime, settings, mailbox: str = "all"):
@@ -365,27 +361,12 @@ def _load_messages(db: Session, source: str, since: datetime, settings, mailbox:
     account's synced rows only and reports nothing."""
     from app.services.application_response_processor import (
         fetch_application_mailboxes,
-        inbound_from_record,
+        stored_inbound_messages,
     )
 
     if source == "imap":
         return asyncio.run(fetch_application_mailboxes(settings, since=since, selection=mailbox))
-    from sqlalchemy import select
-
-    from app.db.models import GmailMessageRecord
-    from app.providers.email.base import normalize_account_key
-
-    account = normalize_account_key(settings.gmail_username or "")
-    records = db.scalars(
-        select(GmailMessageRecord)
-        .where(
-            GmailMessageRecord.account_key == account,
-            GmailMessageRecord.direction == "INBOUND",
-            GmailMessageRecord.provider_arrival_at >= since,
-        )
-        .order_by(GmailMessageRecord.provider_arrival_at, GmailMessageRecord.id)
-    ).all()
-    return [inbound_from_record(r) for r in records], []
+    return stored_inbound_messages(db, settings, since=since), []
 
 
 def process_gmail(

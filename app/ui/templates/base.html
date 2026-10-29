@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}JobTriage{% endblock %} · JobTriage</title>
+<link rel="stylesheet" href="/ui/static/style.css">
+</head>
+<body>
+{% if not hide_nav|default(false) %}
+<header class="top">
+  <strong class="brand">JobTriage</strong>
+  <nav>
+    <a href="/ui/">Dashboard</a>
+    <a href="/ui/vacancies">Vacancies</a>
+    <a href="/ui/applications">Applications</a>
+    <a href="/ui/inbox">Inbox</a>
+    <a href="/ui/follow-ups">Follow-ups</a>
+  </nav>
+  <form method="post" action="/ui/logout" class="logout"><button type="submit">Log out</button></form>
+</header>
+<p class="readonly-note">Read-only view. Nothing on these pages changes data, sends mail or contacts an employer.</p>
+{% endif %}
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

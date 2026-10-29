@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tier, badge %}
+{% block title %}Vacancies{% endblock %}
+{% block content %}
+<h1>Vacancies</h1>
+<form method="get" action="/ui/vacancies" class="filters">
+  <input name="q" value="{{ filters.q }}" placeholder="Title, company, text" maxlength="200">
+  <input name="city" value="{{ filters.city }}" placeholder="City" maxlength="100">
+  <select name="source"><option value="">Any source</option>
+    {% for s in sources %}<option value="{{ s }}" {% if s == filters.source %}selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select>
+  <select name="recommendation"><option value="">Any scorer result</option>
+    {% for r in recommendations %}<option value="{{ r }}" {% if r == filters.recommendation %}selected{% endif %}>{{ r }}</option>{% endfor %}
+  </select>
+  <select name="fit_tier"><option value="">Any fit tier</option>
+    {% for t in tiers %}<option value="{{ t }}" {% if t == filters.fit_tier %}selected{% endif %}>{{ t }}</option>{% endfor %}
+  </select>
+  <select name="applied"><option value="">Applied or not</option>
+    <option value="no" {% if filters.applied == "no" %}selected{% endif %}>Not applied</option>
+    <option value="yes" {% if filters.applied == "yes" %}selected{% endif %}>Already applied</option>
+  </select>
+  <select name="mode"><option value="">Any work mode</option>
+    <option value="remote" {% if filters.mode == "remote" %}selected{% endif %}>Fully remote</option>
+    <option value="hybrid" {% if filters.mode == "hybrid" %}selected{% endif %}>Hybrid / partly remote</option>
+  </select>
+  <button type="submit">Filter</button>
+  <a href="/ui/vacancies">Reset</a>
+</form>
+
+{% if filters.computed %}
+<p class="notice">Fit tier, applied and work-mode filters are computed per vacancy: this page checked {{ page.scanned }} vacancies (at most {{ budget }} per page).
+{% if page.budget_exhausted %}<strong>The scan budget ran out before the page was full — older vacancies were not checked yet.</strong>{% endif %}</p>
+{% endif %}
+
+<table class="vacancies stack">
+  <thead><tr><th>#</th><th>Vacancy</th><th>Location</th><th>Fit tier</th><th>Decision</th><th>Why</th><th>Mode</th><th>Applied</th><th>First seen</th></tr></thead>
+  <tbody>
+  {% for row in page.rows %}
+    <tr>
+      <td data-label="#">{{ row.job.id }}</td>
+      <td data-label="Vacancy"><a href="/ui/vacancies/{{ row.job.id }}">{{ row.job.title }}</a><br><small>{{ row.job.company }} · {{ row.job.source }} · {{ row.job.recommendation }}</small></td>
+      <td data-label="Location">{{ row.job.location or "—" }}</td>
+      <td data-label="Fit tier">{{ tier(row.assessment.fit_tier) }}</td>
+      <td data-label="Decision">{{ badge(row.assessment.decision) }}</td>
+      <td data-label="Why" class="why"><ul>{% for reason in row.assessment.tier_reasons[:3] %}<li>{{ reason }}</li>{% endfor %}</ul>{% if row.assessment.tier_reasons|length > 3 %}<small>+{{ row.assessment.tier_reasons|length - 3 }} more</small>{% endif %}</td>
+      <td data-label="Mode">{{ row.work_mode }}</td>
+      <td data-label="Applied">{% if row.applied %}<strong>yes</strong>{% else %}no{% endif %}</td>
+      <td data-label="First seen">{{ row.job.first_seen_at|local }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="9" class="muted">No vacancy on this page matches the filters{% if page.next_before_id %} — continue to older vacancies{% endif %}.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<nav class="pager">
+  {% if filters.before_id %}<a href="/ui/vacancies?{{ first_query }}">« Newest</a>{% endif %}
+  {% if next_query %}<a href="/ui/vacancies?{{ next_query }}">{% if page.budget_exhausted %}Continue scanning »{% else %}Older »{% endif %}</a>{% else %}<span class="muted">End of list.</span>{% endif %}
+</nav>
+{% endblock %}

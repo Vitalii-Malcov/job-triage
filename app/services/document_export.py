@@ -8,10 +8,12 @@ applies (portal upload or, later, a reviewed draft), with delivery always
 - **DOCX without new dependencies.** A minimal WordprocessingML package is
   written with the standard library (`zipfile`), byte-deterministic: fixed
   member order and fixed 1980-01-01 timestamps, so the same document always
-  has the same SHA-256. PDF is not produced (no PDF library in the project);
-  see docs/STAGE_14D_LIVE_PILOT_READINESS.md.
+  has the same SHA-256.
+- **PDF (Stage 20)**: the same blocks rendered by `app.services.pdf_document`
+  (standard fonts, deterministic, round-trip text check, unrenderable
+  characters refused); `document_format="pdf"`. DOCX stays the default.
 - **Deterministic, sanitized filenames**: `Lebenslauf_<Vorname>_<Nachname>_
-  <Firma>_<Referenz>.docx`; umlauts transliterated, every other character
+  <Firma>_<Referenz>.docx|.pdf`; umlauts transliterated, every other character
   outside `[A-Za-z0-9]` collapsed to "-", each part capped.
 - **No silent overwrite**: an existing target file is refused
   (`DocumentExistsError`). Only an explicitly flagged dry-run directory
@@ -34,6 +36,8 @@ from app.models.application_identity import ApplicationIdentity
 from app.models.cv_draft import TailoredCVDraft
 from app.models.review_package import ReviewedBewerbungContent
 from app.services.gmail_application_draft import render_draft_content
+from app.services.pdf_document import PDF_MEDIA_TYPE, expected_text, render_pdf, text_sha256
+from app.services.pre_submit_validation import SOURCE_DIRECTORY, SOURCE_FILES, SOURCE_TEXT_META
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DELIVERY_NOT_SENT = "NOT_SENT"
@@ -44,7 +48,9 @@ _TRANSLITERATION = str.maketrans(
     {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
 )
 _UNSAFE_RUN = re.compile(r"[^A-Za-z0-9]+")
-_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,180}\.docx$")
+_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,180}\.(docx|pdf)$")
+DocumentFormat = Literal["docx", "pdf"]
+_MEDIA_TYPES: dict[str, str] = {"docx": DOCX_MEDIA_TYPE, "pdf": PDF_MEDIA_TYPE}
 # XML 1.0 forbids most C0 controls; tab/newline are not used inside runs.
 _XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 _PART_LIMIT = 40
@@ -74,11 +80,12 @@ def document_filename(
     last_name: str | None,
     company: str | None,
     reference: str | None,
+    extension: DocumentFormat = "docx",
 ) -> str:
     parts = [safe_filename_component(prefix)] + [
         safe_filename_component(value) for value in (first_name, last_name, company, reference)
     ]
-    name = "_".join(part for part in parts if part) + ".docx"
+    name = "_".join(part for part in parts if part) + f".{extension}"
     if not _FILENAME_RE.match(name):
         raise UnsafeExportTargetError("generated filename is not safe")
     return name
@@ -186,11 +193,30 @@ def render_docx(blocks: tuple[Block, ...] | list[Block]) -> bytes:
     return buffer.getvalue()
 
 
-def letter_blocks(subject: str, body: str) -> tuple[Block, ...]:
-    """The cover letter as document blocks: subject heading, then one
-    paragraph per blank-line-separated block of the rendered letter."""
+def letter_blocks(subject: str, body: str, sender: tuple[str, ...] = ()) -> tuple[Block, ...]:
+    """The cover letter as document blocks: the sender lines (if any),
+    subject heading, then one paragraph per blank-line-separated block of
+    the rendered letter."""
     paragraphs = [part.strip() for part in body.split("\n\n") if part.strip()]
-    return (Block("SUBHEADING", subject), *(Block("PARAGRAPH", part) for part in paragraphs))
+    head = (Block("PARAGRAPH", "\n".join(sender)),) if sender else ()
+    return (
+        *head,
+        Block("SUBHEADING", subject),
+        *(Block("PARAGRAPH", part) for part in paragraphs),
+    )
+
+
+def sender_lines(identity: ApplicationIdentity) -> tuple[str, ...]:
+    """Stage 20: the letter's sender block, from the operator-confirmed
+    identity only (same fields as the CV's contact lines)."""
+    address = ", ".join(
+        part for part in (identity.street, identity.postal_line, identity.country) if part
+    )
+    lines = [identity.full_name]
+    if address:
+        lines.append(address)
+    lines += [f"Telefon: {identity.phone}", f"E-Mail: {identity.email}"]
+    return tuple(lines)
 
 
 # --- files ----------------------------------------------------------------------
@@ -218,7 +244,7 @@ def write_document(
     existing file unless `dry_run_directory=True` AND `directory` lies
     inside the system temp directory."""
     if not _FILENAME_RE.match(filename):
-        raise UnsafeExportTargetError("filename is not a safe .docx name")
+        raise UnsafeExportTargetError("filename is not a safe .docx/.pdf name")
     if not directory.is_dir():
         raise UnsafeExportTargetError("export directory does not exist")
     if dry_run_directory and not _is_dry_run_directory(directory):
@@ -235,7 +261,7 @@ def write_document(
     return ExportedDocument(
         path=target,
         filename=filename,
-        media_type=DOCX_MEDIA_TYPE,
+        media_type=_MEDIA_TYPES[filename.rsplit(".", 1)[1]],
         size_bytes=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
     )
@@ -314,6 +340,40 @@ def render_attachment_plan(plan: AttachmentPlan) -> str:
 
 # --- package --------------------------------------------------------------------
 
+_SOURCE_TAGS = {"TITLE": "h1", "HEADING": "h2", "SUBHEADING": "h3", "BULLET": "li"}
+
+
+def source_html(blocks: tuple[Block, ...], title: str) -> bytes:
+    """The exact text of an exported PDF as the package's source file
+    (`_quelle_html/_cv.html` / `_letter.html`), so `presubmit_check.py
+    --bind` can bind the PDF to it. The file names the hash of that text;
+    --bind refuses a PDF whose text differs (`write_manifest`)."""
+    lines = [
+        "<!doctype html>",
+        '<html lang="de"><head><meta charset="utf-8">',
+        f'<meta name="{SOURCE_TEXT_META}" content="{text_sha256(expected_text(blocks))}">',
+        f"<title>{escape(title)}</title></head><body>",
+    ]
+    for block in blocks:
+        tag = _SOURCE_TAGS.get(block.kind, "p")
+        lines.append(f"<{tag}>{escape(block.text)}</{tag}>")
+    lines.append("</body></html>")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _write_sources(directory: Path, sources: dict[str, bytes], *, dry_run_directory: bool) -> None:
+    """Write the PDF sources; like write_document, never over an existing
+    file outside a dry-run directory."""
+    folder = directory / SOURCE_DIRECTORY
+    folder.mkdir(exist_ok=True)
+    for kind, content in sources.items():
+        target = folder / SOURCE_FILES[kind]
+        if dry_run_directory:
+            target.write_bytes(content)
+            continue
+        with target.open("xb") as handle:
+            handle.write(content)
+
 
 def export_package_documents(
     *,
@@ -324,23 +384,57 @@ def export_package_documents(
     reference: str | None,
     directory: Path,
     dry_run_directory: bool = False,
+    document_format: DocumentFormat = "docx",
 ) -> tuple[list[PlannedAttachment], tuple[str, ...]]:
     """Write the CV (and, when given, the reviewed cover letter) as local
-    DOCX files. Returns the planned attachments and the document warnings
-    (contact-data problems, an unrenderable letter) for
-    `build_attachment_plan`. Writes files only; sends nothing."""
+    DOCX or PDF files. Returns the planned attachments and the document
+    warnings (contact-data problems, an unrenderable letter) for
+    `build_attachment_plan`. Writes files only; sends nothing. Both
+    documents are rendered (and a PDF verified) before any file is written,
+    so a refused PDF never leaves half a package behind."""
     document = build_cv_document(cv, identity)
     names = dict(
         first_name=document.first_name,
         last_name=document.last_name,
         company=company,
         reference=reference,
+        extension=document_format,
     )
+
+    def render(blocks: tuple[Block, ...], title: str) -> bytes:
+        if document_format == "pdf":
+            return render_pdf(blocks, title=title).content
+        return render_docx(blocks)
+
+    cv_content = render(document.blocks, "Lebenslauf")
+    rendered = render_draft_content(reviewed_bewerbung) if reviewed_bewerbung else None
+    # Contact lines only when the CV's own contact checks passed (no
+    # CONTACT_* warning): the same confirmed identity, never a partial block.
+    sender = sender_lines(identity) if identity is not None and not document.warnings else ()
+    letter = (
+        letter_blocks(rendered.subject, rendered.body_lf, sender)
+        if rendered is not None and not isinstance(rendered, str)
+        else None
+    )
+    letter_content = render(letter, "Anschreiben") if letter is not None else None
+    # PDF only: the source files `presubmit_check.py --bind` binds the PDFs to.
+    sources: dict[str, bytes] = {}
+    if document_format == "pdf":
+        sources["cv"] = source_html(document.blocks, "Lebenslauf")
+        if letter is not None:
+            sources["letter"] = source_html(letter, "Anschreiben")
+        existing = [
+            name
+            for kind, name in SOURCE_FILES.items()
+            if kind in sources and (directory / SOURCE_DIRECTORY / name).exists()
+        ]
+        if existing and not dry_run_directory:
+            raise DocumentExistsError(f"refusing to overwrite existing source {existing[0]}")
     attachments = [
         PlannedAttachment(
             "CV",
             write_document(
-                render_docx(document.blocks),
+                cv_content,
                 directory,
                 document_filename("Lebenslauf", **names),
                 dry_run_directory=dry_run_directory,
@@ -351,19 +445,20 @@ def export_package_documents(
     if reviewed_bewerbung is None:
         warnings.append("COVER_LETTER_MISSING")
     else:
-        rendered = render_draft_content(reviewed_bewerbung)
         if isinstance(rendered, str):
             warnings.append(f"COVER_LETTER_{rendered}")
-        else:
+        elif letter_content is not None:
             attachments.append(
                 PlannedAttachment(
                     "COVER_LETTER",
                     write_document(
-                        render_docx(letter_blocks(rendered.subject, rendered.body_lf)),
+                        letter_content,
                         directory,
                         document_filename("Anschreiben", **names),
                         dry_run_directory=dry_run_directory,
                     ),
                 )
             )
+    if sources:
+        _write_sources(directory, sources, dry_run_directory=dry_run_directory)
     return attachments, tuple(warnings)

@@ -1,0 +1,63 @@
+:root {
+  --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6676; --line: #dde1e8;
+  --accent: #2456c7; --good: #1f7a3a; --partial: #8a6d00; --operator: #a34d00; --bad: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171c; --card: #1d2128; --text: #e6e9ef; --muted: #9aa3b2; --line: #2e3440;
+    --accent: #7ea6ff; --good: #5ccf7d; --partial: #e2c044; --operator: #ff9c4a; --bad: #ff7b72; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); }
+main { max-width: 1280px; margin: 0 auto; padding: 0 16px 48px; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--line); }
+.top nav { display: flex; flex-wrap: wrap; gap: 4px 16px; flex: 1; }
+.top nav a { text-decoration: none; font-weight: 500; }
+.brand { font-size: 17px; }
+.logout { margin: 0; }
+.readonly-note { margin: 0; padding: 6px 16px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--line); }
+h1 { font-size: 24px; margin: 20px 0 8px; }
+h2 { font-size: 18px; margin: 28px 0 8px; }
+.sub, .muted, small { color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; color: inherit; text-decoration: none; display: block; }
+.card .label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.card.narrow { max-width: 360px; margin: 64px auto; }
+.stat .num { display: block; font-size: 28px; font-weight: 600; }
+.num.unknown { font-size: 18px; color: var(--operator); }
+.why ul { margin: 0; padding-left: 16px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; vertical-align: top; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+td.r, th.r { text-align: right; }
+tr.row-block td { background: color-mix(in srgb, var(--bad) 10%, transparent); }
+tr.row-verify td { background: color-mix(in srgb, var(--operator) 10%, transparent); }
+.tier, .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); white-space: nowrap; }
+.tier-good_match { color: var(--good); border-color: var(--good); }
+.tier-partial_match { color: var(--partial); border-color: var(--partial); }
+.tier-needs_operator { color: var(--operator); border-color: var(--operator); }
+.tier-not_suitable, .badge-blocked { color: var(--bad); border-color: var(--bad); }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 12px; }
+input, select, button { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); }
+button { cursor: pointer; }
+label { display: block; margin: 12px 0 4px; }
+.card.narrow input { width: 100%; }
+.card.narrow button { margin-top: 12px; }
+.notice { background: var(--card); border-left: 3px solid var(--operator); padding: 8px 12px; }
+.error { color: var(--bad); }
+.pager { display: flex; gap: 16px; margin: 12px 0; }
+.description { white-space: pre-wrap; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+/* Narrow screens: every row of a .stack table becomes a card, each cell
+   labelled from its data-label (no column is hidden, nothing scrolls sideways). */
+@media (max-width: 760px) {
+  table { display: block; overflow-x: auto; }
+  table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
+  table.stack { background: none; border: 0; overflow: visible; }
+  table.stack thead { display: none; }
+  table.stack tr { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 10px; padding: 6px 0; overflow-wrap: anywhere; }
+  table.stack td { border-bottom: 0; padding: 3px 12px; }
+  table.stack td[data-label]::before { content: attr(data-label); display: block; font-size: 12px; font-weight: 600; color: var(--muted); }
+  tr.row-block, tr.row-verify { border-left-width: 4px; }
+  tr.row-block { border-left-color: var(--bad); }
+  tr.row-verify { border-left-color: var(--operator); }
+}
