@@ -257,7 +257,7 @@ Verification:
 | Stage 21 + Stage 20 UI tests after the Codex fixes | 70 passed |
 | Full pytest after the Codex fixes (final) | 6 675 passed, 131 skipped, 0 failed |
 | Ruff check / format | clean (480+ files) |
-| PostgreSQL tests (`test_stage21_vacancy_cache_postgres.py`, wired into the CI zero-skip gate) | NOT RUN locally: no Docker/PostgreSQL on this machine; CI runs them |
+| PostgreSQL tests (`test_stage21_vacancy_cache_postgres.py`, wired into the CI zero-skip gate) | first session: NOT RUN locally; overnight run: see §10 (Docker is reachable through WSL) |
 | Codex review round 1 | REJECT: P1 PG concurrency test began a transaction twice; P2 applications watermark missed edits of older rows |
 | Fixes | `session.rollback()` after the reads in the PG test; watermark = hash over every column of every application + max event id; new two-application negative test |
 | Codex review round 2 (final) | ACCEPT, no P0/P1 |
@@ -265,3 +265,196 @@ Verification:
 Not done here (each needs the operator's explicit approval): production
 backup snapshot, `alembic upgrade head` on production and the production
 backfill (§5.3).
+
+## 9. Production deployment and rollback runbook
+
+**Status: NOT DEPLOYED.** Every step below needs the operator's explicit
+approval; nothing here has been run against production. Commands are
+PowerShell in `E:\Projects\job-triage` (the production working copy).
+
+Facts this order depends on:
+
+- Every tracker CLI, `presubmit_check.py` and the UI refuse a database whose
+  Alembic revision differs from the code's head
+  (`app/core/canonical_runtime.py`: `DATABASE_NOT_AT_MIGRATION_HEAD`). Code
+  and schema therefore move **together**: old code (`b6c1e9a4d2f7`) refuses
+  the migrated database, new code (`c7e2a9d4f1b3`) refuses the unmigrated
+  one. Between steps D2 and D3 no CLI works -- keep that window short.
+- The migration only adds `job_fit_assessments`; no existing table or row is
+  changed. The cache is derived data and can always be rebuilt from `jobs`,
+  `candidate_job_matches`, `job_commute_checks`, `applications` and the
+  profile.
+- The production file uses `journal_mode=delete` (no WAL); a copy made with
+  SQLite's backup API is consistent, a plain file copy of a file being
+  written is not.
+
+### Preflight (P1-P6)
+
+1. Code: `git log -1 --oneline` = `4cdaacf` (or the commit the PR was
+   merged on top of); `git status` shows only the operator's own files.
+2. Revision (read-only):
+   `.\.venv\Scripts\python.exe -c "import sqlite3;c=sqlite3.connect('file:runtime/job_triage_runtime.db?mode=ro',uri=True);print(c.execute('select version_num from alembic_version').fetchone(), c.execute('pragma integrity_check').fetchone())"`
+   -> `('b6c1e9a4d2f7',) ('ok',)`.
+3. Free disk space: at least 3x the database file (backup + migration +
+   cache rows, ~2 MB per 3 000 vacancies).
+4. No writer running: stop the operator UI (Ctrl+C in its window), the
+   scheduler and Telegram bot if started, and do not run tracker CLIs or a
+   collection until V5. `Get-Process python` must show none of them.
+5. Pick a moment with no Bewerbung in progress (no form half-filled, no
+   pending `record-submission`).
+6. Note the SHA-256 of the file: `Get-FileHash runtime\job_triage_runtime.db`.
+
+### Backup (B1-B3)
+
+1. Backup with SQLite's online backup API, outside the repository
+   (DAILY_OPERATIONS §11):
+   ```powershell
+   $ts = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+   $bk = "$env:USERPROFILE\JobTriage-Backups\job_triage_runtime.pre-stage21-migration-$ts.db"
+   .\.venv\Scripts\python.exe -c "import sqlite3,sys;s=sqlite3.connect('file:runtime/job_triage_runtime.db?mode=ro',uri=True);d=sqlite3.connect(sys.argv[1]);s.backup(d);d.close();s.close()" $bk
+   ```
+2. Verify the backup: `PRAGMA integrity_check` = `ok`,
+   `PRAGMA foreign_key_check` empty, `alembic_version` = `b6c1e9a4d2f7`,
+   row counts of `jobs` / `applications` equal to the production file.
+3. Record `$ts`, the backup path and `Get-FileHash $bk` in the operator log.
+
+### Deployment (D1-D6)
+
+1. Merge PR #18 on GitHub (operator decision), then in the production
+   working copy: `git fetch origin` and `git merge --ff-only origin/main`.
+   Do not discard the operator's uncommitted files.
+2. Migrate, with the target named explicitly (`.env` points at a pilot
+   database, and a set `POSTGRES_HOST` would override `DATABASE_URL`):
+   ```powershell
+   $env:DATABASE_ROLE = "production"
+   $env:DATABASE_URL = "sqlite:///runtime/job_triage_runtime.db"
+   $env:POSTGRES_HOST = ""
+   .\.venv\Scripts\python.exe -m alembic current   # must print b6c1e9a4d2f7 -- else STOP
+   .\.venv\Scripts\python.exe -m alembic upgrade head
+   .\.venv\Scripts\python.exe -m alembic current   # c7e2a9d4f1b3 (head)
+   Remove-Item Env:DATABASE_URL, Env:DATABASE_ROLE, Env:POSTGRES_HOST
+   ```
+3. Dry run (read-only):
+   `.\.venv\Scripts\python.exe scripts\stage21_assess_vacancies.py --database runtime/job_triage_runtime.db`
+   -> `fresh=0 stale=0 not_assessed=<all vacancies>`.
+4. Backfill (takes its own backup copy first; ~1 minute for 2 900
+   vacancies):
+   `... scripts\stage21_assess_vacancies.py --database runtime/job_triage_runtime.db --apply --snapshot "$env:USERPROFILE\JobTriage-Backups"`
+   -> `APPLIED: <n> rows written`, exit 0.
+5. Second dry run -> `fresh=<all> stale=0 not_assessed=0 to_assess=0`.
+6. Start the UI with the launcher (`scripts/run_operator_ui.py`): the
+   dashboard shows tier counts instead of UNKNOWN and `0 stale`.
+
+### Verification and smoke tests (V1-V5)
+
+1. `integrity_check` = `ok`; `select count(*) from job_fit_assessments` =
+   number of vacancies; `applications` row count and the newest three
+   applications unchanged (compare with P6/B2 counts -- the migration and
+   the backfill never write them).
+2. Tracker CLI read path works again:
+   `scripts\stage15_application_tracker.py --database runtime/job_triage_runtime.db list`.
+3. UI: dashboard, `/vacancies?fit_tier=NEEDS_OPERATOR`, one vacancy detail
+   page shows "Cached assessment FRESH"; the launcher ends with `UNCHANGED`.
+4. V2 is the head-compatibility check: the tracker opens the database
+   through the same head-equality check as `presubmit_check.py` and refuses
+   it otherwise (`--help` alone would prove nothing).
+5. Re-enable normal operation (collection, scheduler if used). After each
+   collection or profile change run the script again (only missing/stale
+   rows are assessed).
+
+### Rollback
+
+- **Backfill fails or is interrupted (D4):** nothing authoritative is
+  affected; re-run D4 (finished batches of 200 are kept, the rest is
+  assessed again). A partial cache only means "not assessed" counts.
+- **The UI misbehaves with the cache:** empty the cache (it is derived):
+  `delete from job_fit_assessments` -- the UI falls back to the Stage 20
+  behaviour while the table is empty. Needs approval like any production
+  write.
+- **Code rollback to Stage 20:** requires the schema back at
+  `b6c1e9a4d2f7` (the old code refuses a newer revision):
+  `alembic downgrade b6c1e9a4d2f7` (drops only `job_fit_assessments`, with
+  the same explicit environment as D2), then
+  `git checkout 4cdaacf` in a clean state or revert the merge commit.
+- **Migration itself fails or the file is damaged:** stop everything, keep
+  the current file as `job_triage_runtime.broken-<ts>.db`, copy the B1
+  backup to `runtime\job_triage_runtime.db`, verify as in B2, keep the code
+  at `4cdaacf`.
+- **Data written after the backup:** restoring the B1 backup loses every
+  application, event or collection written after B1. Prefer the downgrade
+  (it keeps all authoritative rows); restore only if the file is damaged,
+  and then re-record later submissions from their evidence files
+  (`submission_evidence/`) via `record-submission`, with approval.
+
+## 10. Overnight verification (2026-10-29/30)
+
+| Check | Result |
+|---|---|
+| Local PostgreSQL (disposable `postgres:16` container via WSL Docker, `127.0.0.1:55432`, synthetic credentials) | `alembic upgrade head` from empty -> `c7e2a9d4f1b3`; the full CI PostgreSQL list: 126 passed, 0 skipped |
+| GitHub Actions, PR #18, run 40963735783 (commit `c086f46`) | `test`: Ruff clean, 6 674 passed / 132 skipped; `scheduler-postgres`: 126 tests, 0 skipped; `docker`: pass |
+| Codex audit round 3 (full diff, 15 questions) | REJECT, no P0/P1; two P2 (below) |
+| P2 older writer replaces a newer row | fixed: `upsert_assessment(expected_key=...)` is a compare-and-swap (`ON CONFLICT DO UPDATE ... WHERE input_key = observed`, `RETURNING` for the result -- psycopg reports rowcount -1); the writer passes the key it read in the batch transaction. Tests: SQLite CAS unit test, PostgreSQL two-session interleaving test |
+| P2 Stage 20 fallback not announced | fixed: `fit_cache.cache_status` (MISSING / EMPTY / IN_USE); the dashboard says when the cache is missing or not filled yet and how to fill it. Tests: status unit test, rendered dashboard test |
+| Codex re-review round 4 (fixes only) | REJECT: P2 the writer read the observed row after the inputs (a row committed in between could still be replaced); P3 `presubmit_check.py --help` proves no head compatibility |
+| Round 4 fixes | `assess_batch` reads the observed rows before `global_inputs`/`current_keys`; new interleaving test (fails with the old order, passes with the fix); runbook V4 corrected. Not re-reviewed by Codex: the overnight run was limited to two review rounds |
+
+Performance (synthetic SQLite, this laptop, one run each, a ~2 KB
+description per vacancy, every row cached and fresh; `scratchpad` only):
+
+| Vacancies | `current_keys` (all) | dashboard | filtered list, page 1 | detail |
+|---|---|---|---|---|
+| 3 000 | 0.72 s, 6 SQL | 0.96 s, 15 SQL | 1.80 s, 159 SQL | 0.08 s |
+| 10 000 | 2.4 s | 3.1 s | 2.0 s | 0.10 s |
+| 30 000 | 9.0 s | 8.4 s, peak 20 MB | 2.6 s | 0.10 s |
+
+No N+1 in the key computation (6 statements regardless of size); the cost
+is Python hashing of every vacancy row (json + sha256, ~0.1-0.3 ms per
+row, no single hotspot in the profile). The filtered list's cost is the
+live `assess_job` of the ~50 displayed rows (Stage 20 behaviour, kept on
+purpose so the page shows current evidence). The production copy measured
+0.41 s for the dashboard with 2 888 vacancies. Linear growth makes the
+dashboard slow beyond ~10 000 stored vacancies; the fix is a stored
+per-vacancy content hash maintained by `upsert_job` (schema change,
+follow-up), not a change of the freshness rule.
+
+### Why there is no GOOD_MATCH (diagnosis, no rule changed)
+
+Read-only analysis of a backup-API copy of production (2 888 vacancies,
+profile version 5), imports from the unchanged `job_fit_assessment.py`:
+
+1. **Skills are never evaluated.** 770 matcher analyses exist for 708
+   vacancies, all for profile versions 3 or 4; the profile is at version 5,
+   so `assess_job` treats every one as out of date ->
+   `skills NOT_EVALUATED` for all 2 888 -> at least NEEDS_OPERATOR.
+   2 180 vacancies were never analysed at all. The matcher
+   (`compute_match`) is deterministic, with no LLM and no network, but it
+   runs only on `POST /jobs/{id}/match` (or while preparing a Bewerbung).
+   No pipeline step re-runs it after collection or after a profile change.
+2. **Location is unverified.** 2 827 vacancies have
+   `location DISTANCE_UNVERIFIED`. The car-route limit needs a stored
+   commute check, which needs geocoding and routing (external services,
+   operator decision).
+3. A copy-only experiment re-ran the matcher for all 2 888 vacancies
+   (674 s, network blocked in the process). Skills became
+   STRONG 227 / PARTIAL 1 163 / WEAK 1 498. Tiers: NEEDS_OPERATOR 2 483,
+   NOT_SUITABLE 401, PARTIAL_MATCH 4, GOOD_MATCH 0. 803 vacancies are now
+   NEEDS_OPERATOR **only** because of location, 49 of them with STRONG
+   skills; those 49 are GOOD_MATCH candidates once the route is verified.
+   Other reasons (overlapping): German level to verify 1 053,
+   "experienced" wording 1 032, an experience gap 238.
+4. Unknown and negative evidence are kept apart: NOT_EVALUATED and
+   DISTANCE_UNVERIFIED are verifications (NEEDS_OPERATOR), never barriers;
+   NOT_SUITABLE comes only from blockers or confirmed gaps. The UI shows
+   the reasons per vacancy.
+
+Outside the Stage 21 acceptance criteria (the cache reproduces the live
+assessment exactly). Proposed follow-up, needs approval:
+"skills-analysis coverage". It would be an offline, resumable
+`--apply`/`--snapshot` script that runs the deterministic matcher for
+vacancies without a current analysis, a refresh after profile changes,
+and then the Stage 21 cache refresh.
+- Acceptance: no network or LLM; the thresholds are unchanged; the count
+  of current analyses equals the number of vacancies; the copy reproduces
+  the numbers above.
+- Commute verification for the 803 location-only vacancies stays a
+  separate, operator-approved decision about using the external services.

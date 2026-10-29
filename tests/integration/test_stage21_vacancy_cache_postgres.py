@@ -3,7 +3,8 @@
 - the migration's table and CHECK constraints exist; a one-step downgrade
   drops the table and the upgrade restores it;
 - two concurrent writers upserting the same vacancy leave exactly one
-  consistent row (`INSERT ... ON CONFLICT DO UPDATE`);
+  consistent row (`INSERT ... ON CONFLICT DO UPDATE`), and a writer's
+  compare-and-swap keeps a row another writer committed meanwhile;
 - the UI's read-only connection (`default_transaction_read_only`) reads the
   cache for the dashboard and the filtered list, and cannot write it.
 
@@ -151,6 +152,43 @@ def test_concurrent_writers_leave_one_consistent_row(engine):
             select(JobFitAssessmentRecord.input_key).where(JobFitAssessmentRecord.job_id == job_id)
         ).all()
     assert len(rows) == 1 and rows[0][0] in {"a" * 64, "b" * 64}
+
+
+def test_compare_and_swap_keeps_the_newer_row_of_a_concurrent_writer(engine):
+    """Writer A reads the cache row and assesses; writer B stores a row and
+    commits; A's compare-and-swap must leave B's row in place (Codex Stage 21
+    audit)."""
+    (job_id,) = _jobs(engine, 1)
+    factory = sessionmaker(engine)
+    with factory() as a, factory() as b:
+        a.begin()
+        observed = fit_cache.cached_keys(a, [job_id]).get(job_id)
+        inputs = fit_cache.global_inputs(a)
+        assessment = assess_job(a, job_id)
+        with b.begin():
+            assert fit_cache.upsert_assessment(
+                b,
+                job_id=job_id,
+                key="b" * 64,
+                inputs=inputs,
+                assessment=assessment,
+                expected_key=None,
+            )
+        written = fit_cache.upsert_assessment(
+            a,
+            job_id=job_id,
+            key="a" * 64,
+            inputs=inputs,
+            assessment=assessment,
+            expected_key=observed,
+        )
+        a.commit()
+    assert observed is None and written is False
+    with engine.connect() as conn:
+        stored = conn.execute(
+            select(JobFitAssessmentRecord.input_key).where(JobFitAssessmentRecord.job_id == job_id)
+        ).scalar_one()
+    assert stored == "b" * 64
 
 
 def test_ui_reads_the_cache_on_a_read_only_connection_and_cannot_write_it(engine):

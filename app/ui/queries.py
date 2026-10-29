@@ -432,6 +432,9 @@ class Dashboard:
     # Stage 21: set when the tier counts come from the assessment cache.
     tiers_all: dict[str, Metric] | None = None
     cache: "CacheOverview | None" = None
+    # MISSING / EMPTY: the counts above are the Stage 20 live scan, and the
+    # dashboard tells the operator how to fill the cache (Codex audit).
+    cache_status: fit_cache.CacheStatus = "IN_USE"
 
 
 @dataclass(frozen=True)
@@ -537,7 +540,8 @@ def dashboard_summary(
     due = follow_ups(db, zone, now=now)
     since = now - timedelta(days=DASHBOARD_WINDOW_DAYS)
     tiers_all = cache = None
-    if fit_cache.cache_in_use(db):
+    cache_status = fit_cache.cache_status(db)
+    if cache_status == "IN_USE":
         tiers, tiers_all, cache = _cached_tier_counts(db, since)
     else:
         tiers = _tier_counts(db, since, assess, scan_budget)
@@ -554,4 +558,5 @@ def dashboard_summary(
         follow_ups_week=len(due.next_7_days),
         tiers_all=tiers_all,
         cache=cache,
+        cache_status=cache_status,
     )

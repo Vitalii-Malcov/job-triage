@@ -25,6 +25,10 @@
 <p class="notice">Counts come from the assessment cache and include only up-to-date rows:
 {{ summary.cache.fresh }} fresh · {{ summary.cache.stale }} stale (recompute pending) · {{ summary.cache.not_assessed }} not assessed.
 {% if summary.cache.stale or summary.cache.not_assessed %}Run <code>scripts/stage21_assess_vacancies.py --apply</code> to update them.{% endif %}</p>
+{% elif summary.cache_status == "EMPTY" %}
+<p class="notice"><strong>The assessment cache has not been filled yet.</strong> The counts above come from a live scan of at most {{ scan_budget }} vacancies per page load. Fill it with <code>scripts/stage21_assess_vacancies.py --apply</code> (production: with <code>--snapshot</code>, see DAILY_OPERATIONS §1b).</p>
+{% elif summary.cache_status == "MISSING" %}
+<p class="notice"><strong>This database has no assessment cache</strong> (Stage 21 migration not applied). The counts above come from a live scan of at most {{ scan_budget }} vacancies per page load.</p>
 {% endif %}
 
 <h2>Applications ({{ summary.applications_total }})</h2>

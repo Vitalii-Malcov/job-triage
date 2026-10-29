@@ -105,7 +105,12 @@ def plan(session: Session, *, only_stale: bool) -> tuple[dict[str, int], list[in
 
 
 def assess_batch(session: Session, job_ids: list[int]) -> int:
-    """Assess and upsert one batch in the caller's transaction."""
+    """Assess and upsert one batch in the caller's transaction. Each write is
+    a compare-and-swap against the row read here, so a concurrent writer's
+    newer row is kept (the vacancy is then simply not counted as written)."""
+    # observe the stored rows BEFORE reading the inputs: a row another
+    # writer stores after this point is never replaced (Codex round 4)
+    observed = fit_cache.cached_keys(session, job_ids)
     inputs = fit_cache.global_inputs(session)
     keys = fit_cache.current_keys(session, job_ids, inputs)
     written = 0
@@ -113,10 +118,14 @@ def assess_batch(session: Session, job_ids: list[int]) -> int:
         if job_id not in keys:  # deleted since the plan was made
             continue
         assessment = assess_job(session, job_id)
-        fit_cache.upsert_assessment(
-            session, job_id=job_id, key=keys[job_id], inputs=inputs, assessment=assessment
+        written += fit_cache.upsert_assessment(
+            session,
+            job_id=job_id,
+            key=keys[job_id],
+            inputs=inputs,
+            assessment=assessment,
+            expected_key=observed.get(job_id),
         )
-        written += 1
     return written
 
 

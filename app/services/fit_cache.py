@@ -33,7 +33,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from sqlalchemy import func, inspect, select
+from sqlalchemy import false, func, inspect, select
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -48,6 +48,7 @@ from app.db.models import (
 from app.services.job_fit_assessment import FitAssessment
 
 CacheState = Literal["FRESH", "STALE", "NOT_ASSESSED"]
+CacheStatus = Literal["MISSING", "EMPTY", "IN_USE"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RULE_MODULES = ("app.services.job_fit_assessment", "app.services.fit_cache")
@@ -254,12 +255,17 @@ def cache_table_present(session: Session) -> bool:
     return inspect(session.get_bind()).has_table(JobFitAssessmentRecord.__tablename__)
 
 
-def cache_in_use(session: Session) -> bool:
-    """The table exists (Stage 21 schema) and has been filled at least once;
-    before that the UI keeps its Stage 20 behaviour."""
+def cache_status(session: Session) -> CacheStatus:
+    """MISSING: no Stage 21 table; EMPTY: never filled; IN_USE: filled at
+    least once. Until IN_USE the UI keeps its Stage 20 behaviour and says so."""
     if not cache_table_present(session):
-        return False
-    return session.scalar(select(JobFitAssessmentRecord.job_id).limit(1)) is not None
+        return "MISSING"
+    filled = session.scalar(select(JobFitAssessmentRecord.job_id).limit(1)) is not None
+    return "IN_USE" if filled else "EMPTY"
+
+
+def cache_in_use(session: Session) -> bool:
+    return cache_status(session) == "IN_USE"
 
 
 def cached_keys(session: Session, job_ids: Sequence[int] | None = None) -> dict[int, str]:
@@ -294,6 +300,9 @@ def assessment_values(assessment: FitAssessment) -> dict:
     }
 
 
+_UNCONDITIONAL = object()
+
+
 def upsert_assessment(
     session: Session,
     *,
@@ -302,9 +311,16 @@ def upsert_assessment(
     inputs: GlobalInputs,
     assessment: FitAssessment,
     now: datetime | None = None,
-) -> None:
+    expected_key: str | None | object = _UNCONDITIONAL,
+) -> bool:
     """Insert or replace the vacancy's row (one statement, so two concurrent
-    writers leave one consistent row). The caller owns the transaction."""
+    writers leave one consistent row). The caller owns the transaction.
+
+    With `expected_key` (the stored key the caller read before assessing,
+    None for no row) the write is a compare-and-swap: it lands only while the
+    stored row is still the one observed, so a writer that assessed older
+    inputs never replaces a row another writer stored meanwhile (Codex
+    Stage 21 audit). Returns whether a row was written."""
     values = {
         "job_id": job_id,
         "input_key": key,
@@ -322,4 +338,14 @@ def upsert_assessment(
         raise RuntimeError(f"unsupported database dialect {dialect}")
     statement = insert(JobFitAssessmentRecord).values(**values)
     updated = {k: statement.excluded[k] for k in values if k != "job_id"}
-    session.execute(statement.on_conflict_do_update(index_elements=["job_id"], set_=updated))
+    if expected_key is _UNCONDITIONAL:
+        where = None
+    elif expected_key is None:
+        where = false()  # a row appeared since the caller looked: keep it
+    else:
+        where = JobFitAssessmentRecord.__table__.c.input_key == expected_key
+    # RETURNING, not rowcount: psycopg reports -1 for this statement
+    statement = statement.on_conflict_do_update(
+        index_elements=["job_id"], set_=updated, where=where
+    ).returning(JobFitAssessmentRecord.job_id)
+    return session.execute(statement).first() is not None

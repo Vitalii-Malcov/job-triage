@@ -149,7 +149,13 @@ pages = APIRouter(dependencies=[Depends(require_ui_session)])
 @pages.get("/", include_in_schema=False)
 def dashboard(request: Request, db: Session = Depends(get_ui_db)) -> Response:
     summary = queries.dashboard_summary(db, get_settings(), _zone())
-    return _render(request, "dashboard.html", summary=summary, tiers=queries.FIT_TIERS)
+    return _render(
+        request,
+        "dashboard.html",
+        summary=summary,
+        tiers=queries.FIT_TIERS,
+        scan_budget=queries.SCAN_BUDGET,
+    )
 
 
 @pages.get("/vacancies", include_in_schema=False)

@@ -109,6 +109,9 @@ keeps every finished batch of 200. `--only-stale` refreshes existing stale
 rows without assessing new vacancies. The script needs the database at the
 current Alembic head (`alembic upgrade head`, with approval and a backup for
 production).
+The full production order (preflight, backup, code + migration together,
+backfill, smoke tests, rollback) is `docs/STAGE21_VACANCY_CACHE_PLAN.md` §9.
+Until the cache is filled the dashboard says so explicitly.
 
 ## 2. Which database is production
 

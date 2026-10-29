@@ -413,6 +413,80 @@ def test_empty_cache_keeps_the_stage20_behaviour(session, reader):
         reader, NO_MAIL, queries.operator_zone("Europe/Berlin"), now=NOW
     )
     assert summary.cache is None and summary.tiers_all is None
+    assert summary.cache_status == "EMPTY"
+
+
+def test_cache_status_distinguishes_missing_empty_and_in_use(session):
+    ids = _catalogue(session)
+    assert fit_cache.cache_status(session) == "EMPTY"
+    inputs = fit_cache.global_inputs(session)
+    fit_cache.upsert_assessment(
+        session,
+        job_id=ids[0],
+        key=fit_cache.current_keys(session, ids[:1], inputs)[ids[0]],
+        inputs=inputs,
+        assessment=assess_job(session, ids[0]),
+    )
+    assert fit_cache.cache_status(session) == "IN_USE"
+    session.rollback()
+    session.execute(text("DROP TABLE job_fit_assessments"))
+    assert fit_cache.cache_status(session) == "MISSING"
+    session.rollback()
+
+
+def test_compare_and_swap_keeps_a_row_written_meanwhile(session):
+    """Codex Stage 21 audit: a writer that read the cache row before
+    assessing must not replace a row another writer stored meanwhile."""
+    (job_id, *_) = _catalogue(session)
+    inputs = fit_cache.global_inputs(session)
+    assessment = assess_job(session, job_id)
+
+    def write(key, expected):
+        return fit_cache.upsert_assessment(
+            session,
+            job_id=job_id,
+            key=key,
+            inputs=inputs,
+            assessment=assessment,
+            expected_key=expected,
+        )
+
+    assert write("a" * 64, None)  # no row yet: inserted
+    assert not write("b" * 64, None)  # observed "no row", a row exists now
+    assert not write("b" * 64, "x" * 64)  # observed another key
+    assert _rows(session)[job_id].input_key == "a" * 64
+    assert write("c" * 64, "a" * 64)  # observed the stored row: replaced
+    assert _rows(session)[job_id].input_key == "c" * 64
+    session.rollback()
+
+
+def test_writer_keeps_a_row_committed_while_it_reads_the_inputs(db_path, session, monkeypatch):
+    """Codex round 4: another writer commits a row after this batch began
+    but before it read the inputs; the batch must not replace that row."""
+    (job_id, *_) = _catalogue(session)
+    session.commit()
+    real_inputs = fit_cache.global_inputs
+
+    def inputs_after_a_concurrent_write(batch_session):
+        other = sessionmaker(create_engine(f"sqlite:///{db_path}"))()
+        other_inputs = real_inputs(other)
+        fit_cache.upsert_assessment(
+            other,
+            job_id=job_id,
+            key="b" * 64,
+            inputs=other_inputs,
+            assessment=assess_job(other, job_id),
+        )
+        other.commit()
+        other.close()
+        return real_inputs(batch_session)
+
+    monkeypatch.setattr(writer_cli.fit_cache, "global_inputs", inputs_after_a_concurrent_write)
+    factory = sessionmaker(create_engine(f"sqlite:///{db_path}"))
+    with factory() as batch, batch.begin():
+        assert writer_cli.assess_batch(batch, [job_id]) == 0
+    session.expire_all()
+    assert _rows(session)[job_id].input_key == "b" * 64
 
 
 def test_ui_session_cannot_write_the_cache(db_path, session, reader):
@@ -553,3 +627,16 @@ def test_pages_render_from_the_cache(db_url, client_factory):  # noqa: F811
     listing = client.get(f"/ui/vacancies?fit_tier={tier}").text
     assert "use the assessment cache" in listing and f"/ui/vacancies/{ids[1]}" in listing
     assert "Cached assessment" in client.get(f"/ui/vacancies/{ids[1]}").text
+
+
+def test_dashboard_says_when_the_cache_is_empty(db_url, client_factory):  # noqa: F811
+    engine = create_engine(db_url)
+    db = sessionmaker(engine)()
+    _catalogue(db)
+    db.close()
+    engine.dispose()
+    client = client_factory()
+    _login(client)
+    dashboard = client.get("/ui/").text
+    assert "assessment cache has not been filled yet" in dashboard
+    assert "stage21_assess_vacancies.py --apply" in dashboard
