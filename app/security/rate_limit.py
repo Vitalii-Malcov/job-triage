@@ -406,3 +406,18 @@ def enforce_automation_run_rate_limit(request: Request) -> None:
         max_requests=AUTOMATION_RUN_RATE_LIMIT_REQUESTS,
         window_seconds=AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS,
     )
+
+
+# Stage 20: the browser login form compares a submitted API key, so it gets
+# its own small bucket (a password-guessing surface, unlike a read).
+_ui_login_limiter = _RateLimiter(detail="Login rate limit exceeded")
+UI_LOGIN_RATE_LIMIT_REQUESTS = 10
+UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def enforce_ui_login_rate_limit(request: Request) -> None:
+    _ui_login_limiter.check(
+        request,
+        max_requests=UI_LOGIN_RATE_LIMIT_REQUESTS,
+        window_seconds=UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    )

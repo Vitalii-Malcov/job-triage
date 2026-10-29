@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% macro message_rows(items) %}
+<table class="stack">
+  <thead><tr><th>Message</th><th>Classification</th><th>Correlation</th><th>Proposed action</th><th>Confirmed</th></tr></thead>
+  <tbody>
+  {% for r in items %}
+    <tr>
+      <td data-label="Message"><code>{{ r.message_ref }}</code>{% if r.application_id %}<br><a href="/ui/applications/{{ r.application_id }}">#{{ r.application_id }} {{ r.company }}</a><br><small>{{ r.role }}</small>{% endif %}
+        {% if r.review_candidates %}<br><small>possibly: {% for id in r.review_candidates %}<a href="/ui/applications/{{ id }}">#{{ id }}</a> {% endfor %}</small>{% endif %}</td>
+      <td data-label="Classification">{{ badge(r.classification or "NONE") }}<br><small>rule {{ r.rule or "—" }} · {{ r.classifier_confidence or "—" }}</small></td>
+      <td data-label="Correlation">{{ r.correlation_status }} ({{ r.correlation_confidence }})<br><small>{{ r.correlation_signals|join(", ") or "no signals" }}</small></td>
+      <td data-label="Proposed action">{{ r.action }}{% if r.proposed_status %} → {{ r.proposed_status }}{% elif r.new_status and r.new_status != r.previous_status %} → {{ r.new_status }}{% endif %}
+        {% if r.operator_confirmation_required %}<br><strong>needs your confirmation</strong>{% endif %}<br><small>{{ r.reason }}</small></td>
+      <td data-label="Confirmed">{% if r.duplicate %}already recorded{% else %}not recorded{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">Nothing here.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+{% block title %}Inbox{% endblock %}
+{% block content %}
+<h1>Operator inbox</h1>
+{% if box.state != "OK" %}
+<p class="notice"><strong>{{ box.state }}</strong>: {{ box.reason }}</p>
+{% else %}
+<p class="muted">Stored mail since {{ box.since|local }} ({{ box.reason }}). This page is a dry run of the response processor: nothing is recorded and the mailbox is not contacted. Decide with <code>stage15_application_tracker.py</code> or Telegram operator control.</p>
+<h2>Needs your decision ({{ box.needs_review|length }})</h2>
+{{ message_rows(box.needs_review) }}
+<h2>Other application mail ({{ box.other|length }})</h2>
+{{ message_rows(box.other) }}
+{% endif %}
+{% endblock %}

@@ -35,8 +35,10 @@ import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents.application_response_classifier import (
@@ -642,6 +644,42 @@ def monitored_account_keys(settings) -> list[str]:
         for name in (settings.gmail_username, settings.xing_mailbox_username)
         if name
     ]
+
+
+# The operator's application identity file (project root, never committed).
+APPLICATION_IDENTITY_PATH = Path(__file__).resolve().parents[2] / "application_identity.local.json"
+
+
+def applicant_addresses(settings, identity_path: Path | None = None) -> list[str]:
+    """The applicant's own addresses: mail FROM any of them is never an
+    employer response (all monitored mailboxes plus the identity file)."""
+    addresses = [a for a in (settings.gmail_username, settings.xing_mailbox_username) if a]
+    path = APPLICATION_IDENTITY_PATH if identity_path is None else identity_path
+    if path.is_file():
+        from app.models.application_identity import load_application_identity
+
+        identity = load_application_identity(path)
+        if identity and identity.email:
+            addresses.append(identity.email)
+    return addresses
+
+
+def stored_inbound_messages(db: Session, settings, *, since: datetime) -> list[InboundMessage]:
+    """The primary account's already-synced inbound rows since `since`
+    (arrival order). Reads the database only; IMAP is never contacted."""
+    from app.providers.email.base import normalize_account_key
+
+    account = normalize_account_key(settings.gmail_username or "")
+    records = db.scalars(
+        select(GmailMessageRecord)
+        .where(
+            GmailMessageRecord.account_key == account,
+            GmailMessageRecord.direction == "INBOUND",
+            GmailMessageRecord.provider_arrival_at >= since,
+        )
+        .order_by(GmailMessageRecord.provider_arrival_at, GmailMessageRecord.id)
+    ).all()
+    return [inbound_from_record(r) for r in records]
 
 
 def _arrival_order(message: InboundMessage) -> tuple[int, datetime]:

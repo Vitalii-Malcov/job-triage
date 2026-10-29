@@ -107,6 +107,8 @@ def run(argv: list[str] | None = None) -> int:
     if args.bind:
         bound = write_manifest(package, current_version)
         print(f"BOUND: {sorted(bound['documents'])} to profile v{current_version}")
+        for kind, reason in sorted(bound.get("refused", {}).items()):
+            print(f"NOT BOUND: {kind} -- {reason}")
     report = validate_package(
         package,
         expected,

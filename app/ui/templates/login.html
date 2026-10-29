@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% set hide_nav = true %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>JobTriage</h1>
+  <form method="post" action="/ui/login">
+    <label for="api_key">API key</label>
+    <input id="api_key" name="api_key" type="password" autocomplete="current-password" required autofocus>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <button type="submit">Log in</button>
+  </form>
+</section>
+{% endblock %}

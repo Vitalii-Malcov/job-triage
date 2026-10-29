@@ -44,6 +44,7 @@ from typing import Literal
 
 from app.services.application_correlation import role_phrase
 from app.services.application_duplicates import company_identity
+from app.services.pdf_document import text_sha256
 
 Severity = Literal["BLOCK", "WARN", "OK"]
 Outcome = Literal["BLOCKED", "NEEDS_OPERATOR", "READY"]
@@ -53,7 +54,12 @@ DOCUMENT_FILES: dict[DocumentKind, str] = {
     "cv": "Lebenslauf",
     "letter": "Anschreiben",
 }
+SOURCE_DIRECTORY = "_quelle_html"
 SOURCE_FILES: dict[DocumentKind, str] = {"cv": "_cv.html", "letter": "_letter.html"}
+# Stage 20: a source written by the PDF export names the SHA-256 of the
+# text its PDF must say (`pdf_document.text_sha256`); write_manifest binds
+# such a PDF only when its extracted text has exactly that hash.
+SOURCE_TEXT_META = "jobtriage-pdf-text-sha256"
 DEFAULT_MAX_PAGES: dict[DocumentKind, int] = {"cv": 3, "letter": 1}
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 _LEVELS = {"A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
@@ -286,20 +292,54 @@ MANIFEST = "_manifest.json"
 def write_manifest(package: Path, profile_version: int) -> dict:
     """Bind each PDF of `package` to its source text (and record the profile
     version). Call it right after rendering, once the PDF was looked at;
-    it never touches the documents themselves."""
+    it never touches the documents themselves.
+
+    A source written by the Stage 20 PDF export names the hash of the text
+    its PDF must say; a PDF whose extracted text differs (a wrong, edited or
+    unreadable file) is not bound and listed under `refused`, so the check
+    keeps reporting it as NOT_BOUND."""
     documents = {}
+    refused = {}
     for kind in ("cv", "letter"):
         original = _original(package, kind)  # type: ignore[arg-type]
-        source = package / "_quelle_html" / SOURCE_FILES[kind]  # type: ignore[index]
+        source = package / SOURCE_DIRECTORY / SOURCE_FILES[kind]  # type: ignore[index]
         if original is not None and source.is_file():
+            required = _required_text_hash(source)
+            if required is not None:
+                text = pdf_text(original)
+                if text is None or text_sha256(text) != required:
+                    refused[kind] = "PDF text does not match its exported source"
+                    continue
             documents[kind] = {
                 "pdf": original.name,
                 "pdf_sha256": sha256_file(original),
                 "source_sha256": sha256_file(source),
             }
     manifest = {"profile_version": profile_version, "documents": documents}
+    if refused:
+        manifest["refused"] = refused
     (package / MANIFEST).write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
+
+
+_TEXT_META = re.compile(r'<meta name="' + re.escape(SOURCE_TEXT_META) + r'" content="([^"]*)">')
+
+
+def _required_text_hash(source: Path) -> str | None:
+    """The text hash a Stage 20 export source names; None for any other
+    source (Stage 19 HTML, in any encoding). The marker is looked for in the
+    raw bytes, so a damaged (non-UTF-8) export source cannot pass as Stage 19
+    HTML (Codex review); a marker without a valid hash, or an unreadable
+    source, never matches."""
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        return "invalid"
+    if SOURCE_TEXT_META.encode("ascii") not in raw:
+        return None
+    match = _TEXT_META.search(raw.decode("utf-8", errors="replace"))
+    value = match.group(1) if match else ""
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else "invalid"
 
 
 def _load_manifest(package: Path) -> dict:

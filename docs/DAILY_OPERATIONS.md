@@ -34,6 +34,58 @@ The web process also starts the Telegram bot when `TELEGRAM_BOT_TOKEN` is
 set (operator chat only). To start without the bot, set
 `$env:TELEGRAM_BOT_TOKEN = ""` for that session.
 
+## 1a. Operator UI in the browser (Stage 20, read-only)
+
+One command, from the project folder in PowerShell (the API key is read from
+`.env` or `$env:API_KEY` as usual; it is never written into a script):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_operator_ui.py `
+    --database D:/AI_agent/runtime/job_triage_runtime.db `
+    --snapshot D:/AI_agent/job-triage-backups/ui
+```
+
+Then open <http://127.0.0.1:8000/ui/> and log in with `API_KEY`. Pages:
+dashboard, vacancies (search, city, source, fit tier, applied, work mode),
+vacancy detail (fit tier, criteria, evidence, duplicates), Bewerbungen with
+history, operator inbox (mail waiting for your decision), follow-ups.
+**Ctrl+C** stops the server.
+
+What the launcher does (`scripts/run_operator_ui.py`):
+
+- binds to `127.0.0.1` only, sets `UI_ENABLED=true`, and for its own server
+  process turns **off** the Telegram bot, Alembic auto-upgrade, the
+  scheduler and every send / draft / operator-control flag -- nothing in
+  `.env` is changed;
+- refuses a database path that does not exist (SQLite would create an empty
+  one), a database failing `PRAGMA quick_check`, and a missing `API_KEY`;
+- `--snapshot DIR` copies the database first with SQLite's backup API;
+- refuses to start if the configuration would still point the server at
+  another database (`POSTGRES_HOST` is forced empty for that reason);
+- prints a read-only fingerprint (integrity, rows per table, SHA-256 of the
+  logical content, which includes committed changes still in the WAL) before
+  start and after stop and ends with `UNCHANGED` (exit 0) or
+  `DATABASE CHANGED` (exit 5, with the tables that changed); exit 3 means
+  the server itself failed (e.g. the port was in use). A change means
+  another process (scheduler, tracker CLI) wrote meanwhile -- the UI pages
+  open the database read-only (`PRAGMA query_only`) and cannot write.
+
+Notes:
+
+- If the normal web process (section 1) already runs on port 8000, add
+  `--port 8001` and open <http://127.0.0.1:8001/ui/>.
+- The session cookie is `Secure` by default. Chrome and Edge accept it on
+  `http://127.0.0.1` (checked with Chrome 156). If another browser keeps
+  returning to the login page after a correct key, set
+  `$env:UI_COOKIE_SECURE = "false"` for that shell only -- never for a UI
+  reachable from another machine.
+- Never start the UI with `--host 0.0.0.0` or behind a public port; there is
+  no such option in the launcher on purpose. Remote access needs TLS in front
+  (`docs/STAGE20_UI_ARCHITECTURE.md`).
+- The UI decides nothing: confirming inbox mail, status changes and
+  approvals stay with `stage15_application_tracker.py` and Telegram operator
+  control.
+
 ## 2. Which database is production
 
 `D:\AI_agent\runtime\job_triage_runtime.db` (SQLite, Alembic head
@@ -262,7 +314,10 @@ Right after rendering a package (and looking at the PDFs), bind each PDF to
 its source text once: same command with `--bind` (writes `_manifest.json`
 into the package: SHA-256 of PDF and source + profile version; the
 documents are not touched); a PDF or source changed after binding is
-`BLOCKED`.
+`BLOCKED`. PDFs from the Stage 20 export (`document_format="pdf"`) come with
+their sources in `_quelle_html/`; `--bind` binds such a PDF only if its text
+is exactly the exported text, otherwise it prints `NOT BOUND: cv -- ...` and
+the package stays `NEEDS_OPERATOR`.
 
 Read-only otherwise; contact values are compared, never printed.
 

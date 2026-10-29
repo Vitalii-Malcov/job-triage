@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "_macros.html" import badge %}
+{% block title %}Applications{% endblock %}
+{% block content %}
+<h1>Applications</h1>
+<form method="get" action="/ui/applications" class="filters">
+  <select name="status"><option value="">Any status</option>
+    {% for s in statuses %}<option value="{{ s }}" {% if s == selected %}selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select>
+  <button type="submit">Filter</button>
+</form>
+<table class="stack">
+  <thead><tr><th>#</th><th>Company / role</th><th>Status</th><th>Channel</th><th>Submitted</th><th>Last change</th><th>Next follow-up</th></tr></thead>
+  <tbody>
+  {% for a in applications %}
+    <tr>
+      <td data-label="#">{{ a.id }}</td>
+      <td data-label="Company / role"><a href="/ui/applications/{{ a.id }}">{{ a.company_name }}</a><br><small>{{ a.role_title }}{% if a.location %} · {{ a.location }}{% endif %}</small></td>
+      <td data-label="Status">{{ badge(a.current_status.value) }}</td>
+      <td data-label="Channel">{{ a.application_channel.value }}</td>
+      <td data-label="Submitted">{{ a.submitted_at|local }}</td>
+      <td data-label="Last change">{{ a.last_status_changed_at|local }}</td>
+      <td data-label="Next follow-up">{{ a.next_followup_at|local }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">No applications{% if selected %} with status {{ selected }}{% endif %}.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">{{ applications|length }} application(s). Status changes are made with the CLI or Telegram operator control, not here.</p>
+{% endblock %}

@@ -1,0 +1,5 @@
+{% macro tier(value) %}<span class="tier tier-{{ value|lower }}">{{ value }}</span>{% endmacro %}
+{% macro badge(value) %}<span class="badge badge-{{ value|lower }}">{{ value }}</span>{% endmacro %}
+{% macro metric(m) %}
+{% if m.state == "OK" %}<span class="num">{{ m.value }}</span>{% else %}<span class="num unknown" title="{{ m.reason }}">{{ m.state }}</span><small class="why">{{ m.reason }}</small>{% endif %}
+{% endmacro %}

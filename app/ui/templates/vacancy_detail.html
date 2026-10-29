@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tier, badge %}
+{% block title %}{{ d.job.title }}{% endblock %}
+{% block content %}
+{% set a = d.assessment %}
+<p><a href="/ui/vacancies">« Vacancies</a></p>
+<h1>{{ d.job.title }}</h1>
+<p class="sub">{{ d.job.company }} · {{ d.job.location or "location unknown" }} · {{ d.job.source }} · #{{ d.job.id }}</p>
+<p>
+  {% if d.url %}<a href="{{ d.url }}" rel="noopener noreferrer nofollow" target="_blank">Original posting</a>{% else %}<span class="muted">Posting URL not shown (not an http(s) link): {{ d.job.url }}</span>{% endif %}
+</p>
+
+<div class="grid">
+  <div class="card"><span class="label">Fit tier</span>{{ tier(a.fit_tier) }}</div>
+  <div class="card"><span class="label">Decision</span>{{ badge(a.decision) }}</div>
+  <div class="card"><span class="label">Scorer</span>{{ d.job.recommendation }} ({{ d.job.score }})</div>
+  <div class="card"><span class="label">First / last seen</span>{{ d.job.first_seen_at|local }}<br>{{ d.job.last_seen_at|local }}</div>
+</div>
+
+<h2>Why this tier</h2>
+<ul>{% for reason in a.tier_reasons %}<li>{{ reason }}</li>{% else %}<li class="muted">No reasons recorded.</li>{% endfor %}</ul>
+
+<h2>Criteria</h2>
+<table class="stack">
+  <thead><tr><th>Criterion</th><th>Status</th><th>Reason</th><th>Evidence from the posting</th></tr></thead>
+  <tbody>
+  {% for c in a.criteria %}
+    <tr class="{% if c in a.blockers %}row-block{% elif c in a.verifications %}row-verify{% endif %}">
+      <td data-label="Criterion">{{ c.name }}</td><td data-label="Status">{{ badge(c.status) }}</td><td data-label="Reason">{{ c.reason }}</td><td data-label="Evidence from the posting">{% if c.evidence %}<q>{{ c.evidence }}</q>{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Route</h2>
+{% if d.route %}
+<p>{{ "%.1f"|format(d.route.car_route_km) }} km by car{% if d.route.car_route_minutes %}, {{ d.route.car_route_minutes|round|int }} min{% endif %} · {{ d.route.origin_label }} → {{ d.route.destination_label }} · {{ d.route.method }} · checked {{ d.route.checked_at|local }}</p>
+<p class="muted">{{ d.route.source_note }}</p>
+{% else %}
+<p class="muted">No stored car-route check for this vacancy.</p>
+{% endif %}
+
+<h2>Possible duplicates / existing applications</h2>
+{% if d.findings %}
+<table class="stack">
+  <thead><tr><th>Application</th><th>Strength</th><th>Status</th><th>Signals</th></tr></thead>
+  <tbody>
+  {% for f in d.findings %}
+    <tr><td data-label="Application"><a href="/ui/applications/{{ f.application_id }}">#{{ f.application_id }}</a> {{ f.company }} — {{ f.role }}</td><td data-label="Strength">{{ f.strength }}</td><td data-label="Status">{{ f.status }}</td><td data-label="Signals">{{ f.signals|join(", ") }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No recorded application matches this vacancy.</p>
+{% endif %}
+
+<h2>Description</h2>
+<div class="description">{{ d.job.description or "No description stored." }}</div>
+{% endblock %}

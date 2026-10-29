@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% from "_macros.html" import tier, metric %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Today</h1>
+<div class="grid">
+  <a class="card stat" href="/ui/inbox"><span class="label">Mail needing your decision</span>{{ metric(summary.inbox_review) }}</a>
+  <a class="card stat" href="/ui/follow-ups"><span class="label">Follow-ups due (overdue + today)</span><span class="num">{{ summary.follow_ups_due }}</span><small>{{ summary.follow_ups_week }} more in the next 7 days</small></a>
+  <a class="card stat" href="/ui/vacancies"><span class="label">New vacancies</span><span class="num">{{ summary.jobs_last_24h }}</span><small>last 24 h · {{ summary.jobs_last_7d }} in 7 days · {{ summary.jobs_total }} stored</small></a>
+</div>
+
+<h2>Fit tiers — vacancies first seen in the last {{ summary.window_days }} days</h2>
+<div class="grid">
+{% for t in tiers %}
+  <a class="card stat" href="/ui/vacancies?fit_tier={{ t }}"><span class="label">{{ tier(t) }}</span>{{ metric(summary.tiers[t]) }}</a>
+{% endfor %}
+</div>
+
+<h2>Applications ({{ summary.applications_total }})</h2>
+<table>
+  <thead><tr><th>Status</th><th class="r">Count</th></tr></thead>
+  <tbody>
+  {% for s, n in summary.applications_by_status.items() if n %}
+    <tr><td><a href="/ui/applications?status={{ s }}">{{ s }}</a></td><td class="r">{{ n }}</td></tr>
+  {% else %}
+    <tr><td colspan="2" class="muted">No applications recorded.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
