@@ -14,7 +14,15 @@ __pycache__
 .pytest-review-temp-*
 tests
 docs
-*.db
-*.db-journal
+# data files anywhere in the context (.dockerignore patterns are root-relative)
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.bak
+**/*.local.json
+runtime
+job-triage-backups
+postman
+.postman
 .env
 .env.*

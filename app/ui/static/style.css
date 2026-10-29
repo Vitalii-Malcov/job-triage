@@ -9,7 +9,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 a { color: var(--accent); }
-main { max-width: 1280px; margin: 0 auto; padding: 0 16px 48px; }
+main { max-width: 1280px; margin: 0 auto; padding: 0 16px 48px; overflow-wrap: break-word; }
 .top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--line); }
 .top nav { display: flex; flex-wrap: wrap; gap: 4px 16px; flex: 1; }
 .top nav a { text-decoration: none; font-weight: 500; }
@@ -46,7 +46,8 @@ label { display: block; margin: 12px 0 4px; }
 .notice { background: var(--card); border-left: 3px solid var(--operator); padding: 8px 12px; }
 .error { color: var(--bad); }
 .pager { display: flex; gap: 16px; margin: 12px 0; }
-.description { white-space: pre-wrap; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+/* anywhere: a posting's long URL must wrap instead of widening a phone screen */
+.description { white-space: pre-wrap; overflow-wrap: anywhere;background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
 /* Narrow screens: every row of a .stack table becomes a card, each cell
    labelled from its data-label (no column is hidden, nothing scrolls sideways). */
 @media (max-width: 760px) {

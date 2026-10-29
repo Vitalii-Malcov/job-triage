@@ -10,10 +10,10 @@ older stage document disagree about *how to operate*, this page wins.
 
 ## 1. Start the project
 
-From a fresh PowerShell in `D:\AI_agent`:
+From a fresh PowerShell in the project folder (on the current laptop `E:\Projects\job-triage`):
 
 ```powershell
-$env:DATABASE_URL = "sqlite:///D:/AI_agent/runtime/job_triage_runtime.db"
+$env:DATABASE_URL = "sqlite:///./runtime/job_triage_runtime.db"
 $env:DATABASE_ROLE = "production"
 $env:ALEMBIC_AUTO_UPGRADE = "false"
 $env:OUTBOUND_SENDING_ENABLED = "false"
@@ -41,8 +41,8 @@ One command, from the project folder in PowerShell (the API key is read from
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_operator_ui.py `
-    --database D:/AI_agent/runtime/job_triage_runtime.db `
-    --snapshot D:/AI_agent/job-triage-backups/ui
+    --database runtime/job_triage_runtime.db `
+    --snapshot "$env:USERPROFILE\JobTriage-Backups"
 ```
 
 Then open <http://127.0.0.1:8000/ui/> and log in with `API_KEY`. Pages:
@@ -88,7 +88,7 @@ Notes:
 
 ## 2. Which database is production
 
-`D:\AI_agent\runtime\job_triage_runtime.db` (SQLite, Alembic head
+`runtime\job_triage_runtime.db` in the project folder (SQLite, Alembic head
 `b6c1e9a4d2f7`). Everything else in the repository root (`job_search.db`,
 `stage11_pilot.db`, `stage14b_*.db`, `runtime/*pre-*.db`,
 `runtime/stage16_pilot_scratch.db`) is historical, a pilot or a backup. The
@@ -124,10 +124,10 @@ may still inspect a backup.
 Safe production start (PowerShell, one shell, nothing written to `.env`):
 
 ```powershell
-$env:DATABASE_URL  = "sqlite:///D:/AI_agent/runtime/job_triage_runtime.db"
+$env:DATABASE_URL  = "sqlite:///./runtime/job_triage_runtime.db"
 $env:DATABASE_ROLE = "production"
 # CLI: always name the database explicitly; dry run first, --apply second
-.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database D:/AI_agent/runtime/job_triage_runtime.db list
+.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database runtime/job_triage_runtime.db list
 ```
 
 ## 3. Flags that keep it safe
@@ -187,12 +187,12 @@ target seniority, search terms, primary/secondary roles, languages, skills
 and the confirmed contact data.
 
 ```powershell
-$db = "D:/AI_agent/runtime/job_triage_runtime.db"
+$db = "runtime/job_triage_runtime.db"
 .\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db show
 .\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db history
 # change it: edit the operator file (outside the repo), dry run, then apply
 .\.venv\Scripts\python.exe scripts\stage17_candidate_config.py --database $db apply `
-  --config C:\Users\BOSS\AppData\Local\job-triage-config\candidate_config_2026-10-27.json `
+  --config $env:LOCALAPPDATA\job-triage-config\candidate_config_2026-10-27.json `
   --actor operator --reason "..."            # add --expected-version N --apply
 ```
 
@@ -236,7 +236,7 @@ One vacancy often exists several times (employer BA post, XING copy, agency
 mirror). Always run, for the job row you intend to apply to:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database D:/AI_agent/runtime/job_triage_runtime.db check-job <job_id>
+.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database runtime/job_triage_runtime.db check-job <job_id>
 ```
 
 | Verdict | Exit | Meaning |
@@ -274,7 +274,7 @@ the operator's judgement remains the last guard.
    produces the structured CV/Bewerbung drafts (every statement bound to a
    confirmed profile fact), not the PDF itself; package
    folders live outside the repository
-   (`C:\Users\BOSS\AppData\Local\job-triage-packages\`). Never reuse another
+   (`%LOCALAPPDATA%\job-triage-packages\`). Never reuse another
    application's folder.
 4. **Pre-submit check (mandatory, §7a):** `scripts/presubmit_check.py` on the
    package and the exact upload copies, after uploading and before the final
@@ -296,8 +296,8 @@ from another vacancy can end up in a form (it happened on StepStone). Check
 the package and the exact copy you are about to upload:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\presubmit_check.py --database D:/AI_agent/runtime/job_triage_runtime.db `
-  --package "C:\Users\BOSS\AppData\Local\job-triage-packages\<day>_LiveHunt\ApplicationPrep\Final\<pkg>" `
+.\.venv\Scripts\python.exe scripts\presubmit_check.py --database runtime/job_triage_runtime.db `
+  --package "$env:LOCALAPPDATA\job-triage-packages\<day>_LiveHunt\ApplicationPrep\Final\<pkg>" `
   --company "<employer>" --role "<exact title>" `
   --attach cv=.playwright-mcp/upload/<pkg>/<file>.pdf [--attach letter=...] [--no-letter] `
   [--missing-field "Zeugnisnote"]
@@ -337,7 +337,7 @@ Read-only otherwise; contact values are compared, never printed.
 ## 8. Record a submission (after sending it by hand)
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database D:/AI_agent/runtime/job_triage_runtime.db `
+.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database runtime/job_triage_runtime.db `
   record-submission --company "Firma GmbH" --role "Python Developer (m/w/d)" `
   --source bundesagentur --reference 12345-ABC-S --job-id 123 --channel EMPLOYER_PORTAL `
   --submitted-at 2026-10-21T09:15:00Z --employer-domain firma.de `
@@ -365,7 +365,7 @@ employer's mail domain — it is the strongest signal for matching replies.
 
 ```powershell
 # dry run (reads mail, writes nothing)
-.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database D:/AI_agent/runtime/job_triage_runtime.db process-gmail --since 2026-10-15
+.\.venv\Scripts\python.exe scripts\stage15_application_tracker.py --database runtime/job_triage_runtime.db process-gmail --since 2026-10-15
 # apply
 ... process-gmail --since 2026-10-15 --apply
 ```
@@ -433,7 +433,7 @@ Backup (safe while the app runs; uses SQLite's online backup API):
 
 ```powershell
 $ts = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
-.\.venv\Scripts\python.exe -c "import sqlite3,sys;s=sqlite3.connect('file:D:/AI_agent/runtime/job_triage_runtime.db?mode=ro',uri=True);d=sqlite3.connect(sys.argv[1]);s.backup(d);d.close();print(d)" "C:\Users\BOSS\AppData\Local\job-triage-backups\job_triage_runtime.$ts.db"
+.\.venv\Scripts\python.exe -c "import sqlite3,sys;s=sqlite3.connect('file:runtime/job_triage_runtime.db?mode=ro',uri=True);d=sqlite3.connect(sys.argv[1]);s.backup(d);d.close();print(d)" "$env:USERPROFILE\JobTriage-Backups\job_triage_runtime.$ts.db"
 ```
 
 Verify a backup: `PRAGMA integrity_check` = `ok`, `PRAGMA foreign_key_check`
@@ -441,7 +441,7 @@ empty, `SELECT * FROM alembic_version` = head.
 
 Restore: stop uvicorn (and any CLI), keep the current file as
 `job_triage_runtime.broken-<ts>.db`, copy the backup to
-`D:\AI_agent\runtime\job_triage_runtime.db`, run the verification above,
+`runtime\job_triage_runtime.db` in the project folder, run the verification above,
 start again. Backups and DB files are never committed (`*.db` is ignored).
 
 ## 12. Tests
@@ -449,7 +449,7 @@ start again. Backups and DB files are never committed (`*.db` is ignored).
 ```powershell
 .\.venv\Scripts\ruff.exe check app scripts tests alembic
 .\.venv\Scripts\ruff.exe format --check app scripts tests alembic
-.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp C:\Users\BOSS\AppData\Local\Temp\pt
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp $env:LOCALAPPDATA\Temp\pt
 ```
 
 The full suite takes ~35-40 minutes sequentially; on a memory-tight machine
