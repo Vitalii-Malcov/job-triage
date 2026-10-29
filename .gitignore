@@ -16,6 +16,12 @@ htmlcov/
 # Stage 14D: operator application identity (contact data) stays local.
 *.local.json
 *.db-journal
+# SQLite side files hold real data too (WAL), plus other SQLite/backup names
+*.db-*
+*.sqlite*
+*.bak
+runtime/
+job-triage-backups/
 *.egg-info/
 
 # Local Claude Code permission/tool settings — machine-specific, not shared

@@ -1,7 +1,7 @@
 """Start the read-only operator UI (Stage 20) on 127.0.0.1 with one command.
 
     .\\.venv\\Scripts\\python.exe scripts\\run_operator_ui.py `
-        --database D:/AI_agent/runtime/job_triage_runtime.db
+        --database runtime/job_triage_runtime.db
 
 then open http://127.0.0.1:8000/ui/ and log in with API_KEY.
 

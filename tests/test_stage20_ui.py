@@ -690,3 +690,16 @@ def test_safe_external_url():
     assert queries.safe_external_url("HTTP://a.example") == "HTTP://a.example"
     for bad in (None, "", "javascript:alert(1)", "data:text/html,x", "//a.example", "https://"):
         assert queries.safe_external_url(bad) is None
+
+
+def test_long_words_wrap_instead_of_widening_the_page():
+    # Found on real data: a 64-character URL in a posting widened a 390px
+    # screen. The description must break anywhere; the rest of main breaks
+    # long words without changing table column sizing.
+    from app.ui.routes import UI_DIR
+
+    css = (UI_DIR / "static" / "style.css").read_text(encoding="utf-8")
+    description = next(line for line in css.splitlines() if line.startswith(".description {"))
+    assert "overflow-wrap: anywhere" in description
+    main = next(line for line in css.splitlines() if line.startswith("main {"))
+    assert "overflow-wrap: break-word" in main
