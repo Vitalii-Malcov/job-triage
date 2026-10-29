@@ -64,7 +64,23 @@ Skipped — PostgreSQL-тесты без `TEST_POSTGRES_URL` (в CI их вып�
 
 ## 6. GitHub
 
-Заполняется после публикации: PR, состояние CI.
+| Пункт | Значение |
+|---|---|
+| PR | https://github.com/Vitalii-Malcov/job-triage/pull/15 — **MERGED** (squash) 29.10.2026 |
+| Проверенный коммит PR | `9f28e34` (дерево `24019e4` = дерево локально проверенного `cd5bb4b`) |
+| CI PR (`pull_request` и `push`) | `test` ✓ (Ruff чисто, 473 файла отформатированы, **6632 passed, 128 skipped**), `scheduler-postgres` ✓ (**122 тестов, 0 skipped**), `docker` ✓ — оба прогона зелёные |
+| Merge SHA `main` | **`28a8b5f`**; дерево `main` = проверенному `24019e4` |
+| CI `main` после merge | `test` ✓ (**6632 passed, 128 skipped**), `scheduler-postgres` ✓ (**122 тестов, 0 skipped**), `docker` ✓ |
+| PR #14 (отчёт Stage 19) | не трогался, открыт для решения оператора |
+
+В CI на Linux пропущено на 1 тест больше, чем локально на Windows (128 против 127, passed 6632 против 6633): `tests/test_stage14a_send_readiness_db.py:814` помечен `skipif(os.name != "nt")` — настоящий `GetDriveTypeW` есть только в Windows; локальный прогон на Windows его выполняет.
+
+Проверка после merge (чистый checkout `main` `28a8b5f`, только синтетические данные):
+
+- Тесты Stage 20 + presubmit: 131 passed (код взят из checkout `main`, не из рабочей ветки).
+- Запуск через `scripts/run_operator_ui.py`: страница входа 200, API без ключа 401; неверный ключ → «Invalid key.»; верный → dashboard; поиск с умлаутом, карточки вакансии/заявки, inbox, follow-ups — 200; после выхода — снова вход; внешних запросов 0. Итог запускателя: **UNCHANGED** (целостность, строки, хеш содержимого). Сервер был остановлен принудительно, поэтому код выхода 3 «SERVER FAILED» — ожидаемо (обычный Ctrl+C даёт 0).
+- PDF: экспорт из `main` даёт те же SHA-256, что и до merge (`a53a0dcc…`, `7099d779…`); `presubmit_check.py` — `NEEDS_OPERATOR` до `--bind`, `READY` после; тестовая профильная БД не изменилась.
+- `git status` рабочего клона: изменений в отслеживаемых файлах нет (есть чужие неотслеживаемые папки `.postman/`, `postman/` — не тронуты, не закоммичены).
 
 ## 7. Production
 
