@@ -736,7 +736,7 @@ def test_upgrading_a_database_already_at_a9d3f6b2c4e8_adds_the_new_columns(tmp_p
         head = conn.execute("SELECT version_num FROM alembic_version").fetchone()
     assert {"target_seniority", "search_keywords_json"} <= prefs
     assert {"origin_lat", "origin_lon"} <= checks
-    assert head == ("b6c1e9a4d2f7",)
+    assert head == ("c7e2a9d4f1b3",)  # Stage 21 on top of b6c1e9a4d2f7
     downgrade(_alembic(path), "a9d3f6b2c4e8")
     with sqlite3.connect(path) as conn:
         prefs = {row[1] for row in conn.execute("PRAGMA table_info(candidate_job_preferences)")}

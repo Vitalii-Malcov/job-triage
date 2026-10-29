@@ -1991,6 +1991,42 @@ class JobCommuteCheckRecord(Base):
     )
 
 
+class JobFitAssessmentRecord(Base):
+    """Stage 21: the cached `assess_job` result of one vacancy (one current
+    row per job). `input_key` hashes every input the assessment reads
+    (`app/services/fit_cache.py`); a row whose key differs from the current
+    one is stale and must never be shown as the vacancy's tier. Written only
+    by the offline `scripts/stage21_assess_vacancies.py`; the UI only reads."""
+
+    __tablename__ = "job_fit_assessments"
+    __table_args__ = (
+        CheckConstraint(
+            "fit_tier IN ('GOOD_MATCH', 'PARTIAL_MATCH', 'NEEDS_OPERATOR', 'NOT_SUITABLE')",
+            name="ck_job_fit_assessments_fit_tier",
+        ),
+        CheckConstraint(
+            "decision IN ('BLOCKED', 'NEEDS_VERIFICATION', 'CANDIDATE')",
+            name="ck_job_fit_assessments_decision",
+        ),
+        Index("ix_job_fit_assessments_tier_job", "fit_tier", "job_id"),
+        Index("ix_job_fit_assessments_input_key", "input_key"),
+    )
+
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    input_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    rules_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    profile_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fit_tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    criteria_json: Mapped[str] = mapped_column(Text, nullable=False)
+    tier_reasons_json: Mapped[str] = mapped_column(Text, nullable=False)
+    work_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class CandidateJobMatchRecord(Base):
     """A computed, cached Candidate Profile <-> Job match analysis (Stage
     6B) — see app/agents/candidate_job_matcher.py for the deterministic

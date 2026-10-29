@@ -6,6 +6,14 @@ fit tier / decision / criteria come from `assess_job`, duplicates from
 run over stored messages, follow-up dates from the tracker's persisted
 `next_followup_at`. This module only filters, groups and pages.
 
+Stage 21: once the vacancy assessment cache (`job_fit_assessments`) has been
+filled, the fit-tier / applied / work-mode filters and the dashboard tier
+counts read it instead of running `assess_job` under a scan budget. Only
+FRESH rows (stored input key == current key, `app/services/fit_cache.py`)
+count; stale and not-assessed vacancies are reported as such, never under
+their old tier. Without the table, or while it is empty, the Stage 20 path
+with its scan budget stays in place.
+
 A value that cannot be computed is reported as UNKNOWN / NOT_CONFIGURED with
 a reason, never as 0 (boundary 4).
 """
@@ -22,10 +30,16 @@ from sqlalchemy.orm import Session
 from app.db import application_repository as app_repo
 from app.db.datetime_utils import ensure_utc
 from app.db.job_commute_repository import latest_commute_check
-from app.db.models import ApplicationRecord, JobCommuteCheckRecord, JobRecord
+from app.db.models import (
+    ApplicationRecord,
+    JobCommuteCheckRecord,
+    JobFitAssessmentRecord,
+    JobRecord,
+)
 from app.domain.application_lifecycle import is_terminal
 from app.models.application_lifecycle import Application, ApplicationDetail
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
+from app.services import fit_cache
 from app.services.application_duplicates import DuplicateFinding
 from app.services.application_guard import vacancy_findings
 from app.services.application_response_processor import (
@@ -37,6 +51,7 @@ from app.services.application_response_processor import (
     stored_inbound_messages,
 )
 from app.services.application_tracker import ApplicationTracker
+from app.services.fit_cache import applied, work_mode
 from app.services.job_fit_assessment import FitAssessment, assess_job
 
 PAGE_SIZE = 25
@@ -47,8 +62,6 @@ INBOX_LOOKBACK_DAYS = 30
 FIT_TIERS = ("GOOD_MATCH", "PARTIAL_MATCH", "NEEDS_OPERATOR", "NOT_SUITABLE")
 RECOMMENDATIONS = ("APPLY", "MAYBE", "SKIP", "NEEDS_ENRICHMENT")
 # remote criterion status -> work mode shown / filtered in the UI
-_FULLY_REMOTE = frozenset({"COMPATIBLE", "INCOMPATIBLE", "NOT_CONFIGURED"})
-_HYBRID = frozenset({"HYBRID", "PARTIAL_REMOTE"})
 _WAITING = frozenset({S.SUBMITTED, S.RECEIVED, S.UNDER_REVIEW})
 
 
@@ -67,19 +80,6 @@ def safe_external_url(url: str | None) -> str | None:
     if lowered.startswith(("http://", "https://")) and len(lowered) > len("https://"):
         return url.strip()
     return None
-
-
-def work_mode(assessment: FitAssessment) -> str:
-    status = assessment.criterion("remote").status
-    if status in _FULLY_REMOTE:
-        return "REMOTE"
-    if status in _HYBRID:
-        return "HYBRID"
-    return status  # ONSITE / UNKNOWN
-
-
-def applied(assessment: FitAssessment) -> bool:
-    return assessment.criterion("duplicate").status == "ALREADY_APPLIED"
 
 
 # --- vacancies ---------------------------------------------------------------
@@ -134,6 +134,8 @@ class VacancyPage:
     # True when a computed filter stopped at SCAN_BUDGET: older rows were not
     # looked at, so "no more results" must not be claimed.
     budget_exhausted: bool
+    # Stage 21: the computed filters were answered from fresh cache rows.
+    from_cache: bool = False
 
 
 def _like(value: str) -> str:
@@ -183,6 +185,8 @@ def list_vacancies(
     scan_budget: int = SCAN_BUDGET,
 ) -> VacancyPage:
     query = _vacancy_query(filters)
+    if filters.computed and fit_cache.cache_in_use(db):
+        return _list_from_cache(db, filters, query, assess=assess, page_size=page_size)
     if not filters.computed:
         jobs = db.scalars(query.limit(page_size + 1)).all()
         more = len(jobs) > page_size
@@ -208,6 +212,48 @@ def list_vacancies(
     return VacancyPage(rows, next_before, scanned, budget_exhausted)
 
 
+def _list_from_cache(
+    db: Session,
+    filters: VacancyFilters,
+    query,
+    *,
+    assess: Callable[[Session, int], FitAssessment],
+    page_size: int,
+) -> VacancyPage:
+    """Computed filters as SQL on the cache. A candidate counts only while
+    its row is FRESH; the page rows are then assessed live (at most
+    page_size, ~17 ms each), so the detail shown is always current."""
+    query = query.join(JobFitAssessmentRecord, JobFitAssessmentRecord.job_id == JobRecord.id)
+    if filters.fit_tier:
+        query = query.where(JobFitAssessmentRecord.fit_tier == filters.fit_tier)
+    if filters.applied:
+        query = query.where(JobFitAssessmentRecord.applied.is_(filters.applied == "yes"))
+    if filters.mode:
+        query = query.where(JobFitAssessmentRecord.work_mode == filters.mode.upper())
+    query = query.add_columns(JobFitAssessmentRecord.input_key)
+    inputs = fit_cache.global_inputs(db)
+    rows: list[VacancyRow] = []
+    scanned = 0
+    last_id: int | None = None
+    batch = page_size * 2
+    while True:
+        page_query = query if last_id is None else query.where(JobRecord.id < last_id)
+        candidates = db.execute(page_query.limit(batch)).all()
+        current = fit_cache.current_keys(db, [job.id for job, _ in candidates], inputs)
+        for job, stored_key in candidates:
+            if len(rows) == page_size:
+                return VacancyPage(rows, last_id, scanned, False, from_cache=True)
+            scanned += 1
+            last_id = job.id
+            if stored_key != current.get(job.id):
+                continue  # STALE: never listed under its old tier
+            assessment = assess(db, job.id)
+            if filters.accepts(assessment):
+                rows.append(VacancyRow(job, assessment, safe_external_url(job.url)))
+        if len(candidates) < batch:
+            return VacancyPage(rows, None, scanned, False, from_cache=True)
+
+
 def vacancy_sources(db: Session) -> list[str]:
     return list(db.scalars(select(JobRecord.source).distinct().order_by(JobRecord.source)))
 
@@ -219,6 +265,8 @@ class VacancyDetail:
     url: str | None
     findings: list[DuplicateFinding]
     route: JobCommuteCheckRecord | None
+    # Stage 21: FRESH / STALE / NOT_ASSESSED, None without the cache table.
+    cache_state: str | None = None
 
 
 def vacancy_detail(db: Session, job_id: int) -> VacancyDetail | None:
@@ -231,7 +279,15 @@ def vacancy_detail(db: Session, job_id: int) -> VacancyDetail | None:
         url=safe_external_url(job.url),
         findings=vacancy_findings(db, job),
         route=latest_commute_check(db, job_id),
+        cache_state=_detail_cache_state(db, job_id),
     )
+
+
+def _detail_cache_state(db: Session, job_id: int) -> str | None:
+    if not fit_cache.cache_table_present(db):
+        return None
+    stored = fit_cache.cached_keys(db, [job_id]).get(job_id)
+    return fit_cache.cache_state(stored, fit_cache.current_keys(db, [job_id]).get(job_id))
 
 
 # --- applications ------------------------------------------------------------
@@ -373,6 +429,66 @@ class Dashboard:
     inbox_review: Metric
     follow_ups_due: int
     follow_ups_week: int
+    # Stage 21: set when the tier counts come from the assessment cache.
+    tiers_all: dict[str, Metric] | None = None
+    cache: "CacheOverview | None" = None
+
+
+@dataclass(frozen=True)
+class CacheOverview:
+    fresh: int
+    stale: int
+    not_assessed: int
+
+
+def _cached_tier_counts(
+    db: Session, since: datetime
+) -> tuple[dict[str, Metric], dict[str, Metric], CacheOverview]:
+    """Tier counts over the window and over all vacancies, from FRESH rows
+    only (SQL and hashing; no assess_job)."""
+    current = fit_cache.current_keys(db)
+    stored = dict(
+        (job_id, (key, tier))
+        for job_id, key, tier in db.execute(
+            select(
+                JobFitAssessmentRecord.job_id,
+                JobFitAssessmentRecord.input_key,
+                JobFitAssessmentRecord.fit_tier,
+            )
+        ).all()
+    )
+    in_window = set(db.scalars(select(JobRecord.id).where(JobRecord.first_seen_at >= since)))
+    states: Counter = Counter()
+    window: Counter = Counter()
+    window_open: Counter = Counter()
+    every: Counter = Counter()
+    for job_id, key in current.items():
+        stored_key, tier = stored.get(job_id, (None, None))
+        state = fit_cache.cache_state(stored_key, key)
+        states[state] += 1
+        if state == "FRESH":
+            every[tier] += 1
+            if job_id in in_window:
+                window[tier] += 1
+        elif job_id in in_window:
+            window_open[state] += 1
+    overview = CacheOverview(states["FRESH"], states["STALE"], states["NOT_ASSESSED"])
+    window_reason = ""
+    if window_open:
+        window_reason = (
+            f"excludes {window_open['STALE']} stale and {window_open['NOT_ASSESSED']} "
+            "not assessed vacancies in the window"
+        )
+    all_reason = ""
+    if overview.stale or overview.not_assessed:
+        all_reason = (
+            f"excludes {overview.stale} stale and {overview.not_assessed} not assessed vacancies"
+        )
+    return (
+        {t: Metric(window.get(t, 0), "OK", window_reason) for t in FIT_TIERS},
+        {t: Metric(every.get(t, 0), "OK", all_reason) for t in FIT_TIERS},
+        overview,
+    )
 
 
 def _count_since(db: Session, since: datetime) -> int:
@@ -419,15 +535,23 @@ def dashboard_summary(
         Metric(len(box.needs_review)) if box.state == "OK" else Metric(None, box.state, box.reason)
     )
     due = follow_ups(db, zone, now=now)
+    since = now - timedelta(days=DASHBOARD_WINDOW_DAYS)
+    tiers_all = cache = None
+    if fit_cache.cache_in_use(db):
+        tiers, tiers_all, cache = _cached_tier_counts(db, since)
+    else:
+        tiers = _tier_counts(db, since, assess, scan_budget)
     return Dashboard(
         jobs_total=db.scalar(select(func.count(JobRecord.id))) or 0,
         jobs_last_24h=_count_since(db, now - timedelta(hours=24)),
         jobs_last_7d=_count_since(db, now - timedelta(days=7)),
         window_days=DASHBOARD_WINDOW_DAYS,
-        tiers=_tier_counts(db, now - timedelta(days=DASHBOARD_WINDOW_DAYS), assess, scan_budget),
+        tiers=tiers,
         applications_by_status={s.value: by_status.get(s.value, 0) for s in S},
         applications_total=sum(by_status.values()),
         inbox_review=inbox_metric,
         follow_ups_due=due.due_count,
         follow_ups_week=len(due.next_7_days),
+        tiers_all=tiers_all,
+        cache=cache,
     )

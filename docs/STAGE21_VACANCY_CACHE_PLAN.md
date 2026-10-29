@@ -202,3 +202,66 @@ tools cover the flow; proposed sequence, each write step only with approval:
 - No action that sends anything (mail, draft, Telegram, portal) — those stay
   outside the browser.
 - Tests: CSRF missing/wrong → 403; replay; double submit; audit row present.
+
+## 8. Implementation record (2026-10-29)
+
+Branch `stage21/vacancy-cache` in a separate worktree
+(`E:\Projects\job-triage-stage21`): the main working copy doubles as the
+production environment, and its CLIs and UI require the database to be at
+the code's Alembic head, so a new migration there would make
+`presubmit_check.py` / `record-submission` refuse the production database
+before its (separately approved) migration.
+
+Baseline (main `4cdaacf`, clean tree apart from the operator's own
+untracked files): Ruff check and format clean; full pytest see the handoff
+section below. Production SQLite SHA-256 at start: `21a4c93b…` (changed
+legitimately on 29.10.2026 by `record-submission` of applications 16–18).
+
+| Task | Result | Files |
+|---|---|---|
+| T1 model + migration | `JobFitAssessmentRecord`, revision `c7e2a9d4f1b3` (down `b6c1e9a4d2f7`), real `downgrade()`; head literals in CI and tests updated | `app/db/models.py`, `alembic/versions/c7e2a9d4f1b3_*.py`, `.github/workflows/ci.yml`, head tests |
+| T2 key computation | `app/services/fit_cache.py`: rules hash over the import closure of `job_fit_assessment` + `fit_cache`, job row hash minus `last_seen_at`, latest match / commute keys (same ordering as the live lookups), applications watermark (count, max id, max event id), dialect upsert (`ON CONFLICT DO UPDATE`) | `app/services/fit_cache.py` |
+| T3 writer | `scripts/stage21_assess_vacancies.py`: dry run on a `mode=ro` / read-only connection, `--apply` in batches of 200 with progress/ETA, resumable, `--only-stale`, `--limit`, `--snapshot` (mandatory for the production file), Stage 17 database roles + Alembic head | `scripts/stage21_assess_vacancies.py` |
+| T4 UI | dashboard tier counts (window + all) from FRESH rows with stale / not-assessed counts; computed list filters as SQL on the cache, page rows still assessed live; detail shows the cached state; Stage 20 budget path kept while the table is absent or empty | `app/ui/queries.py`, 3 templates |
+| T5 tests | SQLite: equivalence, per-column and per-input invalidation, rules-hash closure, excluded column never read, never stale-as-current, writer dry run / idempotence / limit / only-stale / interruption / roles / snapshot / missing table, UI cannot write. PostgreSQL (CI gate): constraints, concurrent writers, read-only UI connection, one-step downgrade/upgrade | `tests/test_stage21_vacancy_cache.py`, `tests/integration/test_stage21_vacancy_cache_postgres.py` |
+| T6 docs | operator section 1b, this record | `docs/DAILY_OPERATIONS.md`, this file |
+
+Deviations from §3, decided during implementation:
+
+- The UI keeps the Stage 20 scan-budget path not only without the table but
+  also while it is empty (before the first backfill), so the dashboard does
+  not switch to "everything not assessed" the moment the migration runs.
+- The filtered list selects candidates from FRESH cache rows but still
+  assesses the (at most 25) page rows live, so the evidence shown is always
+  current; a row whose live result disagrees with its filter is dropped.
+- `--only-stale` means "existing stale rows only"; the default run already
+  skips fresh rows, so it is resumable and idempotent without a flag.
+
+Copy-of-production rehearsal (§5.2, 29.10.2026): backup-API copy of the
+production file (opened `mode=ro`) in a temporary directory, deleted
+afterwards. `alembic upgrade head` on the copy; dry run 2 888 not assessed;
+`--apply` wrote 2 888 rows in 55 s (while a full pytest run shared the
+machine); the second dry run reported 2 888 fresh / 0 stale; a random sample
+of 300 rows was identical to live `assess_job` (0 mismatches); the cached
+dashboard took 0.41 s and showed counts over all vacancies (NEEDS_OPERATOR
+2 501, NOT_SUITABLE 387 -- no vacancy has a current matcher analysis, so no
+GOOD/PARTIAL match, the same as the live assessment). Production SHA-256
+`21a4c93b…` before and after.
+
+Verification:
+
+| Check | Result |
+|---|---|
+| Baseline full pytest (clean main `4cdaacf`) | 6 634 passed, 127 skipped, 0 failed |
+| Full pytest, Stage 21 worktree (before the Codex fixes) | 6 674 passed, 131 skipped, 0 failed |
+| Stage 21 + Stage 20 UI tests after the Codex fixes | 70 passed |
+| Full pytest after the Codex fixes (final) | 6 675 passed, 131 skipped, 0 failed |
+| Ruff check / format | clean (480+ files) |
+| PostgreSQL tests (`test_stage21_vacancy_cache_postgres.py`, wired into the CI zero-skip gate) | NOT RUN locally: no Docker/PostgreSQL on this machine; CI runs them |
+| Codex review round 1 | REJECT: P1 PG concurrency test began a transaction twice; P2 applications watermark missed edits of older rows |
+| Fixes | `session.rollback()` after the reads in the PG test; watermark = hash over every column of every application + max event id; new two-application negative test |
+| Codex review round 2 (final) | ACCEPT, no P0/P1 |
+
+Not done here (each needs the operator's explicit approval): production
+backup snapshot, `alembic upgrade head` on production and the production
+backfill (§5.3).

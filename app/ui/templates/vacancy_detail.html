@@ -14,6 +14,7 @@
   <div class="card"><span class="label">Fit tier</span>{{ tier(a.fit_tier) }}</div>
   <div class="card"><span class="label">Decision</span>{{ badge(a.decision) }}</div>
   <div class="card"><span class="label">Scorer</span>{{ d.job.recommendation }} ({{ d.job.score }})</div>
+  {% if d.cache_state %}<div class="card"><span class="label">Cached assessment</span>{{ d.cache_state }}</div>{% endif %}
   <div class="card"><span class="label">First / last seen</span>{{ d.job.first_seen_at|local }}<br>{{ d.job.last_seen_at|local }}</div>
 </div>
 
