@@ -124,7 +124,9 @@ E-mail never sets REJECTED or OFFER. Such a message appears with
 its status and gets `followup_required=True`. Read the actual mail in Gmail,
 then confirm it yourself:
 
-    python scripts/stage15_application_tracker.py --database <db> transition 1 REJECTED --actor <you> --reason "Absage per E-Mail vom 2026-10-30, im Postfach geprüft" --apply
+    python scripts/stage15_application_tracker.py --database <db> transition 1 REJECTED --actor <you> --reason "Absage per E-Mail vom 2026-10-30, im Postfach geprüft" --occurred-at 2026-10-30T09:12:00+01:00 --apply
+
+(`--occurred-at`, Stage 22: the real time of the event, e.g. the mail's Date; UTC offset required, not in the future, not before the current status. Default: now.)
 
 Terminal statuses (OFFER, REJECTED, WITHDRAWN) always need `--actor` and a
 non-empty `--reason` and are recorded with origin OPERATOR.

@@ -23,7 +23,8 @@ Last update: 2026-10-30.
 | PR #18 Stage 21 cache | open, `stage21/vacancy-cache@4a3647c`, CI green, Codex ACCEPT, UI checked on a migrated copy |
 | PR #19 Stage 22 P0-3 repost guard | open, stacked on #18, `stage22/repost-guard@79e54e7`, CI green, Codex ACCEPT |
 | PR #20 Stage 22 P0-1/P0-2 | open, stacked on #19, `stage22/p0-ba-reference@f6dd8a2`; full local pytest 6876 passed / 138 skipped; Codex R7 ACCEPT |
-| Stage 22 P1 | branch `stage22/p1-geo-remote`, stacked on #20 (geography, remote, tiers, identity report, batch matcher) |
+| PR #21 Stage 22 P1 | open, stacked on #20, `stage22/p1-geo-remote@6365cd6`; full local pytest 7034 passed / 138 skipped; Codex R5 ACCEPT |
+| Stage 22 P2 + docs | branch `stage22/p2-operations`, stacked on #21 (`--occurred-at`, README/portfolio corrections) |
 
 Merge plan for #18/#19 (operator-approved strategy, not yet executed):
 merge commit for #18, then retarget #19 to `main` (verified locally: 11
@@ -77,10 +78,9 @@ token shapes, private keys): only a test fixture string. Tracked env files are
 
 ## Next steps (in order)
 
-1. P1: finish Codex review, full pytest, open the stacked PR.
-2. P2 (not started): `transition --occurred-at`, follow-up snooze, deadline-aware
-   follow-ups, XING salary label, "B2 in progress" in the profile.
-3. Documentation pass (README for recruiters, test numbers per SHA).
+1. P2 PR: Codex review, full pytest, open the stacked PR.
+2. Deferred (own approved stage): follow-up snooze / deadline-aware follow-ups
+   (needs a new event type on the append-only `application_events` table).
 4. Operator approvals: merge #18 -> #19 -> #20 -> P1 (merge commits, retarget
    each next PR to `main`); then ONE production window:
    backup -> `alembic upgrade head` (b6c1 -> c7e2 -> d5f1 -> e3b7) ->

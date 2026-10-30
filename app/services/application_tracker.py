@@ -369,10 +369,13 @@ class ApplicationTracker:
         source_reference: str | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        chronological: bool = False,
     ) -> EventOutcome:
         """Policy-validated status change; raises
         `InvalidApplicationTransitionError` for a transition not in the
-        table (including any exit from a terminal status)."""
+        table (including any exit from a terminal status). `chronological`
+        (Stage 22 P2, an operator-given `occurred_at`): refuse a time before
+        the current status was set."""
         return self._write(
             db,
             application_id,
@@ -387,6 +390,7 @@ class ApplicationTracker:
             source_reference=source_reference,
             reason=reason,
             metadata=metadata,
+            chronological=chronological,
         )
 
     def record_submission(self, db: Session, application_id: int, **kwargs: Any) -> EventOutcome:
@@ -406,6 +410,7 @@ class ApplicationTracker:
         occurred_at: datetime | None = None,
         correlation_key: str | None = None,
         metadata: dict[str, Any] | None = None,
+        chronological: bool = False,
     ) -> EventOutcome:
         """Operator correction OUTSIDE the transition table (e.g. leaving a
         terminal status). Always origin OPERATOR; requires an actor and a
@@ -425,6 +430,7 @@ class ApplicationTracker:
             correlation_key=correlation_key,
             reason=reason,
             metadata=metadata,
+            chronological=chronological,
         )
         if outcome.event_recorded:
             logger.info(
@@ -571,6 +577,7 @@ class ApplicationTracker:
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
         followup_required: bool = False,
+        chronological: bool = False,
     ) -> EventOutcome:
         actor_value = _require_text("actor", actor, MAX_ACTOR_LENGTH)
         record = repo.get_application(db, application_id)
@@ -598,6 +605,19 @@ class ApplicationTracker:
             _require_text("reason", reason, MAX_REASON_LENGTH)
 
         when = ensure_utc(occurred_at) if occurred_at else None
+        if (
+            chronological
+            and when is not None
+            and record.last_status_changed_at is not None
+            and when < ensure_utc(record.last_status_changed_at)
+        ):
+            # Stage 22 P2: checked on the row this write is version-bound to
+            # (the update below is a compare-and-swap on `version`), so a
+            # concurrent change can never let history run backwards.
+            raise ApplicationInputError(
+                "occurred_at lies before the current status was set "
+                f"({ensure_utc(record.last_status_changed_at).isoformat()})"
+            )
         now = _now()
         new_status = target if target is not None else current
         values: dict[str, Any] = {"updated_at": now}

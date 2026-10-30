@@ -154,6 +154,28 @@ needs `--snapshot`) runs the existing local, deterministic matcher for every
 vacancy without a current analysis (production copy: 2 118 of 2 888, ~10 min).
 Without it those vacancies stay `NEEDS_OPERATOR` (skills not evaluated).
 
+## P2 — operations
+
+Done:
+- `transition` / `override --occurred-at ISO8601` (real event time, e.g. the
+  employer mail's date; refused when in the future, without offset, or before
+  the current status).
+- Verified, no change needed: follow-up dates exist only for waiting statuses
+  (SUBMITTED / RECEIVED / UNDER_REVIEW) -- a REJECTED application never gets
+  one; nothing in the tracker sends a follow-up (`OUTBOUND_SENDING_ENABLED`
+  stays false); job-board salary estimates (XING) are already labelled
+  "job-board estimate, not stated by the employer" in the salary criterion.
+
+Deliberately NOT done (needs its own approved stage):
+- Snoozing a follow-up / a deadline-aware follow-up date: it needs a new
+  application event type, i.e. a CHECK change on the append-only
+  `application_events` table (SQLite table rebuild under its triggers) --
+  too risky to bundle. Until then: note the date in OFFENE_AKTIONEN and do
+  not follow up before the employer's deadline.
+- "German B2 in progress" in the profile: the confirmed level stays B1 (a
+  course is not a certificate); the operator may add it to the language's
+  `notes` -- no code reads it as B2.
+
 ## Rollout (needs separate approval)
 
 The new revision is applied by the same `alembic upgrade head` as Stage 21.
