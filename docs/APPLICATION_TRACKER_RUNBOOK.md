@@ -54,8 +54,17 @@ time) vs `recorded_at` (write time), `reason`, `summary`, `correlation`
 Read-only. `ALREADY_APPLIED` (exit 3): a STRONG signal (same job row, BA
 reference, posting URL, vacancy fingerprint, or same employer + role).
 `POSSIBLE_DUPLICATE`: identical full title at another company (agency
-mirror) — check by hand. `INFO` lines name other roles at the same employer,
-which are NOT duplicates. Rewritten mirror titles are not detected.
+mirror), or — Stage 22 — `SIMILAR_DESCRIPTION`: the task/requirement text
+shares enough distinctive terms with the job of an earlier application
+(renamed or re-published vacancy; the matched terms are printed below the
+finding) — check by hand. `INFO` lines name other roles at the same employer,
+which are NOT duplicates; a near-identical text at the same employer (a
+renamed posting) is raised to `POSSIBLE_DUPLICATE`. Applications without a
+job row, and vacancies without a description, get no text comparison.
+
+`record-submission` prints a finding whose only signal is
+`SIMILAR_DESCRIPTION` as `ADVISORY` and does **not** refuse because of it;
+every other STRONG/PROBABLE finding still needs `--confirm-distinct-from`.
 
 ## Record a manual submission
 

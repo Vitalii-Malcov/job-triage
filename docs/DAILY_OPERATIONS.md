@@ -269,7 +269,7 @@ mirror). Always run, for the job row you intend to apply to:
 | Verdict | Exit | Meaning |
 |---|---|---|
 | `ALREADY_APPLIED` | 3 | STRONG: same job row, BA reference, URL, fingerprint, or same employer + role. Do not apply. |
-| `POSSIBLE_DUPLICATE` | 0 | PROBABLE: identical full title at another company (typical anonymized agency mirror), or an agency posting in the same city whose title shares the distinctive words of an applied role. Check by hand. |
+| `POSSIBLE_DUPLICATE` | 0 | PROBABLE: identical full title at another company (typical anonymized agency mirror), an agency posting in the same city whose title shares the distinctive words of an applied role, or (Stage 22) `SIMILAR_DESCRIPTION`: the task/requirement text matches the job of an earlier application although title and reference differ (renamed / re-published vacancy, e.g. the ALD "Backend Developer" re-posted by N.O.C, Weber and FERCHAU). Check by hand; advisory only, never a block. |
 | `NO_DUPLICATE_FOUND` | 0 | No deterministic signal. INFO lines list other roles at the same employer (a different role is a legitimate application). |
 
 The second line, `CLASSIFICATION:`, grades how sure the match is:
