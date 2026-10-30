@@ -607,6 +607,7 @@ def _check_job(session: Session, args) -> int:
         fingerprint=job.fingerprint,
         location=job.location,
         description=job.description,
+        source_reference=job.source_reference,
     )
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
     findings = assess_vacancy(
@@ -719,7 +720,14 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         if job is None:
             raise ApplicationNotFoundError(f"job {args.job_id} does not exist")
         mismatches = job_association_mismatches(
-            VacancyView(job.id, job.source, job.company, job.title, job.url),
+            VacancyView(
+                job.id,
+                job.source,
+                job.company,
+                job.title,
+                job.url,
+                source_reference=job.source_reference,
+            ),
             company=args.company,
             role=args.role,
             source=source,
@@ -749,6 +757,7 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         url=job.url if job is not None else args.destination_url,
         fingerprint=None,
         description=job.description if job is not None else None,
+        source_reference=job.source_reference if job is not None else None,
     )
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
     findings = assess_vacancy(

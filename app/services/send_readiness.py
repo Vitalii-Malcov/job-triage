@@ -627,7 +627,10 @@ def _identity_matches_job(identity: VacancyIdentity, job: JobRecord) -> bool:
     return vacancy_identity_matches(
         identity,
         source=job.source,
-        reference_tokens=extract_reference_tokens(job.title, job.url),
+        # Stage 22 P0-1: the stored full reference too -- URL tokens miss a
+        # BA reference with "_"/"." and every posting with an external URL.
+        reference_tokens=extract_reference_tokens(job.title, job.url)
+        | ({job.source_reference} if job.source_reference else set()),
         fingerprint=job.fingerprint,
     )
 

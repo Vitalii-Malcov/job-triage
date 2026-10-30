@@ -87,6 +87,7 @@ def vacancy_findings(db: Session, job: JobRecord) -> list[DuplicateFinding]:
         job.fingerprint,
         job.location,
         job.description,
+        job.source_reference,
     )
     return assess_vacancy(view, applications, applied_job_descriptions(db, applications))
 

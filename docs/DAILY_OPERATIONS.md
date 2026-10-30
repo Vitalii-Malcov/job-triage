@@ -176,7 +176,7 @@ uvicorn, check the `startup_safety_state` line. See also
 
 | Source | How | Notes |
 |---|---|---|
-| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Keywords from `BUNDESAGENTUR_SEARCH_KEYWORDS`. With a stored candidate search configuration (section 5a) the place and radius come from it: the home postal code + city with a 150 km straight-line radius (a superset of everything within 100 km by car) plus a nationwide home-office search (`arbeitszeit=ho`), once per configured search term. Without one, `BUNDESAGENTUR_SEARCH_LOCATION/RADIUS_KM` as before. Re-runs update existing rows by fingerprint (no duplicates). |
+| Bundesagentur für Arbeit (Jobsuche API) | `POST /api/v1/collectors/bundesagentur/run` | Keywords from `BUNDESAGENTUR_SEARCH_KEYWORDS`. With a stored candidate search configuration (section 5a) the place and radius come from it: the home postal code + city with a 150 km straight-line radius (a superset of everything within 100 km by car) plus a nationwide home-office search (`arbeitszeit=ho`), once per configured search term. Without one, `BUNDESAGENTUR_SEARCH_LOCATION/RADIUS_KM` as before. Re-runs update existing rows by fingerprint (source, company, title, URL) -- the same BA posting seen under two URLs is still two rows (the backfill in 4a reports them). |
 | XING job-alert e-mails | `POST /api/v1/collectors/xing/run` | Reads the `XING_MAILBOX_*` inbox read-only, only sender `jobs@mail.xing.com`. Tracking links are stored, **never opened**. |
 
 ```powershell
@@ -188,6 +188,37 @@ Invoke-RestMethod -Method Post -Headers $h http://127.0.0.1:8000/api/v1/collecto
 **Not supported (no collector exists):** LinkedIn, Indeed, StepStone,
 Jobriver, company career pages. Vacancies found there by hand can still be
 applied to and *tracked* (section 8).
+
+### 4a. BA reference and liveness (Stage 22 P0-1 / P0-2)
+
+Every Bundesagentur row keeps the BA's own `referenznummer` in
+`jobs.source_reference` (also when the posting links to the employer's own
+site, and for references with `_`, `.` or `/`). Rows collected before
+Stage 22 are filled once from their BA URL (rows with an employer URL are
+filled by the next collection run):
+
+```powershell
+# dry run: counts, plus references stored on more than one row (reported, not merged)
+.\.venv\Scripts\python.exe scripts\backfill_source_reference.py --database runtime/job_triage_runtime.db
+# write (production needs a verified backup snapshot; never overwrites a stored reference)
+.\.venv\Scripts\python.exe scripts\backfill_source_reference.py --database runtime/job_triage_runtime.db `
+  --apply --snapshot "$env:USERPROFILE\JobTriage-Backups"
+```
+
+Is a posting still online? Read-only, one request per second, nothing is
+written to the database:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\ba_liveness.py --database runtime/job_triage_runtime.db --job-id 144 --plan
+.\.venv\Scripts\python.exe scripts\ba_liveness.py --database runtime/job_triage_runtime.db --limit 50 `
+  --output "$env:USERPROFILE\JobTriage-Backups\liveness.jsonl"
+```
+
+States: `ACTIVE`, `CLOSED` (404 for a full, valid BA reference only),
+`INVALID_REFERENCE` (no or truncated reference -- never requested),
+`SOURCE_ERROR` (429/5xx/timeout/network/rejected key -- says nothing about
+the posting; a re-run with the same `--output` retries only these),
+`UNKNOWN`. A CLOSED result is a hint to check by hand, not a status change.
 
 ## 5. Matching and shortlist
 

@@ -49,6 +49,7 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "first_seen_at",
         "last_seen_at",
         "posting_type",  # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type")
+        "source_reference",  # Stage 22 P0-1 (d5f1a7c3e9b2)
     }
 
     profile_columns = {col["name"] for col in inspector.get_columns("user_profiles")}
@@ -3224,6 +3225,7 @@ def test_alembic_has_exactly_one_head() -> None:
     # the Stage 15 remediation c8e4a2f6d1b9), then OUTBOUND_MESSAGE application
     # events (f4b8d2a6c9e1), then the Stage 17 candidate search configuration
     # (a9d3f6b2c4e8), then search targets + car-route origin (b6c1e9a4d2f7),
-    # then the Stage 21 vacancy assessment cache (c7e2a9d4f1b3)
+    # then the Stage 21 vacancy assessment cache (c7e2a9d4f1b3), then
+    # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "c7e2a9d4f1b3"
+    assert heads[0] == "d5f1a7c3e9b2"

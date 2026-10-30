@@ -34,7 +34,13 @@ from app.models.telegram_operator import OperatorDecision, TelegramDeliveryState
 
 class JobRecord(Base):
     __tablename__ = "jobs"
-    __table_args__ = (UniqueConstraint("fingerprint", name="uq_jobs_fingerprint"),)
+    __table_args__ = (
+        UniqueConstraint("fingerprint", name="uq_jobs_fingerprint"),
+        # Stage 22 P0-1: lookup by the source's own reference. Not unique:
+        # before the fingerprint moves to (source, source_reference), one BA
+        # posting can still exist as several rows (different URLs).
+        Index("ix_jobs_source_source_reference", "source", "source_reference"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -58,6 +64,11 @@ class JobRecord(Base):
     # (only overwritten by a non-None value, exactly like `description`)
     # and app.agents.posting_classifier.
     posting_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Stage 22 P0-1: the source's own reference (BA `referenznummer`), as
+    # sent by the source or derived from a BA job URL by the backfill. Set
+    # once and never blanked or replaced by a later observation (see
+    # app/db/repositories.py::_apply_job_update_fields).
+    source_reference: Mapped[str | None] = mapped_column(String(64), nullable=True)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)

@@ -70,6 +70,7 @@ from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.agents.description_similarity import DescriptionSimilarity, compare_descriptions
+from app.collectors.ba_reference import ba_reference_from_url
 from app.models.application_lifecycle import Application
 from app.services.application_correlation import role_phrase
 from app.services.email_matching import normalize_company_name
@@ -93,7 +94,6 @@ SAME_EMPLOYER_MIN_SHARED = 8
 SAME_EMPLOYER_MIN_OVERLAP = 0.9
 SAME_EMPLOYER_MIN_COVERAGE_OF_LARGER = 0.75
 
-_BA_DETAIL = re.compile(r"/jobsuche/jobdetail/([^/?#]+)", re.IGNORECASE)
 _STRONG = ("SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT", "SAME_EMPLOYER_AND_ROLE")
 # Query parameters that only track a click, never identify a vacancy
 # (compared case-insensitively; plus every `utm_*`). Anything else -- e.g.
@@ -114,6 +114,16 @@ class VacancyView:
     fingerprint: str | None = None
     location: str | None = None
     description: str | None = None
+    # Stage 22 P0-1: the job row's stored full reference; preferred over the
+    # one derivable from a BA URL (absent for an external employer URL).
+    source_reference: str | None = None
+
+
+def vacancy_reference(vacancy: VacancyView) -> str | None:
+    """Case-folded BA reference of the vacancy: the stored one, else the one
+    in its BA URL."""
+    stored = (vacancy.source_reference or "").strip().casefold()
+    return stored or bundesagentur_reference(vacancy.url)
 
 
 @dataclass(frozen=True)
@@ -159,8 +169,11 @@ def normalize_posting_url(url: str | None) -> str | None:
 
 
 def bundesagentur_reference(url: str | None) -> str | None:
-    match = _BA_DETAIL.search(url or "")
-    return match.group(1).casefold() if match else None
+    """Case-folded full BA reference of a public BA job URL, else None.
+    Stage 22 P0-1: the whole reference, also with "_", "." or "/" (the old
+    path-segment regex cut "13319-896770/1_626382LS-S" at the "/")."""
+    reference = ba_reference_from_url(url)
+    return reference.casefold() if reference else None
 
 
 def _title(value: str) -> str:
@@ -250,7 +263,7 @@ def assess_vacancy(
     role = role_phrase(vacancy.title)
     title = _title(vacancy.title)
     url = normalize_posting_url(vacancy.url)
-    ba_ref = bundesagentur_reference(vacancy.url)
+    ba_ref = vacancy_reference(vacancy)
     findings: list[DuplicateFinding] = []
     for app in applications:
         signals: list[str] = []
@@ -347,8 +360,8 @@ def job_association_mismatches(
     consistent). Conservative: normalized company AND role must match (legal
     form, case, punctuation and gender suffix ignored -- an empty
     normalization never matches), the source must be the job's source, and
-    a Bundesagentur reference derivable from the job's URL (or from a BA
-    destination URL) must equal the submission reference."""
+    a Bundesagentur reference stored on the job or derivable from its URL
+    (or from a BA destination URL) must equal the submission reference."""
     mismatches: list[str] = []
     job_company = normalize_company_name(job.company)
     if not job_company or job_company != normalize_company_name(company):
@@ -358,7 +371,7 @@ def job_association_mismatches(
         mismatches.append("ROLE")
     if job.source.strip().casefold() != source.strip().casefold():
         mismatches.append("SOURCE")
-    job_reference = bundesagentur_reference(job.url)
+    job_reference = vacancy_reference(job)
     if job_reference is not None and job_reference != reference.casefold():
         mismatches.append("REFERENCE")
     destination_reference = bundesagentur_reference(destination_url)
