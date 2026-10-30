@@ -53,10 +53,11 @@ _HEADING = re.compile(
 )
 _ROLE_HEADING = re.compile(
     # Candidate-side "bring" phrasings only, modifiers allowed ("Das bringen Sie
-    # (idealerweise / dafuer) mit", "Was du mitbringst", "Du bringst ...");
-    # "Was wir Ihnen bringen" is a benefit list (see _OTHER_HEADING).
+    # (idealerweise / dafuer) mit", "Was du mitbringst", "Du bringst ..."). The
+    # separable "mit" must END the heading: "So bringen Sie Ihre Karriere mit uns
+    # voran" and "Was wir Ihnen bringen" are benefit lists (see _OTHER_HEADING).
     r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|mitbring|"
-    r"bringen\s+sie\b[^:?\n]{0,30}?\bmit\b|bringst\s+du\b[^:?\n]{0,30}?\bmit\b|"
+    r"bringen\s+sie\b[^\n]{0,30}?\bmit\W*$|bringst\s+du\b[^\n]{0,30}?\bmit\W*$|"
     r"du\s+bringst|sie\s+bringen|anforderung|voraussetz|"
     r"qualifikation|skills|kenntnis|role|responsib|requirement|what you|was du|"
     r"was sie|mission|das machst|dein job|wofuer"

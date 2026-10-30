@@ -620,6 +620,9 @@ def test_employer_benefit_heading_with_bringen_is_not_a_role_section():
     )
     role = role_section_text(text)
     assert "kundendaten" in role and "jobrad" not in role and "sabbatical" not in role
+    career = text.replace("Was wir Ihnen bringen:", "So bringen Sie Ihre Karriere mit uns voran:")
+    role = role_section_text(career)
+    assert "kundendaten" in role and "jobrad" not in role
     for heading in (
         "Das bringen Sie mit:",
         "Das bringen Sie idealerweise mit:",
