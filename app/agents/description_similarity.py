@@ -52,8 +52,9 @@ _HEADING = re.compile(
     re.MULTILINE,
 )
 _ROLE_HEADING = re.compile(
-    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|mitbring|anforderung|"
-    r"qualifikation|bringst|skills|kenntnis|role|responsib|requirement|what you|was du|"
+    # "bring" covers "Das bringen Sie mit", "Was du mitbringst", "Du bringst ..."
+    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|bring|anforderung|voraussetz|"
+    r"qualifikation|skills|kenntnis|role|responsib|requirement|what you|was du|"
     r"was sie|mission|das machst|dein job|wofuer"
 )
 _OTHER_HEADING = re.compile(
@@ -129,8 +130,9 @@ def distinctive_stems(description: str | None) -> frozenset[str]:
 @dataclass(frozen=True)
 class DescriptionSimilarity:
     shared: int
-    overlap: float
+    overlap: float  # shared / the SMALLER set (a repost may add or drop lines)
     terms: tuple[str, ...]
+    coverage_of_larger: float = 0.0  # shared / the LARGER set
 
     @property
     def similar(self) -> bool:
@@ -152,4 +154,5 @@ def compare_descriptions(a: str | None, b: str | None) -> DescriptionSimilarity 
         shared=len(shared),
         overlap=round(len(shared) / min(len(left), len(right)), 2),
         terms=tuple(sorted(shared)[:MAX_REPORTED_TERMS]),
+        coverage_of_larger=round(len(shared) / max(len(left), len(right)), 2),
     )

@@ -65,7 +65,7 @@ application after a rejection is exactly what the operator must notice.
 
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -84,10 +84,14 @@ DuplicateClass = Literal[
 ]
 _EXACT = frozenset({"SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT"})
 SIMILAR_DESCRIPTION = "SIMILAR_DESCRIPTION"
-# Same employer: its postings share boilerplate and contact names, so only a
-# near-identical task/requirement text counts (renamed posting, not a sister role).
+# Same employer: its postings share boilerplate, contact names and often a
+# specialist requirement profile, so only a near-identical task/requirement text
+# counts (a renamed posting, not a sister role): enough shared terms, the smaller
+# text almost fully covered AND most of the larger one too (Codex review: a
+# shared profile of 9 terms against an 18-term sister role is not a rename).
 SAME_EMPLOYER_MIN_SHARED = 8
 SAME_EMPLOYER_MIN_OVERLAP = 0.9
+SAME_EMPLOYER_MIN_COVERAGE_OF_LARGER = 0.75
 
 _BA_DETAIL = re.compile(r"/jobsuche/jobdetail/([^/?#]+)", re.IGNORECASE)
 _STRONG = ("SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT", "SAME_EMPLOYER_AND_ROLE")
@@ -226,6 +230,7 @@ def _description_match(
         strict = (
             similarity.shared >= SAME_EMPLOYER_MIN_SHARED
             and similarity.overlap >= SAME_EMPLOYER_MIN_OVERLAP
+            and similarity.coverage_of_larger >= SAME_EMPLOYER_MIN_COVERAGE_OF_LARGER
         )
         return similarity if strict else None
     return similarity if similarity.similar else None
@@ -303,6 +308,30 @@ def assess_vacancy(
         )
     order = {"STRONG": 0, "PROBABLE": 1, "INFO": 2}
     return sorted(findings, key=lambda f: (order[f.strength], f.application_id))
+
+
+_STRENGTH_ORDER = {"STRONG": 0, "PROBABLE": 1, "INFO": 2}
+
+
+def merge_findings(*groups: Iterable[DuplicateFinding]) -> list[DuplicateFinding]:
+    """One finding per application: the strongest strength, every signal of
+    every group (first-seen order) and the first non-empty detail. A weaker
+    finding of one check never hides a stronger one of another (Codex Stage 22
+    review: an advisory text finding must not mask a STRONG SAME_URL)."""
+    merged: dict[int, DuplicateFinding] = {}
+    for finding in (f for group in groups for f in group):
+        current = merged.get(finding.application_id)
+        if current is None:
+            merged[finding.application_id] = finding
+            continue
+        strongest = min((current, finding), key=lambda f: _STRENGTH_ORDER[f.strength])
+        signals = tuple(dict.fromkeys(current.signals + finding.signals))
+        merged[finding.application_id] = replace(
+            strongest,
+            signals=signals,
+            detail=current.detail or finding.detail,
+        )
+    return sorted(merged.values(), key=lambda f: (_STRENGTH_ORDER[f.strength], f.application_id))
 
 
 def job_association_mismatches(

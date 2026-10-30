@@ -574,3 +574,78 @@ def test_applied_jobs_hash_is_stable_without_applications(db):
     _job(db, 1, "X GmbH", "Y", "z")
     db.commit()
     assert fit_cache.applied_jobs_hash(db) == fit_cache.applied_jobs_hash(db)
+
+
+# --- Codex review round 1 ------------------------------------------------------------
+
+GENERIC_DUTIES = (
+    "Ihre Aufgaben:\n- Mitarbeit im Team, Abstimmung mit Fachbereichen, Dokumentation\n"
+)
+REQUIREMENTS_ONLY = (
+    GENERIC_DUTIES + "Das bringen Sie mit:\n"
+    "- Erfahrung mit Modbus, Profinet, Siemens TIA, WinCC, Zenon, Kepware und Ignition\n"
+)
+
+
+def test_requirements_under_das_bringen_sie_mit_are_compared():
+    assert "zenon" in role_section_text(REQUIREMENTS_ONLY)
+    similarity = compare_descriptions(REQUIREMENTS_ONLY, REQUIREMENTS_ONLY)
+    assert similarity is not None and similarity.similar
+    assert {"kepwar", "zenon", "wincc"} <= set(similarity.terms)
+
+
+NL = chr(10)
+SHARED_PROFILE = (
+    "Ihr Profil:" + NL + "- Erfahrung mit Codesys, Beckhoff, TwinCAT, Hilscher, Kepware, Zenon, "
+    "Ignition, WinCC und Profinet" + NL
+)
+SISTER_ROLE_WITH_SHARED_PROFILE = (
+    "Ihre Aufgaben:" + NL + "- Planung von Rechenzentrumsumzügen, Verkabelung, Klimatisierung, "
+    "Brandschutz, USV-Anlagen, Racks, Glasfaser, Patchfelder und Stromverteilung"
+    + NL
+    + SHARED_PROFILE
+)
+
+
+def test_same_employer_shared_profile_is_not_a_rename():
+    similarity = compare_descriptions(SHARED_PROFILE, SISTER_ROLE_WITH_SHARED_PROFILE)
+    assert similarity is not None and similarity.overlap >= 0.9
+    assert similarity.coverage_of_larger < 0.75
+    applied = _application(30, "Beispiel Cloud GmbH", "Platform Engineer", job_id=1)
+    vacancy = _view("Beispiel Cloud GmbH", "Data Center Planner", SISTER_ROLE_WITH_SHARED_PROFILE)
+    findings = assess_vacancy(vacancy, [applied], {30: SHARED_PROFILE})
+    assert [f.signals for f in findings] == [("SAME_EMPLOYER_OTHER_ROLE",)]
+
+
+def test_merge_findings_keeps_the_strongest_and_all_signals():
+    from app.services.application_duplicates import DuplicateFinding, merge_findings
+
+    advisory = DuplicateFinding(1, "PROBABLE", (SIMILAR_DESCRIPTION,), "A", "R", "SUBMITTED", "d")
+    strong = DuplicateFinding(1, "STRONG", ("SAME_URL",), "A", "R", "SUBMITTED")
+    other = DuplicateFinding(2, "INFO", ("SAME_EMPLOYER_OTHER_ROLE",), "B", "S", "SUBMITTED")
+    (first, second) = merge_findings([advisory, other], [strong])
+    assert first.application_id == 1 and first.strength == "STRONG"
+    assert first.signals == (SIMILAR_DESCRIPTION, "SAME_URL") and not first.advisory_only
+    assert second == other
+
+
+def test_record_submission_advisory_never_masks_a_strong_destination_url(tmp_path, capsys):
+    path, _ = _migrated(tmp_path)
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE applications SET destination_url = 'https://jobs.example.invalid/ald-1'")
+        )
+    engine.dispose()
+    code = _record(
+        path,
+        144,
+        "Weber GmbH",
+        "Backend Developer (all genders) 25185",
+        "10001-144-S",
+        "--destination-url",
+        "https://jobs.example.invalid/ald-1",
+    )
+    captured = capsys.readouterr()
+    assert code == 3 and "REFUSED" in captured.err
+    assert "STRONG: application 1" in captured.out and "SAME_URL" in captured.out

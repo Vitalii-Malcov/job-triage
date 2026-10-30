@@ -706,6 +706,7 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         VacancyView,
         assess_vacancy,
         job_association_mismatches,
+        merge_findings,
     )
     from app.services.application_guard import applied_job_descriptions
 
@@ -754,13 +755,10 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         vacancy, applications, applied_job_descriptions(session, applications)
     )
     if args.destination_url and job is not None:
-        findings += [
-            f
-            for f in assess_vacancy(
-                VacancyView(None, source, "", "", args.destination_url), applications
-            )
-            if f.application_id not in {g.application_id for g in findings}
-        ]
+        findings = merge_findings(
+            findings,
+            assess_vacancy(VacancyView(None, source, "", "", args.destination_url), applications),
+        )
     for f in findings:
         label = "ADVISORY" if f.advisory_only else f.strength
         print(
