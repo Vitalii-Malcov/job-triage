@@ -234,7 +234,13 @@ def latest_match_keys(session: Session, job_ids: Sequence[int] | None) -> dict[i
         .where(*_in(CandidateJobMatchRecord.job_id, job_ids))
         .order_by(CandidateJobMatchRecord.job_id, CandidateJobMatchRecord.id)
     ).all()
-    return {job_id: f"{match_id}:{fp}:{version}" for job_id, match_id, fp, version in rows}
+    # Stage 22 P1 (Codex): EVERY analysis row of the job, not only the newest:
+    # assess_job reads the row of the current identity, which need not be the
+    # newest (posting A -> B -> A; concurrent inserts committing out of id order).
+    keys: dict[int, list[str]] = {}
+    for job_id, match_id, fp, version in rows:
+        keys.setdefault(job_id, []).append(f"{match_id}:{fp}:{version}")
+    return {job_id: ";".join(parts) for job_id, parts in keys.items()}
 
 
 def latest_commute_keys(session: Session, job_ids: Sequence[int] | None) -> dict[int, str]:

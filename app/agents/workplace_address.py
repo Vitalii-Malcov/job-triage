@@ -164,3 +164,61 @@ def best_workplace(
         return workplaces[0]
     unlabelled = [a for a in addresses if a.kind == "UNLABELLED" and in_city(a)]
     return unlabelled[0] if len(unlabelled) == 1 else None
+
+
+# Stage 22 P1: a workplace town the posting names in prose, without a street
+# address ("Standort Bruchsal", "Einsatzort: Mainz", "ausschließlich in
+# Hannover"). Only a hint that the BA location may be a head office.
+_STATED_TOWN = re.compile(
+    r"(?i:arbeitsort|einsatzort|dienstort|standort|ausschlie(?:ß|ss)lich\s+in)\b"
+    r"\s*:?\s*(?i:in\s+|ist\s+|am\s+)?(?P<rest>[^\n;]{0,90})"
+)
+_TOWN_NAME = r"((?:Bad |Neu-|Sankt |St\. )?[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ][a-zäöüß]+)?)"
+# "60311 Frankfurt" anywhere in the statement wins (a street may come first)
+_POSTCODE_TOWN = re.compile(r"\b\d{5}\s+" + _TOWN_NAME)
+_LEADING_TOWN = re.compile(_TOWN_NAME)
+_NOT_A_TOWN = frozenset(
+    {
+        "deutschland",
+        "germany",
+        "hessen",
+        "remote",
+        "homeoffice",
+        "home",
+        "unser",
+        "unsere",
+        "unseren",
+        "unserem",
+        "der",
+        "die",
+        "das",
+        "dem",
+        "den",
+        "nach",
+        "vereinbarung",
+        "rhein",  # "Rhein-Main", "Rhein-Neckar": regions, not towns
+        "ruhrgebiet",
+        "region",
+    }
+)
+
+
+def stated_workplace_towns(text: str) -> set[str]:
+    """City keys of workplace towns named in prose (see `_STATED_TOWN`)."""
+    towns = set()
+    for match in _STATED_TOWN.finditer(text or ""):
+        rest = match.group("rest")
+        town = _POSTCODE_TOWN.search(rest)
+        if town is None:
+            town = _LEADING_TOWN.match(rest)
+            # a street with its house number ("Hauptstraße 5"), not a town --
+            # but "Heidelberg"/"Bamberg" alone are towns (Codex P1 round 2)
+            if town is None or re.match(r"\s*\d", rest[town.end() :]):
+                continue
+        name = town.group(1)
+        if re.split(r"[ -]", name)[0].casefold() in _NOT_A_TOWN:
+            continue
+        key = city_key(name)
+        if key:
+            towns.add(key)
+    return towns

@@ -113,6 +113,8 @@ _DESCRIPTIVE: tuple[tuple[re.Pattern[str], Cefr], ...] = (
     (re.compile(r"\bgut(?:e|en)?\b|\bgood\b|solide", re.IGNORECASE), "B2"),
     (re.compile(r"grundkenntnisse|basic|grundlegend", re.IGNORECASE), "A2"),
 )
+# The first entries of _DESCRIPTIVE are fluency/native wording (Stage 22 P1).
+_STRONG_DESCRIPTORS = 2
 _OPTIONAL = re.compile(
     r"wünschenswert|wuenschenswert|von\s+vorteil|idealerweise|nice\s+to\s+have|ein\s+plus"
     r"|optional|gerne|bevorzugt|preferred",
@@ -135,6 +137,10 @@ class LanguageRequirement:
     # level or certificate; the C1 read from it is an interpretation
     # (INFERRED_REQUIREMENT), unlike a stated "C1" (EXPLICIT_REQUIREMENT).
     basis: RequirementBasis = "UNKNOWN"
+    # Stage 22 P1: the selected requirement is worded as fluency / native
+    # ("verhandlungssicher", "fließend", "Muttersprache") or states a C
+    # level -- unlike "sehr gute", which reads as C1 but is only an inference.
+    strong: bool = False
 
 
 _CLAUSE_BREAK = re.compile(r"\.\s|\n|;|•")
@@ -249,14 +255,15 @@ def _clause_bounds(text: str, match: re.Match[str]) -> tuple[int, int]:
 
 def _nearest_descriptor(
     text: str, mention: re.Match[str], clause_start: int, clause_end: int
-) -> Cefr | None:
+) -> tuple[Cefr, bool] | None:
     """The descriptive level word closest to the German mention (before or
     after it, same clause); on equal distance the longer phrase wins, so
     "sehr gute" beats its own "gute"."""
     lo = max(clause_start, mention.start() - 30)
     hi = min(clause_end, mention.end() + 25)
-    best: tuple[int, int, Cefr] | None = None
-    for pattern, value in _DESCRIPTIVE:
+    best: tuple[int, int, Cefr, bool] | None = None
+    for index, (pattern, value) in enumerate(_DESCRIPTIVE):
+        strong = index < _STRONG_DESCRIPTORS
         for match in pattern.finditer(text, lo, hi):
             if match.end() <= mention.start():
                 distance = mention.start() - match.end()
@@ -264,10 +271,10 @@ def _nearest_descriptor(
                 distance = match.start() - mention.end()
             else:
                 distance = 0
-            key = (distance, -(match.end() - match.start()), value)
+            key = (distance, -(match.end() - match.start()), value, strong)
             if best is None or key[:2] < best[:2]:
                 best = key
-    return best[2] if best else None
+    return (best[2], best[3]) if best else None
 
 
 def extract_german_requirement(text: str) -> LanguageRequirement:
@@ -288,7 +295,7 @@ def extract_german_requirement(text: str) -> LanguageRequirement:
         # "Deutsch C1 wünschenswert, B2 zwingend erforderlich" states a
         # mandatory B2). A level before the mention counts only in the
         # mention's own part ("C1 Deutsch", not "Englisch C1, Deutsch").
-        levels: list[tuple[Cefr, bool, bool]] = []
+        levels: list[tuple[Cefr, bool, bool, bool]] = []
         previous: re.Match[str] | None = None
         for cefr in _CEFR.finditer(text, lo, min(hi, mention.end() + _LEVEL_REACH)):
             index = _part_index(parts, cefr.start())
@@ -301,31 +308,47 @@ def extract_german_requirement(text: str) -> LanguageRequirement:
                 text, previous.end(), cefr.start()
             ):
                 # Same statement: keep the lower level of the alternatives.
-                last_level, last_mandatory, _ = levels[-1]
-                levels[-1] = (min(last_level, level, key=order.__getitem__), last_mandatory, True)
+                last_level, last_mandatory, _, _ = levels[-1]
+                lower = min(last_level, level, key=order.__getitem__)
+                levels[-1] = (lower, last_mandatory, True, lower in ("C1", "C2"))
                 previous = cefr
                 continue
-            levels.append((level, not _part_optional(text, parts, index), True))
+            levels.append(
+                (level, not _part_optional(text, parts, index), True, level in ("C1", "C2"))
+            )
             previous = cefr
         if not levels:
             descriptor = _nearest_descriptor(text, mention, clause_start, clause_end)
             if descriptor is not None:
-                levels.append((descriptor, not _part_optional(text, parts, own), False))
-        for level, mandatory, explicit in levels:
+                value, strong = descriptor
+                levels.append((value, not _part_optional(text, parts, own), False, strong))
+        for level, mandatory, explicit, strong in levels:
             # A mandatory level beats any optional one (Codex round 6), then
             # the higher level; an explicit level beats the same inferred.
-            candidate = (1 if mandatory else 0, order[level], 1 if explicit else 0, level, evidence)
-            if best is None or candidate[:3] > best[:3]:
+            candidate = (
+                1 if mandatory else 0,
+                order[level],
+                1 if explicit else 0,
+                # Stage 22 P1 (Codex): on an otherwise equal requirement the
+                # fluency wording wins, independent of sentence order.
+                1 if strong else 0,
+                level,
+                evidence,
+                strong,
+            )
+            if best is None or candidate[:4] > best[:4]:
                 best = candidate
     if best is None:
         return LanguageRequirement(level=None, mandatory=None)
-    mandatory_rank, _, explicit, level, evidence = best
+    mandatory_rank, _, explicit, _, level, evidence, strong = best
     mandatory = bool(mandatory_rank)
     if not mandatory:
         basis: RequirementBasis = "PREFERRED_REQUIREMENT"
     else:
         basis = "EXPLICIT_REQUIREMENT" if explicit else "INFERRED_REQUIREMENT"
-    return LanguageRequirement(level=level, mandatory=mandatory, evidence=evidence, basis=basis)
+    return LanguageRequirement(
+        level=level, mandatory=mandatory, evidence=evidence, basis=basis, strong=strong
+    )
 
 
 # --- salary ------------------------------------------------------------------

@@ -105,7 +105,9 @@ place inside `home_city`; no German municipality extends 50 km from its
 centre, so the superset holds as long as the operator-confirmed origin
 really lies in that place. The coordinates themselves are not
 cross-checked (that would need geocoding the home place)) and, if remote work across Germany is configured, a nationwide
-home-office search (`arbeitszeit=ho`, 5 pages). With `search_keywords`
+home-office search (Stage 22 P1: nationwide, keeping only postings whose BA flag
+`homeofficemoeglich` is true, 10 pages -- the former `arbeitszeit=ho` filter
+returns 0 results on the v6 API without an error). With `search_keywords`
 configured (at most 6) each term gets its own commute and remote search;
 otherwise `BUNDESAGENTUR_SEARCH_KEYWORDS` is the single term (configured
 terms are also used with the legacy place/radius). The first search fails

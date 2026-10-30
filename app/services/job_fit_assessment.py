@@ -9,11 +9,16 @@ good result elsewhere:
 - language compares the posting's German requirement with the candidate's
   confirmed level (a mandatory C1 with a confirmed B1 is a MAJOR_GAP);
 - location / commute is PASS or FAIL only from a stored car-route check
-  (`job_commute_checks`); a known workplace without one is
-  DISTANCE_UNVERIFIED, an unknown workplace is UNKNOWN -- never a guess, and
-  a straight-line estimate is never treated as the car route;
+  (`job_commute_checks`). Without one, Stage 22 P1 estimates from the BA
+  coordinates (ESTIMATE_WITHIN / ESTIMATE_NEAR_LIMIT / ESTIMATE_BEYOND, or
+  LOCATION_UNVERIFIED when the workplace is doubtful); without coordinates a
+  known workplace is DISTANCE_UNVERIFIED, an unknown one UNKNOWN. An
+  estimate ranks the vacancy (tier) but is never the car route: the
+  decision stays NEEDS_VERIFICATION until a route is checked;
 - remote compatibility needs a confirmed fully-remote posting that does not
-  exclude the candidate's region ("bis zu 100%" is not confirmed);
+  exclude the candidate's region ("bis zu 100%" is not confirmed); the BA's
+  own home-office flag only fills in a posting text that says nothing
+  (Stage 22 P1);
 - salary, entry level and start date are informational, never blocking;
 - duplicate risk reuses the Stage 15 tracker check (ALREADY_APPLIED blocks).
 
@@ -28,6 +33,8 @@ from typing import Literal
 
 from sqlalchemy.orm import Session
 
+from app.agents.candidate_job_matcher import ALGORITHM_VERSION as MATCHER_VERSION
+from app.agents.geo_estimate import commutable_state, estimate_commute, state_key
 from app.agents.job_fit_signals import (
     asks_immediate_start,
     classify_remote,
@@ -35,15 +42,20 @@ from app.agents.job_fit_signals import (
     extract_german_requirement,
     extract_salary,
 )
+from app.agents.role_relevance_classifier import classify_title_relevance
+from app.agents.seniority_classifier import classify_title_seniority
 from app.agents.workplace_address import (
     WorkplaceAddress,
     address_words,
     best_workplace,
     city_key,
     city_qualifiers,
+    extract_addresses,
+    stated_workplace_towns,
 )
 from app.db.candidate_job_match_repository import (
     compute_job_snapshot_fingerprint,
+    get_cached_match,
     get_latest_match,
     to_candidate_job_match,
 )
@@ -63,7 +75,10 @@ Decision = Literal["BLOCKED", "NEEDS_VERIFICATION", "CANDIDATE"]
 # already applied); the tier also weighs language, experience, skills, role
 # and salary so an operator sees which vacancies are worth the time. It
 # never blocks anything and is never an instruction to apply.
-FitTier = Literal["NOT_SUITABLE", "NEEDS_OPERATOR", "PARTIAL_MATCH", "GOOD_MATCH"]
+# Stage 22 P1 adds STRETCH ("worth trying despite a stated gap"). The names
+# map to the operator vocabulary: NOT_SUITABLE = unsuitable, NEEDS_OPERATOR =
+# needs verification (data missing), STRETCH, PARTIAL_MATCH, GOOD_MATCH.
+FitTier = Literal["NOT_SUITABLE", "NEEDS_OPERATOR", "STRETCH", "PARTIAL_MATCH", "GOOD_MATCH"]
 
 _LEVEL = {"UNKNOWN": 0, "A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
 
@@ -79,6 +94,44 @@ _BLOCKING = {
 APPROXIMATE_MARGIN_KM = 15
 NEAR_LIMIT_KM = 5
 
+# Stage 22 P1: verifications that still allow a GOOD/PARTIAL tier. The tier is
+# a preliminary ranking (A); the car route stays a pre-Bewerbung check (B):
+# `decision` keeps every one of them NEEDS_VERIFICATION.
+_TIER_ACCEPTS = {
+    ("location", "ESTIMATE_WITHIN"),
+    ("location", "PASS_APPROXIMATE"),
+}
+# Stage 22 P1: a straight line beyond the car-route limit is a lower bound
+# of the route -- the vacancy is out of reach (its workplace was not doubted).
+_TIER_BARRIERS = {
+    ("location", "ESTIMATE_BEYOND"),
+    # Stage 22 P1: an explicitly unrelated profession or a senior title is
+    # never a fit for the junior target, however many skills match.
+    ("role", "OFF_ROLE"),
+    ("entry_level", "SENIOR_TITLE"),
+    ("posting_type", "SELF_EMPLOYMENT"),
+    ("posting_type", "APPRENTICESHIP"),
+}
+# Stage 22 P1: a stated gap the candidate may still try (STRETCH).
+_STRETCH = {
+    ("language", "MAJOR_GAP"),
+    ("language", "GAP"),
+    ("language", "GAP_TO_VERIFY"),
+    ("experience", "GAP"),
+    ("entry_level", "EXPERIENCED"),
+    ("education", "IT_DEGREE_REQUIRED"),
+    ("entry_level", "STUDENT_JOB"),
+    ("skills", "WEAK"),
+}
+_WEAKER = {
+    ("skills", "PARTIAL"),
+    ("role", "OTHER"),
+    ("experience", "PARTIAL"),
+    ("language", "MINOR_GAP"),
+    ("salary", "BELOW"),
+    ("entry_level", "MIXED"),
+}
+
 _VERIFY = {
     ("location", "DISTANCE_UNVERIFIED"),
     ("location", "APPROXIMATE_NEAR_LIMIT"),
@@ -87,6 +140,13 @@ _VERIFY = {
     ("location", "PASS_APPROXIMATE"),
     ("location", "UNKNOWN"),
     ("location", "NOT_CONFIGURED"),
+    # Stage 22 P1: a coordinate estimate is never the car route -- the
+    # decision (pre-Bewerbung check) stays NEEDS_VERIFICATION for all of them.
+    ("location", "ESTIMATE_WITHIN"),
+    ("location", "ESTIMATE_NEAR_LIMIT"),
+    ("location", "ESTIMATE_BEYOND"),
+    ("location", "ESTIMATE_BEYOND_RELOCATION"),
+    ("location", "LOCATION_UNVERIFIED"),
     ("duplicate", "POSSIBLE_DUPLICATE"),
     ("skills", "NOT_EVALUATED"),
 }
@@ -117,6 +177,11 @@ class FitAssessment:
     # profile. "N Jahre" wording alone, UNKNOWN, a confirmed match or an
     # out-of-date analysis go to the operator instead.
     experience_missing_in_profile: bool = False
+    # Stage 22 P1: "verhandlungssicher" / "fließend" / "Muttersprache" (or a
+    # CEFR C level) stated as mandatory is as clear as an explicit level.
+    german_requirement_strong: bool = False
+    # The largest "N Jahre Erfahrung" the posting states.
+    required_years: int | None = None
 
     def criterion(self, name: str) -> Criterion:
         return next(c for c in self.criteria if c.name == name)
@@ -146,6 +211,9 @@ class FitAssessment:
         return self._tier()[1]
 
     def _tier(self) -> tuple[FitTier, list[str]]:
+        """Stage 22 P1 order: NOT_SUITABLE (a barrier) > NEEDS_OPERATOR (data
+        missing / to verify) > STRETCH (worth trying despite a stated gap) >
+        PARTIAL_MATCH > GOOD_MATCH. A tier never blocks anything."""
         by_name = {c.name: c for c in self.criteria}
 
         def why(c: Criterion) -> str:
@@ -156,53 +224,48 @@ class FitAssessment:
         experience = by_name.get("experience")
         entry = by_name.get("entry_level")
         barriers = [why(c) for c in self.blockers]
-        if (
+        barriers += [why(c) for c in self.criteria if (c.name, c.status) in _TIER_BARRIERS]
+        language_barrier = (
             language is not None
             and language.status == "MAJOR_GAP"
             and self.german_level_confirmed
-            and self.german_requirement_basis == "EXPLICIT_REQUIREMENT"
-        ):
+            and (
+                self.german_requirement_basis == "EXPLICIT_REQUIREMENT"
+                or self.german_requirement_strong
+            )
+        )
+        if language_barrier:
             barriers.append(why(language))
-        if (
+        experience_barrier = (
             experience is not None
             and experience.status == "GAP"
-            and entry is not None
-            and entry.status == "EXPERIENCED"
             and self.experience_missing_in_profile
-        ):
+            and (
+                (entry is not None and entry.status == "EXPERIENCED")
+                or (self.required_years or 0) >= 3
+            )
+        )
+        if experience_barrier:
             barriers.append(why(experience))
         if barriers:
             return "NOT_SUITABLE", barriers
-        checks = [why(c) for c in self.verifications]
-        if language is not None and language.status in {"MAJOR_GAP", "GAP", "GAP_TO_VERIFY"}:
-            checks.append(why(language))
-        if experience is not None and experience.status == "GAP":
-            checks.append(why(experience))
-        if entry is not None and entry.status == "EXPERIENCED":
-            checks.append(why(entry))
+        checks = [why(c) for c in self.verifications if (c.name, c.status) not in _TIER_ACCEPTS]
+        # Stage 22 P1 (Codex): a title outside the IT vocabulary is a question
+        # for the operator, never proof of an unrelated role.
+        checks += [why(c) for c in self.criteria if (c.name, c.status) == ("role", "NO_IT_SIGNAL")]
         if checks:
             return "NEEDS_OPERATOR", checks
-        weaker = [
-            why(c)
-            for c in self.criteria
-            if (c.name, c.status)
-            in {
-                ("skills", "PARTIAL"),
-                ("skills", "WEAK"),
-                ("role", "OTHER"),
-                ("experience", "PARTIAL"),
-                ("language", "MINOR_GAP"),
-                ("salary", "BELOW"),
-                ("entry_level", "MIXED"),
-            }
-        ]
+        stretch = [why(c) for c in self.criteria if (c.name, c.status) in _STRETCH]
+        if stretch:
+            return "STRETCH", stretch
+        weaker = [why(c) for c in self.criteria if (c.name, c.status) in _WEAKER]
         skills = by_name.get("skills")
         if weaker or skills is None or skills.status != "STRONG":
             return "PARTIAL_MATCH", weaker or ([why(skills)] if skills else [])
         strengths = [
             why(c)
             for c in self.criteria
-            if c.name in {"skills", "role", "language", "location", "entry_level"}
+            if c.name in {"skills", "role", "language", "location", "entry_level", "education"}
         ]
         return "GOOD_MATCH", strengths
 
@@ -239,10 +302,43 @@ def _role_words(text: str) -> set[str]:
     return set(_WORD.findall(text.casefold())) - _ROLE_FILLER
 
 
+# Stage 22 P1: never a fit for the candidate's target (PhD research, teaching).
+_OFF_ROLE_TITLE = re.compile(
+    r"\b(?:doktorand\w*|ph\.?d\b\.?|doctoral|postdoc\w*|promotionsstelle|trainer(?:in)?|dozent\w*"
+    r"|lehrkraft|lehrer(?:in)?)\b",
+    re.IGNORECASE,
+)
+# Commercial occupations -- OFF_ROLE only when the title names no IT word at
+# all ("IT-Support für Vertriebssoftware" stays a technical role).
+_COMMERCIAL_TITLE = re.compile(
+    r"\b(?:sales|vertrieb\w*|account\s+manager|office\s+manager|sekret(?:ä|ae)r\w*|secretar\w*"
+    r"|buchhalt\w*|kaufm(?:ann|frau|ännisch|aennisch)\w*)\b",
+    re.IGNORECASE,
+)
+# Stage 22 P1: a title must name SOME IT / software / data / technical role.
+_IT_TITLE_WORDS = re.compile(
+    r"entwickl|develop|programm|software|informati|\bit\b|\bit-|devops|engineer|ingenieur|techni"
+    r"|daten|\bdata|analyst|admin|system|netzwerk|network|cloud|\bsap\b|\berp\b|web|\bapp|digital"
+    r"|automatis|automati[oz]|test|\bqa\b|qualit(?:ä|ae)tssicherung|support|helpdesk|\bcode|python|java"
+    r"|\bsql\b|backend|frontend|full.?stack|\bki\b|\bai\b|machine|security|sicherheit|edv|\bsps\b|mechatron"
+    r"|service\s*desk|helpdesk|hotline|level\s*[12]|[12](?:st|nd)\s*level|anwendungsbetreu"
+    r"|anwender|computer|rechenzentrum|elektroni",
+    re.IGNORECASE,
+)
+# Stage 11B lists them as "not software development", but technical IT
+# support / administration is one of the candidate's alternative targets.
+_IT_ADJACENT_SIGNALS = frozenset({"administrator", "systemadministrator"})
+
+
 def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
     """Which configured role priority the title matches (informational: it
     never blocks, and no "Junior" wording is required). A role matches when
     every significant word of one of its "/"-alternatives is in the title."""
+    academic = _OFF_ROLE_TITLE.search(title)
+    if academic is not None:
+        # Stage 22 P1: before role priorities -- "Dozent Python Developer" is
+        # a teaching job even when "Python Developer" is configured.
+        return Criterion("role", "OFF_ROLE", f"title names a non-IT position ({academic.group(0)})")
     if not settings.primary_roles and not settings.secondary_roles:
         return Criterion("role", "NOT_CONFIGURED", "no role priorities configured")
     title_words = set(_WORD.findall(title.casefold()))
@@ -255,6 +351,29 @@ def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
                 words = _role_words(alternative)
                 if words and words <= title_words:
                     return Criterion("role", tier, f"title matches '{role}'")
+    other_profession = (
+        _COMMERCIAL_TITLE.search(title) if not _IT_TITLE_WORDS.search(title) else None
+    )
+    if other_profession is not None:
+        return Criterion(
+            "role",
+            "OFF_ROLE",
+            f"title names a non-IT position ({other_profession.group(0)})",
+        )
+    relevance = classify_title_relevance(title)
+    if relevance.level == "IRRELEVANT" and relevance.matched_signal not in _IT_ADJACENT_SIGNALS:
+        # Stage 22 P1: an explicitly non-software profession ("Aktuar",
+        # "Elektroingenieur"), never only "no configured role matched".
+        return Criterion(
+            "role",
+            "OFF_ROLE",
+            f"title names another profession ({relevance.matched_signal}); "
+            "matching skills do not make it a software role",
+        )
+    if not _IT_TITLE_WORDS.search(title):
+        # Stage 22 P1: no IT, software, data or technical word at all ("Office
+        # Manager", "Account Manager"): keyword overlap in the text is noise.
+        return Criterion("role", "NO_IT_SIGNAL", "title names no IT/technical role")
     return Criterion("role", "OTHER", "title matches no configured role")
 
 
@@ -297,6 +416,12 @@ def language_criterion(text: str, german_level: str) -> Criterion:
     if not requirement.mandatory:
         return Criterion("language", "MINOR_GAP", reason, requirement.evidence)
     if requirement.basis == "INFERRED_REQUIREMENT":
+        if asked - held >= 2 and _strong_wording(requirement):
+            # Stage 22 P1: mandatory "verhandlungssicher" / "fließend" /
+            # native is as clear as a stated C1 (the tier treats it so).
+            return Criterion(
+                "language", "MAJOR_GAP", reason + " (fluency stated)", requirement.evidence
+            )
         # "sehr gute Deutschkenntnisse" is not a C1 certificate: a gap to
         # verify (ask / read the whole posting), never a stated MAJOR_GAP.
         return Criterion("language", "GAP_TO_VERIFY", reason, requirement.evidence)
@@ -304,8 +429,33 @@ def language_criterion(text: str, german_level: str) -> Criterion:
     return Criterion("language", status, reason, requirement.evidence)
 
 
-def remote_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
+def _ba_home_office(job: JobRecord | None) -> Criterion | None:
+    """Stage 22 P1: the BA's own home-office flag, used only when the text
+    says nothing. Never FULLY_REMOTE: "possible" / "up to N %" is not a
+    confirmed fully remote job."""
+    if job is None or getattr(job, "home_office_possible", None) is None:
+        return None
+    if not job.home_office_possible:
+        return Criterion("remote", "ONSITE", "BA: no home office", "homeofficemoeglich=false")
+    kind = (job.home_office_type or "").replace("_", " ").lower()
+    share = f", up to {job.home_office_percent} %" if job.home_office_percent else ""
+    detail = f" ({kind}{share})" if kind or share else ""
+    return Criterion(
+        "remote",
+        "PARTIAL_REMOTE",
+        f"BA: home office possible{detail}; not confirmed as fully remote",
+        "homeofficemoeglich=true",
+    )
+
+
+def remote_criterion(
+    text: str, settings: CandidateSearchSettings, job: JobRecord | None = None
+) -> Criterion:
     signal = classify_remote(text)
+    if signal.mode == "UNKNOWN":
+        stated = _ba_home_office(job)
+        if stated is not None:
+            return stated
     if signal.mode != "FULLY_REMOTE":
         reasons = {
             "PARTIAL_REMOTE": "remote/home office mentioned but not confirmed as fully remote",
@@ -471,6 +621,9 @@ def location_criterion(
             )
             return Criterion("location", "PASS", f"{detail} <= {limit} km{near}")
         return Criterion("location", "FAIL", f"{detail} > {limit} km{relocation}")
+    estimate = _estimate_criterion(job, settings, limit, origin)
+    if estimate is not None:
+        return estimate
     if (job.location or "").strip():
         address = best_workplace(
             job.description or "",
@@ -485,6 +638,81 @@ def location_criterion(
             f"(limit {limit} km){hint}",
         )
     return Criterion("location", "UNKNOWN", "workplace address unknown")
+
+
+def workplace_doubts(job: JobRecord) -> list[str]:
+    """Stage 22 P1: why the BA workplace may not be the real one (agency
+    office, head office, one of several locations)."""
+    doubts = []
+    if is_intermediary(job.company):
+        doubts.append("posted by an agency (its address is not the client's workplace)")
+    count = getattr(job, "workplace_count", None) or 0
+    if count > 1:
+        doubts.append(f"{count} work locations, only the first has coordinates")
+    own = city_key(job.location)
+    text = job.description or ""
+    named = {
+        city_key(a.city)
+        for a in extract_addresses(text, posted_by_agency=is_intermediary(job.company))
+        if a.kind == "WORKPLACE"
+    } | stated_workplace_towns(text)
+    other = sorted(town for town in named if town and own and town != own)
+    if other:
+        doubts.append(f"posting names another workplace ({', '.join(other)})")
+    return doubts
+
+
+def _estimate_criterion(
+    job: JobRecord, settings: CandidateSearchSettings, limit: int, origin: str
+) -> Criterion | None:
+    """Stage 22 P1: a preliminary estimate from the BA coordinates when no
+    car route is stored (`app.agents.geo_estimate`). Ranks the vacancy; the
+    car route stays a pre-Bewerbung check (every status here is in _VERIFY)."""
+    home = settings.commute_origin
+    # getattr: rows read through older query shapes / test doubles lack them
+    lat, lon = getattr(job, "workplace_lat", None), getattr(job, "workplace_lon", None)
+    if home is None or lat is None or lon is None:
+        return None
+    estimate = estimate_commute(home.lat, home.lon, lat, lon, limit)
+    where = job.location or job.workplace_postal_code or "the posted workplace"
+    detail = (
+        f"~{estimate.straight_km:.0f} km straight line from {origin} to {where} "
+        f"(BA coordinates; a car route is never shorter; limit {limit} km by car)"
+    )
+    doubts = workplace_doubts(job)
+    if doubts:
+        return Criterion(
+            "location",
+            "LOCATION_UNVERIFIED",
+            f"{detail}; workplace unverified: {'; '.join(doubts)}",
+        )
+    state = commutable_state(job.workplace_region)
+    if estimate.band == "BEYOND":
+        relocation = {state_key(r) for r in settings.relocation_regions}
+        if job.workplace_region and state_key(job.workplace_region) in relocation:
+            return Criterion(
+                "location",
+                "ESTIMATE_BEYOND_RELOCATION",
+                f"{detail} -- beyond the daily commute, but relocation within "
+                f"{job.workplace_region} would be possible; operator decision",
+            )
+        region = f" in {job.workplace_region}" if state is False else ""
+        return Criterion(
+            "location",
+            "ESTIMATE_BEYOND",
+            f"{detail} -- beyond the limit{region}; relocation there is not considered",
+        )
+    if estimate.band == "WITHIN":
+        return Criterion(
+            "location",
+            "ESTIMATE_WITHIN",
+            f"{detail} -- very likely within the limit; check the car route before applying",
+        )
+    return Criterion(
+        "location",
+        "ESTIMATE_NEAR_LIMIT",
+        f"{detail} -- near the limit; measure the car route",
+    )
 
 
 def salary_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
@@ -530,7 +758,24 @@ def salary_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
     )
 
 
+_STUDENT_JOB = re.compile(r"werkstudent\w*|working\s+student|studentische\w*", re.IGNORECASE)
+
+
 def entry_level_criterion(title: str, text: str) -> Criterion:
+    seniority = classify_title_seniority(title)
+    if seniority.level == "SENIOR" and not entry_level_signals(title, "").positive:
+        # Stage 22 P1: the TITLE itself asks for seniority (senior, lead,
+        # principal, architect ...); the junior candidate is not a fit.
+        return Criterion(
+            "entry_level", "SENIOR_TITLE", f"senior title ({seniority.matched_signal})"
+        )
+    student = _STUDENT_JOB.search(title)
+    if student is not None:
+        return Criterion(
+            "entry_level",
+            "STUDENT_JOB",
+            f"student job ({student.group(0)}): usually requires enrolment; check eligibility",
+        )
     signals = entry_level_signals(title, text)
     if signals.negative and not signals.positive:
         return Criterion("entry_level", "EXPERIENCED", "signals: " + ", ".join(signals.negative))
@@ -544,6 +789,104 @@ def entry_level_criterion(title: str, text: str) -> Criterion:
         )
     # No "junior" wording is not a reason to exclude a posting.
     return Criterion("entry_level", "OPEN", "no seniority stated")
+
+
+_CLAUSE = re.compile(r"[.;\n•]+")
+_DEGREE = re.compile(
+    r"studium|hochschulabschluss|hochschulstudium|abschluss|bachelor|master|diplom|degree",
+    re.IGNORECASE,
+)
+_IT_FIELD = re.compile(
+    r"informatik|computer\s*science|softwaretechnik|software\s*engineering", re.IGNORECASE
+)
+_OTHER_FIELD = re.compile(
+    r"ingenieur|engineering|mint\b|naturwissenschaft|mathematik|physik|elektrotechnik"
+    r"|maschinenbau|technisch|technical",
+    re.IGNORECASE,
+)
+_ALTERNATIVE = re.compile(
+    r"vergleichbar|(?:ä|ae)hnlich|oder\s+(?:eine\s+)?(?:ausbildung|berufserfahrung)"
+    r"|fachinformatiker|quereinst|alternativ|equivalent|similar",
+    re.IGNORECASE,
+)
+# "z. B.", "bzw.", "ggf." must not cut a clause before its alternative.
+_ABBREVIATION = re.compile(
+    r"\b(?:[A-Za-z]|bzw|ggf|etc|evtl|inkl|ca|mind|vgl|sog|usw|abgeschl)\.", re.IGNORECASE
+)
+_NOT_REQUIRED = re.compile(
+    r"nicht\s+(?:zwingend\s+)?(?:erforderlich|notwendig|n(?:ö|oe)tig|vorausgesetzt|voraussetzung)"
+    r"|kein(?:e|en)?\s+(?:muss|voraussetzung|pflicht)|not\s+required|no\s+degree"
+    r"|\bkein(?:e|en)?\s+(?:[\w-]+\s+){0,4}?(?:erforderlich|notwendig|n(?:ö|oe)tig|vorausgesetzt)",
+    re.IGNORECASE,
+)
+_QUEREINSTIEG = re.compile(r"quereinst\w*", re.IGNORECASE)
+_SOFT = re.compile(r"wünschenswert|wuenschenswert|von\s+vorteil|idealerweise|ein\s+plus", re.I)
+
+
+def education_criterion(text: str, quereinstieg_suitable: bool | None = None) -> Criterion:
+    """Stage 22 P1: what the posting asks for in formal education. Only a
+    MANDATORY computer-science degree without any alternative is a gap for
+    the candidate (an engineering degree); an engineering/technical field,
+    "oder vergleichbare Qualifikation", "Quereinstieg" or the BA flag
+    `quereinstiegGeeignet` are not."""
+    if quereinstieg_suitable:
+        return Criterion("education", "QUEREINSTIEG", "BA: suitable for career changers")
+    welcome = _QUEREINSTIEG.search(text or "")
+    if welcome is not None:
+        return Criterion("education", "QUEREINSTIEG", "career changers welcome", welcome.group(0))
+    prose = _ABBREVIATION.sub(lambda m: m.group(0).replace(".", ""), text or "")
+    clauses = [c for c in _CLAUSE.split(prose) if _DEGREE.search(c) and not _NOT_REQUIRED.search(c)]
+    if not clauses:
+        return Criterion("education", "NO_REQUIREMENT", "no degree requirement found")
+    it_only = [
+        c.strip()
+        for c in clauses
+        if _IT_FIELD.search(c)
+        and not _OTHER_FIELD.search(c)
+        and not _ALTERNATIVE.search(c)
+        and not _SOFT.search(c)
+    ]
+    if it_only:
+        return Criterion(
+            "education",
+            "IT_DEGREE_REQUIRED",
+            "a computer-science degree is asked without an alternative",
+            " ".join(it_only[0].split())[:160],
+        )
+    if all(_SOFT.search(c) for c in clauses):
+        return Criterion("education", "OPTIONAL", "a degree is preferred, not required")
+    return Criterion(
+        "education", "DEGREE_OR_EQUIVALENT", "degree or an equivalent/technical field accepted"
+    )
+
+
+def _strong_wording(requirement) -> bool:
+    """Level, mandatory status and wording all from the ONE German
+    requirement the extractor selected (Codex P1 round 3)."""
+    return bool(requirement.mandatory and requirement.level in {"C1", "C2"} and requirement.strong)
+
+
+def german_requirement_is_strong(text: str) -> bool:
+    """A MANDATORY German requirement at C level worded as fluency/native or
+    a stated C level ("sehr gute" alone is not)."""
+    return _strong_wording(extract_german_requirement(text))
+
+
+_POSTING_TYPES = {
+    "ARBEIT": ("EMPLOYMENT", "regular employment"),
+    "PRAKTIKUM_TRAINEE": ("TRAINEE_OR_INTERNSHIP", "trainee programme or internship"),
+    "SELBSTAENDIGKEIT": (
+        "SELF_EMPLOYMENT",
+        "self-employment / freelance (BA: often a training provider's course)",
+    ),
+    "AUSBILDUNG": ("APPRENTICESHIP", "apprenticeship / dual study, not a job for the profile"),
+}
+
+
+def posting_type_criterion(posting_type: str | None) -> Criterion:
+    """Stage 22 P1: the BA's own posting type (`stellenangebotsart`)."""
+    status, reason = _POSTING_TYPES.get(posting_type or "", ("UNKNOWN", "posting type not stated"))
+    return Criterion("posting_type", status, reason, posting_type)
 
 
 def start_date_criterion(text: str, settings: CandidateSearchSettings) -> Criterion:
@@ -599,8 +942,12 @@ def _experience_missing(match: CandidateJobMatch | None) -> bool:
     as MISSING from the profile."""
     if match is None:
         return False
+    # Stage 22 P1 (Codex): only a MANDATORY requirement -- "nice to have:
+    # 3 years" is PREFERRED and never a barrier.
     return any(
-        r.requirement_type == "EXPERIENCE" and r.match_status == "MISSING"
+        r.requirement_type == "EXPERIENCE"
+        and r.match_status == "MISSING"
+        and r.importance == "REQUIRED"
         for r in match.missing_requirements
     )
 
@@ -613,18 +960,26 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
     config = load_search_config(session)
     settings = config.search if config else CandidateSearchSettings()
     text = f"{job.title}\n{job.location or ''}\n{job.description or ''}"
-    match_record = get_latest_match(session, job_id)
     profile = get_candidate_profile(session)
-    # Codex Stage 19 review: the latest analysis may predate a changed
-    # posting or profile; an out-of-date analysis is not evidence.
-    stale = match_record is not None and (
-        match_record.job_snapshot_fingerprint != compute_job_snapshot_fingerprint(job)
-        or profile is None
-        or match_record.candidate_profile_version != profile.profile_version
+    # Codex Stage 19 review: an analysis of another posting or profile
+    # version is not evidence. Stage 22 P1 (Codex): the analysis of the
+    # CURRENT identity (posting, profile version, algorithm), not merely the
+    # newest row -- after a posting changes A -> B -> A the newest row is B's.
+    match_record = (
+        get_cached_match(
+            session,
+            job_id=job_id,
+            candidate_profile_version=profile.profile_version,
+            job_snapshot_fingerprint=compute_job_snapshot_fingerprint(job),
+            algorithm_version=MATCHER_VERSION,
+        )
+        if profile is not None
+        else None
     )
-    match = to_candidate_job_match(match_record) if match_record and not stale else None
+    stale = match_record is None and get_latest_match(session, job_id) is not None
+    match = to_candidate_job_match(match_record) if match_record is not None else None
 
-    remote = remote_criterion(text, settings)
+    remote = remote_criterion(text, settings, job)
     german_level = confirmed_german_level(session)
     assessment = FitAssessment(
         job_id=job.id,
@@ -633,6 +988,8 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         german_requirement_basis=extract_german_requirement(text).basis,
         german_level_confirmed=german_level != "UNKNOWN",
         experience_missing_in_profile=_experience_missing(match),
+        german_requirement_strong=german_requirement_is_strong(text),
+        required_years=entry_level_signals(job.title, job.description or "").required_years,
     )
     assessment.criteria = [
         (
@@ -652,6 +1009,8 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         remote,
         salary_criterion(text, settings),
         entry_level_criterion(job.title, job.description or ""),
+        education_criterion(job.description or "", job.quereinstieg_suitable),
+        posting_type_criterion(job.posting_type),
         start_date_criterion(text, settings),
         duplicate_criterion(session, job),
     ]

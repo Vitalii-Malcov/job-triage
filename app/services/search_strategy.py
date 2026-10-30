@@ -18,8 +18,11 @@ With a configured candidate search (app/models/candidate_search.py):
    route (job_commute_checks) does. Frankfurt, Offenbach, Hanau, Darmstadt,
    Mainz, Wiesbaden and places in neighbouring states are all inside it.
 2. **remote search** (only if remote work across Germany is configured) --
-   no `wo`, `arbeitszeit=ho` (BA: Heim-/Telearbeit), fewer pages. A hit is
-   still assessed for "fully remote, work from the home region allowed".
+   no `wo`, nationwide; only postings whose own BA flag `homeofficemoeglich`
+   is true are kept (Stage 22 P1: the former `arbeitszeit=ho` filter returns
+   0 results on the v6 API without an error, measured 2026-10-30). A kept
+   hit is NOT "remote": it is still assessed for "fully remote, work from the
+   home region allowed" from the posting text.
 
 `search_keywords` (configured) gives one commute and one remote search
 per term; otherwise BUNDESAGENTUR_SEARCH_KEYWORDS is the single term.
@@ -37,8 +40,7 @@ BA_RADIUS_STEPS = (10, 15, 20, 25, 50, 100, 150, 200)
 # Straight-line margin between the BA place centre and the commute origin.
 RADIUS_MARGIN_KM = 50
 DEFAULT_MAX_PAGES = 20
-REMOTE_MAX_PAGES = 5
-HOME_OFFICE = "ho"
+REMOTE_MAX_PAGES = 10
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class BundesagenturQuery:
     radius_km: int
     working_time: str = ""
     max_pages: int = DEFAULT_MAX_PAGES
+    home_office_only: bool = False
 
 
 def ba_radius_for(limit_km: int) -> int:
@@ -95,7 +98,7 @@ def bundesagentur_queries(
                 keywords=term,
                 location="",
                 radius_km=0,
-                working_time=HOME_OFFICE,
+                home_office_only=True,
                 max_pages=REMOTE_MAX_PAGES,
             )
             for term in terms

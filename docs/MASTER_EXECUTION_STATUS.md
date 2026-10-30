@@ -22,7 +22,8 @@ Last update: 2026-10-30.
 | Production code (working copy) | `main@4cdaacf` |
 | PR #18 Stage 21 cache | open, `stage21/vacancy-cache@4a3647c`, CI green, Codex ACCEPT, UI checked on a migrated copy |
 | PR #19 Stage 22 P0-3 repost guard | open, stacked on #18, `stage22/repost-guard@79e54e7`, CI green, Codex ACCEPT |
-| Stage 22 P0-1/P0-2 | branch `stage22/p0-ba-reference`, stacked on #19 (see below) |
+| PR #20 Stage 22 P0-1/P0-2 | open, stacked on #19, `stage22/p0-ba-reference@f6dd8a2`; full local pytest 6876 passed / 138 skipped; Codex R7 ACCEPT |
+| Stage 22 P1 | branch `stage22/p1-geo-remote`, stacked on #20 (geography, remote, tiers, identity report, batch matcher) |
 
 Merge plan for #18/#19 (operator-approved strategy, not yet executed):
 merge commit for #18, then retarget #19 to `main` (verified locally: 11
@@ -37,7 +38,8 @@ files / 6 commits, no force-push needed), then the same for later stacked PRs.
 | 22 P0-3 repost guard | yes | no (PR #19) | no | no migration |
 | 22 P0-1 BA reference | yes | no | no | migration `d5f1a7c3e9b2`, backfill script |
 | 22 P0-2 BA liveness | yes | no | no | read-only CLI |
-| 22 P1 geography / matcher / remote / identity | no | — | — | planned, see audit plan |
+| 22 P1 geography / remote / tiers | yes | no | no | migration `e3b7c9d1f4a6`; quality check on a copy in docs/STAGE22_SEARCH_QUALITY.md |
+| 22 P1-2 vacancy identity | dry-run report only | no | no | no merge implemented (separate approved stage) |
 | 22 P2 operations | no | — | — | planned |
 
 ## Repository clean-up (2026-10-30)
@@ -75,12 +77,14 @@ token shapes, private keys): only a test fixture string. Tracked env files are
 
 ## Next steps (in order)
 
-1. Codex review of P0-1/P0-2, fix to ACCEPT, open the stacked PR.
-2. P1 geography (BA coordinates, workplace vs. headquarters, `LOCATION_UNVERIFIED`).
-3. P1 matcher (role relevance, German level, experience, education, tiers).
-4. P1 remote (no `arbeitszeit=ho`; detail-based home-office flags).
-5. P1 vacancy identity: dry-run merge report only.
-6. P2 operations; documentation; final QA.
-7. Operator approvals: merge #18 → #19 → Stage 22 PRs; then one production
-   window (backup, `alembic upgrade head`, source-reference backfill, cache
-   backfill, smoke tests).
+1. P1: finish Codex review, full pytest, open the stacked PR.
+2. P2 (not started): `transition --occurred-at`, follow-up snooze, deadline-aware
+   follow-ups, XING salary label, "B2 in progress" in the profile.
+3. Documentation pass (README for recruiters, test numbers per SHA).
+4. Operator approvals: merge #18 -> #19 -> #20 -> P1 (merge commits, retarget
+   each next PR to `main`); then ONE production window:
+   backup -> `alembic upgrade head` (b6c1 -> c7e2 -> d5f1 -> e3b7) ->
+   `backfill_source_reference.py --apply --snapshot` ->
+   `stage22_match_vacancies.py --apply --snapshot` ->
+   `stage21_assess_vacancies.py --apply --snapshot` -> smoke tests.
+   A collector run afterwards fills the BA facts (coordinates, home office).
