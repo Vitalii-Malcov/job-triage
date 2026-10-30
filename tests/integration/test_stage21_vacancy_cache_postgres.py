@@ -45,7 +45,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-HEAD = "d5f1a7c3e9b2"  # repository head (Stage 22 P0-1 jobs.source_reference)
+HEAD = "e3b7c9d1f4a6"  # repository head (Stage 22 P1 structured job facts)
 PREVIOUS = "b6c1e9a4d2f7"
 PREFIX = "stage21-cache-pg-"
 NOW = datetime.now(UTC)

@@ -31,6 +31,19 @@ from app.services.email_matching import extract_reference_tokens
 
 logger = logging.getLogger(__name__)
 
+# Stage 22 P1: Job fields persisted 1:1 on JobRecord columns of the same name.
+STRUCTURED_JOB_FACTS = (
+    "workplace_lat",
+    "workplace_lon",
+    "workplace_postal_code",
+    "workplace_region",
+    "workplace_count",
+    "home_office_possible",
+    "home_office_type",
+    "home_office_percent",
+    "quereinstieg_suitable",
+)
+
 DEFAULT_PROFILE_SKILLS = [
     "python",
     "fastapi",
@@ -199,6 +212,12 @@ def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: 
     # become eligible for APPLY again.
     if job.posting_type is not None:
         record.posting_type = job.posting_type
+    # Stage 22 P1: a stated fact is refreshed (the posting may have changed);
+    # an omitted one keeps the stored value.
+    for name in STRUCTURED_JOB_FACTS:
+        value = getattr(job, name)
+        if value is not None:
+            setattr(record, name, value)
 
 
 def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
@@ -326,6 +345,7 @@ def _upsert_job(
         nice_to_have_skills_json=json.dumps(job.nice_to_have_skills),
         posting_type=job.posting_type,
         source_reference=storable_reference(job.source_reference),
+        **{name: getattr(job, name) for name in STRUCTURED_JOB_FACTS},
         score=score.score,
         recommendation=score.recommendation,
         status="NEW",

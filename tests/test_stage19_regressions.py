@@ -79,20 +79,22 @@ def test_good_match():
         # Explicit mandatory German two levels above a confirmed level.
         ({"language": "MAJOR_GAP"}, {}, "NOT_SUITABLE"),
         # ... but not when the candidate's level is unconfirmed (Codex plan
-        # review): that is a question for the operator, not a barrier.
-        ({"language": "MAJOR_GAP"}, {"confirmed": False}, "NEEDS_OPERATOR"),
-        ({"language": "GAP_TO_VERIFY"}, {"basis": "INFERRED_REQUIREMENT"}, "NEEDS_OPERATOR"),
+        # review): not a barrier. Stage 22 P1: a stated language gap is a
+        # STRETCH (worth trying), no longer "needs the operator".
+        ({"language": "MAJOR_GAP"}, {"confirmed": False}, "STRETCH"),
+        ({"language": "GAP_TO_VERIFY"}, {"basis": "INFERRED_REQUIREMENT"}, "STRETCH"),
         # A senior title with an unmet experience requirement.
         ({"experience": "GAP", "entry_level": "EXPERIENCED"}, {}, "NOT_SUITABLE"),
         # Codex rounds 1-4: without a current analysis listing the
         # experience as MISSING (confirmed, UNKNOWN, stale, none) -- verify.
+        # Stage 22 P1: a stated experience gap is a STRETCH, not "verify".
         (
             {"experience": "GAP", "entry_level": "EXPERIENCED"},
             {"experience_missing": False},
-            "NEEDS_OPERATOR",
+            "STRETCH",
         ),
-        # Years asked without a senior title may be "wünschenswert": verify.
-        ({"experience": "GAP"}, {}, "NEEDS_OPERATOR"),
+        # Years asked without a senior title may be "wünschenswert": stretch.
+        ({"experience": "GAP"}, {}, "STRETCH"),
         ({"location": "FAIL"}, {}, "NOT_SUITABLE"),
         ({"location": "DISTANCE_UNVERIFIED"}, {}, "NEEDS_OPERATOR"),
         # GOOD_MATCH needs the role and the money to fit too.

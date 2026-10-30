@@ -153,7 +153,20 @@ def test_cached_rows_equal_the_live_assessment(db_path, session):
 # --- invalidation -----------------------------------------------------------------
 
 
-def _changed(value):
+# Stage 22 P1: typed nullable job columns get a value of their own type.
+_NULL_REPLACEMENT = {
+    "workplace_lat": 50.0,
+    "workplace_lon": 8.0,
+    "workplace_count": 1,
+    "home_office_possible": True,
+    "home_office_percent": 50,
+    "quereinstieg_suitable": True,
+}
+
+
+def _changed(value, column=""):
+    if value is None and column in _NULL_REPLACEMENT:
+        return _NULL_REPLACEMENT[column]
     if isinstance(value, bool):
         return not value
     if isinstance(value, int):
@@ -175,7 +188,7 @@ def test_every_included_job_column_makes_the_row_stale(session, column):
     session.execute(
         update(JobRecord.__table__)
         .where(JobRecord.id == job_id)
-        .values({column: _changed(value.scalar())})
+        .values({column: _changed(value.scalar(), column)})
     )
     session.commit()
     assert fit_cache.current_keys(session)[job_id] != before
@@ -334,8 +347,14 @@ def test_excluded_job_columns_are_never_read_by_the_rules():
         for column in fit_cache.JOB_COLUMNS_EXCLUDED
         if column in path.read_text(encoding="utf-8")
     }
-    # the model defines the column and fit_cache lists the exclusion; no rule reads it
-    assert readers == {"app.db.models", "app.services.fit_cache"}
+    # the model defines the column and fit_cache lists the exclusion; no rule reads it.
+    # Stage 22 P1: app.models.job joins the closure (via the matcher version);
+    # it only declares last_seen_at on the API response models JobListItem /
+    # JobDetail, which no rule builds.
+    assert readers == {"app.db.models", "app.services.fit_cache", "app.models.job"}
+    job_models = fit_cache.rule_closure()["app.models.job"].read_text(encoding="utf-8")
+    api_part = job_models[job_models.index("class JobListItem") :]
+    assert "last_seen_at" not in job_models.replace(api_part, "")
 
 
 # --- never stale-as-current ------------------------------------------------------

@@ -45,7 +45,7 @@ TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION = "b5d2e8f4a1c7"
 PREVIOUS = "a7c3e9f1b2d4"
-HEAD = "d5f1a7c3e9b2"  # repository head (Stage 22 P0-1 jobs.source_reference)
+HEAD = "e3b7c9d1f4a6"  # repository head (Stage 22 P1 structured job facts)
 SUBMITTED_AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
 
 pytestmark = pytest.mark.skipif(

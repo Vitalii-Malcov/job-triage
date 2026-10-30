@@ -69,6 +69,18 @@ class JobRecord(Base):
     # once and never blanked or replaced by a later observation (see
     # app/db/repositories.py::_apply_job_update_fields).
     source_reference: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Stage 22 P1: structured facts the source states (see app.models.job.Job
+    # and app.collectors.bundesagentur.structured_facts). Refreshed by every
+    # observation that carries them; an omitted value keeps the stored one.
+    workplace_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    workplace_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    workplace_postal_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    workplace_region: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    workplace_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    home_office_possible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    home_office_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    home_office_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quereinstieg_suitable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)
@@ -2012,7 +2024,9 @@ class JobFitAssessmentRecord(Base):
     __tablename__ = "job_fit_assessments"
     __table_args__ = (
         CheckConstraint(
-            "fit_tier IN ('GOOD_MATCH', 'PARTIAL_MATCH', 'NEEDS_OPERATOR', 'NOT_SUITABLE')",
+            # Stage 22 P1 (e3b7c9d1f4a6) adds STRETCH
+            "fit_tier IN ('GOOD_MATCH', 'PARTIAL_MATCH', 'STRETCH', 'NEEDS_OPERATOR', "
+            "'NOT_SUITABLE')",
             name="ck_job_fit_assessments_fit_tier",
         ),
         CheckConstraint(

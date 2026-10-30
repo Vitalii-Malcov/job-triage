@@ -50,6 +50,16 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "last_seen_at",
         "posting_type",  # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type")
         "source_reference",  # Stage 22 P0-1 (d5f1a7c3e9b2)
+        # Stage 22 P1 structured facts (e3b7c9d1f4a6)
+        "workplace_lat",
+        "workplace_lon",
+        "workplace_postal_code",
+        "workplace_region",
+        "workplace_count",
+        "home_office_possible",
+        "home_office_type",
+        "home_office_percent",
+        "quereinstieg_suitable",
     }
 
     profile_columns = {col["name"] for col in inspector.get_columns("user_profiles")}
@@ -3226,6 +3236,7 @@ def test_alembic_has_exactly_one_head() -> None:
     # events (f4b8d2a6c9e1), then the Stage 17 candidate search configuration
     # (a9d3f6b2c4e8), then search targets + car-route origin (b6c1e9a4d2f7),
     # then the Stage 21 vacancy assessment cache (c7e2a9d4f1b3), then
-    # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2)
+    # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2), then Stage 22 P1
+    # structured job facts (e3b7c9d1f4a6)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "d5f1a7c3e9b2"
+    assert heads[0] == "e3b7c9d1f4a6"

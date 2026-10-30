@@ -579,6 +579,7 @@ async def run_bundesagentur(
             location=query.location,
             radius_km=query.radius_km,
             working_time=query.working_time,
+            home_office_only=query.home_office_only,
             max_pages=query.max_pages,
         )
         if index == 0:
@@ -601,13 +602,25 @@ async def run_bundesagentur(
                 continue
         batches.append((query_collector, query_jobs))
         logger.info(
-            "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s jobs=%s",
+            "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s "
+            "home_office_only=%s jobs=%s skipped_not_home_office=%s truncated=%s",
             query.label,
             query.keywords,
             query.radius_km,
             query.working_time or "any",
+            query.home_office_only,
             len(batches[-1][1]),
+            # log-only counters (absent on a test double)
+            getattr(query_collector, "skipped_not_home_office", 0),
+            getattr(query_collector, "truncated", False),
         )
+        if query.home_office_only and not query_jobs:
+            # Zero kept postings is reported, never mistaken for "no remote jobs".
+            logger.warning(
+                "bundesagentur_remote_query_empty term=%s skipped_not_home_office=%s",
+                query.keywords,
+                getattr(query_collector, "skipped_not_home_office", 0),
+            )
     # One posting can be returned by several searches; process it once. A
     # single search is passed through untouched (legacy behaviour).
     seen_postings: set[str] = set()

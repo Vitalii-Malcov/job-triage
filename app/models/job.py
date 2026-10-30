@@ -35,6 +35,19 @@ class Job(BaseModel):
     # app.services.collector_runner.score_and_persist's own docstring.
     # S10-003: max_length matches JobRecord.posting_type's VARCHAR(64).
     posting_type: str | None = Field(default=None, max_length=64)
+    # Stage 22 P1: structured facts the source states (BA search result). All
+    # optional; persisted on JobRecord and refreshed by every observation that
+    # carries them (an omitted value keeps the stored one). The collector
+    # sanitizes them, so an out-of-range value never drops the posting.
+    workplace_lat: float | None = Field(default=None, ge=-90, le=90)
+    workplace_lon: float | None = Field(default=None, ge=-180, le=180)
+    workplace_postal_code: str | None = Field(default=None, max_length=10)
+    workplace_region: str | None = Field(default=None, max_length=40)
+    workplace_count: int | None = Field(default=None, ge=0, le=1000)
+    home_office_possible: bool | None = None
+    home_office_type: str | None = Field(default=None, max_length=40)
+    home_office_percent: int | None = Field(default=None, ge=0, le=100)
+    quereinstieg_suitable: bool | None = None
 
     # S10-RR-001 (Codex Stage 10 re-review, BLOCKING): normalizes BEFORE
     # the max_length constraint above is checked (mode="before" runs

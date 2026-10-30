@@ -121,6 +121,49 @@ def _extract_location(posting: dict) -> str:
     return ""
 
 
+def _number(value: object, low: float, high: float) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if low <= value <= high else None
+
+
+def _short_text(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text and len(text) <= limit else None
+
+
+def structured_facts(posting: dict) -> dict:
+    """Stage 22 P1: the BA search result's own structured fields --
+    workplace coordinates/postcode/region of the FIRST `stellenlokation`
+    (with the number of locations), home-office flags and the
+    `quereinstiegGeeignet` flag. Every value is sanitized; an unexpected
+    shape becomes None (no signal), never a dropped posting. Observed on
+    2026-10-30: all 3 073 search results carried coordinates; home-office
+    flags were set on about half of them."""
+    facts: dict = {}
+    locations = posting.get("stellenlokationen")
+    if isinstance(locations, list):
+        facts["workplace_count"] = len(locations) if len(locations) <= 1000 else None
+        first = locations[0] if locations and isinstance(locations[0], dict) else {}
+        lat = _number(first.get("breite"), -90, 90)
+        lon = _number(first.get("laenge"), -180, 180)
+        if lat is not None and lon is not None:
+            facts["workplace_lat"], facts["workplace_lon"] = lat, lon
+        address = first.get("adresse") if isinstance(first.get("adresse"), dict) else {}
+        facts["workplace_postal_code"] = _short_text(address.get("plz"), 10)
+        facts["workplace_region"] = _short_text(address.get("region"), 40)
+    if isinstance(posting.get("homeofficemoeglich"), bool):
+        facts["home_office_possible"] = posting["homeofficemoeglich"]
+    facts["home_office_type"] = _short_text(posting.get("homeofficetyp"), 40)
+    percent = _number(posting.get("homeofficeprozent"), 0, 100)
+    facts["home_office_percent"] = int(percent) if percent is not None else None
+    if isinstance(posting.get("quereinstiegGeeignet"), bool):
+        facts["quereinstieg_suitable"] = posting["quereinstiegGeeignet"]
+    return {key: value for key, value in facts.items() if value is not None}
+
+
 def _map_posting(posting: object) -> Job | None:
     if not isinstance(posting, dict):
         logger.warning(
@@ -184,6 +227,7 @@ def _map_posting(posting: object) -> Job | None:
 
     try:
         return Job(
+            **structured_facts(posting),
             source=SOURCE_NAME,
             title=title,
             company=company,
@@ -217,6 +261,7 @@ class BundesagenturCollector(JobCollector):
         location: str = "",
         radius_km: int = 25,
         working_time: str = "",
+        home_office_only: bool = False,
         page_size: int = 100,
         max_pages: int = 20,
         timeout_seconds: float = 10.0,
@@ -229,6 +274,14 @@ class BundesagenturCollector(JobCollector):
         self.radius_km = radius_km
         # Stage 17C: BA `arbeitszeit` filter ("ho" = Heim-/Telearbeit); empty = any.
         self.working_time = working_time
+        # Stage 22 P1: keep only postings whose own `homeofficemoeglich` is
+        # true (the BA's `arbeitszeit=ho` filter silently returns 0 results
+        # on the v6 API, observed 2026-10-30). Filtered postings are counted
+        # in `skipped_not_home_office`, never as invalid.
+        self.home_office_only = home_office_only
+        self.skipped_not_home_office = 0
+        # Set when the result list was longer than `max_pages` allowed.
+        self.truncated = False
         self.page_size = page_size
         self.max_pages = max_pages
         self.timeout_seconds = timeout_seconds
@@ -249,6 +302,8 @@ class BundesagenturCollector(JobCollector):
             raise BundesagenturAuthError("BUNDESAGENTUR_API_KEY is not configured")
 
         self.skipped_invalid_count = 0
+        self.skipped_not_home_office = 0
+        self.truncated = False
         headers = {"X-API-Key": self.api_key}
         params = self._build_params(since)
 
@@ -343,12 +398,18 @@ class BundesagenturCollector(JobCollector):
                 job = _map_posting(posting)
                 if job is None:
                     self.skipped_invalid_count += 1
+                elif self.home_office_only and job.home_office_possible is not True:
+                    self.skipped_not_home_office += 1
                 else:
                     jobs.append(job)
 
             if total_results is not None and page * self.page_size >= total_results:
                 break
             page += 1
+        else:
+            self.truncated = (
+                total_results is None or total_results > self.max_pages * self.page_size
+            )
 
         return jobs
 

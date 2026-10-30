@@ -247,7 +247,9 @@ def test_salary_below_is_informational_and_mentions_negotiable():
 
 def test_missing_junior_word_is_not_a_negative_signal():
     assert fit.entry_level_criterion("Python Backend Developer", "").status == "OPEN"
-    assert fit.entry_level_criterion("Senior Developer", "").status == "EXPERIENCED"
+    # Stage 22 P1: a senior TITLE is its own status (a tier barrier)
+    assert fit.entry_level_criterion("Senior Developer", "").status == "SENIOR_TITLE"
+    assert fit.entry_level_criterion("Developer", "mehrjährige Erfahrung").status == "EXPERIENCED"
 
 
 def test_start_date_criterion():
@@ -337,6 +339,8 @@ def test_assess_job_end_to_end(db):
         "remote": "HYBRID",
         "salary": "MATCH",
         "entry_level": "OPEN",
+        "education": "NO_REQUIREMENT",  # Stage 22 P1
+        "posting_type": "UNKNOWN",  # Stage 22 P1
         "start_date": "OK",
         "duplicate": "CLEAR",
     }
@@ -575,7 +579,10 @@ def test_configured_search_uses_the_home_place_and_a_superset_radius_plus_remote
         150,
         "",
     )
-    assert (remote.location, remote.radius_km, remote.working_time) == ("", 0, "ho")
+    # Stage 22 P1: `arbeitszeit=ho` returns 0 on the v6 API; the remote search
+    # is nationwide and keeps only postings with the BA home-office flag.
+    assert (remote.location, remote.radius_km, remote.working_time) == ("", 0, "")
+    assert remote.home_office_only and not commute.home_office_only
     assert remote.keywords == commute.keywords == "Python"
 
 
@@ -620,7 +627,7 @@ def test_runner_runs_every_query_and_processes_a_posting_once(db, monkeypatch):
             made.append(self)
 
         async def fetch(self):
-            if self.kwargs["working_time"] == "ho":
+            if self.kwargs["home_office_only"]:
                 return [_posting("10001-A-S"), _posting("10001-B-S")]
             return [_posting("10001-A-S")]
 
@@ -633,10 +640,11 @@ def test_runner_runs_every_query_and_processes_a_posting_once(db, monkeypatch):
             db, _settings(bundesagentur_api_key="real-looking-key-123")
         )
     )
-    assert [(m.kwargs["location"], m.kwargs["working_time"]) for m in made] == [
-        ("12345 Musterstadt", ""),
-        ("", "ho"),
-    ]
+    # Stage 22 P1: the remote search is nationwide with the home-office flag
+    # filter, no longer `arbeitszeit=ho`.
+    assert [
+        (m.kwargs["location"], m.kwargs["working_time"], m.kwargs["home_office_only"]) for m in made
+    ] == [("12345 Musterstadt", "", False), ("", "", True)]
     assert result["fetched"] == 2
     assert db.get(CandidateProfileRecord, 1) is not None
 
@@ -790,11 +798,14 @@ def test_a_failing_later_term_is_reported_and_keeps_other_results(db, monkeypatc
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.skipped_invalid_count = 0
+            self.skipped_not_home_office = 0
+            self.truncated = False
 
         async def fetch(self):
             if self.kwargs["keywords"] == "Softwaretester":
                 raise RuntimeError("term search down")
-            ref = f"10001-{self.kwargs['keywords']}-{self.kwargs['working_time'] or 'x'}-S"
+            kind = "ho" if self.kwargs["home_office_only"] else "x"
+            ref = f"10001-{self.kwargs['keywords']}-{kind}-S"
             return [
                 Job(
                     title="Python Developer",
@@ -826,7 +837,7 @@ def test_a_failing_later_term_is_reported_and_keeps_other_results(db, monkeypatc
         ("Python Backend Developer (m/w/d)", "PRIMARY"),
         ("Junior Python Developer", "PRIMARY"),
         ("Second Level Support / Technical Application Support (m/w/d)", "SECONDARY"),
-        ("Lagerist (m/w/d)", "OTHER"),
+        ("Lagerist (m/w/d)", "NO_IT_SIGNAL"),  # Stage 22 P1: no IT word in the title
     ],
 )
 def test_role_priority_is_informational(title, status):
