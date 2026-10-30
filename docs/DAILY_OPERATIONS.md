@@ -286,9 +286,12 @@ is refused (HTTP 409 / `AlreadyAppliedError`) on every path -- API,
 automation shortlist and Telegram. An application still being prepared
 (PACKAGE_READY/APPROVED) is not refused.
 
-Limitation: a mirror that rewrites the title AND hides the city, or a direct
-re-post under a new employer name, is not detectable deterministically —
-the operator's judgement remains the last guard.
+Limitation: since Stage 22 a mirror that rewrites the title or hides the
+employer is found when its task/requirement text matches the job of an
+earlier application (`SIMILAR_DESCRIPTION`, advisory). It stays undetectable
+when either side has no usable description (XING rows, applications without a
+job row, very short postings) or when the text itself was rewritten beyond the
+shared distinctive terms — the operator's judgement remains the last guard.
 
 ## 7. Preparing a Bewerbung — where human approval is required
 
