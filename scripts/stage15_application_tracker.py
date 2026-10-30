@@ -593,6 +593,7 @@ def _check_job(session: Session, args) -> int:
         classify_duplicate,
         verdict,
     )
+    from app.services.application_guard import applied_job_descriptions
 
     job = session.get(JobRecord, args.job_id)
     if job is None:
@@ -605,9 +606,12 @@ def _check_job(session: Session, args) -> int:
         url=job.url,
         fingerprint=job.fingerprint,
         location=job.location,
+        description=job.description,
     )
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
-    findings = assess_vacancy(vacancy, applications)
+    findings = assess_vacancy(
+        vacancy, applications, applied_job_descriptions(session, applications)
+    )
     result = verdict(findings)
     grade = classify_duplicate(vacancy, findings)
     payload = {
@@ -624,6 +628,7 @@ def _check_job(session: Session, args) -> int:
                 "company": f.company,
                 "role": f.role,
                 "status": f.status,
+                "detail": f.detail,
             }
             for f in findings
         ],
@@ -639,6 +644,8 @@ def _check_job(session: Session, args) -> int:
                 f"  {f.strength} application {f.application_id} [{f.status}] "
                 f"{f.company} | {f.role} ({', '.join(f.signals)})"
             )
+            if f.detail:
+                print(f"    {f.detail}")
     return 3 if result == "ALREADY_APPLIED" else 0
 
 
@@ -699,7 +706,9 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         VacancyView,
         assess_vacancy,
         job_association_mismatches,
+        merge_findings,
     )
+    from app.services.application_guard import applied_job_descriptions
 
     source = _identity_part("--source", args.source)
     reference = _identity_part("--reference", args.reference)
@@ -739,26 +748,32 @@ def _record_submission(session: Session, tracker: ApplicationTracker, args) -> i
         title=args.role,
         url=job.url if job is not None else args.destination_url,
         fingerprint=None,
+        description=job.description if job is not None else None,
     )
     applications = [app_repo.to_application(r) for r in app_repo.iter_applications(session)]
-    findings = assess_vacancy(vacancy, applications)
+    findings = assess_vacancy(
+        vacancy, applications, applied_job_descriptions(session, applications)
+    )
     if args.destination_url and job is not None:
-        findings += [
-            f
-            for f in assess_vacancy(
-                VacancyView(None, source, "", "", args.destination_url), applications
-            )
-            if f.application_id not in {g.application_id for g in findings}
-        ]
+        findings = merge_findings(
+            findings,
+            assess_vacancy(VacancyView(None, source, "", "", args.destination_url), applications),
+        )
     for f in findings:
+        label = "ADVISORY" if f.advisory_only else f.strength
         print(
-            f"{f.strength}: application {f.application_id} [{f.status}] {f.company} | "
+            f"{label}: application {f.application_id} [{f.status}] {f.company} | "
             f"{f.role} ({', '.join(f.signals)})"
         )
+        if f.detail:
+            print(f"    {f.detail}")
+    # A finding whose only signal is the description overlap is advisory
+    # (Stage 22): printed above, never a reason to refuse.
     unconfirmed = sorted(
         f.application_id
         for f in findings
         if f.strength in ("STRONG", "PROBABLE")
+        and not f.advisory_only
         and f.application_id not in set(args.confirm_distinct_from)
     )
     if unconfirmed:

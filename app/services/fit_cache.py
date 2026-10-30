@@ -17,7 +17,11 @@ stale tier is never presented as current:
 - an applications watermark: a hash over every column of every
   application row plus the highest event id. Any application change, also
   an edit of an older row, marks every row stale (Codex Stage 21 review:
-  count / max id / max timestamp missed such edits).
+  count / max id / max timestamp missed such edits);
+- the descriptions of the jobs the applications point to (Stage 22): the
+  duplicate criterion compares each vacancy's text with them
+  (SIMILAR_DESCRIPTION), so an edit of such a job row -- or its deletion --
+  marks every OTHER vacancy's row stale too, not only that job's own row.
 
 Writes happen only through `upsert_assessment`, called by the offline
 `scripts/stage21_assess_vacancies.py`; the UI only reads.
@@ -175,7 +179,8 @@ def global_inputs(session: Session) -> GlobalInputs:
         select(CandidateProfileRecord.profile_version).order_by(CandidateProfileRecord.id).limit(1)
     )
     max_event = session.scalar(select(func.max(ApplicationEventRecord.id)))
-    return GlobalInputs(rules_hash(), profile_version, f"{applications_hash(session)}:{max_event}")
+    watermark = f"{applications_hash(session)}:{applied_jobs_hash(session)}:{max_event}"
+    return GlobalInputs(rules_hash(), profile_version, watermark)
 
 
 def applications_hash(session: Session) -> str:
@@ -188,6 +193,30 @@ def applications_hash(session: Session) -> str:
         payload = [[name, _plain(row[name])] for name in names]
         digest.update(json.dumps(payload, ensure_ascii=False, default=str).encode() + b"\0")
     return digest.hexdigest()
+
+
+def applied_jobs_hash(session: Session) -> str:
+    """The description of every job row an application points to (sorted by
+    job id; a referenced but missing row hashes as absent). `applications.job_id`
+    has no foreign key, so the row may vanish independently."""
+    job_ids = sorted(
+        {
+            job_id
+            for job_id in session.scalars(select(ApplicationRecord.job_id))
+            if job_id is not None
+        }
+    )
+    present = (
+        dict(
+            session.execute(
+                select(JobRecord.id, JobRecord.description).where(JobRecord.id.in_(job_ids))
+            ).all()
+        )
+        if job_ids
+        else {}
+    )
+    payload = [[job_id, job_id in present, present.get(job_id)] for job_id in job_ids]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
 
 def _in(column, job_ids: Sequence[int] | None):

@@ -7,8 +7,8 @@ real-world harm that cannot be undone, so before preparing or submitting
 anything the operator checks the vacancy against every recorded
 application (`stage15_application_tracker.py check-job <job_id>`).
 
-**Deterministic, conservative, read-only.** No fuzzy similarity, no LLM, no
-network, no writes. Each finding names the exact signals that produced it:
+**Deterministic, conservative, read-only.** No LLM, no network, no writes.
+Each finding names the exact signals that produced it:
 
 - STRONG (do not apply again without a deliberate decision):
   SAME_JOB (the application was recorded for this job row),
@@ -29,6 +29,18 @@ network, no writes. Each finding names the exact signals that produced it:
   vs. the applied "IT-Systemintegrator Produktions-IT / Shopfloor", same
   city, was NO_DUPLICATE_FOUND). The agency hides the real employer, so
   this can only ever ask for a human look.
+- ADVISORY (Stage 22, P0-3; PROBABLE strength, never a block):
+  SIMILAR_DESCRIPTION -- the task/requirement text shares enough
+  distinctive terms with the description of the job an application was
+  recorded for (`app.agents.description_similarity`). This is how a
+  renamed or re-published vacancy looks when title, reference and URL all
+  differ (2026-10-30: an applied ALD "Backend Developer" posting re-posted
+  by N.O.C Engineering, Weber GmbH and FERCHAU; ALD renamed another
+  posting). At the SAME employer the bar is higher (near-identical
+  text), because one employer's postings share wording. A finding whose
+  ONLY signal is SIMILAR_DESCRIPTION never makes `record-submission`
+  refuse; it is printed as advisory. No description on either side means
+  no comparison, not "similar".
 - SAME_EMPLOYER_OTHER_ROLE is informational only: a different role at the
   same employer is a genuinely different application (e.g. ALD Backend
   Developer vs. ALD Software Engineer Prototyping).
@@ -52,11 +64,12 @@ application after a rejection is exactly what the operator must notice.
 """
 
 import re
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from app.agents.description_similarity import DescriptionSimilarity, compare_descriptions
 from app.models.application_lifecycle import Application
 from app.services.application_correlation import role_phrase
 from app.services.email_matching import normalize_company_name
@@ -70,6 +83,15 @@ DuplicateClass = Literal[
     "INSUFFICIENT_EVIDENCE",
 ]
 _EXACT = frozenset({"SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT"})
+SIMILAR_DESCRIPTION = "SIMILAR_DESCRIPTION"
+# Same employer: its postings share boilerplate, contact names and often a
+# specialist requirement profile, so only a near-identical task/requirement text
+# counts (a renamed posting, not a sister role): enough shared terms, the smaller
+# text almost fully covered AND most of the larger one too (Codex review: a
+# shared profile of 9 terms against an 18-term sister role is not a rename).
+SAME_EMPLOYER_MIN_SHARED = 8
+SAME_EMPLOYER_MIN_OVERLAP = 0.9
+SAME_EMPLOYER_MIN_COVERAGE_OF_LARGER = 0.75
 
 _BA_DETAIL = re.compile(r"/jobsuche/jobdetail/([^/?#]+)", re.IGNORECASE)
 _STRONG = ("SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT", "SAME_EMPLOYER_AND_ROLE")
@@ -81,7 +103,8 @@ _TRACKING_PARAMS = frozenset({"trackingid", "trk", "refid", "gclid", "fbclid"})
 
 @dataclass(frozen=True)
 class VacancyView:
-    """The job-row facts the check needs (no description, no scores)."""
+    """The job-row facts the check needs (no scores). `description` feeds only
+    the advisory SIMILAR_DESCRIPTION signal."""
 
     job_id: int | None
     source: str
@@ -90,6 +113,7 @@ class VacancyView:
     url: str | None
     fingerprint: str | None = None
     location: str | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +124,12 @@ class DuplicateFinding:
     company: str
     role: str
     status: str
+    detail: str = ""
+
+    @property
+    def advisory_only(self) -> bool:
+        """True when the text overlap is the only reason for this finding."""
+        return self.signals == (SIMILAR_DESCRIPTION,)
 
 
 def _is_tracking_param(name: str) -> bool:
@@ -190,10 +220,30 @@ def _similar_role(a: str, b: str) -> bool:
     return len(shared) >= 2 or (len(shared) == 1 and min(len(left), len(right)) == 1)
 
 
+def _description_match(
+    vacancy: VacancyView, applied_description: str | None, same_company: bool
+) -> DescriptionSimilarity | None:
+    similarity = compare_descriptions(applied_description, vacancy.description)
+    if similarity is None:
+        return None
+    if same_company:
+        strict = (
+            similarity.shared >= SAME_EMPLOYER_MIN_SHARED
+            and similarity.overlap >= SAME_EMPLOYER_MIN_OVERLAP
+            and similarity.coverage_of_larger >= SAME_EMPLOYER_MIN_COVERAGE_OF_LARGER
+        )
+        return similarity if strict else None
+    return similarity if similarity.similar else None
+
+
 def assess_vacancy(
-    vacancy: VacancyView, applications: Iterable[Application]
+    vacancy: VacancyView,
+    applications: Iterable[Application],
+    applied_descriptions: Mapping[int, str | None] | None = None,
 ) -> list[DuplicateFinding]:
-    """Every application this vacancy may duplicate, strongest first."""
+    """Every application this vacancy may duplicate, strongest first.
+    `applied_descriptions` maps an application id to the description of the
+    job row it was recorded for (absent = no text comparison for it)."""
     company = company_identity(vacancy.company)
     via_intermediary = is_intermediary(vacancy.company)
     city = _city(vacancy.location)
@@ -217,6 +267,9 @@ def assess_vacancy(
         same_role = bool(role) and role_phrase(app.role_title) == role
         if same_company and same_role:
             signals.append("SAME_EMPLOYER_AND_ROLE")
+        similarity = None
+        if applied_descriptions and "SAME_JOB" not in signals:
+            similarity = _description_match(vacancy, applied_descriptions.get(app.id), same_company)
         if any(s in _STRONG for s in signals):
             strength: Strength = "STRONG"
         elif not same_company and title and _title(app.role_title) == title:
@@ -231,11 +284,17 @@ def assess_vacancy(
         ):
             signals.append("SIMILAR_ROLE_VIA_INTERMEDIARY")
             strength = "PROBABLE"
+        elif similarity is not None:
+            strength = "PROBABLE"
         elif same_company:
             signals.append("SAME_EMPLOYER_OTHER_ROLE")
             strength = "INFO"
         else:
             continue
+        detail = ""
+        if similarity is not None and strength == "PROBABLE":
+            signals.append(SIMILAR_DESCRIPTION)
+            detail = similarity.describe()
         findings.append(
             DuplicateFinding(
                 application_id=app.id,
@@ -244,10 +303,35 @@ def assess_vacancy(
                 company=app.company_name,
                 role=app.role_title,
                 status=app.current_status.value,
+                detail=detail,
             )
         )
     order = {"STRONG": 0, "PROBABLE": 1, "INFO": 2}
     return sorted(findings, key=lambda f: (order[f.strength], f.application_id))
+
+
+_STRENGTH_ORDER = {"STRONG": 0, "PROBABLE": 1, "INFO": 2}
+
+
+def merge_findings(*groups: Iterable[DuplicateFinding]) -> list[DuplicateFinding]:
+    """One finding per application: the strongest strength, every signal of
+    every group (first-seen order) and the first non-empty detail. A weaker
+    finding of one check never hides a stronger one of another (Codex Stage 22
+    review: an advisory text finding must not mask a STRONG SAME_URL)."""
+    merged: dict[int, DuplicateFinding] = {}
+    for finding in (f for group in groups for f in group):
+        current = merged.get(finding.application_id)
+        if current is None:
+            merged[finding.application_id] = finding
+            continue
+        strongest = min((current, finding), key=lambda f: _STRENGTH_ORDER[f.strength])
+        signals = tuple(dict.fromkeys(current.signals + finding.signals))
+        merged[finding.application_id] = replace(
+            strongest,
+            signals=signals,
+            detail=current.detail or finding.detail,
+        )
+    return sorted(merged.values(), key=lambda f: (_STRENGTH_ORDER[f.strength], f.application_id))
 
 
 def job_association_mismatches(

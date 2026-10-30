@@ -28,7 +28,7 @@ uses the current date):
 | Candidate profile + search configuration | `candidate_profiles.profile_version` | every profile or config change (CAS `+1`, `candidate_profile_repository` / `candidate_search_repository.apply_config_plan`) |
 | Latest matcher analysis | `candidate_job_matches` (latest per job) | a new match run |
 | Latest commute check | `job_commute_checks` (latest per job) | a new route check |
-| Duplicates / already applied | `applications` + `application_events` (all) | any application or event |
+| Duplicates / already applied | `applications` + `application_events` (all); since Stage 22 also the `description` of every job row an application points to (SIMILAR_DESCRIPTION) | any application or event; an edit or deletion of an applied job row |
 | Rules | the code of `job_fit_assessment.py` **and every `app.*` module it imports** (e.g. `app/agents/job_fit_signals.py`, `application_guard`, the search-config models) | a code change |
 
 Note: the existing `compute_job_snapshot_fingerprint` covers title,
@@ -75,7 +75,11 @@ applications_watermark)`
   older row, so every column is hashed. Any application change, including
   such an edit, marks **all** rows stale. That is deliberate: there are
   ~18 applications, the duplicate criterion reads all of them, changes are
-  rare, and a full recompute is ~55 s offline. Per-vacancy dependency
+  rare, and a full recompute is ~55 s offline. Stage 22 adds
+  `fit_cache.applied_jobs_hash` to the watermark: the descriptions of the
+  job rows the applications point to (or their absence), because the
+  duplicate criterion now compares every vacancy's text with them; editing
+  such a row marks every row stale, not only its own. Per-vacancy dependency
   tracking would be more code for little gain.
 - `rules_hash`: computed at runtime, not maintained by hand. It is the SHA-256
   over the source files of `app.services.job_fit_assessment` and every
