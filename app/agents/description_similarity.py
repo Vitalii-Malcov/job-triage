@@ -52,10 +52,12 @@ _HEADING = re.compile(
     re.MULTILINE,
 )
 _ROLE_HEADING = re.compile(
-    # Candidate-side "bring" phrasings only ("Das bringen Sie mit", "Was du
-    # mitbringst", "Du bringst ..."); "Was wir Ihnen bringen" is a benefit list.
-    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|mitbring|bringen sie mit|"
-    r"bringst du mit|du bringst|sie bringen|anforderung|voraussetz|"
+    # Candidate-side "bring" phrasings only, modifiers allowed ("Das bringen Sie
+    # (idealerweise / dafuer) mit", "Was du mitbringst", "Du bringst ...");
+    # "Was wir Ihnen bringen" is a benefit list (see _OTHER_HEADING).
+    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|mitbring|"
+    r"bringen\s+sie\b[^:?\n]{0,30}?\bmit\b|bringst\s+du\b[^:?\n]{0,30}?\bmit\b|"
+    r"du\s+bringst|sie\s+bringen|anforderung|voraussetz|"
     r"qualifikation|skills|kenntnis|role|responsib|requirement|what you|was du|"
     r"was sie|mission|das machst|dein job|wofuer"
 )

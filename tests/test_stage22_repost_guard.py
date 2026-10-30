@@ -620,8 +620,16 @@ def test_employer_benefit_heading_with_bringen_is_not_a_role_section():
     )
     role = role_section_text(text)
     assert "kundendaten" in role and "jobrad" not in role and "sabbatical" not in role
-    for heading in ("Das bringen Sie mit:", "Was du mitbringst:", "Das bringst du mit:"):
-        assert "zenon" in role_section_text(heading + NL + "- Zenon" + NL)
+    for heading in (
+        "Das bringen Sie mit:",
+        "Das bringen Sie idealerweise mit:",
+        "Das bringen Sie dafür mit:",
+        "Was du mitbringst:",
+        "Das bringst du mit:",
+        "Was bringst du idealerweise mit?",
+    ):
+        with_tasks = "Ihre Aufgaben:" + NL + "- Pflege" + NL + heading + NL + "- Zenon" + NL
+        assert "zenon" in role_section_text(with_tasks), heading
 
 
 def test_same_employer_shared_profile_is_not_a_rename():
