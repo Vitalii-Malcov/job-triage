@@ -52,14 +52,16 @@ _HEADING = re.compile(
     re.MULTILINE,
 )
 _ROLE_HEADING = re.compile(
-    # "bring" covers "Das bringen Sie mit", "Was du mitbringst", "Du bringst ..."
-    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|bring|anforderung|voraussetz|"
+    # Candidate-side "bring" phrasings only ("Das bringen Sie mit", "Was du
+    # mitbringst", "Du bringst ..."); "Was wir Ihnen bringen" is a benefit list.
+    r"beschreibung|aufgabe|taetigkeit|erwarte|verantwort|profil|mitbring|bringen sie mit|"
+    r"bringst du mit|du bringst|sie bringen|anforderung|voraussetz|"
     r"qualifikation|skills|kenntnis|role|responsib|requirement|what you|was du|"
     r"was sie|mission|das machst|dein job|wofuer"
 )
 _OTHER_HEADING = re.compile(
     r"bieten|vorteil|benefit|freuen|angebot|ueber uns|wir sind|about us|unternehmen|"
-    r"why us|warum wir|kontakt|ansprech|bewerb|perks"
+    r"why us|warum wir|kontakt|ansprech|bewerb|perks|wir (?:ihnen|dir|euch) bring"
 )
 _STOP_WORDS = frozenset(
     (

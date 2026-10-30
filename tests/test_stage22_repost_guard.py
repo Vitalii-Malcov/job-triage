@@ -607,6 +607,23 @@ SISTER_ROLE_WITH_SHARED_PROFILE = (
 )
 
 
+def test_employer_benefit_heading_with_bringen_is_not_a_role_section():
+    text = (
+        "Ihre Aufgaben:"
+        + NL
+        + "- Pflege der Kundendaten"
+        + NL
+        + "Was wir Ihnen bringen:"
+        + NL
+        + "- Jobrad, Kantine, Betriebskita, Sabbatical, Firmenwagen, Gleitzeitkonto"
+        + NL
+    )
+    role = role_section_text(text)
+    assert "kundendaten" in role and "jobrad" not in role and "sabbatical" not in role
+    for heading in ("Das bringen Sie mit:", "Was du mitbringst:", "Das bringst du mit:"):
+        assert "zenon" in role_section_text(heading + NL + "- Zenon" + NL)
+
+
 def test_same_employer_shared_profile_is_not_a_rename():
     similarity = compare_descriptions(SHARED_PROFILE, SISTER_ROLE_WITH_SHARED_PROFILE)
     assert similarity is not None and similarity.overlap >= 0.9
