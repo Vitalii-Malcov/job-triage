@@ -86,6 +86,33 @@ Notes:
   approvals stay with `stage15_application_tracker.py` and Telegram operator
   control.
 
+### 1b. Vacancy assessment cache (Stage 21)
+
+Once filled, the dashboard's fit-tier counts (14-day window and all stored
+vacancies) and the fit-tier / applied / mode filters read
+`job_fit_assessments` instead of assessing at most 200 vacancies per
+request. Only up-to-date rows count; the dashboard shows how many are
+`stale` or `not assessed`. Before the first fill (or on a database without
+the table) the UI behaves exactly as in Stage 20.
+
+```powershell
+# dry run: counts only, opens the database read-only
+.\.venv\Scripts\python.exe scripts\stage21_assess_vacancies.py --database runtime/job_triage_runtime.db
+# write (production needs a backup snapshot first; ~17 ms per vacancy)
+.\.venv\Scripts\python.exe scripts\stage21_assess_vacancies.py --database runtime/job_triage_runtime.db `
+  --apply --snapshot "$env:USERPROFILE\JobTriage-Backups"
+```
+
+Re-run it after a collection run or a profile/search-configuration change;
+it only assesses vacancies whose cached row is missing or stale, and Ctrl+C
+keeps every finished batch of 50. `--only-stale` refreshes existing stale
+rows without assessing new vacancies. The script needs the database at the
+current Alembic head (`alembic upgrade head`, with approval and a backup for
+production).
+The full production order (preflight, backup, code + migration together,
+backfill, smoke tests, rollback) is `docs/STAGE21_VACANCY_CACHE_PLAN.md` §9.
+Until the cache is filled the dashboard says so explicitly.
+
 ## 2. Which database is production
 
 `runtime\job_triage_runtime.db` in the project folder (SQLite, Alembic head

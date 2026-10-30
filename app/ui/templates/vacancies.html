@@ -27,7 +27,9 @@
   <a href="/ui/vacancies">Reset</a>
 </form>
 
-{% if filters.computed %}
+{% if filters.computed and page.from_cache %}
+<p class="notice">Fit tier, applied and work-mode filters use the assessment cache: only vacancies whose cached assessment is up to date are listed; stale and not-assessed vacancies are left out (see the dashboard counts).</p>
+{% elif filters.computed %}
 <p class="notice">Fit tier, applied and work-mode filters are computed per vacancy: this page checked {{ page.scanned }} vacancies (at most {{ budget }} per page).
 {% if page.budget_exhausted %}<strong>The scan budget ran out before the page was full — older vacancies were not checked yet.</strong>{% endif %}</p>
 {% endif %}
