@@ -21,6 +21,16 @@ stale tier is never presented as current:
 
 Writes happen only through `upsert_assessment`, called by the offline
 `scripts/stage21_assess_vacancies.py`; the UI only reads.
+
+A stored key is only as good as the state `assess_job` read: if the key and
+the assessment come from different states (A, then B), a later return to A
+would make B's assessment read FRESH (Codex audit of 76e8dc1). A writer
+therefore reads the key, the observed cache row and the assessment inside
+ONE transaction that sees one state (`require_consistent_reads`):
+PostgreSQL REPEATABLE READ (one snapshot; a concurrent change to a row it
+writes is a serialization failure, never a lost update) or a SQLite
+transaction begun before the first read (the writer's `BEGIN IMMEDIATE`
+also keeps every other writer out until it commits).
 """
 
 import ast
@@ -298,6 +308,35 @@ def assessment_values(assessment: FitAssessment) -> dict:
         "work_mode": work_mode(assessment),
         "applied": applied(assessment),
     }
+
+
+class InconsistentReadError(RuntimeError):
+    """The session's reads would not all see one database state."""
+
+
+_SNAPSHOT_LEVELS = frozenset({"repeatable read", "serializable"})
+
+
+def require_consistent_reads(session: Session) -> None:
+    """Refuse unless every read the session makes from now on sees the same
+    state until it commits (see the module docstring). Call it before the
+    first read of a write transaction."""
+    connection = session.connection()
+    dialect = connection.dialect.name
+    if dialect == "postgresql":
+        level = connection.exec_driver_sql("SHOW transaction_isolation").scalar()
+        consistent = level in _SNAPSHOT_LEVELS
+    elif dialect == "sqlite":
+        # pysqlite's default sends BEGIN only before the first write, so each
+        # SELECT before it sees its own state; an explicit BEGIN fixes one.
+        consistent = connection.connection.dbapi_connection.in_transaction
+    else:  # pragma: no cover - the project supports SQLite and PostgreSQL only
+        consistent = False
+    if not consistent:
+        raise InconsistentReadError(
+            f"{dialect}: the cache writer needs one consistent read transaction "
+            "(PostgreSQL REPEATABLE READ, SQLite BEGIN before the first read)"
+        )
 
 
 _UNCONDITIONAL = object()

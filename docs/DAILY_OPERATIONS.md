@@ -105,7 +105,7 @@ the table) the UI behaves exactly as in Stage 20.
 
 Re-run it after a collection run or a profile/search-configuration change;
 it only assesses vacancies whose cached row is missing or stale, and Ctrl+C
-keeps every finished batch of 200. `--only-stale` refreshes existing stale
+keeps every finished batch of 50. `--only-stale` refreshes existing stale
 rows without assessing new vacancies. The script needs the database at the
 current Alembic head (`alembic upgrade head`, with approval and a backup for
 production).

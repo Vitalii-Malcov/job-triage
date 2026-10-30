@@ -14,6 +14,17 @@ module removes that implicit switch:
 - without a role, a PILOT or BACKUP database is refused: using one requires
   the explicit `DATABASE_ROLE=pilot`. A backup is never a live database.
 
+The production runtime database is recognised independently of the checkout
+the process runs from (Codex audit of 76e8dc1, P2-2: from a second Git
+worktree the real file used to classify as OTHER_SQLITE, bypassing the
+test-role refusal and the snapshot requirement). A path is
+PRODUCTION_RUNTIME when it is, after resolving `..` and symlinks, or as the
+same file on disk (hard link), `runtime/job_triage_runtime.db` of this
+checkout or of ANY worktree of its Git repository (found from the `.git`
+metadata files; Git itself reads `core.worktree`, once per process),
+or when its file name is
+`job_triage_runtime.db` anywhere outside a backup location.
+
 `check_database_target` is called once at web/scheduler startup, before any
 session is used. Error messages name the kind and the file name, never the
 URL itself (a PostgreSQL URL can carry a password).
@@ -21,8 +32,10 @@ URL itself (a PostgreSQL URL can carry a password).
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -30,7 +43,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_RUNTIME_DB = PROJECT_ROOT / "runtime" / "job_triage_runtime.db"
+PRODUCTION_DB_NAME = "job_triage_runtime.db"
+PRODUCTION_RUNTIME_DB = PROJECT_ROOT / "runtime" / PRODUCTION_DB_NAME
 # Historical pilot databases live in the project root or runtime/ and are
 # named `stage<N>..._<...>.db` (stage10_pilot.db, stage11_pilot.db,
 # stage14b_canonical_v12.db, runtime/stage16_pilot_scratch.db).
@@ -143,15 +157,113 @@ def _same_file(path: Path, other: Path) -> bool:
         return False
 
 
+def _git_text(data: bytes) -> str:
+    """Git stores paths as raw bytes: decode without losing any (no newline
+    translation, undecodable bytes kept as surrogates like `os.fsdecode`)."""
+    return data.decode("utf-8", "surrogateescape")
+
+
+def _read_pointer(path: Path, prefix: str = "") -> Path | None:
+    """A path stored in a Git metadata file, resolved against its directory.
+    Like Git, only the exact prefix and trailing CR/LF are removed -- other
+    whitespace belongs to the path."""
+    try:
+        text = _git_text(path.read_bytes()).rstrip("\r\n")
+    except OSError:
+        return None
+    if not text.startswith(prefix) or len(text) == len(prefix):
+        return None
+    target = Path(text[len(prefix) :])
+    return target if target.is_absolute() else path.parent / target
+
+
+def _git_core_worktrees(common: Path) -> list[str]:
+    """Every `core.worktree` value Git itself reads for the repository whose
+    Git directory is `common`. Git runs inside that directory with the
+    caller's GIT_* variables removed, so Git's own syntax rules, includes,
+    `includeIf` conditions (evaluated for this repository) and the main
+    worktree's `config.worktree` (`extensions.worktreeConfig`) all apply;
+    global/system values only add candidates. No hand-written parser: Codex
+    rounds 6-10 showed that re-implementing Git's config syntax misses cases.
+    [] when Git is unavailable or fails (residual risk, docs section 11)."""
+    environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    try:
+        result = subprocess.run(
+            ["git", "config", "--includes", "--null", "--get-all", "core.worktree"],
+            cwd=common,
+            env=environment,
+            capture_output=True,  # bytes: no newline translation, no code page
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:  # 1: unset; anything else: Git could not read it
+        return []
+    return [value for value in _git_text(result.stdout).split("\0") if value]
+
+
+def _core_worktrees(common: Path) -> list[Path]:
+    """Main-worktree candidates from `core.worktree`, relative to the Git
+    directory like Git. A common directory not named `.git` records its
+    main worktree only there."""
+    paths = [Path(value) for value in _git_core_worktrees(common)]
+    return [path if path.is_absolute() else common / path for path in paths]
+
+
+def checkout_roots(root: Path) -> list[Path]:
+    """`root` plus every worktree of its Git repository: the main worktree
+    (parent of the common `.git` directory, or its `core.worktree`) and each
+    linked worktree listed under `<common>/worktrees/*/gitdir`. Unreadable
+    metadata is skipped. Without `core.worktree`, Git itself does not record
+    where the main worktree of a `--separate-git-dir` repository is."""
+    roots = {Path(_identity(root))}
+    dotgit = root / ".git"
+    git_dir = dotgit if dotgit.is_dir() else _read_pointer(dotgit, "gitdir: ")
+    if git_dir is None:
+        return sorted(roots)
+    common = _read_pointer(git_dir / "commondir") or git_dir
+    common = Path(os.path.realpath(os.path.abspath(common)))
+    if common.name.lower() == ".git":
+        roots.add(Path(_identity(common.parent)))
+    for configured in _core_worktrees(common):  # e.g. `--separate-git-dir`
+        roots.add(Path(_identity(configured)))
+    try:
+        linked = list((common / "worktrees").iterdir())
+    except OSError:
+        linked = []
+    for entry in linked:
+        worktree_git = _read_pointer(entry / "gitdir")
+        if worktree_git is not None:
+            roots.add(Path(_identity(worktree_git.parent)))
+    return sorted(roots)
+
+
+@lru_cache(maxsize=1)
+def known_production_databases() -> tuple[Path, ...]:
+    """The runtime database of every worktree of this repository."""
+    return tuple(root / "runtime" / PRODUCTION_DB_NAME for root in checkout_roots(PROJECT_ROOT))
+
+
+def _is_backup(resolved: Path) -> bool:
+    return _BACKUP_DIR in {part.lower() for part in resolved.parts} or bool(
+        _BACKUP_NAME.search(resolved.name)
+    )
+
+
 def classify_path(path: Path) -> DatabaseKind:
+    """Pure: `realpath`/`stat` only, the file is never opened."""
     identity = _identity(path)
-    if identity == _identity(PRODUCTION_RUNTIME_DB) or _same_file(path, PRODUCTION_RUNTIME_DB):
-        return DatabaseKind.PRODUCTION_RUNTIME
+    for production in (PRODUCTION_RUNTIME_DB, *known_production_databases()):
+        if identity == _identity(production) or _same_file(path, production):
+            return DatabaseKind.PRODUCTION_RUNTIME
     resolved = Path(os.path.realpath(os.path.abspath(path)))
-    if _BACKUP_DIR in {part.lower() for part in resolved.parts} or _BACKUP_NAME.search(
-        resolved.name
-    ):
+    if _is_backup(resolved):
         return DatabaseKind.BACKUP
+    # the production file name, wherever it lives (another clone, an old
+    # project location, a symlinked directory): fail closed
+    if PRODUCTION_DB_NAME in {resolved.name.casefold(), Path(path).name.casefold()}:
+        return DatabaseKind.PRODUCTION_RUNTIME
     if _PILOT_NAME.match(resolved.name) and any(
         _identity(resolved.parent) == _identity(directory) for directory in _PILOT_DIRS
     ):

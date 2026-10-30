@@ -67,10 +67,16 @@ applications_watermark)`
   import closure and fails if an excluded column is ever used there, and a
   test changes each included column alone and expects the row to go stale
   (including `fingerprint` and `source`, Codex plan review).
-- `applications_watermark`: `count(applications)` + `max(application_events.id)`.
-  Any application change marks **all** rows stale. That is deliberate: there are
-  15 applications, changes are rare, and a full recompute is ~50 s offline.
-  Per-vacancy dependency tracking would be more code for little gain.
+- `applications_watermark` (as implemented, `fit_cache.applications_hash`):
+  the SHA-256 over **every column of every `applications` row** (ordered by
+  id, values normalised like the job row) plus `max(application_events.id)`.
+  The first draft of this plan used `count(applications)`; Codex's Stage 21
+  review showed that a count / max id / max timestamp misses an edit of an
+  older row, so every column is hashed. Any application change, including
+  such an edit, marks **all** rows stale. That is deliberate: there are
+  ~18 applications, the duplicate criterion reads all of them, changes are
+  rare, and a full recompute is ~55 s offline. Per-vacancy dependency
+  tracking would be more code for little gain.
 - `rules_hash`: computed at runtime, not maintained by hand. It is the SHA-256
   over the source files of `app.services.job_fit_assessment` and every
   `app.*` module in its transitive import closure (the same import-graph
@@ -82,12 +88,29 @@ applications_watermark)`
   changes a dependency-only module (in a temporary copy) and expects a new
   hash (Codex plan review).
 
-The UI computes the current key per row with SQL only (job columns, profile
-version, two indexed lookups, one global watermark). It **never** runs
-`assess_job` for the list. A row whose stored key differs is shown as
-`STALE (recompute pending)`, never as its old tier; a vacancy without a row is
-`NOT_ASSESSED`. Counts on the dashboard come from fresh rows only and state
-how many are stale or missing.
+The UI computes the current key with SQL and hashing only (the `jobs`
+columns, the profile version, the latest matcher analysis and the latest
+commute check per vacancy, the applications watermark once per request;
+`fit_cache.current_keys`). It **never** runs `assess_job` to decide a
+count or a filter; FRESH means stored key == current key. What the pages
+show (`app/ui/queries.py`, `app/ui/templates/`):
+
+- dashboard: the fit-tier counts (14-day window and all vacancies) come from
+  FRESH rows only, followed by `N fresh · N stale (recompute pending) · N not
+  assessed` and, if any are not fresh, the hint to run the writer. A window
+  with stale or not-assessed vacancies reports its counts with that reason
+  instead of presenting them as complete. While the table is missing or empty
+  the Stage 20 live scan stays in place and a notice says so
+  (`fit_cache.cache_status`: MISSING / EMPTY / IN_USE);
+- vacancy list with a computed filter (fit tier, applied, work mode): the
+  filter runs as SQL on the cache, a STALE or NOT_ASSESSED vacancy is **left
+  out** (never listed under its old tier), and the displayed rows are then
+  assessed live, so their detail is current;
+- vacancy detail: always the live `assess_job`, plus the cache state of
+  that vacancy (`FRESH` / `STALE` / `NOT_ASSESSED`).
+
+A stored key is only correct if it and its assessment were read from the
+same database state; the writer guarantees that (section 3.3 and section 11).
 
 ### 3.3 Writer — offline, explicit, resumable
 
@@ -95,13 +118,18 @@ how many are stale or missing.
 
 - Default is a **dry run**: it computes and prints counts (would insert,
   update, unchanged) and writes nothing.
-- `--apply` upserts in batches of 200, one transaction per batch, and
+- `--apply` upserts in batches of 50, one transaction per batch, and
   prints progress (`done/total`, rate, ETA). Ctrl+C keeps every finished
   batch. Re-running continues with stale and missing rows only (idempotent;
   the upsert compares `input_key`).
+- Each batch reads keys, cache rows and assessments in one consistent
+  transaction (SQLite `BEGIN IMMEDIATE`, PostgreSQL REPEATABLE READ) and
+  retries a conflicting batch up to 3 times; a batch that still conflicts is
+  reported (`CONFLICT`, exit 1) and left for a re-run (section 11).
 - It refuses a backup file and applies the Stage 17 database-role rules like the
-  other tracker CLIs; the production run is preceded by a backup-API
-  snapshot (`--snapshot DIR`).
+  other tracker CLIs; the production file -- recognised from any worktree
+  or checkout (section 11) -- is written only after a verified backup-API
+  snapshot (`--snapshot DIR`: integrity check, same tables and revision).
 - It runs no collector and no matcher, sends nothing, and changes no vacancy,
   application or profile. It writes only `job_fit_assessments`.
 
@@ -221,7 +249,7 @@ legitimately on 29.10.2026 by `record-submission` of applications 16–18).
 |---|---|---|
 | T1 model + migration | `JobFitAssessmentRecord`, revision `c7e2a9d4f1b3` (down `b6c1e9a4d2f7`), real `downgrade()`; head literals in CI and tests updated | `app/db/models.py`, `alembic/versions/c7e2a9d4f1b3_*.py`, `.github/workflows/ci.yml`, head tests |
 | T2 key computation | `app/services/fit_cache.py`: rules hash over the import closure of `job_fit_assessment` + `fit_cache`, job row hash minus `last_seen_at`, latest match / commute keys (same ordering as the live lookups), applications watermark (count, max id, max event id), dialect upsert (`ON CONFLICT DO UPDATE`) | `app/services/fit_cache.py` |
-| T3 writer | `scripts/stage21_assess_vacancies.py`: dry run on a `mode=ro` / read-only connection, `--apply` in batches of 200 with progress/ETA, resumable, `--only-stale`, `--limit`, `--snapshot` (mandatory for the production file), Stage 17 database roles + Alembic head | `scripts/stage21_assess_vacancies.py` |
+| T3 writer | `scripts/stage21_assess_vacancies.py`: dry run on a `mode=ro` / read-only connection, `--apply` in batches of 50 (200 before section 11) with progress/ETA, resumable, `--only-stale`, `--limit`, `--snapshot` (mandatory for the production file), Stage 17 database roles + Alembic head | `scripts/stage21_assess_vacancies.py` |
 | T4 UI | dashboard tier counts (window + all) from FRESH rows with stale / not-assessed counts; computed list filters as SQL on the cache, page rows still assessed live; detail shows the cached state; Stage 20 budget path kept while the table is absent or empty | `app/ui/queries.py`, 3 templates |
 | T5 tests | SQLite: equivalence, per-column and per-input invalidation, rules-hash closure, excluded column never read, never stale-as-current, writer dry run / idempotence / limit / only-stale / interruption / roles / snapshot / missing table, UI cannot write. PostgreSQL (CI gate): constraints, concurrent writers, read-only UI connection, one-step downgrade/upgrade | `tests/test_stage21_vacancy_cache.py`, `tests/integration/test_stage21_vacancy_cache_postgres.py` |
 | T6 docs | operator section 1b, this record | `docs/DAILY_OPERATIONS.md`, this file |
@@ -365,7 +393,7 @@ Facts this order depends on:
 ### Rollback
 
 - **Backfill fails or is interrupted (D4):** nothing authoritative is
-  affected; re-run D4 (finished batches of 200 are kept, the rest is
+  affected; re-run D4 (finished batches of 50 are kept, the rest is
   assessed again). A partial cache only means "not assessed" counts.
 - **The UI misbehaves with the cache:** empty the cache (it is derived):
   `delete from job_fit_assessments` -- the UI falls back to the Stage 20
@@ -458,3 +486,90 @@ and then the Stage 21 cache refresh.
   the numbers above.
 - Commute verification for the 803 location-only vacancies stays a
   separate, operator-approved decision about using the external services.
+
+## 11. Codex audit of `76e8dc1` — security and correctness fix (2026-10-30)
+
+Codex REJECT, two confirmed P2 and one P3.
+
+**P2-1 false FRESH under a concurrent change.** The batch computed the key
+from state A while `assess_job` could read state B: pysqlite sends `BEGIN`
+only before the first write, so every earlier `SELECT` saw its own state,
+and PostgreSQL READ COMMITTED takes a new snapshot per statement. After a
+later A → B → A, B's assessment read FRESH. Comparing the hash a second time
+cannot detect that.
+
+- Fix: `fit_cache.require_consistent_reads` refuses a batch unless all its
+  reads see one state, and the writer engine (`_writer_engine`) provides
+  that state. SQLite uses `BEGIN IMMEDIATE` before the first read, so no
+  other writer can commit until the batch commits; batches are 50, so other
+  writers wait ~1 s, within their 5 s busy timeout. PostgreSQL uses
+  REPEATABLE READ: one snapshot, and a concurrent cache write or vacancy
+  delete on a row the batch writes is a serialization failure. Busy,
+  serialization and deadlock errors roll the batch back and retry it on a
+  fresh state (3 attempts), then `CONFLICT` and exit 1. The compare-and-swap
+  of `upsert_assessment` is unchanged.
+- SQLite tests: A → B → A during a batch (fails before the fix: B's
+  assessment stored under A's key); a concurrent delete and cache write are
+  locked out; a deleted vacancy is skipped (before: `LookupError`); the
+  guard refuses a plain session; retry, then a reported conflict.
+- PostgreSQL tests (a second connection): A → B → A; REPEATABLE READ
+  required; a concurrent cache row leads to a retry; a concurrent delete
+  leads to a retry that skips it; a permanent conflict is not written. Each
+  of these fails under READ COMMITTED.
+
+**P2-2 cross-worktree guard bypass.** `PRODUCTION_RUNTIME_DB` was derived
+from the running checkout, so from `job-triage-stage21` the real
+`E:\Projects\job-triage\runtime\job_triage_runtime.db` classified as
+OTHER_SQLITE: `DATABASE_ROLE=test` could open it, and `--apply` skipped the
+snapshot.
+
+- Fix: `classify_path` (pure: realpath/stat, the file is never opened)
+  treats as PRODUCTION_RUNTIME the runtime database of this checkout **and
+  of every worktree of its repository** (read from `.git`, `commondir` and
+  `worktrees/*/gitdir`; Git itself only reads `core.worktree`), compared by resolved path (`..`,
+  relative paths, symlinks, junctions, case) and by file identity (hard
+  links), and any file named `job_triage_runtime.db` outside a backup
+  location. The writer checks the snapshot requirement before it opens the
+  file, and verifies the snapshot (`PRAGMA integrity_check`, same tables and
+  Alembic revision) before the first write.
+- Tests on a real `git worktree` under tmp: discovery from both sides; the
+  main checkout's database from the linked worktree by absolute and
+  relative path, hard link, symlink (CI) and junction (Windows); the name
+  rule; backups and isolated test databases keep their kind; the test role
+  is refused without opening the file (connect/hash spy); a production write
+  without `--snapshot` is refused before opening; a verified snapshot, then
+  the write; a broken snapshot stops before any write; an isolated SQLite
+  stays writable under the test role. On a worktree checkout the real
+  main-checkout path is also checked (classified only, never opened).
+
+**P3.** Section 3.2 described `count(applications)` and per-row STALE
+labels. It now describes the implemented all-columns applications hash and
+what the dashboard, list and detail actually show.
+
+Codex re-reviews (rounds 5-10) all concerned one detail: the main worktree of
+a `--separate-git-dir` repository, whose common directory is `repo.git`, is
+recorded only in `core.worktree`. Round 5: it was not read at all. Rounds
+6-10: a hand-written config parser kept missing parts of Git's syntax
+(comments, quoting, last value, encoding, conditional includes,
+continuations, `config.worktree`, BOM, pathname interpolation). Final design:
+no parser. `_git_core_worktrees` runs `git config --includes --null --get-all
+core.worktree` inside the common directory, with the caller's `GIT_*`
+variables removed, so Git applies its own rules to this repository, including
+`includeIf` conditions and `extensions.worktreeConfig`. Global and system
+values only add candidates. Output is decoded as UTF-8. Real-Git regression
+tests cover each case Codex named.
+
+**Residual risk (accepted, documented).** A hard link to the production file
+under another name is not recognised when it is used from:
+
+- a copy of the code that is not a worktree of this repository, for example
+  an installed package;
+- a linked worktree of a `--separate-git-dir` repository without
+  `core.worktree` (Git itself records no main-worktree path there);
+- a separate-git-dir worktree on a machine without a working `git` binary
+  (then `core.worktree` cannot be read, and nothing is guessed).
+
+The name rule still covers every copy named `job_triage_runtime.db`, and an
+ordinary `.git` layout is found without Git (from the metadata files). A SQLite batch blocks other writers
+for ~1 s; a writer with a busy timeout below that may get `database is
+locked` and must retry.

@@ -2,12 +2,15 @@
 
 import hashlib
 import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, insert, select, text, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.core.database_target import DatabaseKind
 from app.db.candidate_profile_repository import get_or_create_candidate_profile
@@ -461,32 +464,42 @@ def test_compare_and_swap_keeps_a_row_written_meanwhile(session):
 
 
 def test_writer_keeps_a_row_committed_while_it_reads_the_inputs(db_path, session, monkeypatch):
-    """Codex round 4: another writer commits a row after this batch began
-    but before it read the inputs; the batch must not replace that row."""
+    """Codex round 4: another writer tries to store a row after this batch
+    began but before it read the inputs. On SQLite the batch's BEGIN
+    IMMEDIATE keeps that writer out until the batch commits (P2-1), so the
+    batch writes a row consistent with what it read; the concurrent write
+    fails instead of being lost or replacing a newer row."""
     (job_id, *_) = _catalogue(session)
     session.commit()
     real_inputs = fit_cache.global_inputs
+    outcome: list[str] = []
 
     def inputs_after_a_concurrent_write(batch_session):
-        other = sessionmaker(create_engine(f"sqlite:///{db_path}"))()
-        other_inputs = real_inputs(other)
-        fit_cache.upsert_assessment(
-            other,
-            job_id=job_id,
-            key="b" * 64,
-            inputs=other_inputs,
-            assessment=assess_job(other, job_id),
-        )
-        other.commit()
-        other.close()
+        other = sessionmaker(_other_connection(db_path))()
+        try:
+            fit_cache.upsert_assessment(
+                other,
+                job_id=job_id,
+                key="b" * 64,
+                inputs=real_inputs(other),
+                assessment=assess_job(other, job_id),
+            )
+            other.commit()
+            outcome.append("committed")
+        except OperationalError:
+            outcome.append("locked out")
+        finally:
+            other.close()
         return real_inputs(batch_session)
 
     monkeypatch.setattr(writer_cli.fit_cache, "global_inputs", inputs_after_a_concurrent_write)
-    factory = sessionmaker(create_engine(f"sqlite:///{db_path}"))
+    factory = sessionmaker(writer_cli._writer_engine(create_engine(f"sqlite:///{db_path}")))
     with factory() as batch, batch.begin():
-        assert writer_cli.assess_batch(batch, [job_id]) == 0
+        assert writer_cli.assess_batch(batch, [job_id]) == 1
+    assert outcome == ["locked out"]
     session.expire_all()
-    assert _rows(session)[job_id].input_key == "b" * 64
+    assert _rows(session)[job_id].input_key == fit_cache.current_keys(session, [job_id])[job_id]
+    _assert_no_false_fresh_row(session)
 
 
 def test_ui_session_cannot_write_the_cache(db_path, session, reader):
@@ -640,3 +653,162 @@ def test_dashboard_says_when_the_cache_is_empty(db_url, client_factory):  # noqa
     dashboard = client.get("/ui/").text
     assert "assessment cache has not been filled yet" in dashboard
     assert "stage21_assess_vacancies.py --apply" in dashboard
+
+
+# --- consistent reads (Codex audit of 76e8dc1, P2-1) --------------------------
+
+
+def _assert_no_false_fresh_row(db) -> None:
+    """Every FRESH row carries exactly what `assess_job` computes now."""
+    db.expire_all()
+    current = fit_cache.current_keys(db)
+    for job_id, row in _rows(db).items():
+        if fit_cache.cache_state(row.input_key, current.get(job_id)) == "FRESH":
+            live = fit_cache.assessment_values(assess_job(db, job_id))
+            assert {k: getattr(row, k) for k in live} == live, f"false FRESH row {job_id}"
+
+
+def _other_connection(db_path):
+    """A second, independent connection that gives up at once on a lock."""
+    return create_engine(
+        f"sqlite:///{db_path.as_posix()}", connect_args={"timeout": 0.1}, poolclass=NullPool
+    )
+
+
+def _set_description(engine, job_id, description) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            update(JobRecord).where(JobRecord.id == job_id).values(description=description)
+        )
+
+
+def test_a_b_a_change_during_a_batch_never_leaves_a_false_fresh_row(db_path, session, monkeypatch):
+    """Codex P2-1: the key is computed from state A, the vacancy changes to B
+    before `assess_job` reads it, and later back to A. The stored row must
+    never read FRESH with B's assessment."""
+    ids = _catalogue(session)
+    target = max(ids)  # assessed first (newest first), before the batch writes anything
+    state_a = session.get(JobRecord, target).description
+    state_b = DESCRIPTIONS[1]
+    session.commit()
+    other = _other_connection(db_path)
+    outcome: list[str] = []
+    real = writer_cli.assess_job
+
+    def assess_after_a_concurrent_change(db, job_id):
+        if job_id == target and not outcome:
+            try:
+                _set_description(other, target, state_b)
+                outcome.append("B committed")
+            except OperationalError:
+                outcome.append("locked out")
+        return real(db, job_id)
+
+    monkeypatch.setattr(writer_cli, "assess_job", assess_after_a_concurrent_change)
+    assert _fill(db_path) == 0
+    # B is a different assessment, so a mix-up would be visible
+    _set_description(other, target, state_b)
+    session.expire_all()
+    b_values = fit_cache.assessment_values(assess_job(session, target))
+    assert {k: getattr(_rows(session)[target], k) for k in b_values} != b_values
+    assert (
+        fit_cache.cache_state(
+            _rows(session)[target].input_key, fit_cache.current_keys(session, [target])[target]
+        )
+        == "STALE"
+    )
+    _set_description(other, target, state_a)  # A -> B -> A
+    _assert_no_false_fresh_row(session)
+    assert outcome == ["locked out"]  # SQLite: nobody commits inside a batch
+    other.dispose()
+
+
+def test_concurrent_delete_and_cache_write_wait_for_the_batch(db_path, session, monkeypatch):
+    """Inside a batch no other connection can delete a vacancy or store a
+    cache row; afterwards a deleted vacancy is skipped and a re-run is
+    a no-op."""
+    ids = _catalogue(session)
+    session.commit()
+    other = _other_connection(db_path)
+    blocked: list[str] = []
+    real = writer_cli.assess_job
+
+    def assess_with_concurrent_writers(db, job_id):
+        if not blocked:
+            for name, statement in (
+                ("delete", text("DELETE FROM jobs WHERE id = :j")),
+                ("cache", text("DELETE FROM job_fit_assessments WHERE job_id = :j")),
+            ):
+                try:
+                    with other.begin() as connection:
+                        connection.execute(statement, {"j": min(ids)})
+                except OperationalError:
+                    blocked.append(name)
+        return real(db, job_id)
+
+    monkeypatch.setattr(writer_cli, "assess_job", assess_with_concurrent_writers)
+    assert _fill(db_path) == 0
+    assert blocked == ["delete", "cache"]
+    _assert_no_false_fresh_row(session)
+    monkeypatch.setattr(writer_cli, "assess_job", real)
+    with other.begin() as connection:
+        connection.execute(text("PRAGMA foreign_keys = ON"))
+        connection.execute(text("DELETE FROM jobs WHERE id = :j"), {"j": ids[2]})
+    plan_factory = sessionmaker(writer_cli._writer_engine(create_engine(f"sqlite:///{db_path}")))
+    with plan_factory() as batch, batch.begin():
+        # the deleted vacancy is skipped (no LookupError); ids[3] is rewritten
+        assert writer_cli.assess_batch(batch, [ids[2], ids[3]]) == 1
+    assert ids[2] not in _rows(session)
+    assert _fill(db_path) == 0
+    _assert_no_false_fresh_row(session)
+    other.dispose()
+
+
+def test_assess_batch_refuses_reads_outside_one_transaction(db_path, session):
+    """The guard behind P2-1: without an explicit SQLite transaction every
+    SELECT would see its own state."""
+    (job_id, *_) = _catalogue(session)
+    session.commit()
+    plain = sessionmaker(create_engine(f"sqlite:///{db_path}"))()
+    with pytest.raises(fit_cache.InconsistentReadError):
+        writer_cli.assess_batch(plain, [job_id])
+    plain.close()
+    assert _rows(session) == {}
+
+
+def _busy() -> OperationalError:
+    orig = sqlite3.OperationalError("database is locked")
+    orig.sqlite_errorcode = 5  # SQLITE_BUSY
+    return OperationalError("BEGIN IMMEDIATE", {}, orig)
+
+
+def test_a_write_conflict_retries_the_batch_and_then_reports_it(
+    db_path, session, monkeypatch, capsys
+):
+    ids = _catalogue(session)
+    session.commit()
+    real = writer_cli.assess_batch
+    calls: list[int] = []
+
+    def conflict_once(db, batch):
+        calls.append(len(batch))
+        if len(calls) == 1:
+            raise _busy()
+        return real(db, batch)
+
+    monkeypatch.setattr(writer_cli, "assess_batch", conflict_once)
+    assert _fill(db_path) == 0
+    assert len(calls) == 2 and len(_rows(session)) == len(ids)
+
+    session.execute(update(JobRecord).values(title="Neu (m/w/d)"))
+    session.commit()
+
+    def always_conflict(db, batch):
+        raise _busy()
+
+    monkeypatch.setattr(writer_cli, "assess_batch", always_conflict)
+    capsys.readouterr()
+    assert _fill(db_path) == 1
+    out = capsys.readouterr().out
+    assert "CONFLICT" in out and "re-run" in out
+    _assert_no_false_fresh_row(session)

@@ -5,6 +5,9 @@
 - two concurrent writers upserting the same vacancy leave exactly one
   consistent row (`INSERT ... ON CONFLICT DO UPDATE`), and a writer's
   compare-and-swap keeps a row another writer committed meanwhile;
+- the writer's REPEATABLE READ batch never stores a key and an assessment
+  from different states (A -> B -> A by a second connection), a concurrent
+  cache write or vacancy delete becomes a retried conflict;
 - the UI's read-only connection (`default_transaction_read_only`) reads the
   cache for the dashboard and the filtered list, and cannot write it.
 
@@ -32,6 +35,7 @@ from app.services import fit_cache
 from app.services.job_fit_assessment import assess_job
 from app.ui import queries
 from app.ui.readonly import build_readonly_engine, readonly_sessionmaker
+from scripts import stage21_assess_vacancies as writer_cli
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
@@ -250,3 +254,159 @@ def test_one_step_downgrade_and_upgrade():
     finally:
         upgrade(cfg, "head")
         engine.dispose()
+
+
+# --- consistent reads (Codex audit of 76e8dc1, P2-1) --------------------------
+
+
+def _set_description(engine, job_id, description) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            JobRecord.__table__.update()
+            .where(JobRecord.id == job_id)
+            .values(description=description)
+        )
+
+
+def _stored(engine, job_id):
+    with engine.connect() as conn:
+        return (
+            conn.execute(
+                select(JobFitAssessmentRecord.__table__).where(
+                    JobFitAssessmentRecord.job_id == job_id
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+
+
+def _assert_no_false_fresh_row(engine, job_ids) -> None:
+    factory = sessionmaker(engine)
+    with factory() as session:
+        current = fit_cache.current_keys(session, job_ids)
+        for job_id in job_ids:
+            row = _stored(engine, job_id)
+            if row is None or current.get(job_id) != row["input_key"]:
+                continue
+            live = fit_cache.assessment_values(assess_job(session, job_id))
+            assert {k: row[k] for k in live} == live, f"false FRESH row {job_id}"
+
+
+def test_a_b_a_change_by_a_second_connection_never_leaves_a_false_fresh_row(engine, monkeypatch):
+    """The batch transaction reads the key from state A; a second connection
+    commits B before `assess_job` reads the vacancy, and later A again."""
+    (job_id,) = _jobs(engine, 1)
+    state_a = "Python, FastAPI, SQL. Deutsch B1."
+    state_b = "Senior Java Architekt mit mindestens 8 Jahren Berufserfahrung. Deutsch C1."
+    real = writer_cli.assess_job
+    committed: list[bool] = []
+
+    def assess_after_a_concurrent_change(session, target):
+        if not committed:
+            _set_description(engine, job_id, state_b)  # second connection, committed
+            committed.append(True)
+        return real(session, target)
+
+    monkeypatch.setattr(writer_cli, "assess_job", assess_after_a_concurrent_change)
+    writer = writer_cli._writer_engine(engine)
+    factory = sessionmaker(writer)
+    with factory() as session, session.begin():
+        assert writer_cli.assess_batch(session, [job_id]) == 1
+    assert committed == [True]
+    _assert_no_false_fresh_row(engine, [job_id])  # state B: the row reads STALE
+    with sessionmaker(engine)() as session:
+        b_values = fit_cache.assessment_values(real(session, job_id))
+    row = _stored(engine, job_id)
+    assert {k: row[k] for k in b_values} != b_values  # the A assessment, not B's
+    _set_description(engine, job_id, state_a)  # A -> B -> A
+    _assert_no_false_fresh_row(engine, [job_id])
+    with sessionmaker(engine)() as session:
+        assert fit_cache.current_keys(session, [job_id])[job_id] == row["input_key"]  # FRESH
+
+
+def test_writer_requires_repeatable_read(engine):
+    (job_id,) = _jobs(engine, 1)
+    with sessionmaker(engine)() as session, session.begin():
+        with pytest.raises(fit_cache.InconsistentReadError):
+            writer_cli.assess_batch(session, [job_id])
+
+
+def _hook_once(monkeypatch, action):
+    real = writer_cli.assess_job
+    calls: list[int] = []
+
+    def assess(session, target):
+        if not calls:
+            action()
+        calls.append(target)
+        return real(session, target)
+
+    monkeypatch.setattr(writer_cli, "assess_job", assess)
+    return calls
+
+
+def test_a_cache_row_committed_during_the_batch_is_a_conflict_and_the_retry_wins(
+    engine, monkeypatch
+):
+    """REPEATABLE READ turns the concurrent write into a serialization
+    failure; the retry re-reads everything on a fresh snapshot."""
+    job_ids = _jobs(engine, 2)
+
+    def other_writer():
+        with sessionmaker(engine)() as other, other.begin():
+            fit_cache.upsert_assessment(
+                other,
+                job_id=job_ids[0],
+                key="b" * 64,
+                inputs=fit_cache.global_inputs(other),
+                assessment=assess_job(other, job_ids[0]),
+            )
+
+    calls = _hook_once(monkeypatch, other_writer)
+    factory = sessionmaker(writer_cli._writer_engine(engine))
+    assert writer_cli._write_batch(factory, job_ids) == 2
+    assert len(calls) > len(job_ids)  # the first attempt was rolled back and retried
+    with sessionmaker(engine)() as session:
+        current = fit_cache.current_keys(session, job_ids)
+    assert all(_stored(engine, j)["input_key"] == current[j] for j in job_ids)
+    _assert_no_false_fresh_row(engine, job_ids)
+
+
+def test_a_vacancy_deleted_during_the_batch_is_skipped_after_the_retry(engine, monkeypatch):
+    job_ids = _jobs(engine, 2)
+
+    def delete_one():
+        with engine.begin() as conn:
+            conn.execute(delete(JobRecord).where(JobRecord.id == job_ids[1]))
+
+    _hook_once(monkeypatch, delete_one)
+    factory = sessionmaker(writer_cli._writer_engine(engine))
+    assert writer_cli._write_batch(factory, job_ids) == 1
+    assert _stored(engine, job_ids[1]) is None
+    _assert_no_false_fresh_row(engine, job_ids)
+    # a re-run on the remaining vacancy is a no-op rewrite with the same key
+    key = _stored(engine, job_ids[0])["input_key"]
+    monkeypatch.setattr(writer_cli, "assess_job", assess_job)
+    assert writer_cli._write_batch(factory, [job_ids[0]]) == 1
+    assert _stored(engine, job_ids[0])["input_key"] == key
+
+
+def test_a_conflict_on_every_attempt_is_reported_not_written(engine, monkeypatch):
+    (job_id,) = _jobs(engine, 1)
+    real = writer_cli.assess_job
+
+    def always_conflict(session, target):
+        with sessionmaker(engine)() as other, other.begin():
+            fit_cache.upsert_assessment(
+                other,
+                job_id=job_id,
+                key=os.urandom(32).hex(),
+                inputs=fit_cache.global_inputs(other),
+                assessment=assess_job(other, job_id),
+            )
+        return real(session, target)
+
+    monkeypatch.setattr(writer_cli, "assess_job", always_conflict)
+    factory = sessionmaker(writer_cli._writer_engine(engine))
+    assert writer_cli._write_batch(factory, [job_id]) is None
