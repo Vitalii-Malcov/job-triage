@@ -85,6 +85,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import urlparse
 
+from app.collectors.ba_reference import extract_ba_references
 from app.utils.text import truncate_with_ellipsis
 
 MatchType = Literal["APPLICATION", "JOB_ONLY", "AMBIGUOUS", "UNMATCHED"]
@@ -286,6 +287,10 @@ class JobCandidate:
     location: str
     url: str
     status: str
+    # Stage 22 P0-1: the stored full source reference (BA `referenznummer`),
+    # compared with references quoted in the e-mail; see
+    # `_resolve_by_explicit_reference`.
+    source_reference: str | None = None
 
 
 @dataclass(frozen=True)
@@ -476,6 +481,19 @@ def _resolve_by_thread_association(
     )
 
 
+def _full_reference_token(reference: str) -> str:
+    # Namespaced so a full BA reference can never collide with a URL/label
+    # token, and case-folded like the label tokens are upper-cased.
+    return "BA:" + reference.casefold()
+
+
+def _job_reference_tokens(job: JobCandidate) -> frozenset[str]:
+    tokens = extract_reference_tokens(job.title, job.url)
+    if job.source_reference:
+        tokens = tokens | {_full_reference_token(job.source_reference)}
+    return tokens
+
+
 def _resolve_by_explicit_reference(
     job_candidates: list[JobCandidate], email_reference_tokens: frozenset[str]
 ) -> tuple[EmailMatchResult | None, tuple[MatchEvidenceItem, ...]]:
@@ -493,8 +511,7 @@ def _resolve_by_explicit_reference(
 
     matches: list[tuple[JobCandidate, frozenset[str]]] = []
     for job in job_candidates:
-        job_reference_tokens = extract_reference_tokens(job.title, job.url)
-        overlap = job_reference_tokens & email_reference_tokens
+        overlap = _job_reference_tokens(job) & email_reference_tokens
         if overlap:
             matches.append((job, overlap))
 
@@ -689,7 +706,12 @@ def match_email_to_job(
     email_text = f"{subject}\n{body_plain}"
     normalized_email_text = normalize_company_name(email_text)
     email_tokens = _title_tokens(email_text)
-    email_reference_tokens = extract_reference_tokens(email_text)
+    # Stage 22 P0-1: full BA references quoted in the mail (strict shape, see
+    # app.collectors.ba_reference), matched against stored job references.
+    # Same precedence and ambiguity rules as every other explicit reference.
+    email_reference_tokens = extract_reference_tokens(email_text) | {
+        _full_reference_token(reference) for reference in extract_ba_references(email_text)
+    }
     sender_domain = extract_sender_domain(from_address)
 
     # Tier 1: CURRENT explicit reference — evaluated BEFORE thread

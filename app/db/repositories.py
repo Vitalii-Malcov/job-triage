@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.collectors.ba_reference import storable_reference
 from app.db.models import (
     CompanyResearchIdentityAlias,
     CompanyResearchRecord,
@@ -26,6 +28,8 @@ from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchData
 from app.models.job import Job, JobScore
 from app.services.email_matching import extract_reference_tokens
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PROFILE_SKILLS = [
     "python",
@@ -121,7 +125,9 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
     db.flush()
 
 
-def _finalize_job_write(db: Session, record: JobRecord) -> JobRecord:
+def _finalize_job_write(
+    db: Session, record: JobRecord, source_reference: str | None = None
+) -> JobRecord:
     """Single transaction boundary for a `JobRecord` write and its derived
     `job_reference_tokens` sync (Stage 7B Codex remediation round 3,
     Blocker R3-001) — flushes the already-staged `JobRecord` mutation,
@@ -133,13 +139,38 @@ def _finalize_job_write(db: Session, record: JobRecord) -> JobRecord:
     """
     db.flush()
     try:
+        if source_reference is not None:
+            _store_source_reference(db, record, source_reference)
         sync_job_reference_tokens(db, record)
     except Exception:
         db.rollback()
         raise
     db.commit()
     db.refresh(record)
+    if source_reference is not None and record.source_reference != source_reference:
+        logger.warning(
+            "job_source_reference_conflict job_id=%s kept=%s ignored=%s",
+            record.id,
+            record.source_reference,
+            source_reference,
+        )
     return record
+
+
+def _store_source_reference(db: Session, record: JobRecord, reference: str) -> None:
+    """Stage 22 P0-1: set once, never blanked, never replaced -- atomically.
+    An existing row gets the reference only while it is still empty
+    (`UPDATE ... WHERE source_reference IS NULL`), so two writers (two
+    collector runs, a collector and the backfill) cannot overwrite each
+    other; the loser's value is logged as a conflict by the caller. The
+    fingerprint is URL-based, so a conflict means two postings share one
+    URL and needs a human."""
+    db.execute(
+        update(JobRecord)
+        .where(JobRecord.id == record.id, JobRecord.source_reference.is_(None))
+        .values(source_reference=reference)
+        .execution_options(synchronize_session=False)
+    )
 
 
 def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: datetime) -> None:
@@ -277,7 +308,7 @@ def _upsert_job(
         if historical:
             raise ValueError("historical observation timestamps apply only to a new job record")
         _apply_job_update_fields(existing, job, score, now)
-        _finalize_job_write(db, existing)
+        _finalize_job_write(db, existing, storable_reference(job.source_reference))
         return existing, False
 
     record = JobRecord(
@@ -294,6 +325,7 @@ def _upsert_job(
         must_have_skills_json=json.dumps(job.must_have_skills),
         nice_to_have_skills_json=json.dumps(job.nice_to_have_skills),
         posting_type=job.posting_type,
+        source_reference=storable_reference(job.source_reference),
         score=score.score,
         recommendation=score.recommendation,
         status="NEW",
@@ -315,7 +347,7 @@ def _upsert_job(
                 "historical observation timestamps apply only to a new job record"
             ) from exc
         _apply_job_update_fields(winner, job, score, now)
-        _finalize_job_write(db, winner)
+        _finalize_job_write(db, winner, storable_reference(job.source_reference))
         return winner, False
     return record, True
 

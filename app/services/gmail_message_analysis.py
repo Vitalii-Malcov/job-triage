@@ -53,6 +53,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.agents.email_classifier import CONSEQUENTIAL_CLASSIFICATIONS, classify_email
+from app.collectors.ba_reference import extract_ba_references
 from app.db.gmail_analysis_repository import (
     compute_context_fingerprint,
     get_job_candidates,
@@ -189,8 +190,13 @@ def analyze_gmail_message(
     # recency-bounded pool — an exact reference match older than the
     # recency window must still be discoverable (see that function's
     # docstring).
-    reference_tokens = extract_reference_tokens(f"{message.subject}\n{message.body_plain}")
-    job_candidates = get_job_candidates(db, reference_tokens=reference_tokens)
+    email_text = f"{message.subject}\n{message.body_plain}"
+    reference_tokens = extract_reference_tokens(email_text)
+    job_candidates = get_job_candidates(
+        db,
+        reference_tokens=reference_tokens,
+        source_references=extract_ba_references(email_text),
+    )
     thread_prior_matches = get_thread_prior_matches(
         db,
         account_key=account_key,

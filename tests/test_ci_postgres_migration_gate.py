@@ -242,8 +242,9 @@ def test_repository_head_is_the_application_lifecycle_head() -> None:
     # f4b8d2a6c9e1 (OUTBOUND_MESSAGE application events); Stage 17:
     # a9d3f6b2c4e8 (candidate search configuration), then b6c1e9a4d2f7
     # (search targets + car-route origin coordinates); Stage 21:
-    # c7e2a9d4f1b3 (job_fit_assessments cache table).
-    assert _repository_head() == "c7e2a9d4f1b3"
+    # c7e2a9d4f1b3 (job_fit_assessments cache table); Stage 22 P0-1:
+    # d5f1a7c3e9b2 (jobs.source_reference).
+    assert _repository_head() == "d5f1a7c3e9b2"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

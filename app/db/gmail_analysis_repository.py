@@ -34,7 +34,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -76,6 +76,7 @@ def _job_candidate_from_row(row) -> JobCandidate:
         location=row.location,
         url=row.url,
         status=row.status,
+        source_reference=row.source_reference,
     )
 
 
@@ -84,6 +85,7 @@ def get_job_candidates(
     *,
     limit: int = MATCH_CANDIDATE_SCAN_LIMIT,
     reference_tokens: frozenset[str] = frozenset(),
+    source_references: frozenset[str] = frozenset(),
 ) -> list[JobCandidate]:
     """The bounded candidate `JobRecord` pool matching scores against.
 
@@ -102,6 +104,10 @@ def get_job_candidates(
        older than the `limit` most-recently-seen jobs is still
        discoverable, without ever scanning the whole table or issuing
        one query per candidate.
+    3. Stage 22 P0-1: if `source_references` is non-empty (full BA
+       references quoted in the email, see
+       app.collectors.ba_reference.extract_ba_references), a THIRD query by
+       case-insensitive `JobRecord.source_reference` equality, same ceiling.
     """
     columns = (
         JobRecord.id,
@@ -110,6 +116,7 @@ def get_job_candidates(
         JobRecord.location,
         JobRecord.url,
         JobRecord.status,
+        JobRecord.source_reference,
     )
     recency_rows = db.execute(
         select(*columns).order_by(JobRecord.last_seen_at.desc(), JobRecord.id.desc()).limit(limit)
@@ -126,6 +133,22 @@ def get_job_candidates(
             .limit(REFERENCE_TARGETED_SCAN_LIMIT)
         ).all()
         for row in targeted_rows:
+            candidates.setdefault(row.id, _job_candidate_from_row(row))
+
+    if source_references:
+        reference_rows = db.execute(
+            select(*columns)
+            # Case-insensitive like the in-memory comparison
+            # (email_matching._full_reference_token); references are ASCII.
+            .where(
+                func.lower(JobRecord.source_reference).in_(
+                    sorted({r.lower() for r in source_references})
+                )
+            )
+            .order_by(JobRecord.id)
+            .limit(REFERENCE_TARGETED_SCAN_LIMIT)
+        ).all()
+        for row in reference_rows:
             candidates.setdefault(row.id, _job_candidate_from_row(row))
 
     return list(candidates.values())
@@ -254,6 +277,10 @@ def compute_context_fingerprint(
             "location": c.location,
             "url": c.url,
             "status": c.status,
+            # Stage 22 P0-1: part of the effective context (it can decide a
+            # match); only present when set, so the fingerprint of a context
+            # without stored references is unchanged.
+            **({"source_reference": c.source_reference} if c.source_reference else {}),
         }
         for c in sorted(job_candidates, key=lambda c: c.job_id)
     ]
