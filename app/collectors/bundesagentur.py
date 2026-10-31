@@ -296,6 +296,9 @@ class BundesagenturCollector(JobCollector):
         # of the JobCollector interface itself since `fetch()` must keep
         # returning a plain list[Job].
         self.skipped_invalid_count = 0
+        # `maxErgebnisse` of the last fetch (None when the API did not say);
+        # with `truncated` it tells how many results `max_pages` left out.
+        self.total_results: int | None = None
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
         if not is_api_key_configured(self.api_key):
@@ -304,6 +307,7 @@ class BundesagenturCollector(JobCollector):
         self.skipped_invalid_count = 0
         self.skipped_not_home_office = 0
         self.truncated = False
+        self.total_results = None
         headers = {"X-API-Key": self.api_key}
         params = self._build_params(since)
 
@@ -389,6 +393,7 @@ class BundesagenturCollector(JobCollector):
 
             if total_results is None:
                 total_results = _parse_int(payload.get("maxErgebnisse"))
+                self.total_results = total_results
 
             postings = _extract_postings(payload)
             if not postings:
