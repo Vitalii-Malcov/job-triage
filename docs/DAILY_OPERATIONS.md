@@ -455,8 +455,14 @@ at MEDIUM+ correlation. Rejections and offers are only *reported*
 mail:
 
 ```powershell
-... transition <id> REJECTED --actor operator --reason "Absage vom 2026-11-02, im Postfach geprüft" --apply
+... transition <id> REJECTED --actor operator --reason "Absage vom 2026-11-02, im Postfach geprüft" `
+    --occurred-at 2026-11-02T10:14:00+01:00 --apply
 ```
+
+`--occurred-at` (Stage 22, optional, also for `override`) records WHEN it
+happened -- the employer mail's date -- instead of now, so `received_at` and
+the history keep the real time. It must carry a UTC offset, must not lie in
+the future and not before the current status was set; the dry run prints it.
 
 A message that reads like a lifecycle event but may not or could not be
 applied carries `operator_review=NEEDS_OPERATOR_REVIEW`: a rejection/offer to

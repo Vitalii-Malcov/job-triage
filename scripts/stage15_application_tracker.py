@@ -20,8 +20,8 @@ the status, follow-up date and employer-contact time never change:
                      --message-id "<id@host>" --recipient ADDR --channel CH
                      --sent-at ISO8601 --kind K --actor A --reason R
                      [--sender ADDR] [--subject S] [--evidence TEXT] [--apply]
-State changes:   transition ID STATUS --actor A --reason R [--apply]
-                 override   ID STATUS --actor A --reason R [--apply]
+State changes:   transition ID STATUS --actor A --reason R [--occurred-at ISO8601] [--apply]
+                 override   ID STATUS --actor A --reason R [--occurred-at ISO8601] [--apply]
 
 **Safe by default.** `process-gmail`, `record-outbound`, `transition` and
 `override` are DRY RUNS
@@ -466,6 +466,13 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("status", choices=[s.value for s in ApplicationLifecycleStatus])
         cmd.add_argument("--actor", required=True)
         cmd.add_argument("--reason", required=True)
+        # Stage 22 P2: when it happened (e.g. the employer mail's Date), so a
+        # receipt recorded later keeps its real time; default: now.
+        cmd.add_argument(
+            "--occurred-at",
+            default=None,
+            help="ISO 8601 with UTC offset; not in the future, not before the current status",
+        )
         cmd.add_argument("--apply", action="store_true", help="write (default: dry run)")
     return parser
 
@@ -653,15 +660,19 @@ def _check_job(session: Session, args) -> int:
 def _submitted_at(raw: str, now: datetime | None = None) -> datetime:
     """A real past instant: ISO 8601 with an explicit offset, never later
     than now (UTC-aware comparison, no tolerance)."""
+    return _past_instant(raw, "--submitted-at", now)
+
+
+def _past_instant(raw: str, flag: str, now: datetime | None = None) -> datetime:
     try:
         value = datetime.fromisoformat(raw)
     except ValueError:
-        raise TargetRefusedError("--submitted-at must be ISO 8601") from None
+        raise TargetRefusedError(f"{flag} must be ISO 8601") from None
     if value.tzinfo is None:
-        raise TargetRefusedError("--submitted-at needs an explicit UTC offset (e.g. ...Z)")
+        raise TargetRefusedError(f"{flag} needs an explicit UTC offset (e.g. ...Z)")
     value = value.astimezone(UTC)
     if value > (now or datetime.now(UTC)):
-        raise TargetRefusedError("--submitted-at lies in the future")
+        raise TargetRefusedError(f"{flag} lies in the future")
     return value
 
 
@@ -930,10 +941,21 @@ def _change_status(session: Session, tracker: ApplicationTracker, args) -> int:
         validate_transition(current.current_status, target)
     elif target == current.current_status:
         raise ApplicationInputError("override target equals the current status")
+    occurred_at = datetime.now(UTC)
+    if args.occurred_at is not None:
+        occurred_at = _past_instant(args.occurred_at, "--occurred-at")
+        if occurred_at < current.last_status_changed_at:
+            # history stays in time order: a change never predates the
+            # status it leaves
+            raise TargetRefusedError(
+                "--occurred-at lies before the current status was set "
+                f"({current.last_status_changed_at.isoformat()})"
+            )
     if not args.apply:
         print(
             f"DRY RUN: would {args.command} application {current.id} "
-            f"{current.current_status.value} -> {target.value} (nothing written)"
+            f"{current.current_status.value} -> {target.value} at "
+            f"{occurred_at.isoformat(timespec='seconds')} (nothing written)"
         )
         return 0
     if args.command == "transition":
@@ -944,11 +966,18 @@ def _change_status(session: Session, tracker: ApplicationTracker, args) -> int:
             origin=ApplicationEventOrigin.OPERATOR,
             actor=args.actor,
             reason=args.reason,
-            occurred_at=datetime.now(UTC),
+            occurred_at=occurred_at,
+            chronological=args.occurred_at is not None,
         )
     else:
         outcome = tracker.override_status(
-            session, current.id, target, actor=args.actor, reason=args.reason
+            session,
+            current.id,
+            target,
+            actor=args.actor,
+            reason=args.reason,
+            occurred_at=occurred_at,
+            chronological=args.occurred_at is not None,
         )
     print(
         f"APPLIED: application {outcome.application.id} {outcome.previous_status} -> "

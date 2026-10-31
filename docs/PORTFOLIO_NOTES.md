@@ -8,11 +8,11 @@ An AI-assisted job-search automation backend (FastAPI/PostgreSQL) that collects 
 
 ## 3-sentence description
 
-JobTriage is a FastAPI + PostgreSQL backend that automates the repetitive parts of a job search — collecting postings from multiple sources, scoring them against a candidate profile, and drafting CVs, cover letters, and email responses — while keeping every action that could have a real-world consequence (sending an email, mutating application status) behind an explicit, database-recorded human approval step. It's built with production concerns in mind from the start: Alembic-versioned schema migrations, compare-and-swap concurrency control for its automation scheduler (verified against real PostgreSQL, not just SQLite), and 1900+ tests including dedicated PostgreSQL concurrency integration tests in CI. Content generation is deterministic and template-based rather than free-form LLM output, so every generated fact traces back to a specific, trust-classified source — including a hard rule that content parsed from unauthenticated inbound email can never reach generated text.
+JobTriage is a FastAPI + PostgreSQL backend that automates the repetitive parts of a job search — collecting postings from multiple sources, scoring them against a candidate profile, and drafting CVs, cover letters, and email responses — while keeping every action that could have a real-world consequence (sending an email, mutating application status) behind an explicit, database-recorded human approval step. It's built with production concerns in mind from the start: Alembic-versioned schema migrations, compare-and-swap concurrency control for its automation scheduler (verified against real PostgreSQL, not just SQLite), and ~6 900 tests including dedicated PostgreSQL concurrency integration tests in CI. Content generation is deterministic and template-based rather than free-form LLM output, so every generated fact traces back to a specific, trust-classified source — including a hard rule that content parsed from unauthenticated inbound email can never reach generated text.
 
 ## CV bullet version
 
-- Designed and built a FastAPI/PostgreSQL job-search automation backend (Python, SQLAlchemy, Alembic) with database-enforced concurrency control (lease + CAS locking, verified against real PostgreSQL in CI), deterministic content generation with explicit data-provenance/trust gating, and human-approval-gated outbound actions; 1900+ tests, Dockerized deployment.
+- Designed and built a FastAPI/PostgreSQL job-search automation backend (Python, SQLAlchemy, Alembic) with database-enforced concurrency control (lease + CAS locking, verified against real PostgreSQL in CI), deterministic content generation with explicit data-provenance/trust gating, and human-approval-gated outbound actions; ~6 900 tests, Dockerized deployment.
 
 ## LinkedIn / GitHub portfolio version
 
@@ -20,7 +20,7 @@ JobTriage is a FastAPI + PostgreSQL backend that automates the repetitive parts 
 
 A backend I built to automate the repetitive parts of job hunting (collecting postings, scoring fit, drafting CVs/cover letters/email replies) while keeping a hard human-approval gate around anything that sends real email or touches application status.
 
-Highlights: FastAPI + PostgreSQL + SQLAlchemy + Alembic; database-enforced concurrency control for the automation scheduler (compare-and-swap claiming, lease-based crash recovery, tested against real PostgreSQL — not just SQLite); deterministic, trust-gated content generation instead of free-form LLM calls, so generated text is always traceable to a verified source; 1900+ tests including PostgreSQL-only concurrency integration tests in CI; Dockerized with a documented, validated deployment path.
+Highlights: FastAPI + PostgreSQL + SQLAlchemy + Alembic; database-enforced concurrency control for the automation scheduler (compare-and-swap claiming, lease-based crash recovery, tested against real PostgreSQL — not just SQLite); deterministic, trust-gated content generation instead of free-form LLM calls, so generated text is always traceable to a verified source; ~6 900 tests including PostgreSQL-only concurrency integration tests in CI; Dockerized with a documented, validated deployment path.
 
 Built primarily with Claude Code as the implementation agent and Codex as an independent reviewer — a real case study in AI-assisted software engineering with human-owned architecture decisions and safety boundaries.
 
@@ -31,7 +31,7 @@ JobTriage is a layered FastAPI application (`api → services → agents/provide
 ## Strongest engineering points (verified)
 
 - **FastAPI backend** — `app/main.py`, `app/api/routes.py` (50 routes).
-- **PostgreSQL** — production target, exercised in CI via a real `postgres:16` service container (`.github/workflows/ci.yml`).
+- **PostgreSQL** — supported deployment target (Docker Compose), exercised in CI via a real `postgres:16` service container (`.github/workflows/ci.yml`); the operator's daily database is SQLite.
 - **SQLAlchemy 2.x** — `app/db/models.py`, repository pattern throughout `app/db/`.
 - **Alembic** — 30 migrations, single head `c7d3f9a1e5b8`, CI asserts the chain actually reaches it against a fresh real database.
 - **Pydantic v2 / pydantic-settings** — `app/models/`, `app/core/config.py`.
@@ -41,13 +41,13 @@ JobTriage is a layered FastAPI application (`api → services → agents/provide
 - **Retries/deadlines** — retryable-vs-permanent failure classification across collectors and email providers.
 - **Human approval** — `app/services/response_draft_send.py`, `app/services/follow_up_send.py` — "no approval, no send," enforced in code.
 - **Provenance/trust** — `app/services/response_draft.py::TRUSTED_JOB_SOURCES`, `app/models/candidate_profile.py::is_top_level_fact_usable_for_generation`.
-- **1900+ tests** — `1934 passed, 4 skipped, 0 failed` at the audited HEAD (`pytest -q`).
+- **Tests** — about 6 900 test cases today; commit-pinned results are in the README (*Verified test runs*), e.g. `6876 passed, 138 skipped, 0 failed` at `f6dd8a2`. (Historical: `1934 passed, 4 skipped` at an earlier audited HEAD.)
 - **GitHub Actions** — two-job CI (unit+lint+format, and a real-PostgreSQL concurrency/migration gate), plus a Docker build/config gate added in this branch.
 - **Docker** — `Dockerfile`, `compose.yaml`, locally built and smoke-tested against a real PostgreSQL container (see `docs/DOCKER.md`).
 
 ## GitHub repository description (recommendation)
 
-> AI-assisted job application automation backend — FastAPI + PostgreSQL, deterministic drafting, human-approval-gated sends, CAS-based automation scheduler, 1900+ tests.
+> AI-assisted job application automation backend — FastAPI + PostgreSQL, deterministic drafting, human-approval-gated sends, CAS-based automation scheduler, ~6 900 tests.
 
 ## GitHub topics (recommendation, 10)
 
