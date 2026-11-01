@@ -533,6 +533,8 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
         working_time=query.working_time,
         home_office_only=query.home_office_only,
         max_pages=query.max_pages,
+        offer_type=query.offer_type,
+        published_within_days=query.published_within_days,
     )
 
 

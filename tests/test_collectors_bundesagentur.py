@@ -577,3 +577,63 @@ async def test_request_timeout_408_is_still_retried(monkeypatch):
     jobs = await _make_collector(handler, max_retries=3).fetch()
 
     assert len(jobs) == 1 and attempts["count"] == 2
+
+
+# --- Stage 23: opt-in filters, pagination cut-off, cross-query dedup -------------
+
+
+def _captured_queries():
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json=_page([_posting()]))
+
+    return seen, handler
+
+
+@pytest.mark.asyncio
+async def test_filters_are_off_by_default():
+    seen, handler = _captured_queries()
+    await _make_collector(handler, keywords="Python").fetch()
+    assert "angebotsart" not in seen[0]
+    assert "veroeffentlichtseit" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_employment_and_freshness_filters_are_sent_when_set():
+    seen, handler = _captured_queries()
+    await _make_collector(handler, keywords="Python", offer_type=1, published_within_days=7).fetch()
+    assert seen[0]["angebotsart"] == "1"
+    assert seen[0]["veroeffentlichtseit"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_pagination_cutoff_is_reported_with_left_out_count():
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        postings = [_posting(referenznummer=f"1-{page}-{i}-S") for i in range(2)]
+        return httpx.Response(200, json=_page(postings, max_ergebnisse=50))
+
+    collector = _make_collector(handler, keywords="Python", page_size=2, max_pages=3)
+    jobs = await collector.fetch()
+    assert len(jobs) == 6
+    assert collector.truncated is True
+    assert collector.total_results == 50
+
+
+@pytest.mark.asyncio
+async def test_same_reference_in_two_searches_is_collapsed():
+    from app.services.ba_refresh import fetch_postings
+    from app.services.search_strategy import BundesagenturQuery
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_page([_posting()]))
+
+    queries = [
+        BundesagenturQuery(label="a", keywords="Python", location="", radius_km=0),
+        BundesagenturQuery(label="b", keywords="Backend", location="", radius_km=0),
+    ]
+    result = await fetch_postings(queries, lambda q: _make_collector(handler, keywords=q.keywords))
+    assert [r.fetched for r in result.queries] == [1, 1]
+    assert len(result.postings) == 1
