@@ -577,11 +577,38 @@ _ENTRY_NEGATIVE = re.compile(
     r"|mehrjährig|mehrjaehrig|langjährig|langjaehrig|umfangreiche\s+(?:berufs)?erfahrung",
     re.IGNORECASE,
 )
+# Number words as postings write them ("Mindestens zwei bis drei Jahre
+# Berufserfahrung"). Digits alone left such a stated requirement UNKNOWN.
+_NUMBER_WORDS = {
+    "ein": 1,
+    "eine": 1,
+    "zwei": 2,
+    "drei": 3,
+    "vier": 4,
+    "fünf": 5,
+    "fuenf": 5,
+    "sechs": 6,
+    "sieben": 7,
+    "acht": 8,
+    "neun": 9,
+    "zehn": 10,
+}
+_WORDS = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+_NUMBER = rf"((?<!\d)\d{{1,2}}(?!\d)|(?<![a-zäöüß])(?:{_WORDS})(?![a-zäöüß]))"
+# The lower bound of a range is the requirement ("2-3" and "zwei bis drei" -> 2).
+_RANGE_TAIL = rf"(?:-|–|bis(?:\s+zu)?)\s*(?:\d{{1,2}}|(?:{_WORDS})(?![a-zäöüß]))"
+# "seit vier Jahren bestehendes Unternehmen mit Erfahrung" is company age,
+# not a requirement ("seit"/"vor" directly before the number).
+_NOT_AGE = r"(?<!seit\s)(?<!vor\s)"
 _YEARS = re.compile(
-    r"(\d{1,2})\s*\+?\s*(?:-\s*\d{1,2}\s*)?(?:jahre|years)[^.;\n]{0,40}?(?:erfahrung|experience)"
-    r"|(?:erfahrung|experience)[^.;\n]{0,30}?(\d{1,2})\s*\+?\s*(?:jahre|years)",
+    rf"{_NOT_AGE}{_NUMBER}\s*\+?\s*(?:{_RANGE_TAIL}\s*)?(?:jahre|years)[^.;\n]{{0,40}}?(?:erfahrung|experience)"
+    rf"|(?:erfahrung|experience)[^.;\n]{{0,30}}?{_NOT_AGE}{_NUMBER}\s*\+?\s*(?:{_RANGE_TAIL}\s*)?(?:jahre|years)",
     re.IGNORECASE,
 )
+
+
+def _years_value(token: str) -> int:
+    return int(token) if token.isdigit() else _NUMBER_WORDS[token.casefold()]
 
 
 @dataclass(frozen=True)
@@ -595,7 +622,7 @@ def entry_level_signals(title: str, text: str) -> EntryLevelSignals:
     combined = f"{title}\n{text}"
     positive = sorted({m.group(0).lower() for m in _ENTRY_POSITIVE.finditer(combined)})
     negative = sorted({m.group(0).lower() for m in _ENTRY_NEGATIVE.finditer(combined)})
-    years = [int(m.group(1) or m.group(2)) for m in _YEARS.finditer(combined)]
+    years = [_years_value(m.group(1) or m.group(2)) for m in _YEARS.finditer(combined)]
     return EntryLevelSignals(positive, negative, max(years) if years else None)
 
 
