@@ -52,6 +52,8 @@ class BundesagenturQuery:
     working_time: str = ""
     max_pages: int = DEFAULT_MAX_PAGES
     home_office_only: bool = False
+    offer_type: int | None = None  # Stage 23: BA `angebotsart` (1 = employment)
+    published_within_days: int | None = None  # Stage 23: BA `veroeffentlichtseit` (7 or 14)
 
 
 def ba_radius_for(limit_km: int) -> int:

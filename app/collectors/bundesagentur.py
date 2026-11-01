@@ -264,6 +264,8 @@ class BundesagenturCollector(JobCollector):
         home_office_only: bool = False,
         page_size: int = 100,
         max_pages: int = 20,
+        offer_type: int | None = None,
+        published_within_days: int | None = None,
         timeout_seconds: float = 10.0,
         max_retries: int = 3,
         http_client: httpx.AsyncClient | None = None,
@@ -284,6 +286,13 @@ class BundesagenturCollector(JobCollector):
         self.truncated = False
         self.page_size = page_size
         self.max_pages = max_pages
+        # Stage 23: opt-in BA filters, off by default (behaviour unchanged).
+        # `offer_type` is `angebotsart` (1 = employment only: drops apprenticeships,
+        # internships and self-employment courses). `published_within_days` is
+        # `veroeffentlichtseit`; measured live 2026-11-01, only 7 and 14 narrow
+        # the result (other values returned the unfiltered list).
+        self.offer_type = offer_type
+        self.published_within_days = published_within_days
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         # Injected only by tests, to avoid real network calls; production
@@ -371,6 +380,10 @@ class BundesagenturCollector(JobCollector):
             params["umkreis"] = self.radius_km
         if self.working_time:
             params["arbeitszeit"] = self.working_time
+        if self.offer_type is not None:
+            params["angebotsart"] = self.offer_type
+        if self.published_within_days is not None:
+            params["veroeffentlichtseit"] = self.published_within_days
         if since is not None:
             now = datetime.now(since.tzinfo) if since.tzinfo is not None else datetime.now()
             days_since = max(0, (now - since).days)
