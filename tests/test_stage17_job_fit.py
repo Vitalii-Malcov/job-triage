@@ -333,6 +333,7 @@ def test_assess_job_end_to_end(db):
     assert statuses == {
         "skills": "NOT_EVALUATED",
         "role": "NOT_CONFIGURED",
+        "domain": "OK",  # Stage 23
         "experience": "UNKNOWN",
         "language": "MAJOR_GAP",
         "location": "DISTANCE_UNVERIFIED",
