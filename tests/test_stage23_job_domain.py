@@ -151,3 +151,20 @@ def test_software_sales_manager_is_still_sales():
 def test_hyphenated_service_desk_title_is_support():
     assert title_domain("Junior SAP Service-Desk-Agent") is None
     assert title_domain("Junior SAP Help-Desk Mitarbeiter") is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Analyst Vertriebsperformance & BI Reporting (m/w/d)",
+        "Data & Tracking Solution Architect - Customer Sales (m/w/d)",
+        "Sales Data Analyst (m/w/d)",
+    ],
+)
+def test_data_and_analyst_roles_are_not_sales_specializations(title):
+    assert title_domain(title) is None
+
+
+def test_plain_sales_titles_stay_sales():
+    for title in ("Junior Sales Manager", "Business Development Manager", "Vertriebsmitarbeiter"):
+        assert title_domain(title)[0] == "SALES"
