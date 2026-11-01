@@ -764,3 +764,53 @@ def test_a_different_reference_stored_after_the_plan_blocks_the_facts(db_path):
     assert session.get(JobRecord, ids[0]).workplace_lat is None
     session.close()
     engine.dispose()
+
+
+# --- Stage 24: --discovery ------------------------------------------------------
+
+
+def test_discovery_refuses_without_a_configured_search(db_path, capsys):
+    api = Api([])
+    assert (
+        cli.run(["--database", str(db_path), "--discovery"], collector_factory=api.factory()) == 2
+    )
+    assert "discovery needs a configured commute search" in capsys.readouterr().err
+    assert api.requests == []
+
+
+def test_discovery_dry_run_uses_the_discovery_queries_and_writes_nothing(
+    db_path, monkeypatch, capsys
+):
+    from app.models.candidate_search import CandidateSearchSettings, GeoPoint
+
+    configured = CandidateSearchSettings(
+        home_city="Heusenstamm",
+        home_postal_code="63150",
+        commute_origin_label="Heusenstamm",
+        commute_origin=GeoPoint(lat=50.0559, lon=8.8011),
+        max_commute_km=100,
+        commute_measure="CAR_ROUTE",
+        relocation_regions=["Hessen"],
+        remote_work_scope="GERMANY",
+        remote_work_from_region="Hessen",
+    )
+    monkeypatch.setattr(
+        "app.services.collector_runner._candidate_search_settings", lambda session: configured
+    )
+    seen: list[tuple[str, int | None, int | None]] = []
+
+    def factory(query):
+        seen.append((query.label, query.offer_type, query.published_within_days))
+        return Api([]).factory()(query)
+
+    before = sha(db_path)
+    assert cli.run(["--database", str(db_path), "--discovery"], collector_factory=factory) == 0
+    assert sha(db_path) == before
+    assert {label for label, _, _ in seen} == {
+        "discovery-commute",
+        "discovery-remote",
+        "discovery-remote-weekly",
+    }
+    assert all(offer == 1 for _, offer, _ in seen)
+    assert {days for _, _, days in seen} == {None, 7}
+    assert "DRY RUN" in capsys.readouterr().out

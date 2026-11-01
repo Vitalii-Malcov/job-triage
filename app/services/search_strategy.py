@@ -65,6 +65,86 @@ def ba_radius_for(limit_km: int) -> int:
     raise ValueError(f"car-route limit {limit_km} km exceeds the largest BA radius")
 
 
+# Stage 24: opt-in discovery profile (never used by the scheduler or the default
+# refresh). Terms are the junior / career-changer entry points measured on
+# 2026-11-01; every query asks for employment only (`angebotsart=1`), and the
+# only freshness window used is 7 days (BA ignores other values). Terms that
+# systematically return Elektro / SPS / SAP vacancies ("Junior Automatisierung")
+# are deliberately absent -- the fit assessment's domain criterion removes such
+# titles afterwards, but they would only waste requests.
+DISCOVERY_NEAR_TERMS = (
+    "Junior Python",
+    "Junior Backend",
+    "Junior Softwareentwickler",
+    "Python Entwickler",
+    "Backend Developer",
+    "Anwendungsentwickler",
+    "Softwareentwickler Berufseinsteiger",
+    "Fachinformatiker Anwendungsentwicklung",
+    "Trainee IT",
+    "IT Quereinsteiger",
+)
+DISCOVERY_REMOTE_TERMS = (
+    "Junior Python",
+    "Junior Backend",
+    "IT Quereinsteiger",
+    "Trainee IT",
+)
+# Broad terms are fetched weekly, as the last 7 days only (393 / 45 results,
+# below the 1000-result cut-off).
+DISCOVERY_REMOTE_WEEKLY_TERMS = ("Softwareentwickler", "Anwendungsentwickler")
+DISCOVERY_MAX_PAGES = 5
+EMPLOYMENT_ONLY = 1  # BA `angebotsart`: 1 = ARBEIT
+PUBLISHED_WEEK = 7  # BA `veroeffentlichtseit`: only 7 and 14 narrow the result
+
+
+def discovery_queries(settings, search: CandidateSearchSettings | None) -> list[BundesagenturQuery]:
+    """The Stage 24 discovery searches; empty unless a commute search is
+    configured (the same precondition as the regular strategy)."""
+    regular = bundesagentur_queries(settings, search)
+    commute = next((q for q in regular if q.label == "commute"), None)
+    if commute is None:
+        return []
+    queries = [
+        BundesagenturQuery(
+            label="discovery-commute",
+            keywords=term,
+            location=commute.location,
+            radius_km=commute.radius_km,
+            max_pages=DISCOVERY_MAX_PAGES,
+            offer_type=EMPLOYMENT_ONLY,
+        )
+        for term in DISCOVERY_NEAR_TERMS
+    ]
+    if any(q.label == "remote" for q in regular):
+        queries += [
+            BundesagenturQuery(
+                label="discovery-remote",
+                keywords=term,
+                location="",
+                radius_km=0,
+                home_office_only=True,
+                max_pages=DISCOVERY_MAX_PAGES,
+                offer_type=EMPLOYMENT_ONLY,
+            )
+            for term in DISCOVERY_REMOTE_TERMS
+        ]
+        queries += [
+            BundesagenturQuery(
+                label="discovery-remote-weekly",
+                keywords=term,
+                location="",
+                radius_km=0,
+                home_office_only=True,
+                max_pages=DISCOVERY_MAX_PAGES,
+                offer_type=EMPLOYMENT_ONLY,
+                published_within_days=PUBLISHED_WEEK,
+            )
+            for term in DISCOVERY_REMOTE_WEEKLY_TERMS
+        ]
+    return queries
+
+
 def bundesagentur_queries(
     settings, search: CandidateSearchSettings | None
 ) -> list[BundesagenturQuery]:

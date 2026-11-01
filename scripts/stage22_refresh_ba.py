@@ -121,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="process at most N vacancies")
     parser.add_argument("--create-new", action="store_true", help="also store new vacancies")
     parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument(
+        "--discovery",
+        action="store_true",
+        help="Stage 24: run the opt-in junior discovery searches instead of the configured ones",
+    )
     return parser
 
 
@@ -519,7 +524,7 @@ def _run(args, database: Path, collector_factory: Callable | None) -> int:
     from app.core.config import get_settings
     from app.services.ba_refresh import fetch_postings, plan_refresh
     from app.services.collector_runner import _candidate_search_settings, ba_query_collector
-    from app.services.search_strategy import bundesagentur_queries
+    from app.services.search_strategy import bundesagentur_queries, discovery_queries
     from app.utils.config_flags import is_configured
 
     get_settings.cache_clear()
@@ -536,7 +541,14 @@ def _run(args, database: Path, collector_factory: Callable | None) -> int:
         reader = _readonly_engine(engine)
         try:
             with Session(reader) as session:
-                queries = bundesagentur_queries(settings, _candidate_search_settings(session))
+                search = _candidate_search_settings(session)
+                queries = (
+                    discovery_queries(settings, search)
+                    if args.discovery
+                    else bundesagentur_queries(settings, search)
+                )
+                if args.discovery and not queries:
+                    raise RefusedError("discovery needs a configured commute search")
         finally:
             reader.dispose()
         factory = collector_factory or (lambda query: ba_query_collector(settings, query))
