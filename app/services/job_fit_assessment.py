@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.candidate_job_matcher import ALGORITHM_VERSION as MATCHER_VERSION
 from app.agents.geo_estimate import commutable_state, estimate_commute, state_key
+from app.agents.job_domain import OFF_TARGET_DOMAINS, extract_domain_profile, title_domain
 from app.agents.job_fit_signals import (
     asks_immediate_start,
     classify_remote,
@@ -111,6 +112,10 @@ _TIER_BARRIERS = {
     # Stage 22 P1: an explicitly unrelated profession or a senior title is
     # never a fit for the junior target, however many skills match.
     ("role", "OFF_ROLE"),
+    # Stage 23: the posting is about an off-target specialization (Embedded,
+    # PLC, SAP, Salesforce, PKI, Sales) -- shared words like Linux or SQL do
+    # not make it a Python backend role.
+    ("domain", "OFF_DOMAIN"),
     ("entry_level", "SENIOR_TITLE"),
     ("posting_type", "SELF_EMPLOYMENT"),
     ("posting_type", "APPRENTICESHIP"),
@@ -142,6 +147,8 @@ _VERIFY = {
     # city centre; an approximate PASS is never enough on its own.
     ("location", "PASS_APPROXIMATE"),
     ("location", "UNKNOWN"),
+    ("domain", "OFF_DOMAIN_REQUIRED"),
+    ("domain", "OFF_DOMAIN_TRAINING"),
     ("location", "NOT_CONFIGURED"),
     # Stage 22 P1: a coordinate estimate is never the car route -- the
     # decision (pre-Bewerbung check) stays NEEDS_VERIFICATION for all of them.
@@ -399,6 +406,73 @@ def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
         # Manager", "Account Manager"): keyword overlap in the text is noise.
         return Criterion("role", "NO_IT_SIGNAL", "title names no IT/technical role")
     return Criterion("role", "OTHER", "title matches no configured role")
+
+
+_TRAINING_TITLE = re.compile(r"trainee|quereinsteig|berufseinsteig|einstieg\s+als", re.IGNORECASE)
+
+
+def domain_criterion(
+    title: str, description: str, configured_roles: tuple[str, ...] = ()
+) -> Criterion:
+    """Stage 23: OFF_DOMAIN only on a literal statement -- the title names an
+    off-target specialization, or the text makes one mandatory while no
+    target stack (Python, FastAPI, ...) is required. Mere mentions and
+    "von Vorteil" never count; missing evidence is never a mismatch."""
+    profile = extract_domain_profile(title, description)
+    if profile.title_domain is not None and any(
+        (named := title_domain(alternative)) is not None and named[0] == profile.title_domain
+        for role in configured_roles
+        for alternative in role.split("/")
+    ):
+        # The operator configured this very specialization as a target role.
+        return Criterion(
+            "domain",
+            "OK",
+            f"{profile.title_domain} is a configured target role",
+            profile.title_term,
+        )
+    if profile.title_domain is not None and profile.has_required_target_stack():
+        # A required Python/backend stack beats the title's specialization
+        # word ("Junior SAP Integration Developer" asking for Python): the
+        # operator decides, never an automatic SKIP.
+        return Criterion(
+            "domain",
+            "OFF_DOMAIN_REQUIRED",
+            f"title names {profile.title_domain} but a Python/backend stack is required",
+            profile.title_term,
+        )
+    if profile.title_domain is not None:
+        if _TRAINING_TITLE.search(title):
+            # A programme that trains career changers: the specialization is
+            # still not the candidate's target, but it is the operator's call.
+            return Criterion(
+                "domain",
+                "OFF_DOMAIN_TRAINING",
+                f"{profile.title_domain} specialization offered as a trainee/entry programme",
+                profile.title_term,
+            )
+        return Criterion(
+            "domain",
+            "OFF_DOMAIN",
+            f"title names the {profile.title_domain} specialization",
+            profile.title_term,
+        )
+    if not profile.has_required_target_stack():
+        for domain in OFF_TARGET_DOMAINS:
+            if domain == "SALES":  # a sales word in the text is no specialization
+                continue
+            required = profile.required(domain)
+            if required:
+                # The title does not name the specialization: the operator
+                # reads the posting (support, test and data roles often list
+                # SAP or embedded tooling without being that specialization).
+                return Criterion(
+                    "domain",
+                    "OFF_DOMAIN_REQUIRED",
+                    f"{domain} is required and no Python/backend stack is",
+                    required[0].term,
+                )
+    return Criterion("domain", "OK", "no off-target specialization stated")
 
 
 def experience_criterion(match: CandidateJobMatch | None, title: str, text: str) -> Criterion:
@@ -1027,6 +1101,11 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
             else skills_criterion(match)
         ),
         role_criterion(job.title, settings),
+        domain_criterion(
+            job.title,
+            job.description or "",
+            tuple([*settings.primary_roles, *settings.secondary_roles]),
+        ),
         experience_criterion(match, job.title, job.description or ""),
         language_criterion(text, german_level),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
