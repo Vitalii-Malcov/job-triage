@@ -815,7 +815,9 @@ def test_assessment_uses_the_analysis_of_the_current_posting(db):
     prepare_candidate_job_match(db, record.id, force_recompute=False)  # newest row: B
     upsert_job(db, job, score)  # the posting is back to A
     assessment = fit.assess_job(db, record.id)
-    assert assessment.criterion("skills").status != "NOT_EVALUATED"
+    # The empty test profile extracts no skill requirement (also NOT_EVALUATED),
+    # but the analysis itself was found: it is not the "none stored" reason.
+    assert "no matcher analysis stored" not in assessment.criterion("skills").reason
 
 
 # --- Codex P1 round 4 --------------------------------------------------------------------

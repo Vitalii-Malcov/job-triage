@@ -80,6 +80,9 @@ Decision = Literal["BLOCKED", "NEEDS_VERIFICATION", "CANDIDATE"]
 # needs verification (data missing), STRETCH, PARTIAL_MATCH, GOOD_MATCH.
 FitTier = Literal["NOT_SUITABLE", "NEEDS_OPERATOR", "STRETCH", "PARTIAL_MATCH", "GOOD_MATCH"]
 
+# A STRONG skill fit needs at least this many extracted required skills.
+MIN_SKILL_REQUIREMENTS_FOR_STRONG = 2
+
 _LEVEL = {"UNKNOWN": 0, "A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
 
 # Statuses that make the whole vacancy BLOCKED / NEEDS_VERIFICATION.
@@ -281,6 +284,27 @@ def skills_criterion(match: CandidateJobMatch | None) -> Criterion:
         for r in match.missing_requirements
         if r.requirement_type == "SKILL" and r.importance == "REQUIRED"
     ]
+    # Fit-evidence gating (Stage 22 follow-up): the matcher scores a posting
+    # with no extracted skill requirement at all a neutral 50. That is no
+    # evidence of fit: the operator has to read the posting. A single
+    # extracted skill still counts, so a real junior posting naming only
+    # Python is not demoted.
+    extracted = sum(
+        1
+        for r in [
+            *match.matched_requirements,
+            *match.partial_requirements,
+            *match.missing_requirements,
+            *match.unknown_requirements,
+        ]
+        if r.requirement_type == "SKILL"
+    )
+    if extracted == 0:
+        return Criterion(
+            "skills",
+            "NOT_EVALUATED",
+            "no skill requirement could be extracted; read the posting yourself",
+        )
     score = match.required_skill_score
     if score >= 70 and not missing:
         status = "STRONG"
