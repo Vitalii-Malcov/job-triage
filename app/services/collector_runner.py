@@ -522,6 +522,79 @@ async def _deliver_vacancy_feed(
         logger.warning("vacancy_feed_delivery_error error_type=%s", type(exc).__name__)
 
 
+def ba_query_collector(settings, query) -> BundesagenturCollector:
+    """The collector for one configured search; shared by `run_bundesagentur`
+    and the Stage 22 refresh CLI so both run exactly the same searches."""
+    return BundesagenturCollector(
+        api_key=settings.bundesagentur_api_key,
+        keywords=query.keywords,
+        location=query.location,
+        radius_km=query.radius_km,
+        working_time=query.working_time,
+        home_office_only=query.home_office_only,
+        max_pages=query.max_pages,
+    )
+
+
+async def enrich_and_persist_ba_job(
+    db: Session,
+    collector: BundesagenturCollector,
+    candidate_skills,
+    job: Job,
+    *,
+    fetch_detail: bool = True,
+) -> tuple[JobRecord, JobScore, bool]:
+    """Detail enrichment (live BA description, or the stored one), skill
+    extraction, scoring and persistence of ONE Bundesagentur posting -- the
+    per-job core of `run_bundesagentur`, shared with the Stage 22 refresh CLI
+    so both apply the same rules. Sends nothing; the caller owns rollback.
+    `fetch_detail=False` never calls the BA detail API (the caller already put
+    the description on `job`, e.g. to keep the network out of a write lock)."""
+    existing = get_job_by_fingerprint(db, job)
+    description = job.description
+    if not description.strip() and existing is not None and existing.description.strip():
+        # Search responses currently contain no description. A
+        # persisted non-empty BA description therefore means detail
+        # enrichment already succeeded on an earlier run. Reuse it
+        # and re-run the deterministic extractor locally; requiring
+        # saved skills too would repeatedly call detail for valid
+        # non-technical descriptions where zero matches is expected.
+        description = existing.description
+        logger.debug(
+            "bundesagentur_detail_reused referenznummer=%s",
+            job.source_reference,
+        )
+    elif not description.strip() and job.source_reference and fetch_detail:
+        detail_description = await collector.fetch_detail(job.source_reference)
+        if detail_description is not None:
+            description = detail_description
+    elif not description.strip() and fetch_detail:
+        logger.warning(
+            "bundesagentur_detail_skipped reason=missing_referenznummer url=%s",
+            job.url,
+        )
+
+    extraction = extract_skills(job.title, description)
+    all_skills = sorted(
+        set(job.skills) | set(extraction.must_have_skills) | set(extraction.nice_to_have_skills)
+    )
+    job = job.model_copy(
+        update={
+            "description": description,
+            "skills": all_skills,
+            "must_have_skills": extraction.must_have_skills,
+            "nice_to_have_skills": extraction.nice_to_have_skills,
+            "skill_source": extraction.skill_source,
+        }
+    )
+    if existing is not None and description.strip():
+        # Stage the BA-only enrichment update in the same transaction
+        # committed by upsert_job. If scoring/persistence fails, the
+        # surrounding rollback also restores the previous description.
+        existing.description = description
+    return score_and_persist(db, candidate_skills, job)
+
+
 async def run_bundesagentur(
     db: Session,
     settings,
@@ -573,15 +646,7 @@ async def run_bundesagentur(
     batches: list[tuple[BundesagenturCollector, list[Job]]] = []
     failed_queries = 0
     for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
-        query_collector = BundesagenturCollector(
-            api_key=settings.bundesagentur_api_key,
-            keywords=query.keywords,
-            location=query.location,
-            radius_km=query.radius_km,
-            working_time=query.working_time,
-            home_office_only=query.home_office_only,
-            max_pages=query.max_pages,
-        )
+        query_collector = ba_query_collector(settings, query)
         if index == 0:
             # The first search fails the run exactly as before.
             query_jobs = await query_collector.fetch()
@@ -657,51 +722,9 @@ async def run_bundesagentur(
     skipped_invalid = sum(c.skipped_invalid_count for c, _ in batches)
     for collector, job in work:
         try:
-            existing = get_job_by_fingerprint(db, job)
-            description = job.description
-            if not description.strip() and existing is not None and existing.description.strip():
-                # Search responses currently contain no description. A
-                # persisted non-empty BA description therefore means detail
-                # enrichment already succeeded on an earlier run. Reuse it
-                # and re-run the deterministic extractor locally; requiring
-                # saved skills too would repeatedly call detail for valid
-                # non-technical descriptions where zero matches is expected.
-                description = existing.description
-                logger.debug(
-                    "bundesagentur_detail_reused referenznummer=%s",
-                    job.source_reference,
-                )
-            elif not description.strip() and job.source_reference:
-                detail_description = await collector.fetch_detail(job.source_reference)
-                if detail_description is not None:
-                    description = detail_description
-            elif not description.strip():
-                logger.warning(
-                    "bundesagentur_detail_skipped reason=missing_referenznummer url=%s",
-                    job.url,
-                )
-
-            extraction = extract_skills(job.title, description)
-            all_skills = sorted(
-                set(job.skills)
-                | set(extraction.must_have_skills)
-                | set(extraction.nice_to_have_skills)
+            job_record, result, created = await enrich_and_persist_ba_job(
+                db, collector, candidate_skills, job
             )
-            job = job.model_copy(
-                update={
-                    "description": description,
-                    "skills": all_skills,
-                    "must_have_skills": extraction.must_have_skills,
-                    "nice_to_have_skills": extraction.nice_to_have_skills,
-                    "skill_source": extraction.skill_source,
-                }
-            )
-            if existing is not None and description.strip():
-                # Stage the BA-only enrichment update in the same transaction
-                # committed by upsert_job. If scoring/persistence fails, the
-                # surrounding rollback also restores the previous description.
-                existing.description = description
-            job_record, result, created = score_and_persist(db, candidate_skills, job)
         except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and

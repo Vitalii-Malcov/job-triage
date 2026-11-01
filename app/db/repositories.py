@@ -186,6 +186,26 @@ def _store_source_reference(db: Session, record: JobRecord, reference: str) -> N
     )
 
 
+def refresh_job_structured_facts(db: Session, record: JobRecord, job: Job) -> list[str]:
+    """Stage 22 T6: copy a fresh observation's structured facts (and a still
+    empty `source_reference`) onto an EXISTING row and nothing else -- no
+    score, recommendation, status, description or `last_seen_at`. Same rule
+    as `_apply_job_update_fields`: a stated fact replaces the stored one, an
+    omitted one keeps it. Returns the names of the columns that changed;
+    the caller owns the transaction."""
+    changed: list[str] = []
+    for name in STRUCTURED_JOB_FACTS:
+        value = getattr(job, name)
+        if value is not None and getattr(record, name) != value:
+            setattr(record, name, value)
+            changed.append(name)
+    reference = storable_reference(job.source_reference)
+    if reference is not None and record.source_reference is None:
+        _store_source_reference(db, record, reference)
+        changed.append("source_reference")
+    return changed
+
+
 def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: datetime) -> None:
     """The normal "already exists" update semantics — factored out so
     HARD-007's race-recovery path (below) can apply the EXACT same update

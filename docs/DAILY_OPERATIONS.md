@@ -220,6 +220,36 @@ States: `ACTIVE`, `CLOSED` (404 for a full, valid BA reference only),
 the posting; a re-run with the same `--output` retries only these),
 `UNKNOWN`. A CLOSED result is a hint to check by hand, not a status change.
 
+### 4b. Refresh BA data (Stage 22 T6, `stage22_refresh_ba.py`)
+
+Fills the BA structured facts (coordinates, work place, home office,
+Quereinstieg) of stored vacancies from today's search results and, with
+`--create-new`, stores new vacancies. Dry run is the default and the database
+is opened read-only; `--apply` always needs `--snapshot DIR`. Stop the UI and
+every other process that writes the database first (a competing writer or a
+second refresh is refused).
+
+```powershell
+.\.venv\Scripts\python.exe scripts\stage22_refresh_ba.py --database runtime/job_triage_runtime.db
+.\.venv\Scripts\python.exe scripts\stage22_refresh_ba.py --database runtime/job_triage_runtime.db `
+  --apply --limit 20 --snapshot "$env:USERPROFILE\JobTriage-Backups"      # trial
+.\.venv\Scripts\python.exe scripts\stage22_refresh_ba.py --database runtime/job_triage_runtime.db `
+  --apply --create-new --snapshot "$env:USERPROFILE\JobTriage-Backups"    # daily
+```
+
+Existing vacancies only receive the BA facts and a still empty
+`source_reference`: no score, status, description or `last_seen_at`. A posting
+whose BA reference already belongs to a stored row with another fingerprint is
+listed as a conflict and neither created nor merged -- check it by hand
+(`vacancy_identity_report.py`). A stored vacancy missing from today's results is
+only counted: a result list is a window (pagination, search terms), not proof
+that a posting is closed. The tool sends nothing: Telegram, mail and Gmail
+settings are forced off whatever `.env` says, HTTP is limited to the BA host.
+Exit codes: 0 done, 1 incomplete (re-run), 2 refused, 3 a protected table
+changed (restore the printed snapshot). Afterwards run
+`stage22_match_vacancies.py` and `stage21_assess_vacancies.py` (new vacancies
+without `--only-stale`).
+
 ## 5. Matching and shortlist
 
 - Candidate profile (authoritative: runtime profile v4) —
