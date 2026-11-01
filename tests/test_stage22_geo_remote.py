@@ -613,7 +613,8 @@ def test_the_cache_accepts_stretch_after_the_migration(tmp_path):
         ("Lagerist (m/w/d)", "NO_IT_SIGNAL"),
         ("Junior Sales Manager", "OFF_ROLE"),
         ("Account Manager IT", "OTHER"),  # an IT word: reviewable, not off-role
-        ("IT-Administrator im Bankenumfeld", "OTHER"),  # IT support/admin is an allowed target
+        # Stage 24: administration is CV experience, not a target
+        ("IT-Administrator im Bankenumfeld", "OFF_ROLE"),
         ("Trainee IT (m/w/d)", "OTHER"),
         ("Versuchsingenieur (m/w/d)", "OTHER"),
         ("Fachinformatiker Anwendungsentwicklung", "OTHER"),
@@ -662,15 +663,19 @@ def test_a_werkstudent_title_is_a_student_job():
 @pytest.mark.parametrize(
     "title",
     [
-        "1st Level Service Desk",
-        "Trainee Anwendungsbetreuung",
-        "IT-Support für Vertriebssoftware",
         "Software Developer – Sales Applications",
     ],
 )
 def test_support_trainee_and_mixed_titles_are_never_off_role(title):
     status = fit.role_criterion(title, CandidateSearchSettings(primary_roles=["Backend"])).status
     assert status == "OTHER"
+
+
+@pytest.mark.parametrize("title", ["1st Level Service Desk", "IT-Support für Vertriebssoftware"])
+def test_support_titles_are_off_role_for_the_software_target(title):
+    # Stage 24: the sales word does not matter; support is not the target.
+    settings = CandidateSearchSettings(primary_roles=["Backend"])
+    assert fit.role_criterion(title, settings).status == "OFF_ROLE"
 
 
 def test_a_title_outside_the_vocabulary_asks_the_operator_not_a_barrier():

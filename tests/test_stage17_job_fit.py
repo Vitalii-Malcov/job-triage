@@ -270,6 +270,15 @@ def test_no_overall_score_hides_a_blocker():
     assert assessment.decision == "CANDIDATE"
 
 
+def test_support_title_is_off_role_even_when_a_support_role_is_configured():
+    # Stage 24: support / administration is CV experience, never a target role.
+    settings = SETTINGS.model_copy(
+        update={"secondary_roles": ["Application Support / Technical Application Support"]}
+    )
+    title = "Second Level Support / Technical Application Support (m/w/d)"
+    assert fit.role_criterion(title, settings).status == "OFF_ROLE"
+
+
 # --- database-backed ------------------------------------------------------------------
 
 
@@ -837,7 +846,6 @@ def test_a_failing_later_term_is_reported_and_keeps_other_results(db, monkeypatc
     [
         ("Python Backend Developer (m/w/d)", "PRIMARY"),
         ("Junior Python Developer", "PRIMARY"),
-        ("Second Level Support / Technical Application Support (m/w/d)", "SECONDARY"),
         ("Lagerist (m/w/d)", "NO_IT_SIGNAL"),  # Stage 22 P1: no IT word in the title
     ],
 )

@@ -33,6 +33,7 @@ BUNDESAGENTUR_SEARCH_KEYWORDS/LOCATION/RADIUS_KM is used unchanged.
 
 from dataclasses import dataclass
 
+from app.agents.target_role import is_support_admin_term
 from app.models.candidate_search import CandidateSearchSettings
 
 # Radius steps offered by the BA job search; the API documents `umkreis` in km.
@@ -145,6 +146,25 @@ def discovery_queries(settings, search: CandidateSearchSettings | None) -> list[
     return queries
 
 
+def _target_terms(terms: list[str]) -> list[str]:
+    """Stage 24: the target is software development -- a stored keyword that
+    only finds IT-support / administration vacancies is not searched."""
+    return [term for term in terms if not is_support_admin_term(term)]
+
+
+def _search_terms(stored: list[str], default: str) -> list[str]:
+    """Stored keywords without support/admin terms. If stored keywords existed
+    and ALL were such terms, only a non-support default is used (never an empty
+    term, which BA reads as "every occupation"); without stored keywords the
+    legacy default applies unchanged."""
+    target = _target_terms(stored)
+    if target:
+        return target
+    if stored:
+        return _target_terms([default] if default.strip() else [])
+    return [default]
+
+
 def bundesagentur_queries(
     settings, search: CandidateSearchSettings | None
 ) -> list[BundesagenturQuery]:
@@ -156,7 +176,7 @@ def bundesagentur_queries(
         and search.commute_measure == "CAR_ROUTE"
     )
     if not configured:
-        terms = (search.search_keywords if search is not None else []) or [keywords]
+        terms = _search_terms(search.search_keywords if search is not None else [], keywords)
         return [
             BundesagenturQuery(
                 label="settings",
@@ -167,7 +187,7 @@ def bundesagentur_queries(
             for term in terms
         ]
     location = " ".join(part for part in (search.home_postal_code, search.home_city) if part)
-    terms = search.search_keywords or [keywords]
+    terms = _search_terms(search.search_keywords, keywords)
     radius = ba_radius_for(search.max_commute_km)
     queries = [
         BundesagenturQuery(label="commute", keywords=term, location=location, radius_km=radius)

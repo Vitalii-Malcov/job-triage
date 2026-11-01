@@ -45,6 +45,7 @@ from app.agents.job_fit_signals import (
 )
 from app.agents.role_relevance_classifier import classify_title_relevance
 from app.agents.seniority_classifier import classify_title_seniority
+from app.agents.target_role import support_admin_family
 from app.agents.workplace_address import (
     WorkplaceAddress,
     address_words,
@@ -356,9 +357,6 @@ _IT_TITLE_WORDS = re.compile(
     r"|anwender|computer|rechenzentrum|elektroni",
     re.IGNORECASE,
 )
-# Stage 11B lists them as "not software development", but technical IT
-# support / administration is one of the candidate's alternative targets.
-_IT_ADJACENT_SIGNALS = frozenset({"administrator", "systemadministrator"})
 
 
 def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
@@ -370,6 +368,18 @@ def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
         # Stage 22 P1: before role priorities -- "Dozent Python Developer" is
         # a teaching job even when "Python Developer" is configured.
         return Criterion("role", "OFF_ROLE", f"title names a non-IT position ({academic.group(0)})")
+    family = support_admin_family(title)
+    if family is not None:
+        # Stage 24: the target profession is software development. IT support,
+        # helpdesk and administration are CV experience, not a target -- checked
+        # BEFORE the configured roles, so a stale "Application Support" role in
+        # a stored configuration cannot bring such a title back.
+        return Criterion(
+            "role",
+            "OFF_ROLE",
+            f"title names an IT-support/administration role ({family}); "
+            "the target is software development",
+        )
     if not settings.primary_roles and not settings.secondary_roles:
         return Criterion("role", "NOT_CONFIGURED", "no role priorities configured")
     title_words = set(_WORD.findall(title.casefold()))
@@ -392,7 +402,12 @@ def role_criterion(title: str, settings: CandidateSearchSettings) -> Criterion:
             f"title names a non-IT position ({other_profession.group(0)})",
         )
     relevance = classify_title_relevance(title)
-    if relevance.level == "IRRELEVANT" and relevance.matched_signal not in _IT_ADJACENT_SIGNALS:
+    if relevance.level == "IRRELEVANT" and relevance.matched_signal not in {
+        "administrator",
+        "systemadministrator",
+    }:
+        # Stage 24: administrator titles are decided by support_admin_family above
+        # (with its developer-role exemption), not by this older classifier.
         # Stage 22 P1: an explicitly non-software profession ("Aktuar",
         # "Elektroingenieur"), never only "no configured role matched".
         return Criterion(
