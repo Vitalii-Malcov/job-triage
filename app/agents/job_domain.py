@@ -136,8 +136,8 @@ _TARGET_TITLE = _p(
 _SALES_TECHNICAL = _p(
     r"sales\s*engineer|vertriebs?ingenieur|presales|pre-sales|"
     r"entwickl|developer|software[- ]?(?:engineer|tester|test)|"
-    r"programmier|administrator|\bit-|analy[st]|reporting|\bbi\b|"
-    r"\bdat[ae]n?\b|data\s*(?:engineer|analyst)"
+    r"programmier|administrator|\bit-|analyst|analyse|reporting|solution architect|"
+    r"data\s*(?:engineer|analyst|architect)|datenanalyst|bi[- ]?(?:analyst|developer|entwickl)"
 )
 
 
