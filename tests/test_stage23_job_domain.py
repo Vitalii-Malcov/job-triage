@@ -173,3 +173,8 @@ def test_plain_sales_titles_stay_sales():
 def test_sales_roles_selling_data_or_bi_products_stay_sales():
     assert title_domain("Junior Sales Manager - Data & Analytics")[0] == "SALES"
     assert title_domain("Account Manager - BI Software")[0] == "SALES"
+
+
+def test_reporting_or_analysis_products_do_not_exempt_sales():
+    assert title_domain("Junior Sales Manager - Reporting Software")[0] == "SALES"
+    assert title_domain("Vertriebsmitarbeiter Datenanalyse")[0] == "SALES"
