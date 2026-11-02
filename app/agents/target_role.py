@@ -40,7 +40,7 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("it-techniker", r"\bit[\s-]?techniker\w*|\bit[\s-]?servicetechniker\w*"),
         (
             "administrator",
-            r"\w*administrat(?:or|orin)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
+            r"\b\w*administrat(?:or|orin)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
             r"[\s-]*administration\b|\bit[\s-]?admin\b|\bsysadmin\b|\bsystemverwalt\w*",
         ),
         ("systemintegration", r"\bsystemintegrat(?:or|orin|ion)\b|\bit[\s-]?systemintegrat\w*"),
@@ -69,7 +69,8 @@ _DEV_ROLE = re.compile(
     r"|\b(?:software|anwendungs|applikations)entwicklungs?[\s-]*ingenieur\w*"
     r"|\bqa[\s-]+(?:automation|engineer|tester)\b|\btest[\s-]*automati[a-z]*[\s-]*(?:engineer|developer|ingenieur\w*|entwickler\w*)\b"
     r"|\btestautomatisierer(?:in)?\b|\bsoftware[\s-]?(?:tester|testing[\s-]?engineer|testingenieur\w*|test[\s-]?engineer)\b"
-    r"|\bentwicklungsingenieur\w*|\bfachinformatiker\w*\s+(?:f(?:ü|ue)r\s+)?anwendungsentwicklung"
+    r"|\bentwicklungsingenieur\w*|\bfachinformatiker\w*(?:\s*/\s*in\b|\s*\([^)]{1,12}\))?"
+    r"\s+(?:f(?:ü|ue)r\s+)?anwendungsentwicklung"
     r"|\bentwickler(?:in)?\b|\bdeveloper\b|\bprogrammierer(?:in)?\b",
     re.IGNORECASE,
 )

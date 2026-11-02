@@ -143,6 +143,44 @@ def test_default_keyword_that_is_support_is_not_searched():
     assert bundesagentur_queries(_Support(), search) == []
 
 
+def test_no_search_stored_default_support_term_is_not_searched():
+    class _Support(_S):
+        bundesagentur_search_keywords = "IT-Support"
+
+    assert bundesagentur_queries(_Support(), None) == []
+
+
+def test_nothing_stored_and_blank_default_keeps_legacy_single_query():
+    class _Blank(_S):
+        bundesagentur_search_keywords = ""
+
+    assert [q.keywords for q in bundesagentur_queries(_Blank(), None)] == [""]
+
+
+def test_no_search_stored_target_default_is_kept():
+    assert [q.keywords for q in bundesagentur_queries(_S(), None)] == ["Python"]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Fachinformatiker (m/w/d) für Anwendungsentwicklung - Service Desk Tools",
+        "Fachinformatiker/in für Anwendungsentwicklung - IT-Support Tools",
+        "Fachinformatiker / in fuer Anwendungsentwicklung - Helpdesk Tools",
+    ],
+)
+def test_fachinformatiker_anwendungsentwicklung_gender_forms_are_exempt(title):
+    assert support_admin_family(title) is None
+
+
+def test_long_unmatched_token_is_linear_time():
+    import time
+
+    started = time.perf_counter()
+    support_admin_family("x" * 32000)
+    assert time.perf_counter() - started < 1.0
+
+
 @pytest.mark.parametrize(
     "title",
     [

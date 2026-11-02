@@ -153,16 +153,18 @@ def _target_terms(terms: list[str]) -> list[str]:
 
 
 def _search_terms(stored: list[str], default: str) -> list[str]:
-    """Stored keywords without support/admin terms. If stored keywords existed
-    and ALL were such terms, only a non-support default is used (never an empty
-    term, which BA reads as "every occupation"); without stored keywords the
-    legacy default applies unchanged."""
+    """Stored keywords without support/admin terms. If none is left (or none
+    was stored), the default is used unless it is a support/admin term; after
+    stored keywords existed a blank default is never searched (an empty term
+    reads as "every occupation"). Nothing stored + blank default: legacy."""
     target = _target_terms(stored)
     if target:
         return target
-    if stored:
+    if stored or default.strip():
+        # The configured default is filtered like stored keywords; after stored
+        # keywords were all dropped a blank default is no term at all.
         return _target_terms([default] if default.strip() else [])
-    return [default]
+    return [default]  # nothing stored, blank default: legacy behaviour unchanged
 
 
 def bundesagentur_queries(
