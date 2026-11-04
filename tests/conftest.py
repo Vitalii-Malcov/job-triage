@@ -40,3 +40,14 @@ def _default_engine_is_isolated():
     kind, _ = classify_database_url(session.engine.url.render_as_string(hide_password=True))
     assert kind in {DatabaseKind.OTHER_SQLITE, DatabaseKind.MEMORY}, kind
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_failure_budget():
+    """The failed-auth budget is per-process state shared by every TestClient
+    (same "testclient" peer); clear it so tests cannot lock each other out."""
+    from app.security import rate_limit
+
+    rate_limit._auth_failure_requests.clear()
+    yield
+    rate_limit._auth_failure_requests.clear()

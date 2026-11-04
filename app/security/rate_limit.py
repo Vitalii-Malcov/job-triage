@@ -20,6 +20,7 @@ Architecture:
   `rate_limit_module._xing_requests.clear()` fixtures keep working.
 """
 
+import ipaddress
 import threading
 import time
 from collections import defaultdict, deque
@@ -74,6 +75,86 @@ class _RateLimiter:
             bucket.append(now)
             if len(self.buckets) > self._SWEEP_THRESHOLD:
                 self._evict_expired_buckets(cutoff)
+
+    # Failure-budget path only: live identities are capped, and the expiry
+    # sweep runs at most once per `_MIN_SWEEP_INTERVAL` seconds so rotating
+    # source addresses cannot force a full scan on every request.
+    _MAX_KEYS = 4096
+
+    @staticmethod
+    def _failure_key(identity: str) -> str:
+        """IPv6 clients are tracked per /64: one host routinely controls a
+        whole /64, so per-address identities would be free to rotate."""
+        try:
+            address = ipaddress.ip_address(identity)
+        except ValueError:
+            return identity
+        if address.version == 6:
+            return str(ipaddress.ip_network(f"{address}/64", strict=False))
+        return identity
+
+    _MIN_SWEEP_INTERVAL = 1.0
+    _last_sweep = 0.0
+
+    def reserve(self, request: Request, *, max_requests: int, window_seconds: float) -> float:
+        """Atomically refuse (429) a client already holding `max_requests`
+        live entries, otherwise record one entry for it. The caller refunds
+        it with `refund(request, token)` (the returned token) when the attempt
+        turns out to be legitimate."""
+        key = self._failure_key(
+            resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
+        )
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            bucket = self.buckets.get(key)
+            if bucket is not None:
+                while bucket and bucket[0] < cutoff:
+                    bucket.popleft()
+                if len(bucket) >= max_requests:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=self._detail,
+                    )
+            if len(self.buckets) >= self._SWEEP_THRESHOLD and (
+                now - self._last_sweep >= self._MIN_SWEEP_INTERVAL
+            ):
+                self._last_sweep = now
+                self._evict_expired_buckets(cutoff)
+            if len(self.buckets) >= self._MAX_KEYS and key not in self.buckets:
+                # Hard cap: forget the longest-tracked identity that is NOT
+                # locked out. A locked identity is never forgotten (that
+                # would let address churn reset lockouts); if every tracked
+                # identity is locked, refuse the newcomer (fail closed).
+                victim = next(
+                    (k for k, b in self.buckets.items() if len(b) < max_requests),
+                    None,
+                )
+                if victim is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=self._detail,
+                    )
+                del self.buckets[victim]
+            self.buckets[key].append(now)
+            return now
+
+    def refund(self, request: Request, token: float) -> None:
+        """Undo exactly the `reserve` that returned `token` (a successful
+        authentication). Already-expired entries are simply gone."""
+        key = self._failure_key(
+            resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
+        )
+        with self._lock:
+            bucket = self.buckets.get(key)
+            if bucket is None:
+                return
+            try:
+                bucket.remove(token)
+            except ValueError:
+                return
+            if not bucket:
+                del self.buckets[key]
 
     def _evict_expired_buckets(self, cutoff: float) -> None:
         # Called with self._lock already held. A bucket is fully expired
@@ -406,6 +487,38 @@ def enforce_automation_run_rate_limit(request: Request) -> None:
         max_requests=AUTOMATION_RUN_RATE_LIMIT_REQUESTS,
         window_seconds=AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS,
     )
+
+
+# Accepted trade-off: when 4096 distinct networks are all locked out the table
+# is full and further NEW clients (including the operator) get 429 until a
+# lockout expires (<= AUTH_FAILURE_WINDOW_SECONDS after the attack stops).
+# Failing open instead would allow unlimited key guessing at that scale; a
+# temporary denial is the smaller harm. Existing lockouts are never evicted.
+# Failed-credential budget, shared by every route that checks the API key
+# (REST dependency and the UI login form guard the same secret). Only
+# FAILURES stay charged (a slot is reserved before the comparison and refunded
+# on success); once a client holds AUTH_FAILURE_LIMIT of them inside
+# the window it is refused with 429 BEFORE its key is compared, so a locked-out
+# client learns nothing more about the key -- not even from a correct guess.
+_auth_failure_limiter = _RateLimiter(detail="Too many failed authentication attempts")
+_auth_failure_requests = _auth_failure_limiter.buckets
+AUTH_FAILURE_LIMIT = 10
+AUTH_FAILURE_WINDOW_SECONDS = 300
+
+
+def begin_auth_attempt(request: Request) -> float:
+    """Charge one failure slot for this attempt (429 if none left). Atomic:
+    concurrent attempts cannot overshoot the limit. The caller MUST call
+    `end_auth_attempt_ok` if the credential turns out to be valid."""
+    return _auth_failure_limiter.reserve(
+        request,
+        max_requests=AUTH_FAILURE_LIMIT,
+        window_seconds=AUTH_FAILURE_WINDOW_SECONDS,
+    )
+
+
+def end_auth_attempt_ok(request: Request, token: float) -> None:
+    _auth_failure_limiter.refund(request, token)
 
 
 # Stage 20: the browser login form compares a submitted API key, so it gets

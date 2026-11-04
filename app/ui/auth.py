@@ -66,8 +66,18 @@ def require_ui_enabled() -> None:
 
 
 def require_ui_session(request: Request) -> None:
-    if not session_token_valid(request.cookies.get(COOKIE_NAME), get_settings().api_key):
+    # A forged cookie signed with a guessed key is an online guess at the API
+    # key, so a presented cookie is charged to the shared failed-auth budget
+    # (refunded when valid). No cookie = nothing to guess = no charge.
+    from app.security.rate_limit import begin_auth_attempt, end_auth_attempt_ok
+
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
         raise NotLoggedInError
+    attempt = begin_auth_attempt(request)
+    if not session_token_valid(token, get_settings().api_key):
+        raise NotLoggedInError
+    end_auth_attempt_ok(request, attempt)
 
 
 def require_same_origin(request: Request) -> None:

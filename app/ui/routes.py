@@ -113,14 +113,22 @@ def login_form(request: Request) -> Response:
 
 @router.post("/login", include_in_schema=False, dependencies=[Depends(require_same_origin)])
 async def login(request: Request) -> Response:
-    from app.security.rate_limit import enforce_ui_login_rate_limit
+    from app.security.rate_limit import (
+        begin_auth_attempt,
+        end_auth_attempt_ok,
+        enforce_ui_login_rate_limit,
+    )
 
     enforce_ui_login_rate_limit(request)
+    # Body first: the failure slot is reserved right before the comparison,
+    # so a slow body cannot straddle a lockout.
     body = await _bounded_body(request)
     submitted = parse_qs(body.decode("utf-8", errors="replace")).get("api_key", [""])[0]
     settings = get_settings()
+    token = begin_auth_attempt(request)
     if not api_key_matches(submitted, settings.api_key):
         return _render(request, "login.html", status_code=401, error="Invalid key.")
+    end_auth_attempt_ok(request, token)
     response = RedirectResponse("/ui/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         COOKIE_NAME,
