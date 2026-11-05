@@ -21,8 +21,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 09 | Arch §3 repository transactions | ACCEPTED — task 6e4c0a7, merge 9604cb6 |
 | 10 | Arch §3 large modules | ACCEPTED — task 21a1eea, merge 047f88f |
 | 11 | Arch §3 target roles vs stored config | ACCEPTED — task 4e661ef, merge e9daa49 |
-| 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED (see below; SHAs in git log) |
-| 13–19 | see task list | PENDING |
+| 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED — task 70d0910, merge 1ec31f7 |
+| 13 | Arch §3 stage-named operational scripts | ACCEPTED (see below; SHAs in git log) |
+| 14–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -167,3 +168,12 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Residual: LLM-compatible interfaces exist for Bewerbung planning and company research (their shipped implementations are deterministic; no runtime switch selects an LLM) — "no LLM at runtime" is accurate for this tree, and the guards fail if that changes silently.
 - Full pytest: 7438 passed, 148 skipped, 1 failed (`test_follow_up_send_service::TestLeaseRenewalHeartbeat`, a wall-clock timing flake that passes in isolation 3/3 and earlier full runs; to be made deterministic in TASK 17). Ruff clean. No schema change.
 - Codex: 1 code round ACCEPT with two P3 (fixed) + final ACCEPT.
+
+## TASK 13 — Operational scripts (Architecture §3)
+
+- Confirmed: 19 operator scripts named after build stages (`stage22_refresh_ba.py`, `offline_rescore_stage12.py`, ...).
+- Change: stable command line `python -m app.cli <command>` / console script `jobtriage` (`app/cli.py`, `[project.scripts]`): 19 descriptive command names -> the existing scripts, loaded by path and called through their own entry point (explicit `entry` where `run()` is not the command line — `profile-transfer` uses `main`); exit codes, options, dry-run defaults and database-target refusals are the scripts' own; textual `SystemExit` reasons are preserved. **All old script paths and module names are untouched**, so runbooks/automation need no edit. `docs/OPERATOR_COMMANDS.md` lists the mapping.
+- Not done: the scripts were not renamed or moved (that would break runbooks and the 40+ tests importing `scripts.*`); they stay a repository-checkout tool, not part of the installed package / Docker image (the dispatcher says so).
+- Tests: `tests/test_cli_dispatcher.py` (34): registry completeness guard (a new script must get a command), no stage numbers in names, entry points resolve, `<command> --help` exits 0 for all 18 argparse commands (this found and now guards a real crash in `profile-transfer`), exit-code/argv mapping with fake scripts, subprocess runs of `python -m app.cli --list` and an old script path.
+- Full pytest: 7473 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: 2 code rounds (R1 CHANGES_REQUESTED: profile-transfer entry crash, E501, SystemExit diagnostic; R2 ACCEPT).
