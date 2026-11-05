@@ -3,9 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
+# The distribution keeps its historical name (renaming it would change the installed
+# metadata of every environment and the editable-install paths); the product is JobTriage.
 name = "ai-job-search-control-center"
 version = "0.2.0"
-description = "AI multi-agent job search control center"
+description = "JobTriage: rule-based job triage and approval-gated application drafting backend (no LLM at runtime)"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.116",

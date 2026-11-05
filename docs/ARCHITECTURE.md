@@ -1,6 +1,14 @@
-# Architecture — JobTriage (AI Job Search Control Center)
+# Architecture — JobTriage (formerly "AI Job Search Control Center")
 
 This document maps the system as it actually exists in the codebase at HEAD `f88b84a` (frozen `refactor/project-cleanup-r1`). It does not propose a redesign — see `docs/REFACTORING_BACKLOG.md` for deferred architectural changes.
+
+## What is and is not AI
+
+- **No language model runs in this system.** No module imports an LLM SDK or calls a model API; `tests/test_naming_and_ai_claims.py` enforces both the imports and the declared dependencies.
+- **"Agents" (`app/agents/`)** are deterministic, rule-based analyzers: regex/keyword/rule matching (`job_fit_signals`, `requirement_extractor`, `candidate_job_matcher`, `role_relevance_classifier`, `seniority_classifier`, ...), classifiers over e-mail text (`email_classifier`, `application_response_classifier`) and **template generators** (`cv_adapter`, `bewerbung_generator`, `response_draft_generator`, `follow_up_generator`) that assemble text from stored candidate facts and job data. Every output is traceable to its inputs and reproducible.
+- **Scoring** (`job_scorer`, `job_score_evaluator`) is an explainable formula over matched skills and rule gates, not a learned model.
+- **Where AI *was* used:** the code and tests were written with AI coding assistants (Claude Code as implementer, Codex as independent reviewer) — a development fact, not a runtime capability.
+- **Names.** The product is **JobTriage**. The Python distribution is still called `ai-job-search-control-center` (its historical name; renaming it would change every installed environment's metadata), and the Gmail draft marker domain `@ai-job-search.invalid` is a stored protocol constant used to recognize drafts the app created — it must never be renamed.
 
 ## Layered overview
 

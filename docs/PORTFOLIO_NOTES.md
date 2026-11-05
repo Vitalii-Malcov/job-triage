@@ -4,7 +4,7 @@ Recruiter-facing material. Everything here is verified against the actual reposi
 
 ## 1-sentence description
 
-An AI-assisted job-search automation backend (FastAPI/PostgreSQL) that collects and scores job postings, drafts CVs, cover letters, and email responses deterministically, and gates every outbound action behind explicit human approval.
+A job-search automation backend (FastAPI/PostgreSQL, rule-based — no LLM at runtime, built with AI coding assistants) that collects and scores job postings, drafts CVs, cover letters, and email responses deterministically, and gates every outbound action behind explicit human approval.
 
 ## 3-sentence description
 
@@ -16,7 +16,7 @@ JobTriage is a FastAPI + PostgreSQL backend that automates the repetitive parts 
 
 ## LinkedIn / GitHub portfolio version
 
-**JobTriage — AI-Assisted Job Application Automation Platform**
+**JobTriage — Job Application Triage and Drafting Platform**
 
 A backend I built to automate the repetitive parts of job hunting (collecting postings, scoring fit, drafting CVs/cover letters/email replies) while keeping a hard human-approval gate around anything that sends real email or touches application status.
 
@@ -47,7 +47,7 @@ JobTriage is a layered FastAPI application (`api → services → agents/provide
 
 ## GitHub repository description (recommendation)
 
-> AI-assisted job application automation backend — FastAPI + PostgreSQL, deterministic drafting, human-approval-gated sends, CAS-based automation scheduler, ~6 900 tests.
+> Job application triage and drafting backend (rule-based, no LLM at runtime) — FastAPI + PostgreSQL, deterministic drafting, human-approval-gated sends, CAS-based automation scheduler, ~6 900 tests.
 
 ## GitHub topics (recommendation, 10)
 
