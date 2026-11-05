@@ -126,6 +126,7 @@ def _seed_message(
     references: tuple[str, ...] = (),
 ) -> int:
     parsed = ParsedGmailMessage(
+        sender_auth="DMARC_ALIGNED",
         account_key=account_key,
         mailbox="INBOX",
         uid=uid,

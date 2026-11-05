@@ -166,6 +166,7 @@ from app.services.response_draft_recipient import (
     ReplyRecipientInvalidError,
     derive_reply_recipient,
 )
+from app.services.sender_authentication import SenderAuth, sender_auth_warning
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,14 @@ class ResponseDraftRecipientDriftError(Exception):
     recipient the server derives now. Nothing was written. Mapped to 409."""
 
 
+class ResponseDraftSenderNotAuthenticatedError(Exception):
+    """Task 21: the inbound message's sender is not DMARC-aligned in the stored
+    Authentication-Results (forged, unverified, legacy or unknown). A reply
+    to a forgeable address is refused (approval AND send), fail closed; the
+    operator answers such a sender manually after verifying it elsewhere.
+    Mapped to 409. Carries no address."""
+
+
 class ResponseDraftSupersededError(Exception):
     """Stage 12: the draft is no longer the CURRENT revision for its
     message (see `app.services.response_draft.is_current_response_draft_revision`)
@@ -286,6 +295,17 @@ class ResponseDraftMessageAlreadyRepliedError(Exception):
 def _other_revision_has_live_send(db: Session, account_key: str, draft) -> bool:
     live = get_live_send_for_message(db, account_key, draft.gmail_message_id)
     return live is not None and live.response_draft_id != draft.id
+
+
+def _sender_auth_preview(db: Session, account_key: str, gmail_message_id: int) -> str:
+    """Stored sender-authentication status for display; legacy/unknown reads as UNVERIFIED."""
+    message = get_message_by_id(db, account_key, gmail_message_id)
+    value = message.sender_auth if message is not None else None
+    return (
+        value
+        if value in (SenderAuth.DMARC_ALIGNED, SenderAuth.FAILED)
+        else SenderAuth.UNVERIFIED.value
+    )
 
 
 def _preview_reply_recipient(db: Session, account_key: str, gmail_message_id: int) -> str | None:
@@ -356,6 +376,10 @@ def approve_or_reject_response_draft(
             raise ResponseDraftMissingRecipientError(
                 f"gmail_message_id={draft.gmail_message_id!r} has no safe reply recipient"
             ) from exc
+        if message is None or message.sender_auth != SenderAuth.DMARC_ALIGNED:
+            raise ResponseDraftSenderNotAuthenticatedError(
+                f"gmail_message_id={draft.gmail_message_id!r}: sender is not authenticated"
+            )
         if expected_recipient is not None and expected_recipient != pinned_recipient:
             raise ResponseDraftRecipientDriftError(
                 f"response_draft_id={draft_id!r}: expected_recipient does not match"
@@ -402,6 +426,10 @@ def _build_outbound_message(message, approval: ResponseDraftApprovalRecord) -> O
     if fresh != approval.pinned_recipient:
         raise ResponseDraftRecipientMismatchError(
             f"response_draft_id={approval.response_draft_id!r}: recipient changed since approval"
+        )
+    if message.sender_auth != SenderAuth.DMARC_ALIGNED:
+        raise ResponseDraftSenderNotAuthenticatedError(
+            f"response_draft_id={approval.response_draft_id!r}: sender is not authenticated"
         )
     references = tuple(json.loads(message.references_json))
     if message.message_id_header and message.message_id_header not in references:
@@ -671,6 +699,10 @@ def get_response_draft_state(db: Session, account_key: str, draft_id: int) -> Re
         response_draft_id=draft.id,
         gmail_message_id=draft.gmail_message_id,
         reply_recipient=_preview_reply_recipient(db, account_key, draft.gmail_message_id),
+        sender_authentication=(
+            auth := _sender_auth_preview(db, account_key, draft.gmail_message_id)
+        ),
+        sender_warning=sender_auth_warning(auth),
         draft_status=draft.status,
         is_current_revision=is_current_response_draft_revision(db, account_key, draft),
         approval=to_response_draft_approval(approval) if approval is not None else None,

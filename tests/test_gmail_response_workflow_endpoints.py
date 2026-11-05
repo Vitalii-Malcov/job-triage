@@ -110,6 +110,7 @@ def _seed(session_factory, *, uid: int = 1) -> int:
         record, _ = upsert_message(
             db,
             ParsedGmailMessage(
+                sender_auth="DMARC_ALIGNED",
                 account_key=ACCOUNT,
                 mailbox="INBOX",
                 uid=uid,

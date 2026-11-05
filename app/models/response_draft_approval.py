@@ -107,6 +107,12 @@ class ResponseDraftState(BaseModel):
     # Review 1.3 preview: the recipient a reply would go to now (None when not
     # safely derivable). Display only; the authorization is the approval's pin.
     reply_recipient: str | None = None
+    # Task 21: what the stored Authentication-Results proved about the sender's DOMAIN
+    # (DMARC_ALIGNED / FAILED / UNVERIFIED; legacy rows read as UNVERIFIED) and the
+    # operator-facing sentence. A draft whose sender is not DMARC_ALIGNED can be neither
+    # approved nor sent from this system.
+    sender_authentication: str = "UNVERIFIED"
+    sender_warning: str = ""
     # Stage 12: False when a newer analysis, a candidate-profile edit or a
     # generator upgrade has superseded this revision -- it can then no
     # longer be APPROVED (an approval recorded while it was current still

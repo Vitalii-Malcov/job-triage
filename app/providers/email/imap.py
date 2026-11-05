@@ -81,6 +81,10 @@ from app.providers.email.imap_deadline import (
 )
 from app.providers.email.imap_mailbox import MailboxNameError, mailbox_command_arg
 from app.providers.email.mime_utils import decode_mime_part
+from app.services.sender_authentication import (
+    MAX_AUTH_RESULTS_LENGTH,
+    evaluate_sender_authentication,
+)
 from app.utils.config_flags import is_configured
 from app.utils.html_text import html_to_text
 
@@ -1008,6 +1012,22 @@ class GmailImapProvider:
         body_plain, body_truncated, has_html, attachments = _extract_content(msg)
         body_html_text = _extract_html_text(msg) if has_html and not body_plain else ""
         direction = _direction(trusted_outbound=self.trusted_outbound)
+        # Task 21: topmost-first values, each clamped; only the first is ever evaluated.
+        auth_results = [
+            str(value)[: MAX_AUTH_RESULTS_LENGTH + 1]
+            for value in (msg.get_all("Authentication-Results") or [])
+        ]
+        # Only INBOUND mail is credited, and only with exactly one From header (a second
+        # one makes the visible sender ambiguous).
+        sender_auth = (
+            evaluate_sender_authentication(
+                auth_results,
+                from_address,
+                from_header_count=len(msg.get_all("From") or []),
+            ).value
+            if direction == "INBOUND"
+            else "UNVERIFIED"
+        )
 
         return ParsedGmailMessage(
             account_key=self.account_key,
@@ -1030,4 +1050,5 @@ class GmailImapProvider:
             body_html_text=body_html_text,
             provider_arrival_at=provider_arrival_at,
             attachments=attachments,
+            sender_auth=sender_auth,
         )

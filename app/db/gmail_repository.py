@@ -731,6 +731,7 @@ def upsert_message(
             in_reply_to=parsed.in_reply_to,
             references_json=json.dumps(list(parsed.references)),
             from_address=parsed.from_address,
+            sender_auth=parsed.sender_auth,
             from_display_name=parsed.from_display_name,
             to_addresses_json=json.dumps(list(parsed.to_addresses)),
             cc_addresses_json=json.dumps(list(parsed.cc_addresses)),

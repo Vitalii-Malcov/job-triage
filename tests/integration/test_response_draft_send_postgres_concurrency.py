@@ -146,6 +146,7 @@ def _seed_job(db) -> int:
 
 def _seed_and_approve_draft(db) -> int:
     parsed = ParsedGmailMessage(
+        sender_auth="DMARC_ALIGNED",
         account_key=ACCOUNT,
         mailbox="INBOX",
         uid=1,
