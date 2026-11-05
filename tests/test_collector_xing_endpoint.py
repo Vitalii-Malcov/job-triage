@@ -196,6 +196,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -215,6 +217,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert second.json() == {
@@ -224,6 +228,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -254,6 +260,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -362,6 +370,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 1,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == set()
@@ -379,6 +389,8 @@ class TestRunXingCollector:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == {"<fake-digest@mail.xing.com>"}
@@ -421,9 +433,7 @@ class TestXingCollectorNotifications:
         assert sent_job.title == "Senior Python Dev"
         assert sent_score.score == 90
 
-    def test_possible_collision_is_counted_left_untouched_and_not_notified(
-        self, client, monkeypatch
-    ):
+    def test_different_details_are_a_second_vacancy_and_both_notify(self, client, monkeypatch):
         first = _sample_job(title="Sachbearbeiter (m/w/d)", description="Gehalt: 50.000")
         rival = _sample_job(
             title="Sachbearbeiter (m/w/d)",
@@ -444,10 +454,50 @@ class TestXingCollectorNotifications:
 
         assert response.status_code == 200
         body = response.json()
-        assert (body["created"], body["updated"], body["possible_collisions"]) == (1, 1, 1)
-        # only the first posting alerts; the colliding observation never sends
-        # its own tracking link next to the stored posting's score
-        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [str(first.url)]
+        assert (body["created"], body["updated"]) == (2, 0)
+        assert (body["variant_postings"], body["ambiguous_observations"]) == (1, 0)
+        assert body["possible_collisions"] == 1
+        # two different postings: each alerts with its own link
+        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [
+            str(first.url),
+            str(rival.url),
+        ]
+
+    def test_evidence_free_observation_in_a_multi_row_group_has_no_side_effects(
+        self, client, monkeypatch
+    ):
+        first = _sample_job(title="Sachbearbeiter (m/w/d)", description="Gehalt: 50.000")
+        rival = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="Gehalt: 90.000",
+            url="https://www.xing.com/m/CCCCCCCCCCCCCCCCCCCC3",
+        )
+        blank = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="",
+            url="https://www.xing.com/m/DDDDDDDDDDDDDDDDDDDD4",
+        )
+        notifier = FakeTelegramNotifier()
+
+        response = self._run(
+            client,
+            monkeypatch,
+            jobs=[first, rival, blank],
+            scores_by_title={
+                "Sachbearbeiter (m/w/d)": _job_score(score=90, recommendation="APPLY")
+            },
+            notifier=notifier,
+        )
+
+        body = response.json()
+        assert (body["created"], body["updated"]) == (2, 0)
+        assert (body["variant_postings"], body["ambiguous_observations"]) == (1, 1)
+        assert body["possible_collisions"] == 2
+        # the ambiguous block alerts nothing and touches no posting
+        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [
+            str(first.url),
+            str(rival.url),
+        ]
 
     @pytest.mark.parametrize("recommendation", ["MAYBE", "SKIP", "NEEDS_ENRICHMENT"])
     def test_does_not_notify_for_non_apply_recommendations(
@@ -562,6 +612,8 @@ class TestXingCollectorNotifications:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 3
@@ -602,6 +654,8 @@ class TestSanitizedFailureLogging:
             "skipped_invalid": 0,
             "failed": 1,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert SECRET_TEXT not in caplog.text
@@ -636,6 +690,8 @@ class TestSanitizedFailureLogging:
             "skipped_invalid": 0,
             "failed": 0,
             "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 1

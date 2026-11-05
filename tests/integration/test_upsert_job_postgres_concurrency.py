@@ -735,11 +735,10 @@ XING_MARKER = "review-2-2-xing-collision"
 
 
 class TestRealConcurrentXingCollision:
-    """Review 2.2 on real PostgreSQL: two collectors observe different details for
-    the same XING identity (existing row with a BLANK description). The row lock
-    makes each decision see the other's committed write, so exactly one
-    description is ever stored and the other observation is flagged, never
-    silently overwriting it."""
+    """TASK 20 on real PostgreSQL: collectors observe postings that share one XING
+    identity (company/title/location) concurrently. The advisory lock serializes the
+    decision per identity group, so different evidence always ends as separate rows,
+    identical evidence converges on one row, and nothing is silently overwritten."""
 
     @pytest.fixture()
     def xing_factory(self):
@@ -759,7 +758,7 @@ class TestRealConcurrentXingCollision:
             engine.dispose()
 
     @staticmethod
-    def _xing_job(description: str) -> Job:
+    def _xing_job(description: str, occurrence: int = 1) -> Job:
         return Job(
             source="xing",
             title=f"Sachbearbeiter {XING_MARKER}",
@@ -767,61 +766,15 @@ class TestRealConcurrentXingCollision:
             location="Leipzig",
             url=f"https://www.xing.com/m/{description.replace(' ', '')[:12]}",
             description=description,
+            occurrence=occurrence,
         )
 
-    def test_competing_different_descriptions_store_exactly_one(self, xing_factory):
+    @staticmethod
+    def _run(xing_factory, descriptions):
         from app.db.repositories import upsert_job_observed
 
         score = JobScore(score=50, recommendation="MAYBE")
-        with xing_factory() as seed:
-            upsert_job(seed, self._xing_job(""), score)
-
-        barrier = threading.Barrier(2, timeout=30)
-        outcomes: dict[str, object] = {}
-        errors: list[BaseException] = []
-
-        def worker(description: str):
-            try:
-                with xing_factory() as db:
-                    barrier.wait()
-                    outcomes[description] = upsert_job_observed(
-                        db, self._xing_job(description), score
-                    )
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        threads = [
-            threading.Thread(target=worker, args=(d,)) for d in ("Gehalt: 50.000", "Gehalt: 90.000")
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads)
-        assert errors == []
-
-        with xing_factory() as db:
-            rows = (
-                db.execute(select(JobRecord).where(JobRecord.title.like(f"%{XING_MARKER}%")))
-                .scalars()
-                .all()
-            )
-            assert len(rows) == 1
-            stored = rows[0].description
-        assert stored in ("Gehalt: 50.000", "Gehalt: 90.000")
-        flagged = [d for d, o in outcomes.items() if o.possible_collision]
-        assert flagged == [d for d in outcomes if d != stored]
-        assert all(not o.created for o in outcomes.values())
-
-    def test_new_row_race_loser_converges_through_the_freeze_rule(self, xing_factory, monkeypatch):
-        from app.db.repositories import upsert_job_observed
-
-        score = JobScore(score=50, recommendation="MAYBE")
-        barrier = threading.Barrier(2, timeout=30)
-        monkeypatch.setattr(
-            "app.db.repositories.get_job_by_fingerprint",
-            _synchronized_get_job_by_fingerprint(barrier),
-        )
+        barrier = threading.Barrier(len(descriptions), timeout=30)
         outcomes: list[object] = []
         errors: list[BaseException] = []
         guard = threading.Lock()
@@ -829,33 +782,94 @@ class TestRealConcurrentXingCollision:
         def worker(description: str):
             try:
                 with xing_factory() as db:
-                    outcome = upsert_job_observed(db, self._xing_job(description), score)
+                    barrier.wait()
+                    outcome = upsert_job_observed(
+                        db, TestRealConcurrentXingCollision._xing_job(description), score
+                    )
                     with guard:
                         outcomes.append(outcome)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
-        threads = [
-            threading.Thread(target=worker, args=(d,)) for d in ("Gehalt: 50.000", "Gehalt: 90.000")
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads)
+        threads = [threading.Thread(target=worker, args=(d,)) for d in descriptions]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=90)
+        assert not any(thread.is_alive() for thread in threads)
         assert errors == []
-        assert sorted(o.created for o in outcomes) == [False, True]
-        loser = next(o for o in outcomes if not o.created)
-        assert loser.frozen and loser.possible_collision
+        return outcomes
+
+    def _rows(self, xing_factory):
         with xing_factory() as db:
-            assert (
-                db.scalar(
-                    select(func.count())
-                    .select_from(JobRecord)
-                    .where(JobRecord.title.like(f"%{XING_MARKER}%"))
-                )
-                == 1
+            return (
+                db.execute(select(JobRecord).where(JobRecord.title.like(f"%{XING_MARKER}%")))
+                .scalars()
+                .all()
             )
+
+    def test_competing_different_evidence_on_an_empty_group_keeps_both(self, xing_factory):
+        outcomes = self._run(xing_factory, ["Gehalt: 50.000", "Gehalt: 90.000"])
+        assert sorted(o.created for o in outcomes) == [True, True]
+        assert sum(o.sibling_created for o in outcomes) == 1
+        rows = self._rows(xing_factory)
+        assert sorted(r.description for r in rows) == ["Gehalt: 50.000", "Gehalt: 90.000"]
+        assert len({r.identity_key for r in rows}) == 1
+
+    def test_competing_identical_evidence_converges_on_one_row(self, xing_factory):
+        outcomes = self._run(xing_factory, ["Gehalt: 50.000"] * 4)
+        assert sorted(o.created for o in outcomes) == [False, False, False, True]
+        assert len(self._rows(xing_factory)) == 1
+
+    def test_many_workers_three_distinct_postings_make_exactly_three_rows(self, xing_factory):
+        descriptions = ["Gehalt: 50.000", "Gehalt: 60.000", "Beschäftigung: Teilzeit"] * 3
+        self._run(xing_factory, descriptions)
+        rows = self._rows(xing_factory)
+        assert sorted(r.description for r in rows) == sorted(set(descriptions))
+
+    def test_the_advisory_lock_is_taken_for_the_identity_group(self, xing_factory):
+        """Mutation guard: removing the per-group lock must fail a test, because the
+        unique-retry recovery alone would still produce the same rows."""
+        from sqlalchemy import event
+
+        from app.db.repositories import upsert_job_observed
+
+        statements: list[str] = []
+        score = JobScore(score=50, recommendation="MAYBE")
+        with xing_factory() as db:
+            event.listen(
+                db.get_bind(),
+                "before_cursor_execute",
+                lambda conn, cur, stmt, *a: statements.append(stmt),
+            )
+            upsert_job_observed(db, self._xing_job("Gehalt: 50.000"), score)
+        assert any("pg_advisory_xact_lock" in s for s in statements)
+
+    def test_unique_violation_without_the_lock_still_re_resolves_to_a_sibling(
+        self, xing_factory, monkeypatch
+    ):
+        """Defence in depth: with the advisory lock disabled and both writers deciding on
+        the base fingerprint, the loser's INSERT violates uq_jobs_fingerprint and must
+        become a sibling instead of overwriting the winner's different evidence."""
+        from app.db import repositories
+
+        monkeypatch.setattr(repositories, "_lock_identity_group", lambda db, base: None)
+        real = repositories.resolve_xing_identity
+        barrier = threading.Barrier(2, timeout=30)
+        seen = threading.local()
+
+        def synchronized(session, job, *, lock):
+            resolution = real(session, job, lock=lock)
+            if not getattr(seen, "first", False):
+                seen.first = True
+                barrier.wait()
+            return resolution
+
+        monkeypatch.setattr(repositories, "resolve_xing_identity", synchronized)
+        outcomes = self._run(xing_factory, ["Gehalt: 50.000", "Gehalt: 90.000"])
+        assert sorted(o.created for o in outcomes) == [True, True]
+        rows = self._rows(xing_factory)
+        assert sorted(r.description for r in rows) == ["Gehalt: 50.000", "Gehalt: 90.000"]
 
 
 TX_MARKER = "architecture-3-tx"

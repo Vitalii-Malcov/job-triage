@@ -452,6 +452,11 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if stats.get("possible_collisions")
             else ""
         )
+        + (
+            f" variant_postings={stats['variant_postings']}"
+            if stats.get("variant_postings")
+            else ""
+        )
     )
 
 

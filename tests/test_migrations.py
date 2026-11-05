@@ -50,6 +50,7 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "last_seen_at",
         "posting_type",  # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type")
         "source_reference",  # Stage 22 P0-1 (d5f1a7c3e9b2)
+        "identity_key",  # Task 20 (b4c7e9a1d3f5)
         # Stage 22 P1 structured facts (e3b7c9d1f4a6)
         "workplace_lat",
         "workplace_lon",
@@ -3304,3 +3305,57 @@ def test_alembic_has_exactly_one_head() -> None:
     assert len(script.get_heads()) == 1
     branched = [r.revision for r in script.walk_revisions() if len(r.nextrev) > 1]
     assert branched == []
+
+
+def test_identity_key_migration_keeps_existing_jobs_and_downgrades_cleanly(tmp_path: Path) -> None:
+    """Task 20 (b4c7e9a1d3f5): additive nullable column, nothing back-filled or rewritten."""
+    db_path = tmp_path / "migrations_identity_key.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "a2b7d4f9c1e3")
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert = text(
+        """
+        INSERT INTO jobs (
+            fingerprint, source, title, company, location, url, description,
+            skills_json, score, recommendation, status, first_seen_at, last_seen_at
+        ) VALUES (
+            :fp, 'xing', 'Sachbearbeiter', 'Example GmbH', 'Leipzig',
+            'https://www.xing.com/m/x', :description, '[]', 60, 'MAYBE', 'APPLIED',
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert, {"fp": "legacy-fp", "description": "Gehalt: 50.000"})
+
+    upgrade(cfg, "b4c7e9a1d3f5")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT identity_key, status, score, description FROM jobs")
+        ).one()
+        assert tuple(row) == (None, "APPLIED", 60, "Gehalt: 50.000")
+    assert "ix_jobs_identity_key" in {ix["name"] for ix in inspect(engine).get_indexes("jobs")}
+
+    # a sibling row makes the downgrade refuse BEFORE any DDL (it would be stranded)
+    with engine.begin() as connection:
+        connection.execute(insert, {"fp": "sibling-fp", "description": "Gehalt: 90.000"})
+        connection.execute(
+            text("UPDATE jobs SET identity_key = 'legacy-fp' WHERE fingerprint = 'sibling-fp'")
+        )
+    with pytest.raises(RuntimeError, match="sibling rows"):
+        downgrade(cfg, "a2b7d4f9c1e3")
+    assert "identity_key" in {col["name"] for col in inspect(engine).get_columns("jobs")}
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM jobs WHERE fingerprint = 'sibling-fp'"))
+        # a base row created after the migration (identity_key == fingerprint) is harmless
+        connection.execute(text("UPDATE jobs SET identity_key = fingerprint"))
+
+    downgrade(cfg, "a2b7d4f9c1e3")
+    columns = {col["name"] for col in inspect(engine).get_columns("jobs")}
+    assert "identity_key" not in columns
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*), min(status) FROM jobs")).one() == (
+            1,
+            "APPLIED",
+        )
+    upgrade(cfg, "head")

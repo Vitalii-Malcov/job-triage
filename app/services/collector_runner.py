@@ -394,8 +394,8 @@ def _score_and_persist_composed(
     outcome = upsert_job_observed(db, job, result, commit=False)
     record, created = outcome.record, outcome.created
     if outcome.frozen:
-        # Review 2.2: the stored row was left untouched (probable different
-        # posting, or the operator already acted on it). Report the PERSISTED
+        # The stored row was left untouched (an evidence-free XING observation in a
+        # multi-row group, or the operator already acted on it). Report the PERSISTED
         # assessment, skip posting-type reconciliation and write nothing else.
         frozen_result = JobScore(
             score=record.score,
@@ -439,6 +439,7 @@ def _score_and_persist_composed(
     db.commit()
     db.refresh(record)
     result.is_duplicate = not created
+    result.sibling_posting = outcome.sibling_created
     return record, result, created
 
 
@@ -955,7 +956,8 @@ async def run_xing(
     updated_count = 0
     failed_count = 0
     notified_count = 0
-    possible_collisions = 0
+    ambiguous_observations = 0
+    variant_postings = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
     # per-batch
     # persistence outcome, keyed by the batch's own IMAP UID -- combined
@@ -987,12 +989,18 @@ async def run_xing(
                 )
                 continue
 
+            if result.possible_collision:
+                # Evidence-free observation in a multi-row identity group: it belongs to no
+                # specific stored posting, so no row was written and no posting-specific
+                # side effect (touched job, research, vacancy card, alert) may follow.
+                ambiguous_observations += 1
+                continue
             if created:
                 created_count += 1
             else:
                 updated_count += 1
-            if result.possible_collision:
-                possible_collisions += 1
+            if result.sibling_posting:
+                variant_postings += 1
 
             if touched_jobs is not None:
                 touched_jobs.append(
@@ -1135,10 +1143,14 @@ async def run_xing(
         "updated": updated_count,
         "skipped_invalid": collector.skipped_invalid_count,
         "failed": failed_count,
-        # Review 2.2: observations that looked like a DIFFERENT posting sharing a
-        # stored XING record (same company/title/location, different details).
-        # The stored record was left untouched; review these in the log.
-        "possible_collisions": possible_collisions,
+        # XING identity: `variant_postings` = observations stored as a distinguished
+        # sibling of an existing posting (same company/title/location, different details);
+        # `ambiguous_observations` = evidence-free observations that could not be placed among
+        # several stored rows (nothing written, see the log); `possible_collisions` is their
+        # sum, the single review signal existing consumers read.
+        "possible_collisions": variant_postings + ambiguous_observations,
+        "variant_postings": variant_postings,
+        "ambiguous_observations": ambiguous_observations,
         # True if the IMAP session's total deadline
         # fired before every candidate message could be fetched -- see
         # app.collectors.xing_email.XingEmailCollector.deadline_exceeded.
