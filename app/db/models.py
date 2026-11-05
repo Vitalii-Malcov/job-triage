@@ -1155,6 +1155,15 @@ class ResponseDraftApprovalRecord(Base):
     # subject/body at decision time — see class docstring.
     pinned_subject: Mapped[str] = mapped_column(String(500), nullable=False)
     pinned_body: Mapped[str] = mapped_column(Text, nullable=False)
+    # Review finding 1.3: the reply recipient captured at APPROVAL time (the
+    # inbound message's stored from_address, validated by
+    # app.services.response_draft_recipient). "" = no pinned recipient: a
+    # REJECTED decision, or an approval recorded before this column existed
+    # -- such an approval can never be sent. The send re-derives the recipient
+    # and refuses on any difference. Pinning proves nothing about who really
+    # sent the inbound message (the header is forgeable); it fixes what the
+    # operator authorized.
+    pinned_recipient: Mapped[str] = mapped_column(String(320), nullable=False, server_default="")
 
     decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False

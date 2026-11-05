@@ -621,15 +621,35 @@ class TestRecipientAndHeaderTrustBoundary:
         assert "attacker@evil.example.com" not in sent.body
         assert "leak@evil.example.com" not in sent.body
 
-    def test_missing_recipient_address_is_rejected(self, db):
+    def test_missing_recipient_address_is_refused_at_approval(self, db):
+        """Review 1.3: a message with no safe recipient cannot even be approved
+        (nothing is persisted); a rejection still works."""
+        from app.db.response_draft_approval_repository import get_approval_for_draft
+
         _seed_job(db)
         msg_id = _seed_message(
             db, body_plain=_offer_body("Backend Engineer", "Globex"), from_address=None
         )
-        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
-        provider = FakeOutboundProvider()
+        draft = _generate_draft(db, msg_id=msg_id)
 
         with pytest.raises(ResponseDraftMissingRecipientError):
+            approve_or_reject_response_draft(db, ACCOUNT, draft.id, "APPROVED", None)
+        assert get_approval_for_draft(db, ACCOUNT, draft.id) is None
+        rejected = approve_or_reject_response_draft(db, ACCOUNT, draft.id, "REJECTED", None)
+        assert rejected.pinned_recipient == ""
+
+    def test_recipient_removed_after_approval_is_refused_at_send(self, db):
+        from app.db.models import GmailMessageRecord
+        from app.services.response_draft_send import ResponseDraftRecipientMismatchError
+
+        _seed_job(db)
+        msg_id = _seed_message(db, body_plain=_offer_body("Backend Engineer", "Globex"))
+        draft, _approval = _generate_and_approve_draft(db, msg_id=msg_id)
+        db.get(GmailMessageRecord, msg_id).from_address = None
+        db.commit()
+        provider = FakeOutboundProvider()
+
+        with pytest.raises(ResponseDraftRecipientMismatchError):
             send_response_draft(db, ACCOUNT, draft.id, provider)
         assert provider.call_count == 0
 

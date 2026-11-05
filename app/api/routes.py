@@ -256,6 +256,9 @@ from app.services.response_draft_send import (
     ResponseDraftNotApprovableError,
     ResponseDraftNotApprovedError,
     ResponseDraftNotFoundError,
+    ResponseDraftRecipientDriftError,
+    ResponseDraftRecipientMismatchError,
+    ResponseDraftRecipientNotPinnedError,
     ResponseDraftSendFailedError,
     ResponseDraftSendInProgressError,
     ResponseDraftSendOutcomeUncertainError,
@@ -1683,7 +1686,7 @@ def decide_response_draft(
     account_key = _current_gmail_account_key(get_settings())
     try:
         record = approve_or_reject_response_draft(
-            db, account_key, draft_id, body.decision, body.note
+            db, account_key, draft_id, body.decision, body.note, body.expected_recipient
         )
     except ResponseDraftNotFoundError as exc:
         raise HTTPException(
@@ -1698,6 +1701,16 @@ def decide_response_draft(
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="Response draft already has a recorded decision",
+        ) from exc
+    except ResponseDraftMissingRecipientError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No safe reply recipient is available for this message",
+        ) from exc
+    except ResponseDraftRecipientDriftError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="The reply recipient differs from the one the operator reviewed",
         ) from exc
     except ResponseDraftSupersededError as exc:
         raise HTTPException(
@@ -1784,6 +1797,16 @@ def send_response_draft_endpoint(
         raise HTTPException(
             status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="No recipient address is available for this message",
+        ) from exc
+    except ResponseDraftRecipientNotPinnedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="This approval has no pinned recipient and can never be sent",
+        ) from exc
+    except ResponseDraftRecipientMismatchError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="The reply recipient changed since this draft was approved",
         ) from exc
     except ResponseDraftAlreadySentError as exc:
         raise HTTPException(
