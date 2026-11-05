@@ -50,6 +50,8 @@ class ResponseDraftApproval(BaseModel):
     decision_note: str | None
     pinned_subject: str
     pinned_body: str
+    # "" = none pinned (REJECTED, or approved before recipient pinning: never sendable).
+    pinned_recipient: str = ""
     decided_at: datetime
 
 
@@ -64,6 +66,10 @@ class ResponseDraftApprovalRequest(BaseModel):
 
     decision: ApprovalDecision
     note: str | None = Field(default=None, max_length=2000)
+    # Optional "what the operator saw" guard: when given with APPROVED it must
+    # equal the recipient the server derives now, else 409 and nothing is
+    # written. The recipient is previewed on GET .../state and /pending.
+    expected_recipient: str | None = Field(default=None, max_length=320)
 
 
 class ResponseDraftSendStatus(BaseModel):
@@ -98,6 +104,9 @@ class ResponseDraftState(BaseModel):
     response_draft_id: int
     gmail_message_id: int
     draft_status: str
+    # Review 1.3 preview: the recipient a reply would go to now (None when not
+    # safely derivable). Display only; the authorization is the approval's pin.
+    reply_recipient: str | None = None
     # Stage 12: False when a newer analysis, a candidate-profile edit or a
     # generator upgrade has superseded this revision -- it can then no
     # longer be APPROVED (an approval recorded while it was current still
@@ -121,6 +130,8 @@ class PendingResponseDraft(BaseModel):
 
     response_draft_id: int
     gmail_message_id: int
+    # Review 1.3 preview (None when not safely derivable).
+    reply_recipient: str | None = None
     analysis_id: int
     matched_job_id: int | None
     match_type: str | None

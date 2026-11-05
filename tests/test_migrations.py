@@ -2175,6 +2175,7 @@ def test_response_draft_approvals_table_shape(tmp_path: Path) -> None:
         "decision_note",
         "pinned_subject",
         "pinned_body",
+        "pinned_recipient",
         "decided_at",
     }
 
@@ -3227,6 +3228,75 @@ def test_response_draft_sends_send_attempted_defaults_false_for_rows_created_aft
     assert value in (False, 0)
 
 
+def test_pinned_recipient_migration_round_trip_keeps_rows_and_never_backfills(
+    tmp_path: Path,
+) -> None:
+    """Review 1.3: upgrade adds `pinned_recipient` with '' for existing
+    approvals (never reconstructed -> such approvals stay unsendable),
+    downgrade drops the column without losing approval/send rows, and
+    re-upgrade restores '' (a dropped pin is never silently re-derived)."""
+    db_path = tmp_path / "migrations_pinned_recipient.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "e3b7c9d1f4a6")
+    engine = create_engine(f"sqlite:///{db_path}")
+    assert "pinned_recipient" not in {
+        c["name"] for c in inspect(engine).get_columns("response_draft_approvals")
+    }
+    with engine.begin() as connection:
+        _insert_response_draft_approval(connection, response_draft_id=7)
+        _insert_response_draft_send(connection, response_draft_id=7, approval_id=1, status="SENT")
+
+    upgrade(cfg, "head")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT id, decision, pinned_subject, pinned_recipient "
+                "FROM response_draft_approvals"
+            )
+        ).one()
+    assert (row.id, row.decision, row.pinned_subject, row.pinned_recipient) == (
+        1,
+        "APPROVED",
+        "Re: Test",
+        "",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE response_draft_approvals SET pinned_recipient = 'x@y.example'")
+        )
+
+    with engine.connect() as connection:
+        fk_before = sorted(map(tuple, connection.execute(text("PRAGMA foreign_key_check")).all()))
+    downgrade(cfg, "e3b7c9d1f4a6")
+    inspector = inspect(engine)
+    assert "pinned_recipient" not in {
+        c["name"] for c in inspector.get_columns("response_draft_approvals")
+    }
+    assert any(
+        uc["column_names"] == ["response_draft_id"]
+        for uc in inspector.get_unique_constraints("response_draft_approvals")
+    )
+    with engine.connect() as connection:
+        assert (
+            connection.execute(text("SELECT COUNT(*) FROM response_draft_approvals")).scalar() == 1
+        )
+        assert (
+            connection.execute(text("SELECT status FROM response_draft_sends")).scalar() == "SENT"
+        )
+        # the seed rows are orphans by design; the rebuild must not change that
+        after = sorted(map(tuple, connection.execute(text("PRAGMA foreign_key_check")).all()))
+        assert after == fk_before
+
+    upgrade(cfg, "head")
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT pinned_recipient FROM response_draft_approvals")
+            ).scalar()
+            == ""
+        )
+
+
 def test_alembic_has_exactly_one_head() -> None:
     cfg = _alembic_config(Path("unused-for-this-check.db"))
     heads = ScriptDirectory.from_config(cfg).get_heads()
@@ -3239,4 +3309,4 @@ def test_alembic_has_exactly_one_head() -> None:
     # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2), then Stage 22 P1
     # structured job facts (e3b7c9d1f4a6)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "e3b7c9d1f4a6"
+    assert heads[0] == "f1a8c3d5e7b9"

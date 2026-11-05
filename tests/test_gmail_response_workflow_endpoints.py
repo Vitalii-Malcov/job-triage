@@ -36,9 +36,11 @@ HEADERS = {"X-API-Key": API_KEY}
 class FakeOutboundProvider:
     def __init__(self):
         self.call_count = 0
+        self.messages = []
 
     def send(self, message):
         self.call_count += 1
+        self.messages.append(message)
         return OutboundSendResult(provider_message_id=f"msg-{self.call_count}")
 
 
@@ -285,3 +287,138 @@ class TestFollowUpDecisionBody:
             headers=HEADERS,
         )
         assert response.status_code == 422
+
+
+def _set_from_address(session_factory, msg_id: int, value: str) -> None:
+    from app.db.models import GmailMessageRecord
+
+    with session_factory() as db:
+        db.get(GmailMessageRecord, msg_id).from_address = value
+        db.commit()
+
+
+class TestRecipientPinning:
+    def test_approval_pins_recipient_and_send_uses_it(self, client):
+        test_client, session_factory, provider = client
+        draft_id = _generate(session_factory, _seed(session_factory))
+        resp = _decide(test_client, draft_id)
+        assert resp.status_code == 200
+        assert resp.json()["pinned_recipient"] == "hr@acme.example.com"
+        sent = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert sent.status_code == 200
+        assert [m.to_address for m in provider.messages] == ["hr@acme.example.com"]
+
+    def test_from_header_changed_after_approval_refuses_the_send(self, client):
+        test_client, session_factory, provider = client
+        msg_id = _seed(session_factory)
+        draft_id = _generate(session_factory, msg_id)
+        assert _decide(test_client, draft_id).status_code == 200
+        _set_from_address(session_factory, msg_id, "attacker@evil.example")
+        resp = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert resp.status_code == 409
+        assert "evil" not in resp.text and "acme" not in resp.text
+        assert provider.call_count == 0
+        state = test_client.get(f"/api/v1/response-drafts/{draft_id}/state", headers=HEADERS).json()
+        assert state["send"] is None  # nothing was claimed
+
+    def test_unreadable_from_after_approval_is_a_mismatch_not_a_send(self, client):
+        test_client, session_factory, provider = client
+        msg_id = _seed(session_factory)
+        draft_id = _generate(session_factory, msg_id)
+        assert _decide(test_client, draft_id).status_code == 200
+        _set_from_address(session_factory, msg_id, "")
+        resp = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert resp.status_code == 409 and provider.call_count == 0
+
+    def test_legacy_approval_without_pin_can_never_be_sent(self, client):
+        from app.db.models import ResponseDraftApprovalRecord
+
+        test_client, session_factory, provider = client
+        draft_id = _generate(session_factory, _seed(session_factory))
+        assert _decide(test_client, draft_id).status_code == 200
+        with session_factory() as db:
+            db.query(ResponseDraftApprovalRecord).update({"pinned_recipient": ""})
+            db.commit()
+        resp = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert resp.status_code == 409 and "no pinned recipient" in resp.json()["detail"]
+        assert provider.call_count == 0
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "a@b.example, c@d.example",
+            "Recruiter <hr@acme.example.com>",
+            "hr@acme.example.com\r\nBcc: x@y.example",
+            "hr@acme.example.com\n",
+            "not-an-address",
+            ACCOUNT,
+        ],
+    )
+    def test_unsafe_recipient_is_refused_at_approval_and_nothing_is_written(self, client, bad):
+        test_client, session_factory, provider = client
+        msg_id = _seed(session_factory)
+        draft_id = _generate(session_factory, msg_id)
+        _set_from_address(session_factory, msg_id, bad)
+        resp = _decide(test_client, draft_id)
+        assert resp.status_code == 422
+        state = test_client.get(f"/api/v1/response-drafts/{draft_id}/state", headers=HEADERS).json()
+        assert state["approval"] is None and state["reply_recipient"] is None
+        # a rejection never needs a recipient
+        assert _decide(test_client, draft_id, "REJECTED").json()["pinned_recipient"] == ""
+
+    def test_expected_recipient_guard(self, client):
+        test_client, session_factory, _ = client
+        draft_id = _generate(session_factory, _seed(session_factory))
+        assert (
+            _decide(test_client, draft_id, expected_recipient="other@x.example").status_code == 409
+        )
+        state = test_client.get(f"/api/v1/response-drafts/{draft_id}/state", headers=HEADERS).json()
+        assert state["approval"] is None
+        assert state["reply_recipient"] == "hr@acme.example.com"
+        assert (
+            _decide(test_client, draft_id, expected_recipient="hr@acme.example.com").status_code
+            == 200
+        )
+
+    def test_pending_list_previews_the_recipient(self, client):
+        test_client, session_factory, _ = client
+        _generate(session_factory, _seed(session_factory))
+        item = test_client.get("/api/v1/response-drafts/pending", headers=HEADERS).json()[0]
+        assert item["reply_recipient"] == "hr@acme.example.com"
+
+    def test_already_sent_keeps_its_outcome_even_if_the_pin_is_gone(self, client):
+        from app.db.models import ResponseDraftApprovalRecord
+
+        test_client, session_factory, provider = client
+        draft_id = _generate(session_factory, _seed(session_factory))
+        _decide(test_client, draft_id)
+        first = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert first.status_code == 200
+        with session_factory() as db:
+            db.query(ResponseDraftApprovalRecord).update({"pinned_recipient": ""})
+            db.commit()
+        again = test_client.post(f"/api/v1/response-drafts/{draft_id}/send", headers=HEADERS)
+        assert again.status_code == 409 and "already been sent" in again.json()["detail"]
+        assert provider.call_count == 1
+
+    def test_stale_orm_copy_cannot_hide_a_changed_header(self, client):
+        """The sending session already holds the message; another session
+        changes From; the send must still see the new value."""
+        from app.db.gmail_repository import get_message_by_id
+        from app.services.response_draft_send import (
+            ResponseDraftRecipientMismatchError,
+            send_response_draft,
+        )
+
+        test_client, session_factory, provider = client
+        msg_id = _seed(session_factory)
+        draft_id = _generate(session_factory, msg_id)
+        assert _decide(test_client, draft_id).status_code == 200
+        with session_factory() as db:
+            held = get_message_by_id(db, ACCOUNT, msg_id)  # strong ref: stays cached
+            assert held.from_address == "hr@acme.example.com"
+            _set_from_address(session_factory, msg_id, "attacker@evil.example")
+            assert held.from_address == "hr@acme.example.com"  # still the stale value
+            with pytest.raises(ResponseDraftRecipientMismatchError):
+                send_response_draft(db, ACCOUNT, draft_id, provider)
+        assert provider.call_count == 0

@@ -11,8 +11,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | Task | Finding | State |
 | --- | --- | --- |
 | 01 | 1.1 API key compare / failed-auth rate limit | ACCEPTED — task 5c4646d, merge bab160d |
-| 02 | 1.2 secrets in repr / UI signing key | ACCEPTED (see below) |
-| 03–19 | see task list | PENDING |
+| 02 | 1.2 secrets in repr / UI signing key | ACCEPTED — task d6f1494, merge 73f6bba |
+| 03 | 1.3 response-draft recipient pinning | ACCEPTED (see below; SHAs in git log) |
+| 04–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -49,3 +50,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
   two assertions in `tests/test_stage20_run_operator_ui.py` unwrap SecretStr.
 - Full pytest: 7295 passed, 1 failed (assertion on SecretStr; fixed, file 11 passed), 139 skipped. Ruff check/format clean. No schema change.
 - Codex: plan review + 2 code rounds. R1 CHANGES_REQUESTED (second stale assertion that I had missed), R2 ACCEPT.
+
+## TASK 03 — Response-draft recipient pinning (1.3, MEDIUM)
+
+- Confirmed: yes (recipient read from `GmailMessageRecord.from_address` at send time; approval pinned only subject/body).
+- GATE B: Codex plan review first (PLAN_CHANGES: strict single-mailbox parsing, fresh read, SENT/UNCERTAIN precedence, preview/expected_recipient, migration round trip, missing 422 handler) — all adopted.
+- Schema: `response_draft_approvals.pinned_recipient` (migration `f1a8c3d5e7b9`, head bumped in tests + `ci.yml`). Existing approvals keep `''` and are never sendable; nothing is back-filled.
+- Behaviour: APPROVED pins the validated recipient (`app/services/response_draft_recipient.py`); optional `expected_recipient` guard (409); send uses only the pinned value after a fresh re-derivation matches (409 otherwise, nothing claimed); already SENT/UNCERTAIN/attempted-PENDING keep their outcome before the recipient check; `reply_recipient` preview on `/state` and `/pending`.
+- Residual risk: the stored `From` is still unauthenticated (no SPF/DKIM) — pinning fixes what the operator authorized, not who the sender is. Legacy approved-but-unsent drafts are blocked until a genuinely new revision exists (regeneration with unchanged identity returns the same revision).
+- Tests: 9 new endpoint tests, service tests rewritten, populated SQLite migration round trip. PostgreSQL (throwaway `postgres:16`, localhost:55432): alembic upgrade/downgrade/upgrade OK, 11 PG integration tests passed.
+- Full pytest: 7312 passed, 139 skipped, 0 failed. Ruff clean.
+- Codex: plan review + 2 code rounds (R1 CHANGES_REQUESTED: stale existing test, weak stale-session test; R2 ACCEPT).

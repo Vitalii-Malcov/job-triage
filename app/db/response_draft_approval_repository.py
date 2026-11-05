@@ -100,6 +100,7 @@ def create_approval(
     decision_note: str | None,
     pinned_subject: str,
     pinned_body: str,
+    pinned_recipient: str = "",
 ) -> tuple[ResponseDraftApprovalRecord, bool]:
     """Insert-only decision write. Returns `(record, created)` —
     `created=False` means a decision ALREADY existed for this
@@ -123,6 +124,7 @@ def create_approval(
         decision_note=decision_note,
         pinned_subject=pinned_subject,
         pinned_body=pinned_body,
+        pinned_recipient=pinned_recipient,
     )
     db.add(record)
     try:
@@ -493,6 +495,7 @@ def to_response_draft_approval(record: ResponseDraftApprovalRecord) -> ResponseD
         decision_note=record.decision_note,
         pinned_subject=record.pinned_subject,
         pinned_body=record.pinned_body,
+        pinned_recipient=record.pinned_recipient,
         decided_at=record.decided_at,
     )
 
