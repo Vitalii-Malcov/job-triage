@@ -14,8 +14,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 02 | 1.2 secrets in repr / UI signing key | ACCEPTED — task d6f1494, merge 73f6bba |
 | 03 | 1.3 response-draft recipient pinning | ACCEPTED — task 32336e3, merge 57d58a5 |
 | 04 | 1.4 UI session revocation | ACCEPTED — task b4ec414, merge 10c69ad |
-| 05 | 2.1 processed email identity | ACCEPTED (see below; SHAs in git log) |
-| 06–19 | see task list | PENDING |
+| 05 | 2.1 processed email identity | ACCEPTED — task feff194, merge 1cf7900 |
+| 06 | 2.2 XING dedup collisions | ACCEPTED (see below; SHAs in git log) |
+| 07–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -84,3 +85,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - PostgreSQL (throwaway postgres:16): upgrade, populated downgrade refusal, downgrade/re-upgrade with correct indexes/constraints, 3 PG tests passed.
 - Full pytest: 7330 passed, 142 skipped (3 new PG tests skip without `TEST_POSTGRES_URL`), 0 failed. Ruff clean.
 - Codex: plan review + 3 code rounds (R1 CHANGES_REQUESTED holder not released on failure; R2 `BLOCKED` only for lack of full-suite evidence; R3 ACCEPT with evidence supplied).
+
+## TASK 06 — XING dedup collisions (2.2, MEDIUM)
+
+- Confirmed: yes (key = company/title/location; the existing-row update overwrote score/skills/description, also for operator-touched rows).
+- Constraint analysis: the digest e-mail has no stable reference id (tracking links are per recipient and must never be requested) and the fingerprint cannot change without duplicating every historical production row, so the audit's alternative "flag likely collisions" was implemented. A first design (derived second fingerprint that splits postings) was rejected after Codex plan review (races, Telegram identity, protected blank base).
+- GATE B: Codex plan review, two rounds (PLAN_CHANGES x2 -> flag-and-freeze design with row lock, persisted-values result, alert suppression).
+- Behaviour (XING only, `app/db/repositories.py::_update_existing`): the row is reloaded `FOR UPDATE`; when stored and incoming descriptions both have content and differ (NFKC/casefold/whitespace) OR the legacy `JobRecord.status != "NEW"`, only `last_seen_at` is refreshed. `score_and_persist` then reports the persisted assessment (no posting-type reconciliation), the legacy Telegram alert is skipped for flagged observations, `run_xing` returns `possible_collisions` and Telegram `/run` shows it when non-zero. `upsert_job` keeps its tuple signature; `upsert_job_observed` returns `UpsertOutcome`. No schema change, no historical row touched.
+- Residual: two postings with identical company/title/location AND identical salary/employment text are still indistinguishable; the second posting of a flagged pair stays invisible (only log/summary). A genuine salary change freezes instead of updating. Flags are per observation, not stored. Freeze scope is `JobRecord.status` only (Telegram Save/Skip and Stage 15 do not change it). Operator-status race window is bounded (not a conditional UPDATE).
+- Tests: `tests/test_xing_collision_protection.py`, endpoint test (count + no alert), Telegram `/run` test, PG tests (`test_upsert_job_postgres_concurrency.py`: existing blank row + 2 competing descriptions; new-row race) — 9 passed on postgres:16.
+- Full pytest: 7350 passed, 144 skipped, 0 failed. Ruff clean.
+- Codex: plan review x2 + 1 code round: `VERDICT: ACCEPT` (P3: show collisions in Telegram `/run` — implemented after the verdict, covered by a new test and the full run).

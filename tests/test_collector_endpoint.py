@@ -323,7 +323,7 @@ class TestRunBundesagenturCollector:
         # unusable state that would also break job 3.
         import app.services.collector_runner as collector_runner_module
 
-        original_upsert_job = collector_runner_module.upsert_job
+        original_upsert_job = collector_runner_module.upsert_job_observed
         call_count = {"n": 0}
 
         def flaky_upsert_job(db, job, score):
@@ -332,7 +332,7 @@ class TestRunBundesagenturCollector:
                 raise RuntimeError("simulated persistence failure")
             return original_upsert_job(db, job, score)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", flaky_upsert_job)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", flaky_upsert_job)
 
         response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -618,7 +618,7 @@ class TestSanitizedFailureLogging:
         def _boom(db, job, score):
             raise RuntimeError(SECRET_TEXT)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", _boom)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", _boom)
 
         with caplog.at_level("DEBUG"):
             response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())

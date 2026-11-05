@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -274,6 +275,63 @@ def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
     return "UNIQUE constraint failed: jobs.fingerprint" in str(orig)
 
 
+# Review 2.2: sources whose dedup key is NOT a reliable per-posting identity.
+# For these, an observation that looks like a different posting, or that hits
+# a record the operator has already acted on, never rewrites the stored
+# content (see `_update_existing`). XING only: its digest e-mails carry no
+# stable reference id (the tracking link is per recipient and must never be
+# requested), so identical company/title/location postings share one record.
+_FREEZE_ON_CONFLICT_SOURCES: frozenset[str] = frozenset({"xing"})
+
+
+def _normalized_description(text_value: str | None) -> str:
+    """Comparison form only (never stored): NFKC, casefolded, whitespace collapsed."""
+    return (
+        _WHITESPACE_RUN.sub(" ", unicodedata.normalize("NFKC", text_value or "")).strip().casefold()
+    )
+
+
+def descriptions_conflict(stored: str | None, incoming: str | None) -> bool:
+    """True when both descriptions carry content and differ. A blank side never
+    conflicts (an empty scrape must not split or freeze a record)."""
+    a, b = _normalized_description(stored), _normalized_description(incoming)
+    return bool(a) and bool(b) and a != b
+
+
+@dataclass(frozen=True)
+class UpsertOutcome:
+    record: JobRecord
+    created: bool
+    # Existing record left untouched except `last_seen_at` (collision or the
+    # operator already acted on it); `possible_collision` says it was the former.
+    frozen: bool = False
+    possible_collision: bool = False
+
+
+def _update_existing(
+    db: Session, existing: JobRecord, job: Job, score: JobScore, now: datetime
+) -> UpsertOutcome:
+    """The "already exists" write, shared by the sequential path and HARD-007's
+    race-recovery winner. For `_FREEZE_ON_CONFLICT_SOURCES` the row is locked
+    (`FOR UPDATE` on PostgreSQL) and reloaded first so the decision and the
+    write are atomic with respect to other collectors; a stale identity-map
+    copy can never hide a concurrent change."""
+    if job.source in _FREEZE_ON_CONFLICT_SOURCES:
+        db.refresh(existing, with_for_update=True)
+        collision = descriptions_conflict(existing.description, job.description)
+        if collision or existing.status != "NEW":
+            existing.last_seen_at = now
+            _finalize_job_write(db, existing, None)
+            if collision:
+                logger.warning(
+                    "job_possible_collision source=%s job_id=%s", existing.source, existing.id
+                )
+            return UpsertOutcome(existing, False, frozen=True, possible_collision=collision)
+    _apply_job_update_fields(existing, job, score, now)
+    _finalize_job_write(db, existing, storable_reference(job.source_reference))
+    return UpsertOutcome(existing, False)
+
+
 def upsert_job(
     db: Session,
     job: Job,
@@ -282,6 +340,20 @@ def upsert_job(
     first_seen_at: datetime | None = None,
     last_seen_at: datetime | None = None,
 ) -> tuple[JobRecord, bool]:
+    outcome = upsert_job_observed(
+        db, job, score, first_seen_at=first_seen_at, last_seen_at=last_seen_at
+    )
+    return outcome.record, outcome.created
+
+
+def upsert_job_observed(
+    db: Session,
+    job: Job,
+    score: JobScore,
+    *,
+    first_seen_at: datetime | None = None,
+    last_seen_at: datetime | None = None,
+) -> UpsertOutcome:
     """`first_seen_at`/`last_seen_at` (Stage 14B, keyword-only, both or
     neither): the ORIGINAL collector observation times when a job is
     transferred from another database, so import time is never mistaken
@@ -304,7 +376,7 @@ def _upsert_job(
     score: JobScore,
     first_seen_at: datetime | None,
     last_seen_at: datetime | None,
-) -> tuple[JobRecord, bool]:
+) -> UpsertOutcome:
     """HARD-007 (Codex master review): two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
     None` above (the classic check-then-act TOCTOU window between this
@@ -346,9 +418,7 @@ def _upsert_job(
     if existing:
         if historical:
             raise ValueError("historical observation timestamps apply only to a new job record")
-        _apply_job_update_fields(existing, job, score, now)
-        _finalize_job_write(db, existing, storable_reference(job.source_reference))
-        return existing, False
+        return _update_existing(db, existing, job, score, now)
 
     record = JobRecord(
         fingerprint=fingerprint,
@@ -386,10 +456,8 @@ def _upsert_job(
             raise ValueError(
                 "historical observation timestamps apply only to a new job record"
             ) from exc
-        _apply_job_update_fields(winner, job, score, now)
-        _finalize_job_write(db, winner, storable_reference(job.source_reference))
-        return winner, False
-    return record, True
+        return _update_existing(db, winner, job, score, now)
+    return UpsertOutcome(record, True)
 
 
 def update_job_score_if_posting_type_unchanged(

@@ -195,6 +195,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
 
@@ -213,6 +214,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert second.json() == {
@@ -221,6 +223,7 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
 
@@ -250,6 +253,7 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
 
@@ -331,7 +335,7 @@ class TestRunXingCollector:
 
         import app.services.collector_runner as collector_runner_module
 
-        original_upsert_job = collector_runner_module.upsert_job
+        original_upsert_job = collector_runner_module.upsert_job_observed
         call_count = {"n": 0}
 
         def flaky_upsert_job(db, job, score):
@@ -340,7 +344,7 @@ class TestRunXingCollector:
                 raise RuntimeError("simulated persistence failure")
             return original_upsert_job(db, job, score)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", flaky_upsert_job)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", flaky_upsert_job)
 
         acknowledged: set[str] = set()
         monkeypatch.setattr(
@@ -357,6 +361,7 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == set()
@@ -373,6 +378,7 @@ class TestRunXingCollector:
             "updated": 2,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == {"<fake-digest@mail.xing.com>"}
@@ -414,6 +420,34 @@ class TestXingCollectorNotifications:
         sent_job, sent_score = notifier.calls[0]
         assert sent_job.title == "Senior Python Dev"
         assert sent_score.score == 90
+
+    def test_possible_collision_is_counted_left_untouched_and_not_notified(
+        self, client, monkeypatch
+    ):
+        first = _sample_job(title="Sachbearbeiter (m/w/d)", description="Gehalt: 50.000")
+        rival = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="Gehalt: 90.000",
+            url="https://www.xing.com/m/BBBBBBBBBBBBBBBBBBBB2",
+        )
+        notifier = FakeTelegramNotifier()
+
+        response = self._run(
+            client,
+            monkeypatch,
+            jobs=[first, rival],
+            scores_by_title={
+                "Sachbearbeiter (m/w/d)": _job_score(score=90, recommendation="APPLY")
+            },
+            notifier=notifier,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert (body["created"], body["updated"], body["possible_collisions"]) == (1, 1, 1)
+        # only the first posting alerts; the colliding observation never sends
+        # its own tracking link next to the stored posting's score
+        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [str(first.url)]
 
     @pytest.mark.parametrize("recommendation", ["MAYBE", "SKIP", "NEEDS_ENRICHMENT"])
     def test_does_not_notify_for_non_apply_recommendations(
@@ -527,6 +561,7 @@ class TestXingCollectorNotifications:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 3
@@ -554,7 +589,7 @@ class TestSanitizedFailureLogging:
         def _boom(db, job, score):
             raise RuntimeError(SECRET_TEXT)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", _boom)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", _boom)
 
         with caplog.at_level("DEBUG"):
             response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
@@ -566,6 +601,7 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert SECRET_TEXT not in caplog.text
@@ -599,6 +635,7 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 1

@@ -265,6 +265,20 @@ class TestRunCommand:
         )
 
     @pytest.mark.asyncio
+    async def test_xing_success_reports_possible_collisions_only_when_nonzero(self, monkeypatch):
+        base = {"fetched": 2, "created": 1, "updated": 1, "skipped_invalid": 0, "failed": 0}
+        run = AsyncMock(return_value={**base, "possible_collisions": 1})
+        monkeypatch.setattr(bot, "run_xing", run)
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_run(update, _make_context(["xing"]))
+        assert update.message.reply_text.call_args[0][0].endswith("failed=0 possible_collisions=1")
+
+        run.return_value = {**base, "possible_collisions": 0}
+        update = _make_update(AUTHORIZED_CHAT_ID)
+        await bot.cmd_run(update, _make_context(["xing"]))
+        assert update.message.reply_text.call_args[0][0].endswith("failed=0")
+
+    @pytest.mark.asyncio
     async def test_xing_not_configured(self, monkeypatch):
         monkeypatch.setattr(
             bot,
