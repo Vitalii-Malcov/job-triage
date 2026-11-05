@@ -12,8 +12,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | --- | --- | --- |
 | 01 | 1.1 API key compare / failed-auth rate limit | ACCEPTED — task 5c4646d, merge bab160d |
 | 02 | 1.2 secrets in repr / UI signing key | ACCEPTED — task d6f1494, merge 73f6bba |
-| 03 | 1.3 response-draft recipient pinning | ACCEPTED (see below; SHAs in git log) |
-| 04–19 | see task list | PENDING |
+| 03 | 1.3 response-draft recipient pinning | ACCEPTED — task 32336e3, merge 57d58a5 |
+| 04 | 1.4 UI session revocation | ACCEPTED (see below; SHAs in git log) |
+| 05–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -61,3 +62,13 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: 9 new endpoint tests, service tests rewritten, populated SQLite migration round trip. PostgreSQL (throwaway `postgres:16`, localhost:55432): alembic upgrade/downgrade/upgrade OK, 11 PG integration tests passed.
 - Full pytest: 7312 passed, 139 skipped, 0 failed. Ruff clean.
 - Codex: plan review + 2 code rounds (R1 CHANGES_REQUESTED: stale existing test, weak stale-session test; R2 ACCEPT).
+
+## TASK 04 — UI session revocation (1.4, LOW)
+
+- Confirmed: yes (stateless cookie; logout only cleared the browser copy).
+- GATE B: Codex plan review first (PLAN_CHANGES; option A required: in-memory bounded registry, no DB write because the Stage 20 UI is read-only).
+- Changes: token `expiry.sid.hmac` (random 128-bit session id per login); signing key bound to a random per-process nonce (restart invalidates all cookies); `SessionRevocations` (thread-safe, cap 10 000, never evicts unexpired entries, full => logout answers 503 and the cookie is kept); logout only records correctly signed, unexpired cookies (identical 303 otherwise); signed-but-revoked cookies are refunded from the TASK 01 guess budget and then denied; launchers pinned to `--workers 1` (`scripts/run_operator_ui.py`, `scripts/stage14d_canonical_runtime.py`, `docs/DAILY_OPERATIONS.md`).
+- Residual: per-process state, so one web process/replica is required (documented in `docs/STAGE20_UI_ARCHITECTURE.md`); "log out everywhere" = rotate `UI_SESSION_SECRET`/`API_KEY` and restart. Every restart logs the browser out.
+- Tests: 11 new in `tests/test_stage20_ui.py` (replay after logout, second session, idempotence, forged logout, CSRF, budget, capacity, expiry recovery, threads, restart) + launcher tests.
+- Full pytest: 7324 passed, 139 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: plan review + 3 code rounds (R1 CHANGES_REQUESTED launcher workers, R2 CHANGES_REQUESTED docs command, R3 ACCEPT).

@@ -68,7 +68,7 @@ def test_unchanged_database_and_the_server_command(database, monkeypatch, tmp_pa
 
     assert launcher.main(["--database", str(database), "--port", "8010"], run=run) == 0
     [(command, env)] = calls
-    assert command[-4:] == ["--host", "127.0.0.1", "--port", "8010"]
+    assert command[-6:] == ["--host", "127.0.0.1", "--port", "8010", "--workers", "1"]
     assert env["UI_ENABLED"] == "true" and env["TELEGRAM_BOT_TOKEN"] == ""
     out = capsys.readouterr().out
     assert "UNCHANGED" in out and "secret-launcher-key" not in out
