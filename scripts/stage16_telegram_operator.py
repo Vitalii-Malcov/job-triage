@@ -32,6 +32,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import reveal
+
 try:
     from scripts.stage15_application_tracker import TargetRefusedError, resolve_engine
 except ModuleNotFoundError:  # run as `python scripts/...`
@@ -175,7 +177,7 @@ def _dispatch(session: Session, settings, args, transport) -> int:
     if args.command == "config":
         _print(
             {
-                "telegram_bot_token": configured(settings.telegram_bot_token),
+                "telegram_bot_token": configured(reveal(settings.telegram_bot_token)),
                 "telegram_chat_id": configured(settings.telegram_chat_id),
                 "telegram_operator_user_id": configured(settings.telegram_operator_user_id),
                 "telegram_operator_control_enabled": settings.telegram_operator_control_enabled,

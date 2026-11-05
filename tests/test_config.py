@@ -607,3 +607,58 @@ def test_mail_passwords_absent_from_validation_error_text():
         _settings_with_sentinel_mail_passwords(gmail_lookback_days=-1)
     assert _SENTINEL_GMAIL_PASSWORD not in str(exc_info.value)
     assert _SENTINEL_XING_PASSWORD not in str(exc_info.value)
+
+
+# --- review 1.2: credentials are masked everywhere Settings renders itself ---
+
+_SENTINELS = {
+    "api_key": "SENTINEL-api-key-9f2c",
+    "ui_session_secret": "SENTINEL-ui-secret-1a7e",
+    "telegram_bot_token": "SENTINEL-bot-token-77d1",
+    "bundesagentur_api_key": "SENTINEL-ba-key-3b90",
+    "xing_mailbox_app_password": "SENTINEL-xing-pw-5e44",
+    "gmail_app_password": "SENTINEL-gmail-pw-c0de",
+    "postgres_password": "SENTINEL-pg-pw-2d8a",
+}
+
+
+def test_every_credential_is_masked_in_repr_str_and_errors():
+    from pydantic import SecretStr, ValidationError
+
+    settings = Settings(_env_file=None, **_SENTINELS)
+    rendered = repr(settings) + str(settings)
+    for value in _SENTINELS.values():
+        assert value not in rendered
+    for name in ("api_key", "ui_session_secret", "telegram_bot_token", "bundesagentur_api_key"):
+        assert isinstance(getattr(settings, name), SecretStr)
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, ui_session_hours="not-a-number", **_SENTINELS)
+    for value in _SENTINELS.values():
+        assert value not in str(exc.value)
+
+
+def test_all_credential_looking_fields_are_masked():
+    """Any new *key/*token/*password/*secret field must be SecretStr or
+    repr=False; the one account-identity key is exempt."""
+    from pydantic import SecretStr
+
+    exempt = {"automation_scheduler_account_key"}
+    for name, field in Settings.model_fields.items():
+        if name in exempt:
+            continue
+        looks_secret = name == "database_url" or any(
+            part in name for part in ("password", "token", "secret", "api_key")
+        )
+        if looks_secret:
+            masked = field.repr is False or field.annotation is SecretStr
+            assert masked, name
+
+
+def test_reveal_unwraps_secrets_and_passes_plain_values():
+    from pydantic import SecretStr
+
+    from app.core.config import reveal
+
+    assert reveal(SecretStr("x")) == "x"
+    assert reveal("y") == "y"
+    assert reveal(None) == ""

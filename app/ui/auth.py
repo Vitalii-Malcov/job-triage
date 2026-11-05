@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, status
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings, reveal
 
 COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/1|"
@@ -29,6 +29,30 @@ _TOKEN = re.compile(r"([0-9]{1,12})\.([0-9a-f]{64})")
 
 class NotLoggedInError(Exception):
     """No valid UI session; the route redirects to the login page."""
+
+
+_KEY_CONTEXT = b"jobtriage-ui-session-key/1|"
+
+
+def signing_key(settings: Settings) -> str:
+    """The key UI cookies are signed with -- never the raw API key.
+
+    HMAC-SHA256 keyed with `UI_SESSION_SECRET` (independent secret, when set)
+    or, as a compatibility fallback, the API key itself, over a fixed context
+    plus the CURRENT API key. Binding the API key keeps two properties: an
+    empty `API_KEY` fails closed (empty result, nothing validates) and
+    rotating `API_KEY` revokes every issued cookie. Signing-secret rotation
+    revokes them too. The fallback adds domain separation only (anyone who
+    knows API_KEY can derive it); and a stolen API key still logs in via the
+    login form regardless of mode.
+    """
+    api_key = reveal(settings.api_key)
+    if not api_key:
+        return ""
+    secret = reveal(settings.ui_session_secret) or api_key
+    return hmac.new(
+        secret.encode("utf-8"), _KEY_CONTEXT + api_key.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def _signature(api_key: str, expiry: int) -> str:
@@ -54,7 +78,8 @@ def session_token_valid(token: str | None, api_key: str, *, now: float | None = 
     return hmac.compare_digest(match.group(2), _signature(api_key, expiry))
 
 
-def api_key_matches(submitted: str, api_key: str) -> bool:
+def api_key_matches(submitted: str, api_key: str | object) -> bool:
+    api_key = reveal(api_key)
     if not api_key:
         return False
     return hmac.compare_digest(submitted.encode("utf-8"), api_key.encode("utf-8"))
@@ -75,7 +100,7 @@ def require_ui_session(request: Request) -> None:
     if not token:
         raise NotLoggedInError
     attempt = begin_auth_attempt(request)
-    if not session_token_valid(token, get_settings().api_key):
+    if not session_token_valid(token, signing_key(get_settings())):
         raise NotLoggedInError
     end_auth_attempt_ok(request, attempt)
 

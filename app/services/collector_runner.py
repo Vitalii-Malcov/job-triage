@@ -51,6 +51,7 @@ from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
 from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailCollector
+from app.core.config import reveal
 from app.db.candidate_profile_repository import (
     get_candidate_profile,
     get_candidate_skills_for_scoring,
@@ -526,7 +527,7 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
     """The collector for one configured search; shared by `run_bundesagentur`
     and the Stage 22 refresh CLI so both run exactly the same searches."""
     return BundesagenturCollector(
-        api_key=settings.bundesagentur_api_key,
+        api_key=reveal(settings.bundesagentur_api_key),
         keywords=query.keywords,
         location=query.location,
         radius_km=query.radius_km,
@@ -637,7 +638,7 @@ async def run_bundesagentur(
     whole run to return. See `_maybe_auto_research`'s own docstring for
     the full rationale.
     """
-    if not is_api_key_configured(settings.bundesagentur_api_key):
+    if not is_api_key_configured(reveal(settings.bundesagentur_api_key)):
         raise CollectorNotConfiguredError(
             "Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY."
         )
@@ -711,7 +712,7 @@ async def run_bundesagentur(
     # overhead, but it also keeps the flood-limit pacing below scoped to a
     # single run via one shared notified_count counter.
     notifier = TelegramNotifier(
-        bot_token=settings.telegram_bot_token,
+        bot_token=reveal(settings.telegram_bot_token),
         chat_id=settings.telegram_chat_id,
         timeout_seconds=settings.telegram_timeout_seconds,
         max_retries=settings.telegram_max_retries,
@@ -904,7 +905,7 @@ async def run_xing(
     # One notifier for the whole run (all batches), so the flood-limit pacing
     # via notified_count below is scoped per collector run, not per message.
     notifier = TelegramNotifier(
-        bot_token=settings.telegram_bot_token,
+        bot_token=reveal(settings.telegram_bot_token),
         chat_id=settings.telegram_chat_id,
         timeout_seconds=settings.telegram_timeout_seconds,
         max_retries=settings.telegram_max_retries,

@@ -38,7 +38,7 @@ from app.agents.review_package_builder import (
     ReviewSourceMismatchError,
     ReviewVersionConflictError,
 )
-from app.core.config import get_settings
+from app.core.config import get_settings, reveal
 from app.db.automation_repository import (
     AUTOMATION_RUN_LIST_DEFAULT_LIMIT,
     AUTOMATION_RUN_LIST_MAX_LIMIT,
@@ -370,7 +370,7 @@ async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
         # classification), but this must fail closed regardless of that
         # internal contract, not rely on it.
         notifier = TelegramNotifier(
-            bot_token=settings.telegram_bot_token,
+            bot_token=reveal(settings.telegram_bot_token),
             chat_id=settings.telegram_chat_id,
             timeout_seconds=settings.telegram_timeout_seconds,
             max_retries=settings.telegram_max_retries,

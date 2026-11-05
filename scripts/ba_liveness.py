@@ -41,7 +41,7 @@ except ModuleNotFoundError:  # run as `python scripts/...`
 
 from app.collectors.ba_reference import ba_reference_from_url
 from app.collectors.bundesagentur import SOURCE_NAME, is_api_key_configured
-from app.core.config import get_settings
+from app.core.config import get_settings, reveal
 from app.db.models import JobRecord
 from app.services.ba_liveness import (
     KEY_REJECTED,
@@ -182,7 +182,7 @@ def run(argv: list[str] | None = None) -> int:
             print(f"job {job_id}: {reference or '(no reference -> INVALID_REFERENCE)'}")
         print(f"PLAN: {len(jobs)} jobs, no request made")
         return 0
-    api_key = get_settings().bundesagentur_api_key
+    api_key = reveal(get_settings().bundesagentur_api_key)
     if not is_api_key_configured(api_key):
         print("REFUSED: BUNDESAGENTUR_API_KEY is not configured", file=sys.stderr)
         return 2

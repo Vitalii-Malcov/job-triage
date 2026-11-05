@@ -121,7 +121,7 @@ class TestForgedCookiesAndAtomicity:
         fake = Settings(api_key=API_KEY, ui_enabled=True)
         monkeypatch.setattr("app.ui.routes.get_settings", lambda: fake)
         monkeypatch.setattr("app.ui.auth.get_settings", lambda: fake)
-        from app.ui.auth import COOKIE_NAME, issue_session_token
+        from app.ui.auth import COOKIE_NAME, issue_session_token, signing_key
 
         limit = rate_limit_module.AUTH_FAILURE_LIMIT
         for i in range(limit):
@@ -130,7 +130,7 @@ class TestForgedCookiesAndAtomicity:
             r = client.get("/ui/", follow_redirects=False)
             assert r.status_code == 303
         # Locked out: even a cookie signed with the REAL key is refused.
-        client.cookies.set(COOKIE_NAME, issue_session_token(API_KEY, hours=1), path="/ui")
+        client.cookies.set(COOKIE_NAME, issue_session_token(signing_key(fake), hours=1), path="/ui")
         assert client.get("/ui/", follow_redirects=False).status_code == 429
 
     def test_valid_cookie_and_cookieless_requests_do_not_consume_budget(self, monkeypatch):
@@ -141,6 +141,7 @@ class TestForgedCookiesAndAtomicity:
             NotLoggedInError,
             issue_session_token,
             require_ui_session,
+            signing_key,
         )
 
         fake = Settings(api_key=API_KEY, ui_enabled=True)
@@ -150,7 +151,7 @@ class TestForgedCookiesAndAtomicity:
         good = SimpleNamespace(
             client=peer,
             headers={},
-            cookies={COOKIE_NAME: issue_session_token(API_KEY, hours=1)},
+            cookies={COOKIE_NAME: issue_session_token(signing_key(fake), hours=1)},
         )
         for _ in range(rate_limit_module.AUTH_FAILURE_LIMIT * 3):
             with pytest.raises(NotLoggedInError):

@@ -10,8 +10,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 
 | Task | Finding | State |
 | --- | --- | --- |
-| 01 | 1.1 API key compare / failed-auth rate limit | IN_PROGRESS |
-| 02–19 | see task list | PENDING |
+| 01 | 1.1 API key compare / failed-auth rate limit | ACCEPTED — task 5c4646d, merge bab160d |
+| 02 | 1.2 secrets in repr / UI signing key | ACCEPTED (see below) |
+| 03–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -27,10 +28,24 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
   if 4096 networks are simultaneously locked, new clients get 429 (fail closed).
 - Tests: `tests/test_auth_rate_limit_ordering.py` rewritten (previously documented the gap), `tests/test_security.py`,
   `tests/conftest.py` (autouse budget reset). Targeted: 163 passed (auth/security/UI).
-- Full pytest, pre-fix-round-1 code: 7282 passed, 139 skipped, 0 failed (55m50s). Post-fix rerun: see below.
+- Full pytest, pre-fix-round-1 code: 7282 passed, 139 skipped, 0 failed (55m50s). Post-fix rerun: 7290 passed, 139 skipped, 0 failed (37m27s).
 - Ruff check / format: clean.
 - Codex: 5 invocations, 4 review rounds. R1 CHANGES_REQUESTED (UI cookie oracle, non-atomic, unbounded state),
   R2 CHANGES_REQUESTED (cap eviction reset lockouts, refund wrong entry), R3 CHANGES_REQUESTED (cap-exhaustion DoS →
   documented trade-off + /64), R4 `BLOCKED` solely because Codex cannot run pytest in its sandbox (no code findings),
   R5 `VERDICT: ACCEPT` after being told pytest is run by the implementer.
 - PostgreSQL / migrations: not applicable (no schema change).
+
+## TASK 02 — Secrets and configuration (1.2, HIGH)
+
+- Confirmed: yes (`api_key`, `telegram_bot_token`, `bundesagentur_api_key` were plain `str`, shown by `repr(Settings)`).
+- GATE B: Codex plan review done first (PLAN_CHANGES: use SecretStr, bind signing key to API key for fail-closed + rotation revocation, test semantics) — plan revised accordingly.
+- Changes: the three fields + new optional `ui_session_secret` are `SecretStr`; `reveal()` helper (`app/core/config.py`) unwraps at all
+  consumers in `app/` and `scripts/`; `app/ui/auth.py::signing_key` = HMAC-SHA256(`UI_SESSION_SECRET` or API key, context + current API key).
+  Raw API key is no longer the cookie key; existing cookies are invalidated once (re-login). `.env.example` documents `UI_SESSION_SECRET`.
+  No real keys changed.
+- Honest limits: a stolen API key still logs in through the login form; without `UI_SESSION_SECRET` the derived key adds domain separation only.
+- Tests: `tests/test_config.py` (masking, generic scan, errors), `tests/test_stage20_ui.py` (modes/rotation/fail-closed/roundtrip),
+  two assertions in `tests/test_stage20_run_operator_ui.py` unwrap SecretStr.
+- Full pytest: 7295 passed, 1 failed (assertion on SecretStr; fixed, file 11 passed), 139 skipped. Ruff check/format clean. No schema change.
+- Codex: plan review + 2 code rounds. R1 CHANGES_REQUESTED (second stale assertion that I had missed), R2 ACCEPT.

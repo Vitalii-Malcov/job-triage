@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
+from app.core.config import reveal
 from app.db.automation_schedule_repository import (
     claim_due_schedule,
     get_or_create_schedule,
@@ -106,7 +107,7 @@ def validate_scheduler_settings(settings) -> None:
                 "telegram_daily_digest_enabled=True requires a non-blank "
                 "automation_scheduler_account_key (AUTOMATION_SCHEDULER_ACCOUNT_KEY)."
             )
-        if not settings.telegram_bot_token.strip() or not settings.telegram_chat_id.strip():
+        if not reveal(settings.telegram_bot_token).strip() or not settings.telegram_chat_id.strip():
             raise SchedulerConfigurationError(
                 "telegram_daily_digest_enabled=True requires TELEGRAM_BOT_TOKEN and "
                 "TELEGRAM_CHAT_ID to be configured."
@@ -300,7 +301,7 @@ async def run_due_digest_if_claimed(
     try:
         text = build_digest_text(db, account_key)
         outcome = await send_telegram_text(
-            settings.telegram_bot_token,
+            reveal(settings.telegram_bot_token),
             settings.telegram_chat_id,
             text,
             timeout_seconds=settings.telegram_timeout_seconds,

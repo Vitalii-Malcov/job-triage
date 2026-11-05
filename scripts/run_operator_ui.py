@@ -37,6 +37,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.core.config import reveal
+
 HOST = "127.0.0.1"
 
 # Forced for the server process only. The UI itself is read-only; these keep
@@ -158,7 +160,7 @@ def main(argv: list[str] | None = None, *, run=subprocess.call) -> int:
     if settings.database_url != env["DATABASE_URL"]:
         print("REFUSED: the configuration resolves to a different database", file=sys.stderr)
         return 2
-    if not settings.api_key:
+    if not reveal(settings.api_key):
         print(
             "REFUSED: API_KEY is not set (environment or .env); the UI login needs it",
             file=sys.stderr,
