@@ -59,6 +59,7 @@ from app.db.models import AutomationRunRecord
 from app.providers.email.base import normalize_account_key
 from app.providers.email.imap_deadline import IMAP_SESSION_DEADLINE_SECONDS
 from app.services.automation import _RunLeaseHeartbeat
+from app.services.offload import run_off_loop
 from app.utils.config_flags import is_configured
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,20 @@ def _extend_after_cancel(db: Session, held: list[_Held]) -> None:
 
 
 async def run_collector_exclusively(
+    db: Session,
+    settings,
+    collector_name: str,
+    runner: Callable[..., Awaitable[dict]],
+) -> dict:
+    """`_run_exclusively` on a private event loop in a worker thread (review 2.4):
+    claiming the slot, the collector run, heartbeat shutdown and finalization all
+    block on the database, so none of it may run on the web loop. A cancelled
+    caller waits for the worker before the session can be closed
+    (`app.services.offload`)."""
+    return await run_off_loop(lambda: _run_exclusively(db, settings, collector_name, runner))
+
+
+async def _run_exclusively(
     db: Session,
     settings,
     collector_name: str,

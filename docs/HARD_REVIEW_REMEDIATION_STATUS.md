@@ -16,8 +16,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 04 | 1.4 UI session revocation | ACCEPTED — task b4ec414, merge 10c69ad |
 | 05 | 2.1 processed email identity | ACCEPTED — task feff194, merge 1cf7900 |
 | 06 | 2.2 XING dedup collisions | ACCEPTED — task 22d230a, merge 818b319 |
-| 07 | 2.3 collector concurrency | ACCEPTED (see below; SHAs in git log) |
-| 08–19 | see task list | PENDING |
+| 07 | 2.3 collector concurrency | ACCEPTED — task d74a1de, merge 349108d |
+| 08 | 2.4 event-loop blocking | ACCEPTED (see below; SHAs in git log) |
+| 09–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -109,3 +110,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_collector_exclusion.py` (33), lease-guard ack/watermark tests, digest tests, PG module `tests/integration/test_collector_exclusion_postgres.py` (2 passed on postgres:16; added to the ci.yml zero-skip list).
 - Full pytest: 7385 passed, 146 skipped, 0 failed. Ruff clean.
 - Codex: plan review + 4 code rounds (R1 CHANGES_REQUESTED x5 incl. P1 scheduler key spelling; R2 CHANGES_REQUESTED x3 incl. empty REST key; R3 `BLOCKED` only for missing full-suite evidence; R4 ACCEPT with evidence).
+
+## TASK 08 — Async event-loop blocking (2.4, MEDIUM)
+
+- Confirmed: yes (`async def` endpoints interleaving awaits with synchronous SQLAlchemy work on the web loop, shared with the Telegram poller).
+- GATE B: Codex plan review, 2 rounds (PLAN_CHANGES: `score_job` has an `await`; offload the WHOLE exclusion operation; cancellation must drain the worker before the session is closed; bounded dedicated executor; stronger tests) — adopted.
+- Design: `app/services/offload.py::run_off_loop` runs `await factory()` on a private event loop in a dedicated bounded executor (8 threads); a cancelled caller keeps waiting (absorbing repeated cancels) until the worker ends, retrieves a late failure, then re-raises — the request-scoped Session is never closed under a running worker. Applied to the collector exclusion operation (REST + Telegram `/run`), POST `/automation/runs`, `/gmail/sync`, `/jobs/{id}/research`, `/jobs/{id}/bewerbung-draft` and `score_job`. Service code unchanged.
+- Not done (documented in `docs/DEPLOYMENT.md`): the Telegram poller stays in the web process (topology change); Telegram commands with their own synchronous DB work (`/research`, `/review`, ...) still run on the poller loop; `--workers 1` remains required.
+- Residual: a cancelled/disconnected request waits for its worker (can be long for a collector run); the 8-thread pool queues further long runs.
+- Tests: `tests/test_offload.py` (11, incl. ASGI liveness: `/health` < 0.6 s while collector/automation/score/Gmail workers block 1.2 s), exclusion tests switched to thread-safe events.
+- Full pytest: 7396 passed, 146 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: plan review x2 + 1 code round: `VERDICT: ACCEPT`.

@@ -247,6 +247,7 @@ from app.services.follow_up_send import (
 )
 from app.services.gmail_message_analysis import GmailMessageNotFoundError, analyze_gmail_message
 from app.services.gmail_sync import run_gmail_sync as run_gmail_sync_service
+from app.services.offload import run_off_loop
 from app.services.readiness import check_readiness
 from app.services.response_draft import (
     ResponseDraftAnalysisNotFoundError,
@@ -330,6 +331,11 @@ def ready() -> JSONResponse:
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
 async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
+    # Review 2.4: synchronous scoring/persistence runs off the web loop.
+    return await run_off_loop(lambda: _score_job_service(job, db))
+
+
+async def _score_job_service(job: Job, db: Session) -> JobScore:
     settings = get_settings()
     # CSP-001: CandidateProfile is the sole runtime source of candidate
     # skills for JobScorer -- see get_candidate_skills_for_scoring's own
@@ -596,8 +602,10 @@ async def run_company_research(
 ) -> CompanyResearchRunResponse:
     settings = get_settings()
     try:
-        result = await run_company_research_for_job(
-            db, settings, job_id, force_refresh=body.force_refresh
+        result = await run_off_loop(
+            lambda: run_company_research_for_job(
+                db, settings, job_id, force_refresh=body.force_refresh
+            )
         )
     except ProviderNotConfiguredError as exc:
         raise HTTPException(
@@ -799,7 +807,7 @@ async def run_bewerbung_draft(
     never reused/cached, unlike POST .../match or .../cv-draft.
     """
     try:
-        result = await _run_bewerbung_draft(db, job_id, body.cv_draft_id)
+        result = await run_off_loop(lambda: _run_bewerbung_draft(db, job_id, body.cv_draft_id))
     except AlreadyAppliedError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT, detail=_already_applied_detail(exc)
@@ -1308,7 +1316,9 @@ async def start_automation_run(db: Session = Depends(get_db)) -> AutomationRun:
     settings = get_settings()
     account_key = _current_gmail_account_key(settings)
     try:
-        run = await run_automation_cycle(db, account_key=account_key, settings=settings)
+        run = await run_off_loop(
+            lambda: run_automation_cycle(db, account_key=account_key, settings=settings)
+        )
     except AutomationRunAlreadyInProgressError as exc:
         raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except AutomationRunLeaseLostError as exc:
@@ -1364,7 +1374,7 @@ async def run_gmail_sync(db: Session = Depends(get_db)) -> GmailSyncResult:
     """
     settings = get_settings()
     try:
-        return await run_gmail_sync_service(db, settings)
+        return await run_off_loop(lambda: run_gmail_sync_service(db, settings))
     except CollectorNotConfiguredError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
