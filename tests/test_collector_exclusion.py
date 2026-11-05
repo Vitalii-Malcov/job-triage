@@ -527,3 +527,340 @@ class TestReviewRound1:
             db.commit()
             text = build_digest_text(db, "me@example.com")
         assert "Latest run: #1 status=COMPLETED" in text
+
+
+class TestAutomationCrossKey:
+    """Task 22: a cycle claims ONE key, then verifies no live run holds the other actual key."""
+
+    @pytest.mark.asyncio
+    async def test_a_live_run_under_the_other_key_makes_the_cycle_yield(self, factory, monkeypatch):
+        from app.services import automation
+        from app.services.automation import AutomationRunAlreadyInProgressError
+
+        settings = _settings(automation_scheduler_account_key="Zed@Example.com")
+        called = []
+
+        async def never(*a, **k):  # the collectors must not start
+            called.append(1)
+            return dict(STATS)
+
+        monkeypatch.setattr(automation, "AUTOMATION_STEPS", ("bundesagentur", "xing"))
+        with factory() as db:
+            create_running_run(db, account_key="Zed@Example.com", holder="scheduler:1")
+        with factory() as db, pytest.raises(AutomationRunAlreadyInProgressError, match="yielded"):
+            await automation.run_automation_cycle(
+                db, account_key="me@example.com", settings=settings
+            )
+        assert called == []
+        by_key = {r.account_key: r for r in _runs(factory)}
+        assert by_key["Zed@Example.com"].status == "RUNNING"  # the live run is untouched
+        assert by_key["me@example.com"].status == "FAILED"
+        assert "Yielded" in (by_key["me@example.com"].error_summary or "")
+
+    @pytest.mark.asyncio
+    async def test_an_expired_lease_under_the_other_key_does_not_block(self, factory, monkeypatch):
+        from app.services import automation
+
+        settings = _settings(automation_scheduler_account_key="zed@example.com")
+        with factory() as db:
+            run, _ = create_running_run(db, account_key="zed@example.com", holder="crashed:1")
+            db.execute(
+                update(AutomationRunRecord)
+                .where(AutomationRunRecord.id == run.id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=5))
+            )
+            db.commit()
+
+        async def ok_step(*a, **k):
+            return dict(STATS)
+
+        monkeypatch.setattr(automation, "run_bundesagentur", ok_step)
+        monkeypatch.setattr(automation, "run_xing", ok_step)
+        with factory() as db:
+            record = await automation.run_automation_cycle(
+                db, account_key="me@example.com", settings=settings
+            )
+        assert record.status in {"COMPLETED", "PARTIAL"}
+
+    @pytest.mark.asyncio
+    async def test_a_single_identity_installation_never_yields(self, factory, monkeypatch):
+        from app.services import automation
+
+        async def ok_step(*a, **k):
+            return dict(STATS)
+
+        monkeypatch.setattr(automation, "run_bundesagentur", ok_step)
+        monkeypatch.setattr(automation, "run_xing", ok_step)
+        with factory() as db:
+            record = await automation.run_automation_cycle(
+                db, account_key="me@example.com", settings=_settings()
+            )
+        assert record.status in {"COMPLETED", "PARTIAL"}
+
+
+class TestHoldCollectorSlots:
+    def test_the_slots_are_held_during_the_body_and_released_completed_after(self, factory):
+        settings = _settings(automation_scheduler_account_key="zed@example.com")
+        with factory() as db:
+            with ce.hold_collector_slots(db, settings, "ba_refresh") as hold:
+                inside = {r.account_key: r.status for r in _runs(factory)}
+                assert not hold.lease_lost()
+                hold.stats.update(created=0, updated=3, failed=0)
+        assert inside == {"me@example.com": "RUNNING", "zed@example.com": "RUNNING"}
+        runs = _runs(factory)
+        assert {r.status for r in runs} == {"COMPLETED"}
+        assert all(json.loads(r.results_json)["manual:ba_refresh"]["status"] == "ok" for r in runs)
+
+    def test_a_taken_slot_refuses_before_the_body_runs(self, factory):
+        with factory() as db:
+            create_running_run(db, account_key="me@example.com", holder="scheduler:1")
+        ran = []
+        with factory() as db, pytest.raises(CollectorRunInProgressError):
+            with ce.hold_collector_slots(db, _settings(), "ba_refresh"):
+                ran.append(1)
+        assert ran == []
+
+    def test_a_body_exception_finalizes_failed_and_frees_the_slot(self, factory):
+        with factory() as db, pytest.raises(RuntimeError):
+            with ce.hold_collector_slots(db, _settings(), "ba_refresh"):
+                raise RuntimeError("boom")
+        assert [r.status for r in _runs(factory)] == ["FAILED"]
+        with factory() as db:  # the slot is free again
+            with ce.hold_collector_slots(db, _settings(), "ba_refresh"):
+                pass
+
+    def test_an_expired_lease_at_the_end_is_reported_not_succeeded(self, factory):
+        with factory() as db, pytest.raises(CollectorRunLeaseLostError):
+            with ce.hold_collector_slots(db, _settings(), "ba_refresh"):
+                with factory() as side:
+                    side.execute(
+                        update(AutomationRunRecord).values(
+                            lease_expires_at=datetime.now(UTC) - timedelta(seconds=5)
+                        )
+                    )
+                    side.commit()
+        assert [r.status for r in _runs(factory)] != ["COMPLETED"]
+
+
+class TestLiveConflictingRun:
+    """`live_conflicting_run` never trusts a plain read of an expired-looking row."""
+
+    def test_a_live_row_is_a_conflict_and_is_left_alone(self, factory):
+        from app.db.automation_repository import live_conflicting_run
+
+        with factory() as db:
+            other, _ = create_running_run(db, account_key="zed@example.com", holder="h:1")
+            mine, _ = create_running_run(db, account_key="me@example.com", holder="h:2")
+            found = live_conflicting_run(
+                db, ["zed@example.com", "me@example.com"], exclude_run_id=mine.id
+            )
+            assert found is not None and found.id == other.id
+        assert {r.account_key: r.status for r in _runs(factory)} == {
+            "zed@example.com": "RUNNING",
+            "me@example.com": "RUNNING",
+        }
+
+    def test_an_expired_row_is_reconciled_by_cas_and_is_no_conflict(self, factory):
+        from app.db.automation_repository import live_conflicting_run
+
+        with factory() as db:
+            dead, _ = create_running_run(db, account_key="zed@example.com", holder="crashed:1")
+            dead_id = dead.id
+            db.execute(
+                update(AutomationRunRecord)
+                .where(AutomationRunRecord.id == dead_id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=5))
+            )
+            db.commit()
+            mine, _ = create_running_run(db, account_key="me@example.com", holder="h:2")
+            assert live_conflicting_run(db, ["zed@example.com"], exclude_run_id=mine.id) is None
+        assert {r.id: r.status for r in _runs(factory)}[dead_id] == "FAILED"
+
+    def test_a_renewal_that_commits_first_wins_over_the_expired_looking_read(
+        self, factory, monkeypatch
+    ):
+        """The row still LOOKS expired to the first read, but its holder renews before the
+        reconciliation CAS runs: the CAS loses and the row is a conflict."""
+        from app.db import automation_repository as repo
+
+        with factory() as db:
+            other, _ = create_running_run(db, account_key="zed@example.com", holder="h:1")
+            other_id = other.id
+            db.execute(
+                update(AutomationRunRecord)
+                .where(AutomationRunRecord.id == other_id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            db.commit()
+            mine, _ = create_running_run(db, account_key="me@example.com", holder="h:2")
+
+            real = repo.reconcile_stale_run_to_failed
+
+            def renewed_first(session, record):
+                with factory() as side:  # the holder's renewal commits just before the CAS
+                    side.execute(
+                        update(AutomationRunRecord)
+                        .where(AutomationRunRecord.id == other_id)
+                        .values(lease_expires_at=datetime.now(UTC) + timedelta(seconds=60))
+                    )
+                    side.commit()
+                return real(session, record)
+
+            monkeypatch.setattr(repo, "reconcile_stale_run_to_failed", renewed_first)
+            found = repo.live_conflicting_run(db, ["zed@example.com"], exclude_run_id=mine.id)
+            assert found is not None and found.id == other_id
+        assert {r.id: r.status for r in _runs(factory)}[other_id] == "RUNNING"
+
+
+class TestInterruptedCycleKeepsExclusion:
+    @pytest.mark.asyncio
+    async def test_a_cancelled_cycle_extends_the_lease_and_stays_running(
+        self, factory, monkeypatch
+    ):
+        from app.services import automation
+
+        started = asyncio.Event()
+
+        async def hangs(*a, **k):
+            started.set()
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(automation, "run_bundesagentur", hangs)
+        monkeypatch.setattr(automation, "run_xing", hangs)
+
+        async def cycle():
+            with factory() as db:
+                await automation.run_automation_cycle(
+                    db, account_key="me@example.com", settings=_settings()
+                )
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(started.wait(), timeout=20)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        (run,) = _runs(factory)
+        assert run.status == "RUNNING"  # fail closed: reconciled only after the lease expires
+        horizon = datetime.now(UTC) + timedelta(seconds=ce.CANCELLED_LEASE_EXTENSION_SECONDS - 30)
+        expires = run.lease_expires_at
+        expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+        assert expires > horizon
+
+    def test_a_renewal_never_shortens_the_expiry(self, factory):
+        from app.db.automation_repository import renew_run_lease
+
+        with factory() as db:
+            run, _ = create_running_run(db, account_key="me@example.com", holder="h:1")
+            assert renew_run_lease(db, run.id, holder="h:1", ttl_seconds=3600)
+            long_expiry = db.get(AutomationRunRecord, run.id).lease_expires_at
+            assert renew_run_lease(db, run.id, holder="h:1", ttl_seconds=1)  # a late, short renewal
+            db.expire_all()
+            assert db.get(AutomationRunRecord, run.id).lease_expires_at == long_expiry
+            # a longer renewal still extends it
+            assert renew_run_lease(db, run.id, holder="h:1", ttl_seconds=7200)
+            db.expire_all()
+            assert db.get(AutomationRunRecord, run.id).lease_expires_at > long_expiry
+
+    @pytest.mark.asyncio
+    async def test_a_renewal_slower_than_the_heartbeat_join_cannot_shorten_the_extension(
+        self, factory, monkeypatch
+    ):
+        """The heartbeat's `stop()` joins for at most interval + 1 s. A renewal that takes
+        longer survives it and commits AFTER the extension; being monotonic, it cannot undo it."""
+        import time
+
+        from app.services import automation
+
+        real_renew = automation.renew_run_lease
+
+        def very_slow_renewal(db, run_id, *, holder, ttl_seconds):
+            if ttl_seconds < 2:
+                time.sleep(1.4)  # longer than interval (0.02) + 1.0
+            return real_renew(db, run_id, holder=holder, ttl_seconds=ttl_seconds)
+
+        monkeypatch.setattr(automation, "renew_run_lease", very_slow_renewal)
+        started = asyncio.Event()
+
+        async def hangs(*a, **k):
+            started.set()
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(automation, "run_bundesagentur", hangs)
+        monkeypatch.setattr(automation, "run_xing", hangs)
+
+        async def cycle():
+            with factory() as db:
+                await automation.run_automation_cycle(
+                    db,
+                    account_key="me@example.com",
+                    settings=_settings(),
+                    lease_ttl_seconds=1.5,
+                    heartbeat_interval_seconds=0.02,
+                )
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(started.wait(), timeout=20)
+        await asyncio.sleep(0.1)  # a very slow renewal is now mid-flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(1.6)  # the straggler has landed
+        (run,) = _runs(factory)
+        expires = run.lease_expires_at
+        expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+        assert expires > datetime.now(UTC) + timedelta(
+            seconds=ce.CANCELLED_LEASE_EXTENSION_SECONDS - 30
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_late_heartbeat_renewal_cannot_shorten_the_extension(
+        self, factory, monkeypatch
+    ):
+        """Regression: a renewal that is still IN FLIGHT when the cycle is interrupted would
+        commit after the extension and shorten the expiry back to one TTL. Renewals are made
+        slow here so one is certainly mid-flight at the cancellation; the extension must wait
+        for the heartbeat to be stopped and drained."""
+        import time
+
+        from app.services import automation
+
+        real_renew = automation.renew_run_lease
+
+        def slow_heartbeat_renewal(db, run_id, *, holder, ttl_seconds):
+            if ttl_seconds < 2:  # the heartbeat's own renewals, not the extension
+                time.sleep(0.3)
+            return real_renew(db, run_id, holder=holder, ttl_seconds=ttl_seconds)
+
+        monkeypatch.setattr(automation, "renew_run_lease", slow_heartbeat_renewal)
+        started = asyncio.Event()
+
+        async def hangs(*a, **k):
+            started.set()
+            await asyncio.sleep(60)
+
+        monkeypatch.setattr(automation, "run_bundesagentur", hangs)
+        monkeypatch.setattr(automation, "run_xing", hangs)
+
+        async def cycle():
+            with factory() as db:
+                await automation.run_automation_cycle(
+                    db,
+                    account_key="me@example.com",
+                    settings=_settings(),
+                    lease_ttl_seconds=1.0,
+                    heartbeat_interval_seconds=0.02,
+                )
+
+        task = asyncio.create_task(cycle())
+        await asyncio.wait_for(started.wait(), timeout=20)
+        await asyncio.sleep(0.1)  # a slow renewal is now mid-flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.6)  # any straggler would have landed by now
+        (run,) = _runs(factory)
+        expires = run.lease_expires_at
+        expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+        assert expires > datetime.now(UTC) + timedelta(
+            seconds=ce.CANCELLED_LEASE_EXTENSION_SECONDS - 30
+        )

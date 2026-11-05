@@ -768,6 +768,11 @@ async def run_bundesagentur(
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
     skipped_invalid = sum(c.skipped_invalid_count for c, _ in batches)
     for collector, job in work:
+        if is_lease_lost is not None and is_lease_lost():
+            # Ownership is gone: another run may own the slot now. Jobs already
+            # committed stay (idempotent); no NEW vacancy write is started.
+            logger.warning("bundesagentur_collector_stopped_lease_lost")
+            break
         try:
             job_record, result, created = await enrich_and_persist_ba_job(
                 db, collector, candidate_skills, job
@@ -966,9 +971,19 @@ async def run_xing(
     # attempted. Only a batch whose `mark_message_processed` actually ran
     # (i.e. every job in it persisted) counts as "handled" here.
     batch_uid_outcomes: dict[int, bool] = {}
+    lease_stop = False
     for batch in message_batches:
+        if lease_stop:
+            break
         batch_failed = False
         for job in batch.jobs:
+            if is_lease_lost is not None and is_lease_lost():
+                # Ownership is gone: no NEW vacancy write is started; this message
+                # stays unacknowledged (the owner re-reads it, dedup keeps it safe).
+                lease_stop = True
+                batch_failed = True
+                logger.warning("xing_collector_stopped_lease_lost")
+                break
             try:
                 job_record, result, created = score_and_persist(db, candidate_skills, job)
             except Exception as exc:

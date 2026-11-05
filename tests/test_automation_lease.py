@@ -17,10 +17,10 @@ Covers exactly the required scenarios:
 import asyncio
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -774,11 +774,23 @@ class TestShutdownRequestedDuringActiveCycleCleansUpSafely:
         ]
         assert leaked == []
 
-        time.sleep(0.15)  # let the abandoned lease genuinely expire
         monkeypatch.undo()  # restore the REAL collector steps
 
         db2 = session_factory()
         try:
+            # Task 22: an interrupted cycle keeps its exclusion (the lease was extended past
+            # the IMAP deadline because a worker thread may still be running), so even after
+            # the original short TTL has passed a replacement is refused ...
+            time.sleep(0.15)
+            with pytest.raises(AutomationRunAlreadyInProgressError):
+                asyncio.run(run_automation_cycle(db2, account_key=ACCOUNT, settings=Settings()))
+            # ... until that extended lease genuinely expires, then crash recovery reconciles it.
+            db2.execute(
+                update(AutomationRunRecord)
+                .where(AutomationRunRecord.id == run.id)
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            db2.commit()
             replacement = asyncio.run(
                 run_automation_cycle(db2, account_key=ACCOUNT, settings=Settings())
             )
