@@ -31,10 +31,13 @@ Without a configured search the single legacy query from
 BUNDESAGENTUR_SEARCH_KEYWORDS/LOCATION/RADIUS_KM is used unchanged.
 """
 
+import logging
 from dataclasses import dataclass
 
 from app.agents.target_role import is_support_admin_term
 from app.models.candidate_search import CandidateSearchSettings
+
+logger = logging.getLogger(__name__)
 
 # Radius steps offered by the BA job search; the API documents `umkreis` in km.
 BA_RADIUS_STEPS = (10, 15, 20, 25, 50, 100, 150, 200)
@@ -148,8 +151,16 @@ def discovery_queries(settings, search: CandidateSearchSettings | None) -> list[
 
 def _target_terms(terms: list[str]) -> list[str]:
     """Stage 24: the target is software development -- a stored keyword that
-    only finds IT-support / administration vacancies is not searched."""
-    return [term for term in terms if not is_support_admin_term(term)]
+    only finds IT-support / administration vacancies is not searched. The drop is
+    logged (count only) so a stale stored keyword is never ignored silently."""
+    kept = [term for term in terms if not is_support_admin_term(term)]
+    if len(kept) != len(terms):
+        logger.info(
+            "search_terms_excluded_by_target_policy dropped=%s kept=%s",
+            len(terms) - len(kept),
+            len(kept),
+        )
+    return kept
 
 
 def _search_terms(stored: list[str], default: str) -> list[str]:

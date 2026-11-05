@@ -40,6 +40,7 @@ except ModuleNotFoundError:  # run as `python scripts/...`
     from scripts.stage14a_send_readiness import UnsafeInputPathError, validate_local_json_path
     from scripts.stage15_application_tracker import TargetRefusedError, resolve_engine
 
+from app.agents.target_role import configured_role_conflicts
 from app.db.candidate_profile_repository import (
     CandidateProfileVersionConflictError,
     get_candidate_profile,
@@ -69,7 +70,19 @@ def _show(session: Session) -> int:
         trust = config.contact_trust.get(name)
         origin = f"  [{trust.source}/{trust.confidence}]" if trust else ""
         print(f"contact.{name}={value}{origin}")
+    _print_policy_conflicts(config.search)
     return 0
+
+
+def _print_policy_conflicts(search) -> int:
+    """Stored roles/keywords the software-development target policy ignores; the stored
+    values are shown as they are and are never changed by this report."""
+    conflicts = configured_role_conflicts(
+        search.primary_roles, search.secondary_roles, search.search_keywords
+    )
+    for conflict in conflicts:
+        print(f"POLICY_CONFLICT {conflict.describe()}")
+    return len(conflicts)
 
 
 def _history(session: Session) -> int:
@@ -104,6 +117,17 @@ def _apply(session: Session, args) -> int:
         print("REFUSED: no candidate profile stored", file=sys.stderr)
         return 2
     plan = plan_config_change(profile, spec)
+    # Report on the configuration that WILL be stored: the current settings overlaid with
+    # the fields the file states (a partial file keeps the stored roles).
+    stored = load_search_config(session)
+    effective = stored.search if stored is not None else None
+    if effective is not None and spec.search is not None:
+        stated = {name: getattr(spec.search, name) for name in spec.search.model_fields_set}
+        effective = effective.model_copy(update=stated)
+    elif effective is None:
+        effective = spec.search
+    if effective is not None:
+        _print_policy_conflicts(effective)
     mode = "APPLY" if args.apply else "DRY RUN"
     print(f"{mode}: profile_version={plan.base_version} source={spec.source}")
     for change in plan.changes:

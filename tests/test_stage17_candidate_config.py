@@ -759,3 +759,64 @@ def test_b6c1_downgrade_refuses_to_discard_populated_values(tmp_path):
         )
     with pytest.raises(RuntimeError, match="candidate_job_preferences holds 1 row"):
         downgrade(_alembic(path), "a9d3f6b2c4e8")
+
+
+def test_cli_show_and_dry_run_report_policy_conflicts_without_changing_the_stored_roles(
+    migrated, capsys
+):
+    """The stored secondary role 'Technical Application Support' contradicts the
+    software-development target policy: it is reported, kept as stored, and applying
+    the file still stores exactly what the operator confirmed."""
+    path, config = migrated
+    common = ["apply", "--config", str(config), "--actor", "operator", "--reason", "confirmed"]
+    assert _cli(path, *common) == 0
+    dry = capsys.readouterr().out
+    assert "POLICY_CONFLICT secondary_roles: 'Technical Application Support'" in dry
+    assert _cli(path, *common, "--apply", "--expected-version", "2") == 0
+    capsys.readouterr()
+    assert _cli(path, "show") == 0
+    shown = capsys.readouterr().out
+    assert 'search.secondary_roles=["Technical Application Support"]' in shown  # stored as given
+    assert "POLICY_CONFLICT secondary_roles: 'Technical Application Support'" in shown
+
+
+def test_cli_reports_conflicts_of_the_effective_configuration_for_partial_files(migrated, capsys):
+    """A partial apply file leaves the stored roles in place, so a stored conflicting
+    role must still be reported (and a no-op / search-less file reports it too)."""
+    path, config = migrated
+    common = ["--actor", "operator", "--reason", "confirmed"]
+    assert (
+        _cli(path, "apply", "--config", str(config), *common, "--apply", "--expected-version", "2")
+        == 0
+    )
+    capsys.readouterr()
+
+    partial = config.parent / "partial.json"
+    partial.write_text(
+        json.dumps(
+            {
+                "schema": "jobtriage.candidate-config/1",
+                "source": "USER_CONFIRMED",
+                "confirmed_on": "2026-10-27",
+                "search": {"search_keywords": ["Python"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _cli(path, "apply", "--config", str(partial), *common) == 0
+    out = capsys.readouterr().out
+    assert "POLICY_CONFLICT secondary_roles: 'Technical Application Support'" in out
+
+    no_search = config.parent / "no_search.json"
+    no_search.write_text(
+        json.dumps(
+            {
+                "schema": "jobtriage.candidate-config/1",
+                "source": "USER_CONFIRMED",
+                "confirmed_on": "2026-10-27",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _cli(path, "apply", "--config", str(no_search), *common) == 0
+    assert "POLICY_CONFLICT secondary_roles" in capsys.readouterr().out
