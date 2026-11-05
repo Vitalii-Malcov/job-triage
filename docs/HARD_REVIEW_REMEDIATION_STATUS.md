@@ -25,8 +25,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 13 | Arch §3 stage-named operational scripts | ACCEPTED — task 19a2f73, merge 105f980 |
 | 14 | Arch §3 rate limiter duplication | ACCEPTED — task 7fb2b5f, merge 65861b6 |
 | 15 | Quality §4 review history in comments | ACCEPTED — task 13052fe, merge 0222b79 |
-| 16 | Quality §4 CI maintainability | ACCEPTED (see below; SHAs in git log) |
-| 17–19 | see task list | PENDING |
+| 16 | Quality §4 CI maintainability | ACCEPTED — task 2922648, merge d39b493 |
+| 17 | Quality §4 test quality | ACCEPTED (see below; SHAs in git log) |
+| 18–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -208,3 +209,12 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Residual: the guard proves workflow text and the marker partition, not Actions behaviour; ordering between cycling modules is not enforced (each restores head in a `finally`; Codex found no remaining need for HARD-008 to run last).
 - Full pytest: 7601 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: 1 code round `VERDICT: ACCEPT` (P3: forbid extra selectors — implemented with tests).
+
+## TASK 17 — Test quality (Quality §4)
+
+- Confirmed: tests asserting substrings of module source (`".store(" not in source`, `"httpx." not in source`) — 34 `inspect.getsource` uses; the README count mixed functions and parametrized cases.
+- Converted to behaviour / AST (no test deleted, names kept): IMAP provider read-only guarantee (a client that REFUSES and RECORDS every STORE/EXPUNGE/COPY/APPEND/... while a real fetch runs, plus the recorded wire commands: read-only SELECT, UID SEARCH/FETCH only, every FETCH item checked one by one so `BODY.PEEK[]` is the only body request); follow-up send service "no network" (every `socket.connect` / `httpx` send refused and recorded during a full send); "never imports an HTTP client / smtplib / imaplib" via the static-import fixture `imported_modules` (relative imports resolved; dynamic imports a documented blind spot; own fixture tests). Meta-tests prove each guard fails when its invariant is broken (Codex mutation probes: STORE inside the FETCH handler, `(RFC822.SIZE BODY[])`, HTTP inside `try/except`, slow dispatch — all detected).
+- Flake removed: `TestLeaseRenewalHeartbeat::test_renewal_reports_ownership_lost...` (failed twice in 40-minute full runs) is now event-driven; Codex verified it with 0.4 s / 1.0 s artificial pre-send delays.
+- Counts (`docs/TEST_INVENTORY.md`): 4,732 `def test_`; 7,756 collected; last completed full run 7,608 passed / 0 failed / 148 skipped (141 PostgreSQL modules — NOT run by a local SQLite run, executed by the CI job and once locally on postgres:16 in TASK 16 —, 5 symlinks, 1 canonical DB, 1 worktree). 27 `inspect.getsource` uses remain in 13 files (docs/contract and import guards) — listed, not converted.
+- Full pytest: 7608 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: 3 code rounds (R1 CHANGES_REQUESTED x5: swallowed forbidden calls, swallowed HTTP, FETCH metadata, heartbeat race, relative imports + doc totals; R2 `BLOCKED` only for the full run; R3 ACCEPT).

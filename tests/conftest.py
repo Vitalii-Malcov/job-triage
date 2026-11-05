@@ -64,3 +64,40 @@ def repository_head() -> str:
     heads = ScriptDirectory.from_config(Config(str(root / "alembic.ini"))).get_heads()
     assert len(heads) == 1, f"migration scripts must have exactly one head, found {heads}"
     return heads[0]
+
+
+@pytest.fixture(scope="session")
+def imported_modules():
+    """`imported_modules(module) -> set[str]`: every module name a Python module imports STATICALLY
+    (import statements in its AST, relative imports resolved against its package; dynamic
+    `importlib`/`__import__` calls are invisible), so formatting, comments and docstrings that
+    merely MENTION a library never matter. A name is recorded dotted ("urllib.request") together
+    with its parents ("urllib"), and `from a import b` records both "a" and "a.b"."""
+    import ast
+    import importlib.util
+    import inspect
+
+    def collect(module) -> set[str]:
+        package = module.__package__ or module.__name__.rpartition(".")[0]
+        names: set[str] = set()
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Import):
+                found = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = importlib.util.resolve_name(
+                        "." * node.level + (node.module or ""), package
+                    )
+                else:
+                    base = node.module
+                if not base:
+                    continue
+                found = [base, *(f"{base}.{alias.name}" for alias in node.names)]
+            else:
+                continue
+            for name in found:
+                parts = name.split(".")
+                names.update(".".join(parts[: i + 1]) for i in range(len(parts)))
+        return names
+
+    return collect
