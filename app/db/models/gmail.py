@@ -61,7 +61,7 @@ class GmailThreadRecord(Base):
     Message-ID/In-Reply-To/References at all (an unlinkable singleton
     thread of one).
 
-    **`account_key` (GMAIL-002).** `thread_key` alone is scoped to
+    **`account_key`.** `thread_key` alone is scoped to
     `account_key` — a raw Message-ID/In-Reply-To/References value is
     trusted only within one configured mailbox account. Without this, a
     later switch of `GMAIL_USERNAME` to a different account could
@@ -70,7 +70,7 @@ class GmailThreadRecord(Base):
     the same Message-ID string. See `normalize_account_key` in
     app/providers/email/base.py.
 
-    **Message-ID collision policy (GMAIL-011).** A `thread_key` equal to
+    **Message-ID collision policy.** A `thread_key` equal to
     a message's own Message-ID (the "this message is a thread root"
     case — see `resolve_thread_anchor`) is not treated as trustworthy
     proof of shared conversation if that same Message-ID string is *also*
@@ -106,7 +106,7 @@ class GmailThreadRecord(Base):
         nullable=False,
     )
 
-    # S7E-013 (Codex re-review, final safety fix): a generic, Gmail-thread-
+    # a generic, Gmail-thread-
     # scoped mutual-exclusion primitive — see
     # app.db.gmail_repository.acquire_thread_lock/wait_for_thread_lock for
     # the CAS mechanics. Deliberately just "who currently holds this
@@ -142,7 +142,7 @@ class GmailMessageRecord(Base):
     **Dedup identity is `(account_key, mailbox, uid_validity, uid)`, not
     `message_id_header`.** An IMAP UID is only guaranteed stable while
     UIDVALIDITY for that mailbox hasn't changed, AND is only meaningful
-    within the one account whose mailbox it belongs to (GMAIL-002) — so
+    within the one account whose mailbox it belongs to — so
     all four must be compared together, never the bare UID alone.
     `message_id_header` is kept for threading only (see
     GmailThreadRecord) and is deliberately NOT the dedup identity: it can
@@ -156,13 +156,13 @@ class GmailMessageRecord(Base):
     in this project logs `body_plain`, `subject`, `from_address`,
     `from_display_name`, `to_addresses_json`, or `cc_addresses_json`.
 
-    **Invariants enforced at the DB layer (GMAIL-009), not just in
+    **Invariants enforced at the DB layer, not just in
     application code**: `uid`/`uid_validity` must be positive (0 and
     negative values are never valid IMAP identifiers), and `direction`
     must be one of the two known values — defense in depth against any
     insert path that bypasses app/db/gmail_repository.py.
 
-    **`automation_processed_at` (AUD-004, Astra R3): a durable PER-MESSAGE
+    **`automation_processed_at`: a durable PER-MESSAGE
     completion marker, not a global monotonic `id` watermark.** Stage 8D's
     `gmail_response_drafts` step used to track progress as a single
     per-account `AutomationMailProgressRecord.gmail_after_message_id`
@@ -264,7 +264,7 @@ class GmailMessageRecord(Base):
     provider_arrival_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
-    # S7E-013 (Codex re-review, final safety fix): True ONLY when
+    # True ONLY when
     # `provider_arrival_at` above came from a real, successfully-parsed
     # IMAP INTERNALDATE (see app/providers/email/imap.py's
     # `_parse_internal_date`) — False for BOTH of `provider_arrival_at`'s
@@ -304,7 +304,7 @@ class GmailMessageRecord(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
-    # AUD-004 (Astra R3): see the class docstring's own section on this
+    # see the class docstring's own section on this
     # column for the full rationale. NULL = not yet fully processed by
     # Stage 8D's gmail_response_drafts step (analysis + response-draft-or
     # -NO_RESPONSE_RECOMMENDED-or-OUTBOUND-skip) — eligible for every
@@ -319,7 +319,7 @@ class GmailMessageRecord(Base):
 
 class GmailMessageIdClaimRecord(Base):
     """The DB-enforced atomic arbiter of "who owns this Message-ID"
-    within one account (GMAIL-011 concurrency fix).
+    within one account.
 
     **Why this table exists.** The original Message-ID collision guard
     (a Python `SELECT ... WHERE message_id_header = :anchor` followed by
@@ -397,7 +397,7 @@ class GmailMessageIdClaimRecord(Base):
 
 
 class GmailPermanentSkipRecord(Base):
-    """FINAL-004 (Astra R5A): a durable, per-message "never fetch this
+    """a durable, per-message "never fetch this
     UID again" marker for a Gmail IMAP message whose CONTENT itself makes
     it permanently unpersistable -- oversized past MAX_RAW_MESSAGE_SIZE,
     or a MIME structure that fails to parse -- as distinct from a
@@ -408,7 +408,7 @@ class GmailPermanentSkipRecord(Base):
     **Why this table exists.** `app.db.gmail_repository.get_known_uids`
     already excludes already-PERSISTED UIDs from a sync's candidate list
     before `app.providers.email.base.MAX_MESSAGES_PER_SYNC` is applied
-    (GMAIL-005/012) — but a message that is skipped every single run
+     — but a message that is skipped every single run
     (never persisted, since its content itself is what's wrong) was NEVER
     excluded that way: it remained a "new" candidate on every future sync
     forever. Combined with oldest-UID-first prioritization (see

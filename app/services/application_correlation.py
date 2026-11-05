@@ -24,7 +24,7 @@ and only for messages inside the application's response window):
   application (supporting only -- thread headers are forgeable).
 - SENDER: the exact sender address (compared as a hash, never stored in
   clear) already sent a message that was correlated to this application.
-  EVIDENCE ONLY (Codex night-audit review round 3): no string key can
+  EVIDENCE ONLY: no string key can
   tell aliases of one employer apart ("IBM" vs "International Business
   Machines"), so a correlation that reaches MEDIUM only because of SENDER
   never writes anything -- the processor reports it for operator review
@@ -311,7 +311,7 @@ def _with_sender_signal(
         return evaluations
     by_company = [e for e in evaluations if "COMPANY" in e.signals]
     seen = [e for e in by_company if sender_seen(e.application_id)]
-    # Codex night-audit review P1: an address that merely LOOKS unique per
+    # an address that merely LOOKS unique per
     # application (plus-token) may be shared by an ATS across applications,
     # so the sender never decides between two applications at one employer
     # -- counting EVERY in-window application of that employer, also those

@@ -361,16 +361,16 @@ class TestOwnership:
     async def test_a_run_longer_than_the_ttl_keeps_its_lease_via_the_heartbeat(
         self, factory, monkeypatch
     ):
-        monkeypatch.setattr(ce, "AUTOMATION_RUN_LEASE_TTL_SECONDS", 0.6)
+        monkeypatch.setattr(ce, "AUTOMATION_RUN_LEASE_TTL_SECONDS", 3.0)
 
         async def runner(db, settings, *, is_lease_lost=None):
-            await asyncio.sleep(1.5)  # > TTL; the heartbeat (every 0.2s) must renew
+            await asyncio.sleep(7.0)  # > 2x TTL; the heartbeat (every 1.0s) must renew
             assert not is_lease_lost()
             return STATS
 
         monkeypatch.setattr(
             "app.services.collector_exclusion.create_running_run",
-            lambda db, **kw: create_running_run(db, **{**kw, "ttl_seconds": 0.6}),
+            lambda db, **kw: create_running_run(db, **{**kw, "ttl_seconds": 3.0}),
         )
         with factory() as db:
             assert await run_collector_exclusively(db, _settings(), "xing", runner) == STATS

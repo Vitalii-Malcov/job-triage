@@ -39,7 +39,7 @@ Software Engineer, AI Engineer, ...) count as positive signals --
 "Engineer" alone is not a listed role-family signal either), not a
 regression: UNKNOWN fails open, exactly as intended.
 
-**S11B-002: bare "Developer" is ALSO not a sufficient positive signal on
+**bare "Developer" is ALSO not a sufficient positive signal on
 its own.** "Business Developer", "Senior Business Developer", "Property
 Developer", and "Real Estate Developer" are real, common job titles
 where "Developer" means a business/deal originator or a real-estate
@@ -67,7 +67,7 @@ role-family signal and a real irrelevant-family signal is ambiguous by
 construction and must fail open (UNKNOWN), not be resolved by pattern
 list order.
 
-**S11B-003: STRONG (role-phrase) vs. WEAK (bare domain word) irrelevant
+**STRONG (role-phrase) vs. WEAK (bare domain word) irrelevant
 signals.** A bare domain/technology word ("qgis", "elektrotechnik",
 "projektmanagement") is deliberately too weak to classify IRRELEVANT on
 its own -- "QGIS Developer", "Software Engineer Elektrotechnik", and
@@ -162,7 +162,7 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("systemadministrator", r"\bsystemadministrator(?:in)?\b"),
         ("administrator", r"\badministrator(?:in)?\b"),
         ("presales", r"\bpresales\b"),
-        # S11B-003/S11B-004: explicit ROLE PHRASES, not the bare domain
+        # explicit ROLE PHRASES, not the bare domain
         # word "qgis" alone -- "QGIS Developer"/"QGIS Python Engineer"/
         # "QGIS Software Engineer" must not be forced IRRELEVANT merely
         # because a GIS tool is named; only an explicit non-dev role
@@ -171,7 +171,7 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # ("QGIS Experte") and hyphenated ("QGIS-Experte") real-world
         # connector forms.
         ("qgis-expert", r"\bqgis[\s-]+(?:expert(?:e|in)?|spezialist(?:in)?)\b"),
-        # S11B-003/S11B-004: explicit ROLE PHRASES, not bare
+        # explicit ROLE PHRASES, not bare
         # "elektrotechnik" -- "Software Engineer Elektrotechnik"/"Python
         # Engineer Elektrotechnik" must not be forced IRRELEVANT merely
         # because the electrical-engineering DOMAIN is named; only an
@@ -185,7 +185,7 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("ingenieur-elektrotechnik", r"\bingenieur(?:in)?\s+(?:f(?:ü|ue)r\s+)?elektrotechnik\b"),
         ("elektroingenieur", r"\belektroingenieur(?:in)?\b"),
         ("elektrotechniker", r"\belektrotechniker(?:in)?\b"),
-        # S11B-003/S11B-004: explicit ROLE PHRASES, not bare
+        # explicit ROLE PHRASES, not bare
         # "projektmanagement" -- "Software Developer Projektmanagement
         # Tools"/"Python Engineer Projektmanagement" must not be forced
         # IRRELEVANT merely because the project-management DOMAIN is
@@ -195,7 +195,7 @@ _IRRELEVANT_TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # "Berater Projektmanagement" and "Berater im Projektmanagement".
         ("projektmanager", r"\bprojektmanager(?:in)?\b"),
         ("berater-projektmanagement", r"\bberater(?:in)?\s+(?:im\s+)?projektmanagement\b"),
-        # S11B-001: "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard
+        # "Wissenschaftliche(r) Mitarbeiter(in)" -- the standard
         # German academic-research-ASSISTANT title family (Stage 11 pilot
         # false positives: Uniklinikum Frankfurt, Statistisches
         # Bundesamt). Requires the explicit ROLE noun "Mitarbeiter(in)"
@@ -236,7 +236,7 @@ _APPLY_ELIGIBLE_ADJACENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tup
     )
 )
 
-# S11B-003: WEAK ambiguity signals -- bare domain/technology words that
+# WEAK ambiguity signals -- bare domain/technology words that
 # must NEVER, on their own (no positive signal, no STRONG irrelevant
 # phrase present), be enough to classify IRRELEVANT ("do NOT reject
 # solely because 'Elektrotechnik' appears somewhere in an otherwise
@@ -277,7 +277,7 @@ def classify_title_relevance(title: str) -> TitleRelevanceClassification:
         strong_signal      -- a genuine non-software ROLE phrase, e.g.
                               "QGIS Expert", "Ingenieur Elektrotechnik"
         weak_signal         -- a bare domain/technology word, e.g. "qgis",
-                              "elektrotechnik" (S11B-003)
+                              "elektrotechnik"
 
     Truth table:
 

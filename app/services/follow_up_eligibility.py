@@ -42,7 +42,7 @@ class ThreadMessageInfo:
     gmail_message_id: int
     direction: Direction
     timestamp: datetime
-    # S7E-013 (Codex re-review, final safety fix): True ONLY if
+    # True ONLY if
     # `timestamp` came from a real, successfully-parsed IMAP INTERNALDATE
     # (`GmailMessageRecord.provider_arrival_is_trusted`) — False for a
     # legacy/pre-migration row or a message whose IMAP fetch didn't
@@ -84,13 +84,13 @@ def evaluate_follow_up_eligibility(
     3. No `OUTBOUND` message in `thread_messages` — spec: "a real prior
        OUTBOUND message" is a hard precondition; a job with only inbound
        correspondence (or none at all) is never eligible.
-    4. S7E-013 (Codex re-review): the anchor's `timestamp_is_trusted` is
+    4. the anchor's `timestamp_is_trusted` is
        False — a legacy/backfilled row or a message whose IMAP fetch
        never returned a parseable INTERNALDATE. Its chronology cannot be
        safely reasoned about at all, so this fails closed rather than
        risk computing a wrong `due_at` or a wrong reply comparison from
        it.
-    5. S7E-013: an `INBOUND` message in `thread_messages` has
+    5. an `INBOUND` message in `thread_messages` has
        `timestamp_is_trusted` False — whether it is a reply received
        after the (trusted) anchor cannot be safely determined, so the
        follow-up is suppressed rather than risk sending despite an
@@ -150,7 +150,7 @@ def evaluate_follow_up_eligibility(
 
     anchor = outbound_messages[-1]
 
-    # S7E-013 (Codex re-review, final safety fix): the anchor's own
+    # the anchor's own
     # arrival time must be provider-trusted before it's used for
     # anything below (due_at, reply comparison) — a legacy/backfilled or
     # INTERNALDATE-less timestamp is never safe to reason about.

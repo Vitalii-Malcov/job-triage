@@ -46,7 +46,7 @@ Signal is drawn from, in order:
    "Schülerkurse" -- a real trainer job title -- never false-positive
    purely by containing "kurs" as a substring).
 
-**Stage 10 review finding (S10-002, blocking).** An earlier version ran
+**Stage 10 review finding.** An earlier version ran
 the title-pattern fallback unconditionally, including against
 `ARBEIT`-typed postings -- "Mitarbeiter Weiterbildung (m/w/d)" (a real
 L&D-department staff role -- training is the role's SUBJECT MATTER, not
@@ -119,7 +119,7 @@ def classify_posting(
     if required_preference is not None and required_preference not in allowed_employment_types:
         return PostingClassification(False, f"posting_type_requires_preference:{posting_type}")
 
-    # S10-002: a structurally-confirmed ARBEIT posting is trusted outright
+    # a structurally-confirmed ARBEIT posting is trusted outright
     # -- the title-keyword fallback below is reserved for postings with no
     # such confirmation and must never override it (see module docstring).
     if posting_type == ARBEIT:

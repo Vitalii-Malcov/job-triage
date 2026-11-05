@@ -70,7 +70,7 @@ class CandidateProfileRecord(Base):
     professional_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     career_goal: Mapped[str] = mapped_column(Text, default="", nullable=False)
     target_roles_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
-    # CP-M-02: per-field provenance for the top-level fields above — JSON
+    # per-field provenance for the top-level fields above — JSON
     # dict of {field_name: {"source": ..., "confidence": ...}}, only ever
     # containing entries for fields that have actually been set via PATCH
     # (see app/db/candidate_profile_repository.py's apply_candidate_profile_patch

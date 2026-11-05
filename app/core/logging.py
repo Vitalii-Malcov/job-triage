@@ -24,7 +24,7 @@ def configure_logging() -> None:
     root.addHandler(handler)
     root.setLevel(logging.INFO)
 
-    # AUD-002: httpx (and python-telegram-bot, which sends its own
+    # httpx (and python-telegram-bot, which sends its own
     # requests through an internal httpx.AsyncClient) logs every request
     # at INFO level as `HTTP Request: %s %s "%s %d %s"` with the FULL
     # request URL -- for a Telegram Bot API call, that URL embeds the

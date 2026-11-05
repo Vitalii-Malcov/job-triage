@@ -57,7 +57,7 @@ class AutomationRunRecord(Base):
     is a PARTIAL unique index — `UNIQUE(account_key) WHERE status =
     'RUNNING'` — the sole arbiter of "at most one RUNNING run per
     account at a time", enforced by the database, not a Python
-    check-then-act read. S8A-001 (Codex re-review): declared with BOTH
+    check-then-act read. S8A-001: declared with BOTH
     `sqlite_where` and `postgresql_where` (identical predicate) so this
     project's SQLite deployment and a future PostgreSQL one describe the
     exact same semantics — see
@@ -118,7 +118,7 @@ class AutomationRunRecord(Base):
     results_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # S8A-002: ownership-aware lease — see class docstring's "Crash
+    # ownership-aware lease — see class docstring's "Crash
     # recovery via an ownership-aware lease" section.
     lease_holder: Mapped[str | None] = mapped_column(String(200), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
@@ -264,7 +264,7 @@ class AutomationMailProgressRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_key: Mapped[str] = mapped_column(String(320), nullable=False)
 
-    # AUD-004 (Astra R3): NO LONGER READ OR WRITTEN by
+    # NO LONGER READ OR WRITTEN by
     # app.services.automation_gmail.prepare_gmail_response_drafts -- an
     # `id`-ordered watermark is unsafe under PostgreSQL's
     # commit-visibility semantics (a lower-`id` row can commit after a

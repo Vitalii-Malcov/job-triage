@@ -152,7 +152,7 @@ def mailbox_identity_aliases(name: str) -> tuple[str, ...]:
 
 
 def canonical_mailbox_identity(name: str) -> str:
-    """ASTRA-GMAIL-001-R1: the ONE spelling persisted for the server
+    """the ONE spelling persisted for the server
     mailbox `name` selects -- its canonical modified-UTF-7 wire form
     (`[Gmail]/Отправленные` and `[Gmail]/&BB4E...-` both give
     `[Gmail]/&BB4E...-`). Injective over wire mailboxes, so equal results

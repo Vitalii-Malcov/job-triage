@@ -93,7 +93,7 @@ logger = logging.getLogger(__name__)
 # offset (see `list_due_follow_ups`).
 FOLLOW_UP_JOB_SCAN_LIMIT = 200
 
-# S7E-009: bump whenever a change to this module (or anything it reads
+# bump whenever a change to this module (or anything it reads
 # that isn't already covered by its own version field — e.g. the
 # eligibility rule's own shape) could change generated proposal content
 # for otherwise-identical inputs, so an old fingerprint stops matching and
@@ -119,7 +119,7 @@ class FollowUpFreshState:
     """The complete freshly-recomputed eligibility state for one job at
     the instant it was read — the single source of truth both
     `evaluate_follow_up_for_job` (evaluation time) and
-    `app.services.follow_up_send`'s send-time revalidation (S7E-002) read
+    `app.services.follow_up_send`'s send-time revalidation read
     from, so the two call sites can never silently disagree about what
     "still eligible" means.
     """
@@ -190,7 +190,7 @@ def compute_follow_up_input_fingerprint(
     generator_version: str,
     follow_up_delay_days: int,
 ) -> str:
-    """S7E-009 (Codex remediation): a SHA-256 hex digest over every
+    """a SHA-256 hex digest over every
     trusted input this proposal's content/identity depends on. Any change
     to one of these values between two evaluations of the SAME anchor
     produces a DIFFERENT fingerprint — see `FollowUpProposalRecord`'s
@@ -277,7 +277,7 @@ def _build_proposal(
             f"for account_key={account_key!r}"
         )
 
-    # S7E-008: derive+validate the single canonical recipient BEFORE doing
+    # derive+validate the single canonical recipient BEFORE doing
     # anything else — an anchor with no safe recipient must never become a
     # proposal at all (see FollowUpRecipientInvalidError's docstring).
     recipient = derive_canonical_recipient(

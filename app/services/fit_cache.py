@@ -234,7 +234,7 @@ def latest_match_keys(session: Session, job_ids: Sequence[int] | None) -> dict[i
         .where(*_in(CandidateJobMatchRecord.job_id, job_ids))
         .order_by(CandidateJobMatchRecord.job_id, CandidateJobMatchRecord.id)
     ).all()
-    # Stage 22 P1 (Codex): EVERY analysis row of the job, not only the newest:
+    # Stage 22 P1: EVERY analysis row of the job, not only the newest:
     # assess_job reads the row of the current identity, which need not be the
     # newest (posting A -> B -> A; concurrent inserts committing out of id order).
     keys: dict[int, list[str]] = {}

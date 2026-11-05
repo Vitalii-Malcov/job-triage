@@ -105,7 +105,7 @@ class XingScanProgressRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    # Codex gate follow-up (Astra R4A MEDIUM, mailbox scope): deterministic
+    # deterministic
     # non-secret hash of (imap_host, imap_port, username, mailbox) -- see
     # `app.db.xing_scan_progress_repository.compute_mailbox_scope`'s own
     # docstring. Part of the row's real identity together with `source`:

@@ -34,7 +34,7 @@ router = APIRouter()
     dependencies=[Depends(require_api_key), Depends(enforce_collector_rate_limit)],
 )
 async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str, int]:
-    """S8A-003: fetch + score + persist logic lives in
+    """fetch + score + persist logic lives in
     `app.services.collector_runner.run_bundesagentur` — shared with the
     Telegram control center's `/run bundesagentur` command and Stage 8A's
     automation orchestrator. This endpoint only translates that
@@ -58,11 +58,11 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     except CollectorError as exc:
-        # HARD-002 (adversarial hardening r1): this branch used to call
+        # this branch used to call
         # `logger.exception(...)`, which logs the FULL traceback
         # (including any chained upstream exception's own str()) --
         # exactly the leakage class already identified and fixed for the
-        # XING branch below (Codex gate follow-up, Astra R4B, NEW-003).
+        # XING branch below.
         # A raw httpx/requests connection error's `__cause__` can carry
         # host/response-body text; `exc`'s own message is already
         # sanitized by the collector before it reaches here, so only
@@ -90,7 +90,7 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
     dependencies=[Depends(require_api_key), Depends(enforce_xing_rate_limit)],
 )
 async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
-    """S8A-003: see `run_bundesagentur_collector` above — same split,
+    """see `run_bundesagentur_collector` above — same split,
     `app.services.collector_runner.run_xing` owns the actual logic.
     """
     settings = common.get_settings()

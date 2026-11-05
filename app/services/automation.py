@@ -132,11 +132,11 @@ class AutomationRunAlreadyInProgressError(Exception):
 
 
 class AutomationRunLeaseLostError(Exception):
-    """S8A-002 (Codex re-review); NEW-004 (Astra R4A) extends WHEN this
+    """S8A-002; NEW-004 extends WHEN this
     fires. Ownership of the run's lease was lost while
     `run_automation_cycle` was still executing — mapped to 409.
 
-    NEW-004: this is now raised the INSTANT lease loss is observed,
+    this is now raised the INSTANT lease loss is observed,
     checked before every step/collector `run_automation_cycle` is about
     to launch (see `_raise_if_lease_lost`), not only once at the very
     end after every step had already run. A confirmed-lost lease means a
@@ -171,12 +171,12 @@ async def _run_step(
     step's own internal per-job transaction handling before it returned
     or raised).
 
-    `touched_jobs` (S8C-POOL-001): one shared, run-scoped sink passed to
+    `touched_jobs`: one shared, run-scoped sink passed to
     every collector step so `run_automation_cycle` can hand Stage 8C the
     exact set of jobs THIS run's own collectors persisted — see
     `app.services.collector_runner.TouchedJob`.
 
-    `is_lease_lost` (Codex gate follow-up, Astra R4A lease-loss MEDIUM):
+    `is_lease_lost`:
     forwarded unchanged to `step_callable`
     (`app.services.collector_runner.run_bundesagentur`/`run_xing`, the
     only two callables `_run_step` is ever used for) as its own
@@ -229,7 +229,7 @@ async def _run_step(
         )
         return {"status": "failed", "counters": None, "error_type": type(exc).__name__}
 
-    # AUD-009 (Astra R2): `step_callable` returning normally only means it
+    # `step_callable` returning normally only means it
     # didn't RAISE — `run_bundesagentur`/`run_xing` isolate per-job
     # failures internally (see their own docstrings) and report them via
     # `counters["failed"]` instead of propagating, so a return here can
@@ -247,7 +247,7 @@ async def _run_step(
         status = "failed"
     else:
         status = "partial"
-    # NEW-001 (Astra R4A): a collector step whose own IMAP session
+    # a collector step whose own IMAP session
     # deadline fired before every candidate could be fetched (currently
     # only `run_xing` reports this key -- `run_bundesagentur` has no such
     # deadline and simply omits it, so `.get(..., False)` is the correct
@@ -273,7 +273,7 @@ async def _run_shortlist_drafts_step(db: Session, settings, touched_jobs: list[T
     inside its own returned `items`/`failures`/`counters["failed"]` —
     `app.services.automation_shortlist.prepare_shortlist_drafts` never
     lets a single job's exception propagate this far. `touched_jobs`
-    (S8C-POOL-001) is the exact set of jobs THIS run's own collector
+     is the exact set of jobs THIS run's own collector
     steps persisted, collected by `run_automation_cycle` below.
     """
     try:
@@ -363,7 +363,7 @@ async def _run_follow_up_proposals_step(db: Session, account_key: str, settings)
 
 
 def _compute_overall_status(step_results: dict[str, dict], core_step_names) -> str:
-    """S8C-STATUS-001 (Codex review): core JOB COLLECTION success is
+    """core JOB COLLECTION success is
     authoritative for FAILED — a downstream Stage 8C `shortlist_drafts`
     step that happens to report "ok" (e.g. because zero candidate jobs
     were eligible, which is trivially "ok" on its own) must never promote
@@ -374,7 +374,7 @@ def _compute_overall_status(step_results: dict[str, dict], core_step_names) -> s
     `step_results` contains only those same core steps, so this reduces
     to exactly the previous all-ok/none-ok/mixed logic.
 
-    AUD-009 (Astra R2): a core collector step's own `status` (see
+    a core collector step's own `status` (see
     `_run_step`) can now be "partial" (some fetched jobs persisted, some
     failed) — that is still real, attributable business success, so it
     counts the same as "ok" for the FAILED-override check below; only
@@ -406,7 +406,7 @@ def _build_error_summary(step_results: dict[str, dict]) -> str | None:
 
 
 class _RunLeaseHeartbeat:
-    """S8A-002 (Codex re-review): periodically renews an
+    """periodically renews an
     `AutomationRunRecord`'s lease on `holder`'s behalf for as long as
     `run_automation_cycle` is executing — mirrors
     `app.services.follow_up_send._ThreadLockHeartbeat` almost exactly
@@ -491,7 +491,7 @@ class _RunLeaseHeartbeat:
 
 
 def _raise_if_lease_lost(heartbeat: _RunLeaseHeartbeat, run_id: int, account_key: str) -> None:
-    """NEW-004 (Astra R4A): the fail-closed gate `run_automation_cycle`
+    """the fail-closed gate `run_automation_cycle`
     calls before every collector/optional step and before returning to
     finalize the run — see `AutomationRunLeaseLostError`'s own docstring
     for the full rationale. Checking only ONCE at the very end (the old
@@ -561,7 +561,7 @@ async def run_automation_cycle(
         interval_seconds=effective_heartbeat_interval,
     )
     heartbeat.start()
-    # S8C-POOL-001: one run-scoped, in-memory sink shared by both collector
+    # one run-scoped, in-memory sink shared by both collector
     # steps below -- the exact-attribution record of which jobs THIS run's
     # own collectors persisted, handed to Stage 8C instead of inferring
     # attribution from JobRecord.last_seen_at (which could also match a job
@@ -571,7 +571,7 @@ async def run_automation_cycle(
     try:
         step_results: dict[str, dict] = {}
         for step_name in AUTOMATION_STEPS:
-            # NEW-004: checked before EVERY step, not only once at the
+            # checked before EVERY step, not only once at the
             # very end — see _raise_if_lease_lost's own docstring.
             _raise_if_lease_lost(heartbeat, run.id, account_key)
             step_results[step_name] = await _run_step(
@@ -619,11 +619,11 @@ async def run_automation_cycle(
         overall_status = _compute_overall_status(step_results, AUTOMATION_STEPS)
         error_summary = _build_error_summary(step_results)
 
-        # S8A-002: one last check immediately before the final write —
+        # one last check immediately before the final write —
         # exclusivity for this run's own bookkeeping is no longer
         # provable once lost, so fail closed rather than risk overwriting
         # whatever a new owner has since recorded for this row. Every
-        # step above already checked before ITS OWN launch (NEW-004); this
+        # step above already checked before ITS OWN launch; this
         # catches the remaining instant between the last step finishing
         # and this write.
         _raise_if_lease_lost(heartbeat, run.id, account_key)
@@ -646,7 +646,7 @@ async def run_automation_cycle(
                 "another process may now own it."
             )
 
-        # Codex gate follow-up (Astra R4B, AUD-010 LOW): account_key is a
+        # account_key is a
         # normalized email address and must never appear in runtime logs
         # -- run.id (this run's own surrogate key) already identifies the
         # row without it, mirroring app.services.scheduler's identical

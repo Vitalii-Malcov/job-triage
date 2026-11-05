@@ -38,12 +38,12 @@ class FollowUpProposal(BaseModel):
     body: str
     language: FollowUpLanguage
     missing_fields: list[str]
-    # S7E-008: the single validated external recipient this follow-up
+    # the single validated external recipient this follow-up
     # would be sent to — see app.services.follow_up_recipient. Visible
     # here so a human reviewing GET /follow-ups/{id} sees exactly who a
     # send would go to before ever approving it.
     recipient: str
-    # S7E-009: opaque staleness identity — see
+    # opaque staleness identity — see
     # app.services.follow_up.compute_follow_up_input_fingerprint. Exposed
     # for auditability/debugging only; callers never need to construct or
     # compare it themselves.
@@ -111,7 +111,7 @@ class FollowUpApproval(BaseModel):
     decision_note: str | None
     pinned_subject: str
     pinned_body: str
-    # S7E-008: verbatim copy of the approved proposal's own validated
+    # verbatim copy of the approved proposal's own validated
     # `recipient` at decision time — the exact address a subsequent send
     # will use, pinned and visible in this human-approval artifact
     # alongside pinned_subject/pinned_body.

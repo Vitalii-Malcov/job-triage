@@ -1,4 +1,4 @@
-"""The Bundesagentur fuer Arbeit `referenznummer` of a posting (Stage 22, P0-1).
+"""The Bundesagentur fuer Arbeit `referenznummer` of a posting.
 
 The reference is the posting's only stable identity at the BA, but before
 Stage 22 it was not persisted: `JobRecord` had no column for it, and the

@@ -13,7 +13,7 @@ candidate-job matching, and calls no LLM/provider of any kind — purely
 deterministic fetch + persist infrastructure (CLAUDE.md's Stage 7A
 constraints).
 
-**Privacy (GMAIL-003).** Logging here never includes subject/body/
+**Privacy.** Logging here never includes subject/body/
 addresses/display names, and never logs a caught exception's message
 text or traceback (`exc_info`) — only `type(exc).__name__` and safe
 counters. A persistence-layer error (e.g. a driver-level IntegrityError)
@@ -51,7 +51,7 @@ class GmailInboxService:
                 # sync will see the same message again (its IMAP UID is
                 # unaffected by our own failed write) and retry it.
                 #
-                # GMAIL-003: log only the exception's type, never its
+                # log only the exception's type, never its
                 # message text or traceback (no exc_info) — a driver-level
                 # error message can embed row content (subject/body/
                 # addresses), which must never reach the logs.
@@ -65,7 +65,7 @@ class GmailInboxService:
             else:
                 duplicates += 1
 
-        # FINAL-004 (Astra R5A): durably record every UID this run
+        # durably record every UID this run
         # determined is permanently unfetchable (message content itself
         # is the problem — see GmailFetchResult.permanently_skipped's
         # docstring) so a future sync's candidate list excludes it,
@@ -87,7 +87,7 @@ class GmailInboxService:
                     fetch_result.permanently_skipped,
                 )
             except Exception as exc:
-                # GMAIL-003: type only, never the exception's own message
+                # type only, never the exception's own message
                 # text (a driver-level error can embed row content).
                 db.rollback()
                 logger.warning(

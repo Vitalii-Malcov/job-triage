@@ -2,7 +2,7 @@
 knowledge of their own -- shared only because the check was
 byte-identical across independent call sites.
 
-HARD-004 (adversarial hardening r1): `is_configured` used to live in
+`is_configured` used to live in
 `app/collectors/base.py`, which created a layering smell -- both
 `app/providers/email/{imap,smtp}.py` (a lower/sibling layer) and
 `app/collectors/{bundesagentur,xing_email}.py` imported across package

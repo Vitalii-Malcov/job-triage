@@ -95,7 +95,7 @@ def stylesheet() -> FileResponse:
 
 
 async def _bounded_body(request: Request) -> bytes:
-    """Codex review A (P2): never buffer more than MAX_LOGIN_BODY bytes of an
+    """never buffer more than MAX_LOGIN_BODY bytes of an
     unauthenticated request (declared length first, then the stream)."""
     too_large = HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
     declared = request.headers.get("content-length", "")

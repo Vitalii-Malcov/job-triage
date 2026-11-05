@@ -166,7 +166,7 @@ _BARE_SOFTENER = re.compile(
     re.IGNORECASE,
 )
 # A CEFR level this far after the German mention still belongs to it.
-# Codex round 9: "Deutschkenntnisse für die ... Kommunikation mit Kunden auf
+# "Deutschkenntnisse für die ... Kommunikation mit Kunden auf
 # mindestens B2-Niveau" states the level well after the mention.
 _LEVEL_REACH = 140
 # "Führerschein Klasse C1" is a driving licence, not a language level.
@@ -323,13 +323,13 @@ def extract_german_requirement(text: str) -> LanguageRequirement:
                 value, strong = descriptor
                 levels.append((value, not _part_optional(text, parts, own), False, strong))
         for level, mandatory, explicit, strong in levels:
-            # A mandatory level beats any optional one (Codex round 6), then
+            # A mandatory level beats any optional one, then
             # the higher level; an explicit level beats the same inferred.
             candidate = (
                 1 if mandatory else 0,
                 order[level],
                 1 if explicit else 0,
-                # Stage 22 P1 (Codex): on an otherwise equal requirement the
+                # Stage 22 P1: on an otherwise equal requirement the
                 # fluency wording wins, independent of sentence order.
                 1 if strong else 0,
                 level,

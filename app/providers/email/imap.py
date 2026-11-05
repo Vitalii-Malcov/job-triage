@@ -29,10 +29,10 @@ parent's Message-ID rather than the true thread root, so a small minority
 of dropped-References threads may end up split across more than one
 GmailThreadRecord. app/db/gmail_repository.py additionally guards against
 a *reused* Message-ID being trusted as high-confidence proof of shared
-conversation (GMAIL-011) — see that module's docstring. Full server-side
+conversation — see that module's docstring. Full server-side
 Gmail threading is left for a later stage if ever needed.
 
-**Read-only / no-Seen guarantee (GMAIL-001).** Every body fetch uses
+**Read-only / no-Seen guarantee.** Every body fetch uses
 `BODY.PEEK[]`, never bare `RFC822`/`BODY[]` — see base.py's module
 docstring for why a non-PEEK fetch would itself mutate the mailbox
 (setting `\\Seen`) even though it looks like a pure read.
@@ -86,7 +86,7 @@ from app.utils.html_text import html_to_text
 
 logger = logging.getLogger(__name__)
 
-# AUD-005: bounds every blocking socket operation on the IMAP connection
+# bounds every blocking socket operation on the IMAP connection
 # (connect, TLS handshake, and every later imaplib call on the same
 # socket -- SELECT/STATUS/UID SEARCH/UID FETCH/CLOSE/LOGOUT all share it).
 # A hung/black-holed IMAP peer raises socket.timeout within this bound
@@ -101,7 +101,7 @@ IMAP_OPERATION_TIMEOUT_SECONDS = 30.0
 _RFC822_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
 _INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 
-# FINAL-004 (Astra R5A): reasons `_fetch_one` classifies as PERMANENT --
+# reasons `_fetch_one` classifies as PERMANENT --
 # the message's own content is what's wrong, so retrying will fail
 # identically forever -- as opposed to every other `_fetch_one` `None`
 # return (fetch failed, malformed response shape, transport error),
@@ -182,7 +182,7 @@ def _parse_date(raw: str | None) -> datetime | None:
 
 
 def _parse_internal_date(fetch_header: bytes) -> datetime | None:
-    """S7E-011 (Codex re-review): extract the server-assigned IMAP
+    """extract the server-assigned IMAP
     INTERNALDATE from a `(INTERNALDATE BODY.PEEK[])` fetch response's
     header line (e.g. `1 (UID 1 INTERNALDATE "07-Sep-2026 12:34:56 +0000"
     BODY[] {123}`), per RFC 3501's `"dd-Mon-yyyy hh:mm:ss +zzzz"` format —
@@ -219,7 +219,7 @@ _STATUS_ATOM_SPECIALS = frozenset(b'(){%*"\\')
 
 
 def _normalize_status_response(data: object) -> tuple[bytes, bytes] | None:
-    """ASTRA-GMAIL-002-R2: imaplib's STATUS data -> `(mailbox, rest)` of
+    """imaplib's STATUS data -> `(mailbox, rest)` of
     exactly ONE response, `rest` being everything after the mailbox
     (` (UIDVALIDITY 100)`), or None. Two shapes exist:
 
@@ -231,11 +231,11 @@ def _normalize_status_response(data: object) -> tuple[bytes, bytes] | None:
     Anything else (several responses, a stray prefix, a size mismatch,
     non-bytes parts) is rejected, never guessed at.
 
-    ASTRA-GMAIL-002-R1: the outer container must be exactly the `list`
+    the outer container must be exactly the `list`
     imaplib returns -- a dict/set/bytes/str/tuple/generator/None is
     rejected up front rather than iterated, so e.g. a dict's keys are
     never read as response lines and no TypeError escapes.
-    ASTRA-GMAIL-002-R2: a literal mailbox must not contain NUL/CR/LF
+    a literal mailbox must not contain NUL/CR/LF
     (RFC 3501 CHAR8 excludes NUL; CR/LF are never mailbox data);
     high-bit bytes are legal CHAR8 and pass through."""
     if type(data) is not list:
@@ -287,7 +287,7 @@ def _split_status_mailbox(line: bytes) -> tuple[bytes, bytes] | None:
 
 
 def _parse_status_uid_validity(data: object) -> int | None:
-    """ASTRA-GMAIL-002: UIDVALIDITY from a STATUS response, validated as a
+    """UIDVALIDITY from a STATUS response, validated as a
     WHOLE: `mailbox SP "(" name SP number *(SP name SP number) ")"` and
     nothing else -- one attribute group, balanced, no trailing bytes, each
     attribute name at most once, exactly one UIDVALIDITY of at most 32
@@ -339,14 +339,14 @@ def _attachment_metadata(part: Message, filename: str | None) -> ParsedAttachmen
     # Decoding here is purely to measure byte length for metadata — the
     # decoded bytes are never stored, returned beyond this int, or
     # otherwise inspected/opened. See base.py's ParsedAttachment docstring
-    # (GMAIL-006) for the honest transfer-vs-persistence distinction.
+    # for the honest transfer-vs-persistence distinction.
     payload = part.get_payload(decode=True)
     size = len(payload) if payload is not None else None
     return ParsedAttachment(filename=decoded_filename or None, content_type=content_type, size=size)
 
 
 def _is_attachment_part(part: Message) -> bool:
-    # GMAIL-004: an embedded email (message/rfc822) is always treated as
+    # an embedded email (message/rfc822) is always treated as
     # an opaque attachment, regardless of whether it declares an explicit
     # Content-Disposition — its own inner parts must never be mistaken for
     # the parent message's body. See `_walk_body_and_attachments`, which
@@ -366,7 +366,7 @@ def _walk_body_and_attachments(
     depth: int = 0,
 ) -> None:
     """Recursively extract body text + attachment metadata, pruning an
-    attachment's entire subtree instead of flattening it (GMAIL-004).
+    attachment's entire subtree instead of flattening it.
 
     `email.message.Message.walk()` flattens every part in the MIME tree,
     including the descendants of a `message/rfc822` (or any other)
@@ -429,7 +429,7 @@ def _first_html_part(part: Message, state: dict, depth: int = 0) -> str | None:
     """The first BODY text/html part, with the same attachment pruning and
     MIME bounds as `_walk_body_and_attachments`.
 
-    Codex S15 P2: stricter than `_is_attachment_part` -- a part that carries
+    stricter than `_is_attachment_part` -- a part that carries
     a filename is a file even when it says `Content-Disposition: inline`
     (e.g. an attached "old-rejection.html"), so it is never read as the
     employer's message. Only unnamed text/html parts count as the body."""
@@ -462,7 +462,7 @@ def _extract_html_text(msg: Message) -> str:
 
 
 def _direction(*, trusted_outbound: bool) -> Direction:
-    """S7E-001 (Codex remediation, HIGH): direction is decided ENTIRELY by
+    """direction is decided ENTIRELY by
     which mailbox this message was fetched from — never by inspecting the
     message's own `From` header. A `From` header claiming to be our own
     account address is trivially forgeable by anyone able to send us mail
@@ -510,13 +510,13 @@ class GmailImapProvider:
         self.app_password = app_password
         self.mailbox = mailbox
         self.lookback_days = lookback_days
-        # S7E-001: True only for a provider instance explicitly constructed
+        # True only for a provider instance explicitly constructed
         # to sync the account's real Sent-mail folder — see `_direction`'s
         # docstring. Every message this instance parses is classified
         # OUTBOUND/INBOUND purely from this flag, never from message
         # content.
         self.trusted_outbound = trusted_outbound
-        # GMAIL-002: the stable, non-secret account identity every
+        # the stable, non-secret account identity every
         # ParsedGmailMessage from this provider is scoped by.
         self.account_key = normalize_account_key(username)
         # Injected only by tests, to avoid a real IMAP connection —
@@ -550,7 +550,7 @@ class GmailImapProvider:
     def _fetch_sync(self, since: datetime) -> GmailFetchResult:
         client = self._injected_client
         owns_connection = client is None
-        # AUD-005: a real total wall-clock deadline for this whole session
+        # a real total wall-clock deadline for this whole session
         # (login through select/search/fetch/close/logout), not just the
         # per-read inactivity timeout `timeout=` already gives the socket
         # -- see imap_deadline.py's module docstring for why a slow-drip
@@ -602,7 +602,7 @@ class GmailImapProvider:
             raise GmailConnectionError("IMAP UID SEARCH failed")
 
         tokens = data[0].split() if data and data[0] else []
-        # UID32-001: parse every SEARCH token HERE, before the known-UID
+        # parse every SEARCH token HERE, before the known-UID
         # lookup, the cap and any FETCH, so an invalid token (see
         # `_parse_imap_uid`) can never take a valid message's place in
         # the per-sync cap. Each one is counted as skipped (the same
@@ -626,7 +626,7 @@ class GmailImapProvider:
         known_uids = self._get_known_uids(uid_validity, uids) if uids else set()
         uids = [uid for uid in uids if uid not in known_uids]
 
-        # GMAIL-005: bound how many message bodies one sync run will
+        # bound how many message bodies one sync run will
         # fetch at all. The OLDEST UIDs (Gmail UIDs are monotonically
         # increasing within a mailbox) are prioritized, not the
         # newest — deliberately, to avoid a starvation failure mode:
@@ -654,7 +654,7 @@ class GmailImapProvider:
             logger.warning("gmail_sync_message_cap_exceeded cap=%s", MAX_MESSAGES_PER_SYNC)
 
         messages: list[ParsedGmailMessage] = []
-        # FINAL-004 (Astra R5A): (uid, reason) pairs for every UID this
+        # (uid, reason) pairs for every UID this
         # run determined is PERMANENTLY unfetchable (message content
         # itself is the problem) -- see GmailFetchResult.permanently_skipped
         # and app.db.models.GmailPermanentSkipRecord for how the caller
@@ -664,7 +664,7 @@ class GmailImapProvider:
         permanently_skipped: list[tuple[int, str]] = []
         for uid in uids:
             uid_bytes = str(uid).encode("ascii")
-            # AUD-005: once the total session deadline has fired, the
+            # once the total session deadline has fired, the
             # connection's socket is already forcibly closed (see
             # ImapSessionDeadline) -- stop issuing further FETCHes on it
             # instead of letting each remaining UID fail one at a time.
@@ -673,7 +673,7 @@ class GmailImapProvider:
             try:
                 parsed, permanent_skip_reason = self._fetch_one(client, uid_bytes, uid_validity)
             except OSError:
-                # Codex gate follow-up (Astra R4A MEDIUM): a transport
+                # a transport
                 # -level failure mid-FETCH (the between-iterations
                 # `.exceeded` check above cannot catch this -- the
                 # watchdog can force-close the socket WHILE a FETCH is
@@ -697,7 +697,7 @@ class GmailImapProvider:
             else:
                 messages.append(parsed)
 
-        # NEW-001 (Astra R4A): a prior version of this method RAISED
+        # a prior version of this method RAISED
         # GmailConnectionError here, discarding `messages` entirely --
         # every message that had already completed fetch+parse before the
         # deadline fired was silently lost, never persisted, with no
@@ -732,14 +732,14 @@ class GmailImapProvider:
         value = _parse_status_uid_validity(data)
         if value is None:
             raise GmailConnectionError("Could not determine mailbox UIDVALIDITY")
-        # GMAIL-009: UIDVALIDITY 0 is a reserved/invalid value per
+        # UIDVALIDITY 0 is a reserved/invalid value per
         # RFC 3501 — never trust it as a real mailbox generation.
         if value <= 0:
             raise GmailConnectionError("IMAP reported an invalid UIDVALIDITY")
         return value
 
     def _read_message_size(self, client: ImapClient, uid_bytes: bytes) -> int | None:
-        """GMAIL-005: a lightweight `RFC822.SIZE` FETCH, used to decide
+        """a lightweight `RFC822.SIZE` FETCH, used to decide
         whether the full body is even worth fetching — never itself
         transfers the message body.
 
@@ -774,7 +774,7 @@ class GmailImapProvider:
 
     def _connect(self, deadline: ImapSessionDeadline | None = None) -> imaplib.IMAP4_SSL:
         try:
-            # AUD-001: imaplib.IMAP4_SSL's default ssl_context (when None)
+            # imaplib.IMAP4_SSL's default ssl_context (when None)
             # is built via ssl._create_stdlib_context(), which -- unlike
             # ssl.create_default_context() -- sets verify_mode=CERT_NONE
             # and check_hostname=False. Without an explicit verifying
@@ -811,7 +811,7 @@ class GmailImapProvider:
                     timeout=IMAP_OPERATION_TIMEOUT_SECONDS,
                 )
         except (OSError, imaplib.IMAP4.error) as exc:
-            # GMAIL-003 (Codex final review, MEDIUM): constructor-time
+            # constructor-time
             # protocol failures -- imaplib.IMAP4.error/abort, e.g. a
             # malformed/aborted greeting or CAPABILITY response, or the
             # deadline forcing the socket closed mid-read -- can carry
@@ -848,7 +848,7 @@ class GmailImapProvider:
     ) -> tuple[ParsedGmailMessage | None, str | None]:
         """Returns `(parsed, permanent_skip_reason)`.
 
-        `permanent_skip_reason` is non-None (FINAL-004, Astra R5A) ONLY
+        `permanent_skip_reason` is non-None ONLY
         for a narrow set of cases that are a pure, deterministic
         function of this message's own immutable CONTENT: an oversized
         raw size, or `email.message_from_bytes`
@@ -885,7 +885,7 @@ class GmailImapProvider:
             logger.warning("gmail_message_invalid_uid")
             return None, None
 
-        # GMAIL-005: check the server-reported size BEFORE transferring
+        # check the server-reported size BEFORE transferring
         # the body at all. An unknown size (None) proceeds rather than
         # failing closed — see _read_message_size's docstring.
         size = self._read_message_size(client, uid_bytes)
@@ -894,17 +894,17 @@ class GmailImapProvider:
             return None, PERMANENT_SKIP_REASON_OVERSIZED
 
         try:
-            # GMAIL-001: BODY.PEEK[] fetches the full message without
+            # BODY.PEEK[] fetches the full message without
             # setting \Seen — a bare RFC822/BODY[] fetch would mutate the
             # mailbox as a side effect of this "read". INTERNALDATE is
-            # requested in the SAME fetch (S7E-011, Codex re-review): it
+            # requested in the SAME fetch: it
             # costs nothing extra over BODY.PEEK[] (one round trip either
             # way) and is the server-assigned arrival timestamp this
             # project's Gmail correspondence chronology now trusts — see
             # `_parse_internal_date` and ParsedGmailMessage.provider_arrival_at.
             typ, msg_data = client.uid("fetch", uid_bytes, "(INTERNALDATE BODY.PEEK[])")
         except OSError:
-            # Codex gate follow-up (Astra R4A MEDIUM): a genuine
+            # a genuine
             # transport/protocol failure mid-FETCH (including the total
             # session deadline's watchdog force-closing the socket
             # WHILE this call is blocked in flight) must NEVER be
@@ -926,7 +926,7 @@ class GmailImapProvider:
             logger.warning("gmail_message_fetch_failed")
             return None, None
 
-        # GMAIL-010: everything from here — including validating the
+        # everything from here — including validating the
         # shape of `msg_data[0]` itself — stays inside this single
         # per-message try/except, so a malformed/unexpected FETCH response
         # shape can never propagate out of _fetch_one and abort the rest
@@ -977,7 +977,7 @@ class GmailImapProvider:
             )
             return parsed, None
         except Exception as exc:
-            # GMAIL-010: everything above (validating msg_data[0]'s
+            # everything above (validating msg_data[0]'s
             # shape, and OUR OWN _parse_message extraction logic) stays
             # inside this single per-message try/except, so a malformed/
             # unexpected FETCH response shape or an internal bug in our

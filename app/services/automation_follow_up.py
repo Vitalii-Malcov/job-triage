@@ -142,7 +142,7 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
             db, account_key, expected_cursor=cursor, new_cursor=job.id
         )
         if not advanced:
-            # S8D-PROGRESS-002 (Codex review): a newer owner already
+            # a newer owner already
             # moved this account's progress -- this job's own evaluation
             # genuinely succeeded, but that success could not be safely
             # recorded as this account's current position. Fail closed,
@@ -177,7 +177,7 @@ async def prepare_follow_up_proposals(db: Session, *, account_key: str, settings
             if wrapped:
                 cursor_wrapped = 1
             else:
-                # S8D-PROGRESS-002 (Codex review): the wrap-to-NULL CAS
+                # the wrap-to-NULL CAS
                 # itself was lost to a newer owner -- cursor_wrapped must
                 # stay 0 (it did NOT happen) and this must never be
                 # reported as "ok".

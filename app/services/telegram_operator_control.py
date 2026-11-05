@@ -32,7 +32,7 @@ CONFLICT_REQUIRES_OVERRIDE, and only `override_decision` (operator CLI,
 mandatory reason) records a superseding decision. Concurrent presses are
 serialized by UNIQUE(idempotency_key).
 
-**Approval vs. concurrent review changes (Codex S16 P1).** An APPROVE never
+**Approval vs. concurrent review changes.** An APPROVE never
 trusts the readiness read by `load_target`: inside the approval
 transaction -- after the decision row is flushed, before the lifecycle
 write commits -- `_approve_review_locked` re-reads the review row with

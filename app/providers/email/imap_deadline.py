@@ -1,4 +1,4 @@
-"""AUD-005: a REAL total wall-clock deadline for one IMAP session.
+"""a REAL total wall-clock deadline for one IMAP session.
 
 Both `app.providers.email.imap.GmailImapProvider` and
 `app.collectors.xing_email.XingEmailCollector` already set a `timeout=` on
@@ -136,7 +136,7 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-# FINAL-003 (Astra R5A): "spawn" is used explicitly rather than relying
+# "spawn" is used explicitly rather than relying
 # on the platform default -- this module's DNS-resolution call always
 # runs from inside a worker thread (see app.collectors.xing_email
 # .fetch_message_batches's asyncio.to_thread / app.providers.email.imap
@@ -189,7 +189,7 @@ class HasClose(Protocol):
     def close(self) -> None: ...
 
 
-# AUD-005: total wall-clock budget for one IMAP session (LOGIN through
+# total wall-clock budget for one IMAP session (LOGIN through
 # LOGOUT) once the connection is established. Generous enough for a normal
 # sync (GmailImapProvider caps one run at MAX_MESSAGES_PER_SYNC=500
 # individually fetched messages) while still giving a slow-drip peer a
@@ -246,7 +246,7 @@ class ImapSessionDeadline:
         self._extra_closable: HasClose | None = None
         self._fired = threading.Event()
         self._timer: threading.Timer | None = None
-        # FINAL-003: set in __enter__, read by resolve_addrinfo_bounded's
+        # set in __enter__, read by resolve_addrinfo_bounded's
         # own remaining-time wait -- the SAME reference point self._timer
         # uses, so the pre-socket DNS/connect phase never gets a budget
         # larger than the total session deadline.
@@ -446,7 +446,7 @@ class ImapSessionDeadline:
         )
 
     def _force_close(self, sock: socket.socket, extra_closable: HasClose | None) -> None:
-        # Codex final review: closing `extra_closable` (a
+        # closing `extra_closable` (a
         # socket.makefile()-derived buffered reader) FIRST -- the
         # previous version of this fix -- is itself unsafe: CPython's
         # buffered I/O objects (`io.BufferedReader`, what `self.file`/
@@ -704,7 +704,7 @@ class DeadlineIMAP4SSL(imaplib.IMAP4_SSL):
         self, host: str = "", port: int = imaplib.IMAP4_SSL_PORT, timeout: float | None = None
     ) -> None:
         super().open(host, port, timeout)
-        # AUD-005 (Codex final review, HIGH): self.sock is already bound
+        # self.sock is already bound
         # (via _create_socket above), but the makefile()-backed reader
         # IMAP4.open() just created (self.file on CPython <=3.13,
         # self._file on 3.14+ -- get_imap_makefile_reader handles the

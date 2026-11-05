@@ -130,7 +130,7 @@ GENERIC_TITLE_TOKEN_MAX_TOKENS = 3
 MATCH_CONFIDENCE_HIGH_THRESHOLD = 70
 MATCH_CONFIDENCE_MEDIUM_THRESHOLD = 30
 
-# Ambiguity margin (Codex review): exact-tie-only ambiguity detection let
+# Ambiguity margin: exact-tie-only ambiguity detection let
 # a single noisy token (e.g. one extra generic word) manufacture a false
 # winner between two near-equal composite candidates (41 vs 40, 41 vs
 # 39). Candidates within this many points of the top COMPOSITE score are
@@ -214,7 +214,7 @@ _LEGAL_SUFFIX_PATTERN = re.compile(
 )
 _WORD_PATTERN = re.compile(r"[a-zA-ZäöüÄÖÜß0-9+#.]+")
 
-# Round 3 (Blocker R3-004): a Codex review reproduced "No reference"
+# Round 3: a Codex review reproduced "No reference"
 # extracting a false token "ERENCE" — the bare "ref" alternative (meant to
 # catch short forms like "Ref: ABC123") matched the "ref" PREFIX of the
 # ordinary English word "reference", and the old trailing `[:\s#]*` (ZERO
@@ -287,7 +287,7 @@ class JobCandidate:
     location: str
     url: str
     status: str
-    # Stage 22 P0-1: the stored full source reference (BA `referenznummer`),
+    # the stored full source reference (BA `referenznummer`),
     # compared with references quoted in the e-mail; see
     # `_resolve_by_explicit_reference`.
     source_reference: str | None = None
@@ -706,7 +706,7 @@ def match_email_to_job(
     email_text = f"{subject}\n{body_plain}"
     normalized_email_text = normalize_company_name(email_text)
     email_tokens = _title_tokens(email_text)
-    # Stage 22 P0-1: full BA references quoted in the mail (strict shape, see
+    # full BA references quoted in the mail (strict shape, see
     # app.collectors.ba_reference), matched against stored job references.
     # Same precedence and ambiguity rules as every other explicit reference.
     email_reference_tokens = extract_reference_tokens(email_text) | {

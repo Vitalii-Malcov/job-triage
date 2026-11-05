@@ -70,7 +70,7 @@ _TECHNICAL_INVITATION = re.compile(
     r"technical\s+interview\s+invitation",
     re.IGNORECASE,
 )
-# Codex S15 P2: a negated marker ("This is not a technical interview", "Es
+# a negated marker ("This is not a technical interview", "Es
 # handelt sich nicht um ein technisches Gespräch", "kein Fachgespräch") must
 # not upgrade an interview. Negation is clause-scoped: only the text between
 # the last clause boundary and the marker is inspected.

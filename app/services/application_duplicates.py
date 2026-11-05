@@ -50,7 +50,7 @@ Company identity for these checks folds what the shared
 keys): umlaut transliteration, "e.G."/"eG" and dotted abbreviations
 ("N.O.C" = "NOC"). A branch suffix ("... Standort Frankfurt") is NOT
 folded: "Example Standort Berlin GmbH" and "Example GmbH" may be different
-employers, and SAME_EMPLOYER_AND_ROLE blocks (Codex night-audit review).
+employers, and SAME_EMPLOYER_AND_ROLE blocks.
 
 `classify_duplicate` grades the findings for the operator:
 EXACT_DUPLICATE (job row, reference, URL or fingerprint identical),
@@ -114,7 +114,7 @@ class VacancyView:
     fingerprint: str | None = None
     location: str | None = None
     description: str | None = None
-    # Stage 22 P0-1: the job row's stored full reference; preferred over the
+    # the job row's stored full reference; preferred over the
     # one derivable from a BA URL (absent for an external employer URL).
     source_reference: str | None = None
 
@@ -170,7 +170,7 @@ def normalize_posting_url(url: str | None) -> str | None:
 
 def bundesagentur_reference(url: str | None) -> str | None:
     """Case-folded full BA reference of a public BA job URL, else None.
-    Stage 22 P0-1: the whole reference, also with "_", "." or "/" (the old
+    the whole reference, also with "_", "." or "/" (the old
     path-segment regex cut "13319-896770/1_626382LS-S" at the "/")."""
     reference = ba_reference_from_url(url)
     return reference.casefold() if reference else None

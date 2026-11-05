@@ -42,7 +42,7 @@ this module writes carries `requires_human_review=True` unconditionally
 (see that model's docstring) — Stage 7C only ever proposes; Stage 7D
 (not yet built) owns human approval and any eventual send action.
 
-**Round 2 (Codex MEDIUM remediation).**
+**Round 2.**
 
 - **Job trust laundering.** A `JobRecord` is not automatically "trusted
   stored fact" just because it is persisted — `app.collectors.xing_email`

@@ -33,7 +33,7 @@ class Job(BaseModel):
     # re-score that omits this field can reuse the stored value instead
     # of losing the classification — see
     # app.services.collector_runner.score_and_persist's own docstring.
-    # S10-003: max_length matches JobRecord.posting_type's VARCHAR(64).
+    # max_length matches JobRecord.posting_type's VARCHAR(64).
     posting_type: str | None = Field(default=None, max_length=64)
     # Stage 22 P1: structured facts the source states (BA search result). All
     # optional; persisted on JobRecord and refreshed by every observation that
@@ -49,7 +49,7 @@ class Job(BaseModel):
     home_office_percent: int | None = Field(default=None, ge=0, le=100)
     quereinstieg_suitable: bool | None = None
 
-    # S10-RR-001 (Codex Stage 10 re-review, BLOCKING): normalizes BEFORE
+    # normalizes BEFORE
     # the max_length constraint above is checked (mode="before" runs
     # ahead of Pydantic's own built-in string validation) -- "" and
     # whitespace-only are collapsed to None, and surrounding whitespace on

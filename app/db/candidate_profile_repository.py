@@ -76,7 +76,7 @@ class CandidateProfileConsistencyError(Exception):
 
 
 class CandidateProfileVersionConflictError(Exception):
-    """Raised by apply_candidate_profile_patch (CP-M-03) when the caller's
+    """Raised by apply_candidate_profile_patch when the caller's
     `expected_profile_version` no longer matches the current
     `profile_version` — either a concurrent PATCH already committed first,
     or the caller never read a fresh GET before patching.
@@ -186,7 +186,7 @@ def get_candidate_profile(
 
 
 def get_candidate_skills_for_scoring(db: Session) -> frozenset[str]:
-    """CSP-001: the single, canonical runtime source of candidate skills
+    """the single, canonical runtime source of candidate skills
     for `app.agents.job_scorer.JobScorer` — a pure, read-only projection of
     the singleton CandidateProfile's trusted skill names.
 
@@ -464,7 +464,7 @@ def apply_candidate_profile_patch(
     `cascade="all, delete-orphan"` to delete the old rows); a present
     `job_preferences` replaces the preferences object wholesale.
 
-    **CP-M-03: optimistic concurrency via an atomic compare-and-swap.**
+    **optimistic concurrency via an atomic compare-and-swap.**
     `patch.expected_profile_version` must match the row's current
     `profile_version` — enforced with a single `UPDATE ... WHERE id=1 AND
     profile_version=:expected` statement executed *before* any child-
@@ -480,7 +480,7 @@ def apply_candidate_profile_patch(
     transaction, restoring both the version and every child row to exactly
     what they were before this call (see the explicit try/except below).
 
-    **CP-M-02: top-level field provenance.** For every
+    **top-level field provenance.** For every
     TOP_LEVEL_TRUST_FIELDS name present in this PATCH, its `field_trust`
     entry is set to the caller's explicit `patch.field_trust[name]` if
     given, else defaults to MANUAL_ENTRY/CONFIRMED (a direct authenticated

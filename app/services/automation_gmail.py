@@ -134,7 +134,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         mismatch = GmailAccountMismatchError(
             "automation account_key does not match normalize_account_key(settings.gmail_username)"
         )
-        # S8D-PRIVACY-001: account_key IS the Gmail address -- never logged.
+        # account_key IS the Gmail address -- never logged.
         logger.warning("automation_gmail_sync_account_mismatch")
         return {"status": "failed", "counters": None, "error_type": type(mismatch).__name__}
 
@@ -182,7 +182,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
         "deadline_exceeded": deadline_exceeded,
     }
 
-    # S8D-SYNC-001/002 (Codex review): honest ok/partial/failed derivation --
+    # honest ok/partial/failed derivation --
     # a mailbox-level exception on ONE side is "partial" even if the
     # other mailbox had zero per-message failures; BOTH raising is
     # "failed". With NEITHER raising, any per-message
@@ -207,7 +207,7 @@ async def prepare_gmail_sync(db: Session, *, account_key: str, settings) -> dict
     elif counters["failed"] > 0:
         status = "partial"
     elif deadline_exceeded:
-        # NEW-001 (Astra R4A): the IMAP session's total wall-clock
+        # the IMAP session's total wall-clock
         # deadline fired before every candidate message could be fetched
         # -- whatever WAS fetched persisted cleanly (failed == 0 here by
         # construction), but more work is still pending for this account.
@@ -290,7 +290,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
             )
             break  # at-least-once retry (spec section 9): stop, never skip ahead
 
-        # S8D-AUDIT-001 (Codex review): increment immediately after a
+        # increment immediately after a
         # successful analysis, BEFORE attempting response-draft
         # generation -- so a later draft failure still leaves these
         # counters truthfully reflecting the already-committed analysis
@@ -300,7 +300,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
         else:
             analyzed_reused += 1
 
-        # S8D-OUTBOUND-001 (Codex review): the user's own Sent message
+        # the user's own Sent message
         # must still be analyzed (it carries real thread/job/follow-up
         # context -- see app.services.follow_up's anchor-message
         # dependency), but must NEVER get a response draft: that would
@@ -356,7 +356,7 @@ async def prepare_gmail_response_drafts(db: Session, *, account_key: str, settin
 
         advanced = mark_message_automation_processed(db, message.id)
         if not advanced:
-            # AUD-004/S8D-PROGRESS-001: a concurrent processor already
+            # a concurrent processor already
             # marked THIS message processed -- the message's own
             # pipeline genuinely succeeded (analysis, and draft-or
             # -outbound-skip), but that success could not be safely

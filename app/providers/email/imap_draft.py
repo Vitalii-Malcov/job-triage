@@ -136,7 +136,7 @@ def validate_drafts_mailbox_name(name: str) -> None:
 def encode_mailbox_wire(name: str) -> str:
     """The exact quoted modified-UTF-7 wire form of the configured decoded
     name, or `MailboxNameError`. Bound-checked against
-    `MAX_DRAFTS_MAILBOX_WIRE_LENGTH` (S9D-CONF-001) -- never truncated --
+    `MAX_DRAFTS_MAILBOX_WIRE_LENGTH` -- never truncated --
     and round-trip verified."""
     validate_drafts_mailbox_name(name)
     try:
