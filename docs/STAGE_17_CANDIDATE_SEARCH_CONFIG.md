@@ -161,3 +161,7 @@ sent (SUBMITTED or later) refuses the draft (`AlreadyAppliedError`, HTTP 409).
 Applications still being prepared are not refused.
 
 Nothing in Stage 17 sends mail, contacts an employer or submits anything.
+
+## Target-role policy vs the stored configuration (review, Architecture 3)
+
+The deployment has ONE written target profession (`app/agents/target_role.py::TARGET_PROFESSION`, software development). IT-support / helpdesk / administration titles are ranked off-role and their keywords are not searched (Stage 24), even if the stored configuration still names such a role or keyword. The stored values are the operator's data and are **never rewritten** by this policy. Instead the disagreement is reported: `scripts/stage17_candidate_config.py show` and `apply` (dry run too) print one `POLICY_CONFLICT <field>: <value> ...` line per ignored stored role/keyword, and the collector logs `search_terms_excluded_by_target_policy dropped=N kept=M` when it drops stored keywords. To make such a role count again the policy itself must be changed in code; editing the stored role has no effect on the exclusion.

@@ -19,8 +19,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 07 | 2.3 collector concurrency | ACCEPTED — task d74a1de, merge 349108d |
 | 08 | 2.4 event-loop blocking | ACCEPTED — task 5e7aa2d, merge c54164d |
 | 09 | Arch §3 repository transactions | ACCEPTED — task 6e4c0a7, merge 9604cb6 |
-| 10 | Arch §3 large modules | ACCEPTED (see below; SHAs in git log) |
-| 11–19 | see task list | PENDING |
+| 10 | Arch §3 large modules | ACCEPTED — task 21a1eea, merge 047f88f |
+| 11 | Arch §3 target roles vs stored config | ACCEPTED (see below; SHAs in git log) |
+| 12–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -145,3 +146,13 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Full pytest: 7420 passed, 148 skipped, 2 failed — one wrong route-count constant of mine (fixed), one wall-clock timing test (`test_follow_up_send_service::TestLeaseRenewalHeartbeat`) that passes in isolation and in 3 reruns (flaky under full-suite load, not touched by this change). Ruff clean.
 - Residual: docs/comments still mention `app/db/models.py` / `app/api/routes.py` as historical paths (TASK 18); CLAUDE.md/AGENTS.md mention `app/db/models.py` (not edited here — CLAUDE.md has uncommitted operator changes).
 - Codex: 2 code rounds: R1 CHANGES_REQUESTED (stale source-closure test), R2 `VERDICT: ACCEPT`.
+
+## TASK 11 — Candidate target roles (Architecture §3)
+
+- Finding re-assessed: `app/agents/target_role.py` hard-codes the software-development target / IT-support-admin exclusion while Stage 17 stores a candidate search configuration. The code is a *deliberate Stage 24 product decision* (a stale stored "Application Support" must not revive such titles — enforced by tests), so letting stored roles override it would reverse that decision, and a persisted policy field would need a schema change. The contradiction was that it was **silent**.
+- Change (behaviour unchanged, stored settings never touched): the policy is now explicit (`TARGET_PROFESSION`, documented precedence); pure `configured_role_conflicts(primary, secondary, keywords)` reports every stored role (each "/"-alternative separately, as ranking does) and keyword (whole, as searched) the policy ignores, with source-specific wording; `scripts/stage17_candidate_config.py show` and `apply` (dry run too, on the *effective* configuration = stored settings overlaid with the stated fields; also for partial/no-`search` files) print `POLICY_CONFLICT ...` lines; `search_strategy` logs `search_terms_excluded_by_target_policy dropped=N kept=M` (counts only). Documented in `docs/STAGE_17_CANDIDATE_SEARCH_CONFIG.md`.
+- Verified: developer and hybrid titles (`Software Developer Support Tools`, `IT-Administrator / Softwareentwickler`, ...) are kept; `Python Systemadministrator`, `Fachinformatiker Systemintegration`, helpdesk/level-support titles are OFF_ROLE.
+- Residual (pre-existing classifier limits, not changed): titles where the developer word names the *audience* (`IT-Support für Softwareentwickler`, `Helpdesk für Softwareentwickler`) are kept; `TARGET_PROFESSION` is descriptive, not a runtime switch — changing the target needs a code change (or a future persisted policy field + migration).
+- Tests: +9 in `tests/test_stage24_target_role.py`, +2 CLI tests in `tests/test_stage17_candidate_config.py`.
+- Full pytest: 7432 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: 3 code rounds (R1 CHANGES_REQUESTED x2 P2 + P3: role alternatives, partial files, wording; R2 `BLOCKED` only for missing full-suite evidence; R3 ACCEPT).

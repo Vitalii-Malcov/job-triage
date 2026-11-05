@@ -10,8 +10,19 @@ never flagged. Nothing here reads or writes the database.
 """
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from app.agents.role_relevance_classifier import classify_title_relevance
+
+# Review (Architecture 3, "built for one person"): the target profession is a POLICY of
+# this deployment, written down here once instead of being implied by regexes. The
+# candidate's stored configuration (Stage 17: roles, search keywords) is the user's data
+# and is never rewritten by it; where the two disagree the policy wins at search/ranking
+# time (a stale stored "Application Support" cannot revive such titles -- Stage 24) and
+# the disagreement is REPORTED (`configured_role_conflicts`, shown by
+# `scripts/stage17_candidate_config.py show|apply` and logged when keywords are dropped).
+TARGET_PROFESSION = "software development"
 
 _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE))
@@ -92,3 +103,51 @@ def is_support_admin_term(term: str) -> bool:
     """For configured search keywords: a search term that only finds support
     or administration vacancies ("Application Support", "Systemintegrator")."""
     return support_admin_family(term) is not None
+
+
+@dataclass(frozen=True)
+class RoleConflict:
+    """One stored role/keyword (or one "/"-alternative of a role) the policy ignores."""
+
+    source: str  # "primary_roles" | "secondary_roles" | "search_keywords"
+    value: str  # the conflicting text (for a role: the alternative)
+    family: str
+    role: str | None = None  # the whole stored role when `value` is one alternative of it
+
+    def describe(self) -> str:
+        if self.source == "search_keywords":
+            effect = f"excluded from the search queries ({TARGET_PROFESSION} target policy)"
+        else:
+            effect = (
+                f"titles of this family are ranked off-role whatever this configured priority "
+                f"says ({TARGET_PROFESSION} target policy)"
+            )
+        shown = f"{self.value!r}" + (f" (in {self.role!r})" if self.role else "")
+        return f"{self.source}: {shown} is a {self.family} role -- {effect}"
+
+
+def configured_role_conflicts(
+    primary_roles: Iterable[str] = (),
+    secondary_roles: Iterable[str] = (),
+    search_keywords: Iterable[str] = (),
+) -> list[RoleConflict]:
+    """Stored roles / keywords that the policy excludes, in configuration order.
+    A role's "/"-separated alternatives are checked one by one (ranking does the same);
+    a keyword is checked as a whole (it is searched as one term). Pure: reads nothing,
+    writes nothing, never changes the stored settings."""
+    conflicts: list[RoleConflict] = []
+    for source, values in (("primary_roles", primary_roles), ("secondary_roles", secondary_roles)):
+        for role in values:
+            for alternative in (part.strip() for part in role.split("/")):
+                family = support_admin_family(alternative) if alternative else None
+                if family is not None:
+                    conflicts.append(
+                        RoleConflict(
+                            source, alternative, family, role=None if alternative == role else role
+                        )
+                    )
+    for keyword in search_keywords:
+        family = support_admin_family(keyword)
+        if family is not None:
+            conflicts.append(RoleConflict("search_keywords", keyword, family))
+    return conflicts

@@ -225,3 +225,102 @@ def test_testautomatisierer_role_noun_is_kept():
 )
 def test_software_architects_are_kept(title):
     assert support_admin_family(title) is None
+
+
+# --- review: the policy vs the stored configuration is reported, never rewritten ------
+
+
+class TestPolicyConflictsAreReportedNotRewritten:
+    def test_conflicts_name_every_ignored_stored_entry_in_order(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        conflicts = configured_role_conflicts(
+            primary_roles=["Junior Python Developer", "Systemintegrator"],
+            secondary_roles=["Technical Application Support"],
+            search_keywords=["Python", "Helpdesk", "Systemadministrator"],
+        )
+        assert [(c.source, c.value) for c in conflicts] == [
+            ("primary_roles", "Systemintegrator"),
+            ("secondary_roles", "Technical Application Support"),
+            ("search_keywords", "Helpdesk"),
+            ("search_keywords", "Systemadministrator"),
+        ]
+        assert all("software development" in c.describe() for c in conflicts)
+
+    def test_developer_roles_and_hybrids_are_no_conflict(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        assert (
+            configured_role_conflicts(
+                ["Python Backend Developer", "Software Developer Support Tools"],
+                [],
+                ["Python", "Backend", "IT-Administrator / Softwareentwickler"],
+            )
+            == []
+        )
+
+    def test_the_report_never_mutates_the_inputs(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        primary, keywords = ["Helpdesk Mitarbeiter"], ["Application Support"]
+        configured_role_conflicts(primary, [], keywords)
+        assert primary == ["Helpdesk Mitarbeiter"] and keywords == ["Application Support"]
+
+    def test_a_stale_stored_support_role_still_cannot_revive_such_a_title(self):
+        # unchanged Stage 24 contract: the policy wins at ranking time
+        settings = CandidateSearchSettings(
+            primary_roles=["Application Support"], secondary_roles=["Helpdesk"]
+        )
+        assert role_criterion("Application Support Analyst (m/w/d)", settings).status == "OFF_ROLE"
+
+    def test_dropped_keywords_are_logged_by_count_only(self, caplog):
+        search = CandidateSearchSettings(
+            primary_roles=["Python Developer"], search_keywords=["Python", "Helpdesk"]
+        )
+        with caplog.at_level("INFO", logger="app.services.search_strategy"):
+            queries = bundesagentur_queries(_settings_for_queries(), search)
+        assert queries
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("search_terms_excluded_by_target_policy dropped=1 kept=1" in m for m in messages)
+        assert not any("Helpdesk" in m for m in messages)
+
+
+def _settings_for_queries():
+    from app.core.config import Settings
+
+    return Settings(_env_file=None, bundesagentur_search_keywords="Python")
+
+
+class TestRoleAlternativesAndWording:
+    def test_each_slash_alternative_of_a_role_is_checked(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        conflicts = configured_role_conflicts(
+            primary_roles=["Application Support / Python Developer", "Python Developer"],
+        )
+        assert [(c.source, c.value, c.role) for c in conflicts] == [
+            ("primary_roles", "Application Support", "Application Support / Python Developer")
+        ]
+        assert "(in 'Application Support / Python Developer')" in conflicts[0].describe()
+
+    def test_a_hybrid_keyword_is_judged_whole_a_hybrid_role_per_alternative(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        # a keyword is searched as ONE term: the developer word keeps the hybrid
+        assert (
+            configured_role_conflicts(search_keywords=["IT-Administrator / Softwareentwickler"])
+            == []
+        )
+        # a role's alternatives match titles separately: "IT-Administrator" alone is off-role
+        [conflict] = configured_role_conflicts(
+            secondary_roles=["IT-Administrator / Softwareentwickler"]
+        )
+        assert conflict.value == "IT-Administrator"
+
+    def test_wording_is_source_specific(self):
+        from app.agents.target_role import configured_role_conflicts
+
+        [role] = configured_role_conflicts(primary_roles=["Helpdesk"])
+        [keyword] = configured_role_conflicts(search_keywords=["Helpdesk"])
+        assert "ranked off-role" in role.describe()
+        assert "excluded from the search queries" in keyword.describe()
