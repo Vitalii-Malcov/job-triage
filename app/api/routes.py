@@ -207,6 +207,11 @@ from app.services.candidate_preparation import (
 from app.services.candidate_preparation import (
     prepare_candidate_job_match as _run_candidate_job_match,
 )
+from app.services.collector_exclusion import (
+    CollectorRunInProgressError,
+    CollectorRunLeaseLostError,
+    run_collector_exclusively,
+)
 from app.services.collector_runner import (
     CollectorError,
     CollectorNotConfiguredError,
@@ -1194,7 +1199,17 @@ async def run_bundesagentur_collector(db: Session = Depends(get_db)) -> dict[str
     """
     settings = get_settings()
     try:
-        return await run_bundesagentur(db, settings)
+        return await run_collector_exclusively(db, settings, "bundesagentur", run_bundesagentur)
+    except CollectorRunInProgressError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="A collector or automation run is already in progress",
+        ) from exc
+    except CollectorRunLeaseLostError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="The run lost its exclusivity lease and was not recorded as complete",
+        ) from exc
     except CollectorNotConfiguredError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
@@ -1237,7 +1252,17 @@ async def run_xing_collector(db: Session = Depends(get_db)) -> dict[str, int]:
     """
     settings = get_settings()
     try:
-        return await run_xing(db, settings)
+        return await run_collector_exclusively(db, settings, "xing", run_xing)
+    except CollectorRunInProgressError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="A collector or automation run is already in progress",
+        ) from exc
+    except CollectorRunLeaseLostError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="The run lost its exclusivity lease and was not recorded as complete",
+        ) from exc
     except CollectorNotConfiguredError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)

@@ -56,6 +56,11 @@ from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
 from app.providers.base import ProviderNotConfiguredError
 from app.services import gmail_application_draft as gmail_draft
+from app.services.collector_exclusion import (
+    CollectorRunInProgressError,
+    CollectorRunLeaseLostError,
+    run_collector_exclusively,
+)
 from app.services.collector_runner import (
     run_bundesagentur,
     run_company_research_for_job,
@@ -414,12 +419,21 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = SessionLocal()
     try:
         try:
-            if collector_name == "bundesagentur":
-                stats = await run_bundesagentur(db, settings)
-            else:
-                stats = await run_xing(db, settings)
+            runner = run_bundesagentur if collector_name == "bundesagentur" else run_xing
+            stats = await run_collector_exclusively(db, settings, collector_name, runner)
         except CollectorNotConfiguredError as exc:
             await update.message.reply_text(str(exc))
+            return
+        except CollectorRunInProgressError:
+            await update.message.reply_text(
+                f"{collector_name}: a collector or automation run is already in progress."
+            )
+            return
+        except CollectorRunLeaseLostError:
+            await update.message.reply_text(
+                f"{collector_name}: the run lost its exclusivity lease and was not recorded "
+                "as complete; check the data before running again."
+            )
             return
         except CollectorError as exc:
             await update.message.reply_text(f"{collector_name} collector run failed: {exc}")

@@ -486,6 +486,9 @@ class _RunLeaseHeartbeat:
         self._stop_event.set()
         self._thread.join(timeout=self._interval_seconds + 1.0)
 
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
 
 def _raise_if_lease_lost(heartbeat: _RunLeaseHeartbeat, run_id: int, account_key: str) -> None:
     """NEW-004 (Astra R4A): the fail-closed gate `run_automation_cycle`

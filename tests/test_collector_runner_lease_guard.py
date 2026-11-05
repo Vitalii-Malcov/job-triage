@@ -289,7 +289,7 @@ class TestBundesagenturLeaseGuard:
 
 
 class TestXingLeaseGuard:
-    async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None):
+    async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None, uid_validity=None):
         CountingResearchService.calls = []
         CountingNotifier.calls = []
 
@@ -304,8 +304,9 @@ class TestXingLeaseGuard:
                 # is a legitimate value (mirrors a fake/injected client
                 # that never determined a real UIDVALIDITY) and simply
                 # makes run_xing skip the watermark-advance step.
-                self.uid_validity: int | None = None
+                self.uid_validity: int | None = uid_validity
                 self.confirmed_uids: list[int] = []
+                self.candidate_uids: list[int] = [1]
 
             async def fetch_message_batches(self, since=None):
                 from app.collectors.xing_email import XingEmailBatch
@@ -357,6 +358,51 @@ class TestXingLeaseGuard:
 
         db.expire_all()
         assert db.query(JobRecord).count() == 2
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_leaves_the_message_unacknowledged_and_the_watermark_alone(
+        self, db, monkeypatch
+    ):
+        """Review 2.3: persisted jobs stay (idempotent), but the shared state --
+        the Message-ID acknowledgement and the scan watermark -- is left to the
+        run that owns the mailbox now."""
+        from app.db.models import XingScanProgressRecord
+        from app.db.repositories import is_message_processed
+
+        job = Job(
+            source="xing",
+            title="Backend Engineer",
+            company="Lost Lease Co",
+            url="https://www.xing.com/m/LLLLLLLLLLLLLLLLLLLL9",
+            description="",
+            skills=[],
+        )
+        result = await self._run(db, monkeypatch, [job], is_lease_lost=lambda: True, uid_validity=7)
+
+        assert result["created"] == 1
+        db.expire_all()
+        assert db.query(JobRecord).count() == 1
+        assert not is_message_processed(db, "xing", "<digest@mail.xing.com>")
+        assert db.query(XingScanProgressRecord).count() == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_lease_acknowledges_and_advances_the_watermark(self, db, monkeypatch):
+        from app.db.models import XingScanProgressRecord
+        from app.db.repositories import is_message_processed
+
+        job = Job(
+            source="xing",
+            title="Backend Engineer",
+            company="Healthy Lease Co",
+            url="https://www.xing.com/m/HHHHHHHHHHHHHHHHHHHH8",
+            description="",
+            skills=[],
+        )
+        await self._run(db, monkeypatch, [job], is_lease_lost=lambda: False, uid_validity=7)
+
+        db.expire_all()
+        assert is_message_processed(db, "xing", "<digest@mail.xing.com>")
+        assert db.query(XingScanProgressRecord).count() == 1
 
     @pytest.mark.asyncio
     async def test_standalone_caller_without_lease_guard_is_unaffected(self, db, monkeypatch):
