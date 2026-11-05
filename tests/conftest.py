@@ -51,3 +51,16 @@ def _reset_auth_failure_budget():
     rate_limit._auth_failure_requests.clear()
     yield
     rate_limit._auth_failure_requests.clear()
+
+
+@pytest.fixture(scope="session")
+def repository_head() -> str:
+    """The single Alembic head of the migration scripts, read from the script tree itself, so no
+    test (and no CI step) hard-codes a revision id that every new migration would have to edit."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[1]
+    heads = ScriptDirectory.from_config(Config(str(root / "alembic.ini"))).get_heads()
+    assert len(heads) == 1, f"migration scripts must have exactly one head, found {heads}"
+    return heads[0]

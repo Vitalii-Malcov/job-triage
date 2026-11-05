@@ -27,6 +27,7 @@ import pytest
 import sqlalchemy.exc
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -45,14 +46,19 @@ TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION = "b5d2e8f4a1c7"
 PREVIOUS = "a7c3e9f1b2d4"
-HEAD = "a2b7d4f9c1e3"  # repository head (review 2.1 processed email identity)
+HEAD = ScriptDirectory.from_config(Config(str(PROJECT_ROOT / "alembic.ini"))).get_current_head()
 SUBMITTED_AT = datetime(2026, 10, 17, 14, 2, 50, tzinfo=UTC)
 
-pytestmark = pytest.mark.skipif(
-    not TEST_POSTGRES_URL,
-    reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
-    "(GitHub Actions' scheduler-postgres job sets it).",
-)
+# Cycles Alembic down/up on the shared test database (restores head in a `finally`):
+# CI runs these in the second phase, see docs/CI.md.
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_POSTGRES_URL,
+        reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
+        "(GitHub Actions' scheduler-postgres job sets it).",
+    ),
+    pytest.mark.pg_migration_cycle,
+]
 
 
 @pytest.fixture()

@@ -129,7 +129,7 @@ def _indexes(engine):
     }
 
 
-def test_migration_round_trip_keeps_rows_and_swaps_the_identity(tmp_path):
+def test_migration_round_trip_keeps_rows_and_swaps_the_identity(tmp_path, repository_head):
     db_path = tmp_path / "mig.db"
     cfg = _cfg(db_path)
     upgrade(cfg, "f1a8c3d5e7b9")
@@ -161,7 +161,9 @@ def test_migration_round_trip_keeps_rows_and_swaps_the_identity(tmp_path):
     with pytest.raises(RuntimeError, match="more than one source"):
         downgrade(cfg, "f1a8c3d5e7b9")
     with engine.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "a2b7d4f9c1e3"
+        assert (
+            c.execute(text("SELECT version_num FROM alembic_version")).scalar() == repository_head
+        )
         assert c.execute(text("SELECT COUNT(*) FROM processed_email_messages")).scalar() == 3
     assert not _indexes(engine)["ix_processed_email_messages_message_id"]
     assert not any(t.startswith("_alembic_tmp") for t in inspect(engine).get_table_names())
