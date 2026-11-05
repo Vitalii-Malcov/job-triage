@@ -22,8 +22,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 10 | Arch §3 large modules | ACCEPTED — task 21a1eea, merge 047f88f |
 | 11 | Arch §3 target roles vs stored config | ACCEPTED — task 4e661ef, merge e9daa49 |
 | 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED — task 70d0910, merge 1ec31f7 |
-| 13 | Arch §3 stage-named operational scripts | ACCEPTED (see below; SHAs in git log) |
-| 14–19 | see task list | PENDING |
+| 13 | Arch §3 stage-named operational scripts | ACCEPTED — task 19a2f73, merge 105f980 |
+| 14 | Arch §3 rate limiter duplication | ACCEPTED (see below; SHAs in git log) |
+| 15–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -177,3 +178,12 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_cli_dispatcher.py` (34): registry completeness guard (a new script must get a command), no stage numbers in names, entry points resolve, `<command> --help` exits 0 for all 18 argparse commands (this found and now guards a real crash in `profile-transfer`), exit-code/argv mapping with fake scripts, subprocess runs of `python -m app.cli --list` and an old script path.
 - Full pytest: 7473 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: 2 code rounds (R1 CHANGES_REQUESTED: profile-transfer entry crash, E501, SystemExit diagnostic; R2 ACCEPT).
+
+## TASK 14 — Rate limiter duplication (Architecture §3)
+
+- Confirmed: 17 identical `enforce_*` functions (`limiter.check(request, max_requests=A, window_seconds=B)`).
+- Change (deliberately narrow): one factory `_quota(name, limiter, lambda: (A, B))` replaces the 17 function bodies; every limit constant, limiter, bucket alias, 429 detail, the thread-safe `_RateLimiter`, trusted-proxy identity, the generic settings-driven limiter and the TASK 01 failed-auth budget are unchanged. The limits are still module-level names read at call time (monkeypatch/ops compatible); the dependencies keep their `enforce_*` names (route-guard tests).
+- Not done / honest limit: the 17 declarations and their justification paragraphs remain (the module did not get shorter — the comment cleanup is TASK 15); no dynamic registry (would hide names from readers and monkeypatching).
+- Tests: `tests/test_rate_limit_quotas.py` (17 quotas x 5 behaviours + bucket independence, alias identity, proxy identity).
+- Full pytest: 7561 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: 1 code round `VERDICT: ACCEPT` (AST-compared that limits, details, aliases and locking are unchanged; noted the improvement is narrow).

@@ -166,6 +166,23 @@ class _RateLimiter:
             del self.buckets[stale_key]
 
 
+def _quota(name: str, limiter: "_RateLimiter", quota):
+    """FastAPI dependency enforcing a fixed per-client quota on `limiter`.
+
+    `quota` is a zero-argument callable returning `(max_requests, window_seconds)`; the
+    limits are module-level constants read at CALL time (not bound at definition), so a
+    test or an operator hook can still replace `XING_RATE_LIMIT_REQUESTS` etc. The
+    dependency keeps its `enforce_*` name (introspection, route-guard tests)."""
+
+    def enforce(request: Request) -> None:
+        max_requests, window_seconds = quota()
+        limiter.check(request, max_requests=max_requests, window_seconds=window_seconds)
+
+    enforce.__name__ = name
+    enforce.__qualname__ = name
+    return enforce
+
+
 _generic_limiter = _RateLimiter(detail="Rate limit exceeded")
 _requests = _generic_limiter.buckets
 
@@ -190,12 +207,11 @@ COLLECTOR_RATE_LIMIT_REQUESTS = 5
 COLLECTOR_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_collector_rate_limit(request: Request) -> None:
-    _collector_limiter.check(
-        request,
-        max_requests=COLLECTOR_RATE_LIMIT_REQUESTS,
-        window_seconds=COLLECTOR_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_collector_rate_limit = _quota(
+    "enforce_collector_rate_limit",
+    _collector_limiter,
+    lambda: (COLLECTOR_RATE_LIMIT_REQUESTS, COLLECTOR_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate, stricter bucket than the generic collector limit above, specific
@@ -213,12 +229,11 @@ XING_RATE_LIMIT_REQUESTS = 3
 XING_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
-def enforce_xing_rate_limit(request: Request) -> None:
-    _xing_limiter.check(
-        request,
-        max_requests=XING_RATE_LIMIT_REQUESTS,
-        window_seconds=XING_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_xing_rate_limit = _quota(
+    "enforce_xing_rate_limit",
+    _xing_limiter,
+    lambda: (XING_RATE_LIMIT_REQUESTS, XING_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate, stricter bucket for company-research runs: each call can make
@@ -232,12 +247,11 @@ COMPANY_RESEARCH_RATE_LIMIT_REQUESTS = 10
 COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
-def enforce_company_research_rate_limit(request: Request) -> None:
-    _company_research_limiter.check(
-        request,
-        max_requests=COMPANY_RESEARCH_RATE_LIMIT_REQUESTS,
-        window_seconds=COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_company_research_rate_limit = _quota(
+    "enforce_company_research_rate_limit",
+    _company_research_limiter,
+    lambda: (COMPANY_RESEARCH_RATE_LIMIT_REQUESTS, COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate bucket for candidate-job-match runs: unlike the collector/XING/
@@ -253,12 +267,11 @@ MATCH_RATE_LIMIT_REQUESTS = 30
 MATCH_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_match_rate_limit(request: Request) -> None:
-    _match_limiter.check(
-        request,
-        max_requests=MATCH_RATE_LIMIT_REQUESTS,
-        window_seconds=MATCH_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_match_rate_limit = _quota(
+    "enforce_match_rate_limit",
+    _match_limiter,
+    lambda: (MATCH_RATE_LIMIT_REQUESTS, MATCH_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate bucket for CV draft generation: like matching (section above),
@@ -271,12 +284,11 @@ CV_DRAFT_RATE_LIMIT_REQUESTS = 30
 CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_cv_draft_rate_limit(request: Request) -> None:
-    _cv_draft_limiter.check(
-        request,
-        max_requests=CV_DRAFT_RATE_LIMIT_REQUESTS,
-        window_seconds=CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_cv_draft_rate_limit = _quota(
+    "enforce_cv_draft_rate_limit",
+    _cv_draft_limiter,
+    lambda: (CV_DRAFT_RATE_LIMIT_REQUESTS, CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate, stricter bucket for Bewerbung generation: unlike match/cv-draft
@@ -290,12 +302,11 @@ BEWERBUNG_RATE_LIMIT_REQUESTS = 5
 BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_bewerbung_rate_limit(request: Request) -> None:
-    _bewerbung_limiter.check(
-        request,
-        max_requests=BEWERBUNG_RATE_LIMIT_REQUESTS,
-        window_seconds=BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_bewerbung_rate_limit = _quota(
+    "enforce_bewerbung_rate_limit",
+    _bewerbung_limiter,
+    lambda: (BEWERBUNG_RATE_LIMIT_REQUESTS, BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate bucket for review-package writes (create/patch/approve/reject):
@@ -310,12 +321,11 @@ REVIEW_WRITE_RATE_LIMIT_REQUESTS = 30
 REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_review_write_rate_limit(request: Request) -> None:
-    _review_write_limiter.check(
-        request,
-        max_requests=REVIEW_WRITE_RATE_LIMIT_REQUESTS,
-        window_seconds=REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_review_write_rate_limit = _quota(
+    "enforce_review_write_rate_limit",
+    _review_write_limiter,
+    lambda: (REVIEW_WRITE_RATE_LIMIT_REQUESTS, REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate, stricter bucket for the Gmail inbox IMAP sync endpoint — same
@@ -330,12 +340,11 @@ GMAIL_RATE_LIMIT_REQUESTS = 3
 GMAIL_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
-def enforce_gmail_rate_limit(request: Request) -> None:
-    _gmail_limiter.check(
-        request,
-        max_requests=GMAIL_RATE_LIMIT_REQUESTS,
-        window_seconds=GMAIL_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_gmail_rate_limit = _quota(
+    "enforce_gmail_rate_limit",
+    _gmail_limiter,
+    lambda: (GMAIL_RATE_LIMIT_REQUESTS, GMAIL_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate bucket for Stage 7B analysis runs: like match/cv-draft/
@@ -349,12 +358,11 @@ GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS = 30
 GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_gmail_analysis_rate_limit(request: Request) -> None:
-    _gmail_analysis_limiter.check(
-        request,
-        max_requests=GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS,
-        window_seconds=GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_gmail_analysis_rate_limit = _quota(
+    "enforce_gmail_analysis_rate_limit",
+    _gmail_analysis_limiter,
+    lambda: (GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS, GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate bucket for Stage 7C response-draft generation: like the Stage
@@ -368,12 +376,11 @@ RESPONSE_DRAFT_RATE_LIMIT_REQUESTS = 30
 RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_response_draft_rate_limit(request: Request) -> None:
-    _response_draft_limiter.check(
-        request,
-        max_requests=RESPONSE_DRAFT_RATE_LIMIT_REQUESTS,
-        window_seconds=RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_response_draft_rate_limit = _quota(
+    "enforce_response_draft_rate_limit",
+    _response_draft_limiter,
+    lambda: (RESPONSE_DRAFT_RATE_LIMIT_REQUESTS, RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Bucket for Stage 7D approve/reject decisions: pure local DB read+write,
@@ -387,12 +394,14 @@ RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS = 30
 RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_response_draft_decision_rate_limit(request: Request) -> None:
-    _response_draft_decision_limiter.check(
-        request,
-        max_requests=RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS,
-        window_seconds=RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_response_draft_decision_rate_limit = _quota(
+    "enforce_response_draft_decision_rate_limit",
+    _response_draft_decision_limiter,
+    lambda: (
+        RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS,
+        RESPONSE_DRAFT_DECISION_RATE_LIMIT_WINDOW_SECONDS,
+    ),
+)
 
 
 # Separate, stricter bucket for Stage 7D SEND — same rationale as
@@ -407,12 +416,14 @@ RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS = 5
 RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_response_draft_send_rate_limit(request: Request) -> None:
-    _response_draft_send_limiter.check(
-        request,
-        max_requests=RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS,
-        window_seconds=RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_response_draft_send_rate_limit = _quota(
+    "enforce_response_draft_send_rate_limit",
+    _response_draft_send_limiter,
+    lambda: (
+        RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS,
+        RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS,
+    ),
+)
 
 
 # Bucket for Stage 7E follow-up evaluation: unlike a single-message Stage
@@ -425,12 +436,11 @@ FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS = 10
 FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_follow_up_evaluate_rate_limit(request: Request) -> None:
-    _follow_up_evaluate_limiter.check(
-        request,
-        max_requests=FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS,
-        window_seconds=FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_follow_up_evaluate_rate_limit = _quota(
+    "enforce_follow_up_evaluate_rate_limit",
+    _follow_up_evaluate_limiter,
+    lambda: (FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS, FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Bucket for Stage 7E follow-up approve/reject decisions: pure local DB
@@ -442,12 +452,11 @@ FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS = 30
 FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_follow_up_decision_rate_limit(request: Request) -> None:
-    _follow_up_decision_limiter.check(
-        request,
-        max_requests=FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS,
-        window_seconds=FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_follow_up_decision_rate_limit = _quota(
+    "enforce_follow_up_decision_rate_limit",
+    _follow_up_decision_limiter,
+    lambda: (FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS, FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Separate, stricter bucket for Stage 7E follow-up SEND — same rationale
@@ -459,12 +468,11 @@ FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS = 5
 FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_follow_up_send_rate_limit(request: Request) -> None:
-    _follow_up_send_limiter.check(
-        request,
-        max_requests=FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS,
-        window_seconds=FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_follow_up_send_rate_limit = _quota(
+    "enforce_follow_up_send_rate_limit",
+    _follow_up_send_limiter,
+    lambda: (FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS, FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Stage 8A: POST /automation/runs coordinates BOTH the Bundesagentur and
@@ -481,12 +489,11 @@ AUTOMATION_RUN_RATE_LIMIT_REQUESTS = 3
 AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS = 600
 
 
-def enforce_automation_run_rate_limit(request: Request) -> None:
-    _automation_run_limiter.check(
-        request,
-        max_requests=AUTOMATION_RUN_RATE_LIMIT_REQUESTS,
-        window_seconds=AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_automation_run_rate_limit = _quota(
+    "enforce_automation_run_rate_limit",
+    _automation_run_limiter,
+    lambda: (AUTOMATION_RUN_RATE_LIMIT_REQUESTS, AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS),
+)
 
 
 # Accepted trade-off: when 4096 distinct networks are all locked out the table
@@ -528,9 +535,8 @@ UI_LOGIN_RATE_LIMIT_REQUESTS = 10
 UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
-def enforce_ui_login_rate_limit(request: Request) -> None:
-    _ui_login_limiter.check(
-        request,
-        max_requests=UI_LOGIN_RATE_LIMIT_REQUESTS,
-        window_seconds=UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS,
-    )
+enforce_ui_login_rate_limit = _quota(
+    "enforce_ui_login_rate_limit",
+    _ui_login_limiter,
+    lambda: (UI_LOGIN_RATE_LIMIT_REQUESTS, UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS),
+)
