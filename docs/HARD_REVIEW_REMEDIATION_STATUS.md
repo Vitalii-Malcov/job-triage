@@ -27,7 +27,8 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 15 | Quality §4 review history in comments | ACCEPTED — task 13052fe, merge 0222b79 |
 | 16 | Quality §4 CI maintainability | ACCEPTED — task 2922648, merge d39b493 |
 | 17 | Quality §4 test quality | ACCEPTED (task `346040c`, merge `76fe0bf`) |
-| 18–19 | see task list | PENDING |
+| 18 | Documentation alignment | ACCEPTED (task `d0f8d1d`, merge `69cdb3a`) |
+| 19 | Final independent audit | ACCEPTED (see below; SHAs in git log) |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -226,3 +227,11 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Not changed: runbooks (`RUNBOOK.md`, `DAILY_OPERATIONS.md`) contain no stale merge/deploy claims.
 - Tests: docs-only; focused run (naming/AI claims, CI gate, module structure, migrations, attribution hygiene) 170 passed; Ruff clean. Full pytest repeated in TASK 19. No schema change.
 - Codex: 3 rounds (R1 and R2 REJECT: "19 tasks" overstatement, "neither done anywhere", TD-001 marked addressed, task-18 status wording; R3 `VERDICT: ACCEPT`).
+
+## TASK 19 — Final independent audit
+
+- Evidence on integration head `69cdb3a` (docs-only difference to the task-18 merge): full pytest 7608 passed, 148 skipped (141 PostgreSQL modules not run by the SQLite run, 5 symlinks, 1 canonical DB, 1 worktree), 0 failed, 2 warnings, 34 min 54 s. PostgreSQL (local Docker `postgres:16`, fresh database): `alembic upgrade head` -> single head `a2b7d4f9c1e3` -> `downgrade base` -> `upgrade head`; integration phase 1 105 passed, phase 2 (`pg_migration_cycle`) 36 passed. Ruff check and format clean (496 files).
+- Regression areas (API auth, Gmail approval safety, Telegram/collector, vacancy dedup, application tracking) are covered by the full suite above; Codex audited them on the cumulative diff `main..fix/hard-review-integration`, and also checked that all API routes except probes are guarded (55 routes, 0 unguarded) and that all 47 model tables are still registered.
+- Production isolation: `runtime/job_triage_runtime.db` last modified 2026-11-04 17:27, BEFORE the first remediation commit (2026-11-05 00:41); no remediation step opened it. No push, no remote PR, no `main` merge, no outbound message.
+- Codex: cumulative audit `VERDICT: ACCEPT`, no findings.
+- Not verified: GitHub Actions (never run on these branches); real-Gmail validation; production rollout.
