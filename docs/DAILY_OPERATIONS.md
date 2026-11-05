@@ -19,7 +19,7 @@ $env:ALEMBIC_AUTO_UPGRADE = "false"
 $env:OUTBOUND_SENDING_ENABLED = "false"
 $env:TELEGRAM_GMAIL_DRAFT_ENABLED = "false"
 $env:TELEGRAM_OPERATOR_CONTROL_ENABLED = "true"
-.\.venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 Checks: `GET http://127.0.0.1:8000/api/v1/health` → `{"status":"ok"}`,

@@ -185,6 +185,9 @@ def main(argv: list[str] | None = None, *, run=subprocess.call) -> int:
         HOST,
         "--port",
         str(args.port),
+        # UI sessions (nonce + logout registry) are per process: exactly one.
+        "--workers",
+        "1",
     ]
     status = 0
     try:

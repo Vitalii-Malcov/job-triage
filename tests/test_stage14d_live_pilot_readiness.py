@@ -928,3 +928,19 @@ def _requirement_python() -> RequirementMatch:
 
 def test_profile_language_model_still_accepts_unknown_level():
     assert CandidateLanguage(language="Englisch").level == "UNKNOWN"
+
+
+def test_canonical_runtime_server_is_pinned_to_one_worker(monkeypatch):
+    """UI sessions (process nonce + logout registry) are per process, so the
+    launcher must ignore an inherited WEB_CONCURRENCY and run exactly one."""
+    import sys
+    import types
+
+    from scripts import stage14d_canonical_runtime as runtime
+
+    calls = []
+    fake = types.SimpleNamespace(run=lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setitem(sys.modules, "uvicorn", fake)
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    runtime._start_server(8123)
+    assert calls == [(("app.main:app",), {"host": "127.0.0.1", "port": 8123, "workers": 1})]
