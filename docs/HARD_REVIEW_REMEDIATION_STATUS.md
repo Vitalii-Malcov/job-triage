@@ -26,7 +26,7 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 14 | Arch §3 rate limiter duplication | ACCEPTED — task 7fb2b5f, merge 65861b6 |
 | 15 | Quality §4 review history in comments | ACCEPTED — task 13052fe, merge 0222b79 |
 | 16 | Quality §4 CI maintainability | ACCEPTED — task 2922648, merge d39b493 |
-| 17 | Quality §4 test quality | ACCEPTED (see below; SHAs in git log) |
+| 17 | Quality §4 test quality | ACCEPTED (task `346040c`, merge `76fe0bf`) |
 | 18–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
@@ -218,3 +218,11 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Counts (`docs/TEST_INVENTORY.md`): 4,732 `def test_`; 7,756 collected; last completed full run 7,608 passed / 0 failed / 148 skipped (141 PostgreSQL modules — NOT run by a local SQLite run, executed by the CI job and once locally on postgres:16 in TASK 16 —, 5 symlinks, 1 canonical DB, 1 worktree). 27 `inspect.getsource` uses remain in 13 files (docs/contract and import guards) — listed, not converted.
 - Full pytest: 7608 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: 3 code rounds (R1 CHANGES_REQUESTED x5: swallowed forbidden calls, swallowed HTTP, FETCH metadata, heartbeat race, relative imports + doc totals; R2 `BLOCKED` only for the full run; R3 ACCEPT).
+
+## TASK 18 — Documentation alignment
+
+- Confirmed: README, `docs/MASTER_EXECUTION_STATUS.md` still described PRs #18-#21 as open / not in `main` (`4cdaacf`), although `main@78a947b` contains merged PRs #18-#29 (Stages 21-24); the README test count mixed collected and passed tests and cited feature-branch commits.
+- Changed: README (test section, project-status table with developed / merged / tested / deployed, remediation row), `docs/MASTER_EXECUTION_STATUS.md` (rewritten state, stage table, next steps), `docs/TECHNICAL_DEBT.md` (reconciliation table). Deployment is claimed only per operator notes (Stage 21 + 22 rolled out 2026-10-31, `d5a7d27`, schema `e3b7c9d1f4a6`); PRs #23-#29 marked "not verified"; remediation marked local-only, not pushed, not deployed, GitHub Actions not run; rules-hash / fit-cache refill noted.
+- Not changed: runbooks (`RUNBOOK.md`, `DAILY_OPERATIONS.md`) contain no stale merge/deploy claims.
+- Tests: docs-only; focused run (naming/AI claims, CI gate, module structure, migrations, attribution hygiene) 170 passed; Ruff clean. Full pytest repeated in TASK 19. No schema change.
+- Codex: 3 rounds (R1 and R2 REJECT: "19 tasks" overstatement, "neither done anywhere", TD-001 marked addressed, task-18 status wording; R3 `VERDICT: ACCEPT`).
