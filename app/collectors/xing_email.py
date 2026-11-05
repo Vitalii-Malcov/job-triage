@@ -58,6 +58,7 @@ import imaplib
 import logging
 import re
 import ssl
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -277,6 +278,53 @@ def _extract_plaintext_body(msg: Message) -> str:
 
 def _split_blocks(body: str) -> list[str]:
     return [block.strip() for block in _SEPARATOR_RE.split(body) if block.strip()]
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def _evidence_key(job: Job) -> tuple[str, str, str, str]:
+    """Comparison form of everything a digest tells about a posting (never stored).
+
+    Company/title/location use EXACTLY the persistence base-key semantics
+    (`strip().casefold()`, no further normalization) and the description the same
+    NFKC/whitespace/casefold form the repository compares, so the occurrence a block
+    receives here and the identity group it lands in downstream always agree."""
+    description = _SPACE_RUN.sub(" ", unicodedata.normalize("NFKC", job.description)).strip()
+    return (
+        job.company.strip().casefold(),
+        job.title.strip().casefold(),
+        job.location.strip().casefold(),
+        description.casefold(),
+    )
+
+
+def assign_occurrences(jobs: list[Job]) -> list[Job]:
+    """Message-local multiplicity of identical posting blocks.
+
+    The digest has no posting id, so two postings with identical text can only be told
+    apart by the fact that ONE e-mail lists both. A further block with the same
+    company/title/location/details but a DIFFERENT tracking link is the n-th occurrence;
+    the same link again is a repeated block of one posting and is dropped. A block without
+    details (no salary / employment text) carries no identity evidence and always keeps
+    occurrence 1. The links are compared as opaque strings and are never requested.
+    """
+    links_by_key: dict[tuple[str, str, str, str], list[str]] = {}
+    result: list[Job] = []
+    for job in jobs:
+        key = _evidence_key(job)
+        links = links_by_key.setdefault(key, [])
+        link = str(job.url)
+        if link in links:
+            continue
+        links.append(link)
+        occurrence = len(links) if key[3] else 1
+        result.append(
+            job
+            if occurrence == job.occurrence
+            else job.model_copy(update={"occurrence": occurrence})
+        )
+    return result
 
 
 def _parse_block(block: str) -> Job | None:
@@ -853,4 +901,7 @@ class XingEmailCollector(JobCollector):
         if not jobs:
             logger.warning("xing_email_no_valid_job_blocks message_id=%s", message_id)
 
-        return XingEmailBatch(message_id=message_id, jobs=tuple(jobs), uid=uid), False
+        return (
+            XingEmailBatch(message_id=message_id, jobs=tuple(assign_occurrences(jobs)), uid=uid),
+            False,
+        )

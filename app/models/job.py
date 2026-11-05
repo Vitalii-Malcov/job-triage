@@ -48,6 +48,11 @@ class Job(BaseModel):
     home_office_type: str | None = Field(default=None, max_length=40)
     home_office_percent: int | None = Field(default=None, ge=0, le=100)
     quereinstieg_suitable: bool | None = None
+    # XING only, never persisted: message-local multiplicity of an identical posting block
+    # (the n-th block with the same company/title/location/details but a different link
+    # inside ONE e-mail). 1 for everything else. See
+    # app.db.repositories.resolve_xing_identity.
+    occurrence: int = Field(default=1, ge=1, le=20)
 
     # normalizes BEFORE
     # the max_length constraint above is checked (mode="before" runs
@@ -80,9 +85,12 @@ class JobScore(BaseModel):
     recommendation: Recommendation
     data_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     is_duplicate: bool = False
-    # Review 2.2: this observation looked like a DIFFERENT posting sharing a
-    # stored record's identity (XING). The stored record was left untouched.
+    # XING: an observation without evidence (no salary/employment text) could not be
+    # placed among several stored rows of one identity; the stored row was left untouched.
     possible_collision: bool = False
+    # XING: this observation was stored as a distinguished sibling of an existing
+    # posting with the same company/title/location but different details.
+    sibling_posting: bool = False
 
 
 class JobListItem(BaseModel):

@@ -31,6 +31,11 @@ class JobRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # XING only: the base (company|title|location) fingerprint shared by every
+    # distinguished sibling of one e-mail identity. NULL for every other source and for
+    # rows stored before the column existed (those are members of their own base
+    # group via `fingerprint`). Never an authority over `fingerprint`.
+    identity_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source: Mapped[str] = mapped_column(String(100), nullable=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     company: Mapped[str] = mapped_column(String(300), nullable=False)
