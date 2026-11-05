@@ -80,6 +80,9 @@ class JobScore(BaseModel):
     recommendation: Recommendation
     data_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     is_duplicate: bool = False
+    # Review 2.2: this observation looked like a DIFFERENT posting sharing a
+    # stored record's identity (XING). The stored record was left untouched.
+    possible_collision: bool = False
 
 
 class JobListItem(BaseModel):

@@ -66,7 +66,7 @@ from app.db.repositories import (
     is_message_processed,
     mark_message_processed,
     update_job_score_if_posting_type_unchanged,
-    upsert_job,
+    upsert_job_observed,
 )
 from app.db.xing_scan_progress_repository import (
     advance_xing_scan_progress,
@@ -365,7 +365,20 @@ def score_and_persist(
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
     result = _score_for_posting_type(db, candidate_skills, job, effective_posting_type)
-    record, created = upsert_job(db, job, result)
+    outcome = upsert_job_observed(db, job, result)
+    record, created = outcome.record, outcome.created
+    if outcome.frozen:
+        # Review 2.2: the stored row was left untouched (probable different
+        # posting, or the operator already acted on it). Report the PERSISTED
+        # assessment, skip posting-type reconciliation and write nothing else.
+        frozen_result = JobScore(
+            score=record.score,
+            recommendation=record.recommendation,
+            data_confidence=record.data_confidence,
+            is_duplicate=True,
+            possible_collision=outcome.possible_collision,
+        )
+        return record, frozen_result, False
 
     observed_posting_type = record.posting_type
     if observed_posting_type != effective_posting_type:
@@ -914,6 +927,7 @@ async def run_xing(
     updated_count = 0
     failed_count = 0
     notified_count = 0
+    possible_collisions = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
     # Codex gate follow-up (Astra R4A MEDIUM, starvation): per-batch
     # persistence outcome, keyed by the batch's own IMAP UID -- combined
@@ -949,6 +963,8 @@ async def run_xing(
                 created_count += 1
             else:
                 updated_count += 1
+            if result.possible_collision:
+                possible_collisions += 1
 
             if touched_jobs is not None:
                 touched_jobs.append(
@@ -973,7 +989,8 @@ async def run_xing(
                 # Stage 9A: see run_bundesagentur's identical branch.
                 record_collected_job(db, job_record, settings)
             elif (
-                result.recommendation == "APPLY"
+                not result.possible_collision
+                and result.recommendation == "APPLY"
                 and result.score >= settings.min_job_score_to_notify
             ):
                 # Same best-effort contract as run_bundesagentur: notification
@@ -1086,6 +1103,10 @@ async def run_xing(
         "updated": updated_count,
         "skipped_invalid": collector.skipped_invalid_count,
         "failed": failed_count,
+        # Review 2.2: observations that looked like a DIFFERENT posting sharing a
+        # stored XING record (same company/title/location, different details).
+        # The stored record was left untouched; review these in the log.
+        "possible_collisions": possible_collisions,
         # NEW-001 (Astra R4A): True if the IMAP session's total deadline
         # fired before every candidate message could be fetched -- see
         # app.collectors.xing_email.XingEmailCollector.deadline_exceeded.
