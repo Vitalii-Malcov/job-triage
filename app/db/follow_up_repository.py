@@ -27,7 +27,7 @@ from app.services.follow_up_eligibility import ThreadMessageInfo
 # matched thread pool for one job before giving up rather than risking an
 # unbounded scan.
 FOLLOW_UP_MATCHED_THREAD_SCAN_LIMIT = 50
-# S7E-003 (Codex remediation): how many distinct JOBS a single Gmail
+# how many distinct JOBS a single Gmail
 # thread is checked against for the reverse thread->job ambiguity guard —
 # see `get_matched_job_ids_for_thread`. Mirrors
 # FOLLOW_UP_MATCHED_THREAD_SCAN_LIMIT's own "protects against a
@@ -153,7 +153,7 @@ def get_thread_message_infos(
     different guise: it is trustworthy (never sender-controlled) but not
     ORDER-preserving across a single sync run, because
     `app.api.routes._run_gmail_sync` always syncs INBOX, THEN Sent
-    (S7E-001) as two independent persist passes. On a first-time/
+     as two independent persist passes. On a first-time/
     historical sync — or any run that imports a whole thread's backlog at
     once — a real OUTBOUND message and a chronologically LATER recruiter
     INBOUND reply can both be new to that one run; because INBOX is
@@ -192,7 +192,7 @@ def get_thread_message_infos(
 def get_matched_job_ids_for_thread(
     db: Session, account_key: str, thread_id: int, limit: int = FOLLOW_UP_MATCHED_JOB_SCAN_LIMIT
 ) -> frozenset[int]:
-    """S7E-005 (Codex remediation): the REVERSE of `get_matched_thread_ids_for_job`
+    """the REVERSE of `get_matched_thread_ids_for_job`
     — every distinct `matched_job_id` any message in `thread_id` is
     currently decisively matched to (LATEST analysis only, APPLICATION/
     JOB_ONLY only — same `_DECISIVE_MATCH_TYPES` rule). A job's own
@@ -231,7 +231,7 @@ def get_matched_job_ids_for_thread(
 def get_follow_up_proposal_by_anchor_and_fingerprint(
     db: Session, account_key: str, anchor_gmail_message_id: int, input_fingerprint: str
 ) -> FollowUpProposalRecord | None:
-    """S7E-009 (Codex remediation): identity lookup now includes
+    """identity lookup now includes
     `input_fingerprint`, not just the anchor — see
     `FollowUpProposalRecord`'s docstring. A caller whose trusted inputs
     have changed since the last evaluation of this anchor computes a

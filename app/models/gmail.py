@@ -59,7 +59,7 @@ class GmailMessage(BaseModel):
 
 
 class GmailMessageSummary(BaseModel):
-    """Compact representation for GET /gmail/messages (GMAIL-007).
+    """Compact representation for GET /gmail/messages.
 
     Deliberately excludes `body_plain`, full recipient arrays (`to`/`cc`),
     `references`, and per-attachment detail — a bulk list response (up to
@@ -111,8 +111,8 @@ class GmailSyncResult(BaseModel):
     """Structured summary of one POST /gmail/sync run. Never includes any
     message content — only counts (spec section 14).
 
-    `deadline_exceeded` (NEW-001, Astra R4A): True if the IMAP session's
-    total wall-clock deadline (AUD-005) fired before every candidate
+    `deadline_exceeded`: True if the IMAP session's
+    total wall-clock deadline fired before every candidate
     message could be fetched this run — see
     `app.providers.email.base.GmailFetchResult.deadline_exceeded`.
     `fetched`/`created`/etc. still faithfully count whatever DID complete

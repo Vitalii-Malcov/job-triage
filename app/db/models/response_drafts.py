@@ -324,7 +324,7 @@ class ResponseDraftSendRecord(Base):
       deciding what to do next) is intentionally out of scope for Stage
       7D — this table's job is only to make the ambiguity visible and
       prevent an automated duplicate-send risk, not to resolve it. Also
-      reached (HARD-008, Codex master review) when a row is found
+      reached when a row is found
       PENDING with `send_attempted=True` on a later attempt — see
       `send_attempted` below — since a successful send whose SENT-commit
       itself then failed is indistinguishable, from a later reader's
@@ -332,7 +332,7 @@ class ResponseDraftSendRecord(Base):
       attempt; all three fail closed to UNCERTAIN rather than ever being
       silently retried.
 
-    **`send_attempted`** (HARD-008, Codex master review) durably
+    **`send_attempted`** durably
     distinguishes "transmission was never attempted for this claim"
     (safe to hand to a later request) from "transmission may already be
     underway or already happened" (never blindly retried) — see that
@@ -386,7 +386,7 @@ class ResponseDraftSendRecord(Base):
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    # HARD-008 (Codex master review, crash/CAS recovery): False for the
+    # False for the
     # entire window between winning the PENDING claim and the instant
     # right before `OutboundEmailProvider.send` is actually invoked;
     # flipped to True by a dedicated CAS

@@ -49,7 +49,7 @@ async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
 
 async def _score_job_service(job: Job, db: Session) -> JobScore:
     settings = common.get_settings()
-    # CSP-001: CandidateProfile is the sole runtime source of candidate
+    # CandidateProfile is the sole runtime source of candidate
     # skills for JobScorer -- see get_candidate_skills_for_scoring's own
     # docstring. Never the legacy UserProfile table.
     candidate_skills = get_candidate_skills_for_scoring(db)
@@ -63,7 +63,7 @@ async def _score_job_service(job: Job, db: Session) -> JobScore:
         result.is_duplicate,
     )
 
-    # S11E-001 (Codex Stage 11E review, BLOCKING): Stage 11E (and Stage
+    # Stage 11E (and Stage
     # 11A/11B before it) can deliberately leave a job at a HIGH score
     # with recommendation="SKIP" -- e.g. a low-unique-evidence-cardinality
     # single-signal match, or a senior/irrelevant title excluded after

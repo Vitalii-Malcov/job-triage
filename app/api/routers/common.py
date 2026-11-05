@@ -41,7 +41,7 @@ def _already_applied_detail(exc: AlreadyAppliedError) -> dict:
 
 def _current_gmail_account_key(settings) -> str:
     """The account_key every Gmail read endpoint scopes itself to
-    (GMAIL-002) — the currently configured GMAIL_USERNAME, normalized.
+     — the currently configured GMAIL_USERNAME, normalized.
     Read endpoints never require Gmail to be configured to respond (an
     empty account_key simply matches no persisted rows, which is a safe,
     fail-closed default), but scoping every read by it means a later

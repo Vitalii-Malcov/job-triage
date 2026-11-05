@@ -104,7 +104,7 @@ def get_job_candidates(
        older than the `limit` most-recently-seen jobs is still
        discoverable, without ever scanning the whole table or issuing
        one query per candidate.
-    3. Stage 22 P0-1: if `source_references` is non-empty (full BA
+    3. if `source_references` is non-empty (full BA
        references quoted in the email, see
        app.collectors.ba_reference.extract_ba_references), a THIRD query by
        case-insensitive `JobRecord.source_reference` equality, same ceiling.
@@ -277,7 +277,7 @@ def compute_context_fingerprint(
             "location": c.location,
             "url": c.url,
             "status": c.status,
-            # Stage 22 P0-1: part of the effective context (it can decide a
+            # part of the effective context (it can decide a
             # match); only present when set, so the fingerprint of a context
             # without stored references is unchanged.
             **({"source_reference": c.source_reference} if c.source_reference else {}),

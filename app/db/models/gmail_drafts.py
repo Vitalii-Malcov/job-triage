@@ -148,7 +148,7 @@ class GmailApplicationDraftRecord(Base):
     content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     renderer_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
     drafts_mailbox: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    # S9D-CONF-001: 200 decoded code points expand to at most 1,602 ASCII
+    # 200 decoded code points expand to at most 1,602 ASCII
     # characters as quoted modified UTF-7; 2048 covers that with margin.
     # The encoded value is bound-checked before any claim -- never truncated.
     drafts_mailbox_wire: Mapped[str | None] = mapped_column(String(2048), nullable=True)

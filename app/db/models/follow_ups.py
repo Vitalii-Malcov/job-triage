@@ -70,7 +70,7 @@ class FollowUpProposalRecord(Base):
 
     __tablename__ = "follow_up_proposals"
     __table_args__ = (
-        # S7E-009 (Codex remediation): identity now includes
+        # identity now includes
         # `input_fingerprint`, not just the anchor — see that column's
         # docstring below. A still-matching re-evaluation of the same
         # anchor with UNCHANGED trusted inputs is idempotent exactly as
@@ -110,7 +110,7 @@ class FollowUpProposalRecord(Base):
     language: Mapped[str] = mapped_column(String(5), nullable=False)
     missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
 
-    # S7E-008 (Codex remediation): the single canonical external recipient
+    # the single canonical external recipient
     # this follow-up would be sent to, derived and VALIDATED (non-empty,
     # unambiguous, not self, well-formed, no CRLF) from the anchor
     # OUTBOUND message's own `to_addresses` at proposal-build time — see
@@ -120,7 +120,7 @@ class FollowUpProposalRecord(Base):
     # verbatim copy instead of a live re-read.
     recipient: Mapped[str] = mapped_column(String(320), nullable=False, server_default="")
 
-    # S7E-009 (Codex remediation): SHA-256 hex digest over every trusted
+    # SHA-256 hex digest over every trusted
     # input this proposal's content depends on (job_id, thread_id, anchor,
     # trusted job title/company, candidate name/profile_version, recipient,
     # language, provider, generator_version) — see
@@ -184,7 +184,7 @@ class FollowUpApprovalRecord(Base):
 
     pinned_subject: Mapped[str] = mapped_column(String(500), nullable=False)
     pinned_body: Mapped[str] = mapped_column(Text, nullable=False)
-    # S7E-008 (Codex remediation): verbatim copy of the approved proposal's
+    # verbatim copy of the approved proposal's
     # own validated `recipient` at decision time — same "pin what the human
     # saw" rationale as pinned_subject/pinned_body above, and the exact
     # value app.services.follow_up_send sends to (never re-derived live at
@@ -260,7 +260,7 @@ class FollowUpSendRecord(Base):
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    # S7E-010 (Codex remediation, crash/CAS recovery): False for the entire
+    # False for the entire
     # window between winning the PENDING claim and the instant right
     # before `OutboundEmailProvider.send` is actually invoked; flipped to
     # True by a dedicated CAS (`app.db.follow_up_approval_repository

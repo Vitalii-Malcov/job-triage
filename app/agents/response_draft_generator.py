@@ -62,7 +62,7 @@ SUPPORTED_RESPONSE_CLASSIFICATIONS: frozenset[str] = frozenset(
 # candidate_profile_version, generator_version) idempotency identity — see
 # app.db.models.ResponseDraftRecord's docstring.
 #
-# v1 -> v2 (Codex remediation, final blocker): the job-trust-laundering
+# v1 -> v2: the job-trust-laundering
 # fix in app.services.response_draft (TRUSTED_JOB_SOURCES) changed what
 # SAFE output looks like for a message matched to an untrusted-source
 # (e.g. XING email-derived) job, but did not change any template text

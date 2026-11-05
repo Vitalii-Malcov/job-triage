@@ -96,7 +96,7 @@ SourceType = Literal[
 # is_usable_for_generation for the single rule future agents must apply.
 FactConfidence = Literal["CONFIRMED", "UNCONFIRMED", "INFERRED", "UNKNOWN"]
 
-# CP-M-01 (Codex review): confidence=CONFIRMED alone is not enough — a fact
+# confidence=CONFIRMED alone is not enough — a fact
 # whose *source* was never a direct human assertion (IMPORTED, INFERRED,
 # UNKNOWN) must never be treated as generation-safe, no matter what its
 # confidence field says. Only these three sources represent "the candidate,
@@ -113,7 +113,7 @@ def is_usable_for_generation(source: SourceType, confidence: FactConfidence) -> 
     BOTH the source must be a trusted, directly-human-asserted one
     (TRUSTED_GENERATION_SOURCES) AND confidence must be CONFIRMED.
 
-    Confidence alone is insufficient (CP-M-01): `source=INFERRED,
+    Confidence alone is insufficient: `source=INFERRED,
     confidence=CONFIRMED` or `source=UNKNOWN, confidence=CONFIRMED` must
     never pass — a fact nobody directly asserted is not made trustworthy by
     a confidence flag alone. This is a two-argument function on purpose;
@@ -124,7 +124,7 @@ def is_usable_for_generation(source: SourceType, confidence: FactConfidence) -> 
     return source in TRUSTED_GENERATION_SOURCES and confidence == "CONFIRMED"
 
 
-# Stage 6A section 5 (CP-M-02): top-level candidate-profile fields that
+# Stage 6A section 5: top-level candidate-profile fields that
 # carry independent per-field provenance via CandidateProfile.field_trust /
 # CandidateProfilePatchRequest.field_trust — see FieldTrust and
 # is_top_level_fact_usable_for_generation below. `target_roles` is
@@ -150,7 +150,7 @@ TOP_LEVEL_TRUST_FIELDS: frozenset[str] = frozenset(
 
 class FieldTrust(BaseModel):
     """Provenance envelope for one top-level Candidate Profile field
-    (CP-M-02) — see TOP_LEVEL_TRUST_FIELDS for which fields carry one.
+     — see TOP_LEVEL_TRUST_FIELDS for which fields carry one.
 
     Defaults match a direct authenticated PATCH with no explicit override:
     the human is asserting this fact about themselves right now (Stage 6A
@@ -368,7 +368,7 @@ class CandidateProfile(BaseModel):
     career_goal: str = ""
     target_roles: list[str] = Field(default_factory=list)
 
-    # CP-M-02: per-field provenance for the top-level fields above — keyed
+    # per-field provenance for the top-level fields above — keyed
     # by field name, only present once that field has actually been set via
     # a PATCH (see TOP_LEVEL_TRUST_FIELDS / apply_candidate_profile_patch).
     # A field absent from this dict has no recorded trust and is never
@@ -386,7 +386,7 @@ class CandidateProfile(BaseModel):
 
 
 def is_top_level_fact_usable_for_generation(profile: CandidateProfile, field_name: str) -> bool:
-    """Stage 6B safety helper (CP-M-02): mechanically ask "is this
+    """Stage 6B safety helper: mechanically ask "is this
     top-level candidate fact (e.g. professional_title, professional_summary)
     safe to state as true in a generated document?" without guessing.
 
@@ -441,7 +441,7 @@ class CandidateProfilePatchRequest(BaseModel):
     endpoint with different erasure semantics would only add a way to
     accidentally destroy data.
 
-    **CP-M-03: `expected_profile_version` is required, and is concurrency
+    **`expected_profile_version` is required, and is concurrency
     metadata, not a candidate fact.** It is never persisted as profile
     content and never enters `field_trust` bookkeeping — see
     app/db/candidate_profile_repository.py's apply_candidate_profile_patch,
@@ -452,7 +452,7 @@ class CandidateProfilePatchRequest(BaseModel):
     CandidateProfileVersionConflictError there) — the caller must GET the
     current profile and retry with the fresh version.
 
-    **CP-M-02: `field_trust`, if present, only accepts entries for fields
+    **`field_trust`, if present, only accepts entries for fields
     also being set in this same PATCH.** A `field_trust` entry for a field
     that isn't in this payload's own top-level keys is rejected (422) —
     trust metadata is never adjusted independently of the value it

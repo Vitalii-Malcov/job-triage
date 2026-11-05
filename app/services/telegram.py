@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 
 # HTTP statuses that are reliable evidence the sendMessage request was
-# REJECTED without creating a message (Codex S9A-CODEX-001): the request was
+# REJECTED without creating a message: the request was
 # refused for its content/auth/target (400 bad request, 401 bad token, 403
 # bot blocked / not in chat, 404 unknown token path) or throttled before
 # processing (429 Too Many Requests). Every other non-2xx status -- notably
@@ -72,7 +72,7 @@ async def send_telegram_text(
     once-per-date retry policy, and `TelegramNotifier.send_job` below
     for the existing best-effort job-alert retry loop).
 
-    **Classification rule (Codex Stage 8E BLOCKER fix): if we cannot
+    **Classification rule: if we cannot
     PROVE Telegram did NOT receive/process the request, the outcome is
     UNCERTAIN, never FAILED.** Only two situations are provably
     "never reached Telegram, safe to retry":
@@ -81,7 +81,7 @@ async def send_telegram_text(
       `DEFINITIVE_REJECTION_STATUS_CODES` (400/401/403/404/429) -- the
       request was rejected (e.g. bad token, chat not found, rate-limited)
       without a message being created. Any OTHER non-2xx status (5xx
-      gateway/server errors, 409, ...) is UNCERTAIN (Codex S9A-CODEX-001):
+      gateway/server errors, 409, ...) is UNCERTAIN:
       a gateway can return 502/504 after Telegram already accepted the
       message, so the error response does not prove non-delivery.
     - `httpx.ConnectError` / `httpx.ConnectTimeout` / `httpx.PoolTimeout`
@@ -150,7 +150,7 @@ async def send_telegram_message(
             return TelegramSendResult(TelegramSendOutcome.FAILED)
         # 5xx gateway/server errors and undocumented statuses: the POST may
         # already have been accepted upstream before this error response was
-        # produced -- delivery cannot be disproven (S9A-CODEX-001).
+        # produced -- delivery cannot be disproven.
         logger.warning(
             "telegram_send_uncertain error_type=%s status_code=%s",
             type(exc).__name__,

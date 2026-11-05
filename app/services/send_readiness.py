@@ -13,7 +13,7 @@ itself one of the required checks: if `OUTBOUND_SENDING_ENABLED` is ever
 true the gate reports NOT ready, so this gate can never be read as a reason
 to turn outbound on.
 
-**Vacancy-specific, fail closed (Codex 14A review).**
+**Vacancy-specific, fail closed.**
 
 - Destination: only a human-operator-verified, vacancy-specific portal or
   email passes (`is_channel_verified`; an email must pass the strict email
@@ -627,7 +627,7 @@ def _identity_matches_job(identity: VacancyIdentity, job: JobRecord) -> bool:
     return vacancy_identity_matches(
         identity,
         source=job.source,
-        # Stage 22 P0-1: the stored full reference too -- URL tokens miss a
+        # the stored full reference too -- URL tokens miss a
         # BA reference with "_"/"." and every posting with an external URL.
         reference_tokens=extract_reference_tokens(job.title, job.url)
         | ({job.source_reference} if job.source_reference else set()),

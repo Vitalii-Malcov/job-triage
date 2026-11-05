@@ -37,7 +37,7 @@ class ShortlistDraftItem(BaseModel):
     ONLY (spec section 9) — never candidate name, CV/Bewerbung text, job
     description, email, or a raw exception message.
 
-    **S8C-AUDIT-001 (Codex review): truthful even on partial failure.**
+    **truthful even on partial failure.**
     A job that reached the shortlist always gets ONE item here, whatever
     happens next. If CV preparation itself fails, `cv_draft_id` is `None`
     (no draft exists). If CV preparation SUCCEEDS but the LATER Bewerbung
@@ -64,7 +64,7 @@ class ShortlistDraftItem(BaseModel):
 
 
 class AutomationJobFailure(BaseModel):
-    """S8C-AUDIT-002 (Codex review), extended by Stage 8D: a bounded,
+    """S8C-AUDIT-002, extended by Stage 8D: a bounded,
     privacy-safe technical failure record — persisted in
     AutomationRunStepResult.failures so a future consumer (Stage 8E's
     digest) can answer "which job failed, at which phase, with which
@@ -93,8 +93,8 @@ class AutomationMessageItem(BaseModel):
     persisted in AutomationRunStepResult.items for the
     `gmail_response_drafts` step. Technical metadata ONLY — never
     subject/body/addresses/display names/response content. Mirrors
-    `ShortlistDraftItem`'s truthful-on-partial-failure shape
-    (S8C-AUDIT-001): if analysis succeeds but response-draft generation
+    `ShortlistDraftItem`'s truthful-on-partial-failure shape:
+    if analysis succeeds but response-draft generation
     fails, `analysis_id`/`analysis_created` still report the real,
     already-committed analysis row. `response_status` is the existing
     Stage 7C `ResponseDraftStatus` value (`"PROPOSED"`/

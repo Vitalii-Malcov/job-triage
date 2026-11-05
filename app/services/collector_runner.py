@@ -97,7 +97,7 @@ __all__ = [
     "score_and_persist",
 ]
 
-# S10-RR-001: bounds the compare-and-swap retry loop in score_and_persist
+# bounds the compare-and-swap retry loop in score_and_persist
 # below. Each attempt only fires when a CONCRETE concurrent write has
 # just been observed (not speculatively), so exhausting this many
 # attempts means an unusually sustained write storm on the exact same
@@ -109,7 +109,7 @@ class JobScoreReconciliationError(Exception):
     """Raised when score_and_persist cannot converge a JobRecord's
     (score, recommendation) with its own currently-persisted posting_type
     within MAX_POSTING_TYPE_RECONCILE_ATTEMPTS compare-and-swap attempts
-    (S10-RR-001) -- surfaces a genuine, unresolved consistency problem to
+     -- surfaces a genuine, unresolved consistency problem to
     the caller rather than silently giving up and leaving a possibly
     inconsistent (posting_type, recommendation) pairing on the row.
     """
@@ -117,7 +117,7 @@ class JobScoreReconciliationError(Exception):
 
 @dataclass(frozen=True)
 class TouchedJob:
-    """S8C-POOL-001 (Codex review): a cheap, in-memory record of one job
+    """a cheap, in-memory record of one job
     THIS collector call actually persisted successfully — the run-local
     attribution mechanism Stage 8C uses instead of inferring "touched by
     this run" from `JobRecord.last_seen_at >= run.started_at` (which
@@ -172,7 +172,7 @@ def _candidate_target_seniority(db: Session):
     already SKIP on ordinary skill grounds never pays for this extra
     Candidate Profile read.
 
-    S11A-003 (Codex review): uses the PURE `get_candidate_profile` lookup,
+    uses the PURE `get_candidate_profile` lookup,
     not `get_or_create_candidate_profile` -- scoring is a read path and
     must never have the side effect of creating the singleton
     CandidateProfile row (with `db.add()` + `db.commit()`) purely because
@@ -182,7 +182,7 @@ def _candidate_target_seniority(db: Session):
     `target_roles` list) -- there is nothing to derive from a profile
     that doesn't exist yet.
 
-    S11A-004 (Codex review): `db.no_autoflush` wraps the ENTIRE read path
+    `db.no_autoflush` wraps the ENTIRE read path
     -- `get_candidate_profile` (a `Session.get()`, which autoflushes by
     default) AND `to_candidate_profile_response`'s own relationship
     access (`record.skills`, `.experiences`, etc. -- lazy-loaded
@@ -241,7 +241,7 @@ def _score_for_posting_type(
     it can safely be called twice by score_and_persist below (once before
     persistence, and again as the S10-001 post-write consistency check).
 
-    CSP-001: `candidate_skills` is the CandidateProfile-derived, immutable
+    `candidate_skills` is the CandidateProfile-derived, immutable
     projection from `app.db.candidate_profile_repository.
     get_candidate_skills_for_scoring` -- callers load it ONCE per request/
     collector run (never once per vacancy) and pass the SAME collection
@@ -276,7 +276,7 @@ def score_and_persist(
 ) -> tuple[JobRecord, JobScore, bool]:
     """Score a Job against the given candidate skills and persist it.
 
-    CSP-001: `candidate_skills` is the CandidateProfile-derived, immutable
+    `candidate_skills` is the CandidateProfile-derived, immutable
     skill projection from `app.db.candidate_profile_repository.
     get_candidate_skills_for_scoring` -- the SOLE runtime source of
     candidate skills for `app.agents.job_scorer.JobScorer`. Never the
@@ -312,7 +312,7 @@ def score_and_persist(
     classification instead of silently treating the posting as
     untyped/unknown.
 
-    **S10-001 (Codex Stage 10 review, BLOCKING): concurrent-write
+    **concurrent-write
     consistency.** The `existing` read immediately below and
     `upsert_job`'s OWN separate internal read (plus its HARD-007
     race-recovery re-read on an INSERT collision) are not atomic with
@@ -324,7 +324,7 @@ def score_and_persist(
     stale `recommendation=APPLY` computed by a losing writer back when it
     still believed the posting was untyped.
 
-    **S10-RR-001 (Codex Stage 10 RE-review, BLOCKING): the reconciliation
+    **the reconciliation
     itself must not be a second TOCTOU window.** An earlier version of
     this fix re-read `record.posting_type`, recomputed, and committed
     unconditionally -- a THIRD writer could change posting_type again in
@@ -345,7 +345,7 @@ def score_and_persist(
     untouched by any of this -- this loop only ever runs AFTER
     `upsert_job` has already returned a durably-persisted row.
 
-    **S10-RR-002 (Codex Stage 10 re-re-review, BLOCKING): never manually
+    **never manually
     reassign the score fields onto `record` after a successful CAS.**
     `update_job_score_if_posting_type_unchanged` commits -- and a commit
     EXPIRES every object in this Session's identity map, `record`
@@ -421,7 +421,7 @@ def _score_and_persist_composed(
                 data_confidence=result.data_confidence,
                 commit=False,
             )
-            # S10-RR-002: reload from the DB instead of assigning onto
+            # reload from the DB instead of assigning onto
             # `record` -- see the docstring section above. Applies
             # whether the CAS succeeded (picks up exactly what was just
             # written) or failed (picks up the current posting_type to
@@ -453,7 +453,7 @@ async def run_company_research_for_job(
     message). Raises ProviderNotConfiguredError if the active provider
     needs configuration that isn't set, InvalidCompanyIdentityError if
     the job has no usable company name, or AmbiguousCompanyIdentityError
-    (FR-M-01) if the job's normalized company name is shared by 2+
+     if the job's normalized company name is shared by 2+
     distinct known-domain companies on file — no other provider failure
     propagates here, see CompanyResearchService.get_or_run's
     failure-isolation contract and CompanyResearchRunResponse's
@@ -491,7 +491,7 @@ async def _maybe_auto_research(
     unbounded number of research runs. Manual triggers (POST
     /jobs/{id}/research, Telegram /research) are unaffected by this budget.
 
-    Codex gate follow-up (Astra R4A, lease-loss MEDIUM): `is_lease_lost`
+    `is_lease_lost`
     is an OPTIONAL callback (`None` for every standalone caller -- the
     manual endpoint, Telegram bot command; only
     `app.services.automation.run_automation_cycle` ever passes one, bound
@@ -513,7 +513,7 @@ async def _maybe_auto_research(
     if budget["remaining"] <= 0:
         return
     budget["remaining"] -= 1
-    # NEW-002 (Astra R4A): captured as plain scalars BEFORE the call, not
+    # captured as plain scalars BEFORE the call, not
     # read from `record` inside the except block below — see that
     # block's own comment for why.
     job_id = record.id
@@ -521,7 +521,7 @@ async def _maybe_auto_research(
     try:
         await CompanyResearchService().get_or_run(db, record, settings)
     except Exception as exc:
-        # NEW-002 (Astra R4A): a failure here (e.g. a flush/commit inside
+        # a failure here (e.g. a flush/commit inside
         # CompanyResearchService.get_or_run's own persistence calls) can
         # leave `db` — the SAME shared session the caller uses for core
         # job scoring/persistence — in SQLAlchemy's "pending rollback"
@@ -659,7 +659,7 @@ async def run_bundesagentur(
     own presentation (HTTP status code, chat message, or
     AutomationRunStepResult).
 
-    `touched_jobs` (S8C-POOL-001): optional kw-only sink. When provided,
+    `touched_jobs`: optional kw-only sink. When provided,
     every job this call successfully scores+persists is appended as a
     `TouchedJob` immediately after that commit — BEFORE the best-effort
     Telegram/auto-research side effects below, so a notification/research
@@ -669,7 +669,7 @@ async def run_bundesagentur(
     Existing callers (the API endpoint, the Telegram bot command) omit
     this parameter entirely and see no behavior change whatsoever.
 
-    `is_lease_lost` (Codex gate follow-up, Astra R4A lease-loss MEDIUM):
+    `is_lease_lost`:
     optional kw-only callback, `None` for every standalone caller (the
     API endpoint, the Telegram bot command) -- only
     `app.services.automation.run_automation_cycle` passes one. Checked
@@ -747,7 +747,7 @@ async def run_bundesagentur(
             work.append((query_collector, job))
         seen_postings |= batch_identities
 
-    # CSP-001: loaded ONCE for this whole collector run, never once per
+    # loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
     candidate_skills = get_candidate_skills_for_scoring(db)
     # One notifier per collector run (not per job): send_job() opens its own
@@ -819,7 +819,6 @@ async def run_bundesagentur(
             # affect created/updated/failed counts or abort the run.
             if notified_count > 0:
                 await asyncio.sleep(1)
-            # Codex gate follow-up (Astra R4A lease-loss MEDIUM, take 2):
             # rechecked HERE, immediately before send_job() -- covers both
             # "lease lost during the pacing sleep above" (the bug: the
             # previous version checked is_lease_lost() only BEFORE that
@@ -882,8 +881,7 @@ async def run_xing(
     Shared by POST /collectors/xing/run, the Telegram control center's
     `/run xing` command, and Stage 8A's automation orchestrator — see
     `run_bundesagentur` above for the same rationale, including
-    `touched_jobs`'s exact semantics (S8C-POOL-001) and `is_lease_lost`'s
-    (Codex gate follow-up, Astra R4A lease-loss MEDIUM).
+    `touched_jobs`'s and `is_lease_lost`'s exact semantics.
     """
     if not is_configured(settings.xing_mailbox_username) or not is_configured(
         settings.xing_mailbox_app_password
@@ -893,14 +891,14 @@ async def run_xing(
             "XING_MAILBOX_USERNAME and XING_MAILBOX_APP_PASSWORD."
         )
 
-    # Codex gate follow-up (Astra R4A MEDIUM, starvation): the persisted
+    # the persisted
     # scan watermark from the LAST run -- see
     # app.db.models.XingScanProgressRecord's docstring. `scan_progress`
     # may be None (brand-new installation) or have both fields unset
     # (never successfully advanced yet); either way `XingEmailCollector`
     # treats that identically to "scan everything in the search window",
     # same as before this fix existed.
-    # Codex gate follow-up (Astra R4A MEDIUM, mailbox scope): scopes the
+    # scopes the
     # watermark row to THIS configured mailbox -- see
     # `compute_mailbox_scope`'s own docstring for why `source="xing"`
     # alone is not a safe key (two different mailboxes can coincidentally
@@ -942,7 +940,7 @@ async def run_xing(
     message_batches = await collector.fetch_message_batches()
     jobs = [job for batch in message_batches for job in batch.jobs]
 
-    # CSP-001: loaded ONCE for this whole collector run, never once per
+    # loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
     candidate_skills = get_candidate_skills_for_scoring(db)
     # One notifier for the whole run (all batches), so the flood-limit pacing
@@ -959,7 +957,7 @@ async def run_xing(
     notified_count = 0
     possible_collisions = 0
     auto_research_budget = {"remaining": settings.company_research_auto_max_per_run}
-    # Codex gate follow-up (Astra R4A MEDIUM, starvation): per-batch
+    # per-batch
     # persistence outcome, keyed by the batch's own IMAP UID -- combined
     # with `collector.confirmed_uids` below to compute the new
     # contiguous confirmed-handled prefix once every batch has been
@@ -1060,7 +1058,7 @@ async def run_xing(
             mark_message_processed(db, "xing", batch.message_id)
         batch_uid_outcomes[batch.uid] = not batch_failed and not lease_lost_now
 
-    # Codex gate follow-up (Astra R4A HIGH, watermark gap): compute and
+    # compute and
     # persist how far the scan can safely resume from next run.
     # `handled_uids` combines every UID this run either (a) confirmed
     # safe to skip without ever yielding a batch (`collector.confirmed_uids`)
@@ -1102,7 +1100,6 @@ async def run_xing(
                 new_watermark = uid
             else:
                 break
-        # Codex gate follow-up (Astra R4A MEDIUM take 3, UIDVALIDITY CAS):
         # the epoch THIS run actually observed at the top of the function
         # (before deciding scan_from_uid/computing new_watermark) -- the
         # baseline `advance_xing_scan_progress`'s reset CAS is contingent
@@ -1142,7 +1139,7 @@ async def run_xing(
         # stored XING record (same company/title/location, different details).
         # The stored record was left untouched; review these in the log.
         "possible_collisions": possible_collisions,
-        # NEW-001 (Astra R4A): True if the IMAP session's total deadline
+        # True if the IMAP session's total deadline
         # fired before every candidate message could be fetched -- see
         # app.collectors.xing_email.XingEmailCollector.deadline_exceeded.
         # _run_step (app.services.automation) treats this as forcing a

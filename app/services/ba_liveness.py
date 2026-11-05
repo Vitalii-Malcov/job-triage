@@ -1,4 +1,4 @@
-"""Is a Bundesagentur posting still online? (Stage 22, P0-2)
+"""Is a Bundesagentur posting still online?
 
 Read-only: one detail request per reference, nothing is written anywhere.
 The 2026-10-30 research treated every 404 as "closed" and was wrong 478 of

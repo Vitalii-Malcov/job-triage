@@ -198,7 +198,7 @@ class ApplicationEventRecord(Base):
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
-# Database-level append-only guarantee (Codex S15 P2). The migration
+# Database-level append-only guarantee. The migration
 # c8e4a2f6d1b9 creates exactly these objects; the listeners below make
 # `Base.metadata.create_all` (test and dev schemas) install them as well, so
 # the guarantee never depends on the ORM guards further down.

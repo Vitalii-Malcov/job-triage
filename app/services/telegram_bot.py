@@ -135,7 +135,7 @@ def _is_authorized(update: Update, settings: Settings) -> bool:
     if settings.telegram_chat_id and chat_id == settings.telegram_chat_id:
         return True
 
-    # S8E-HARDEN-001: never log chat_id or message/command text here --
+    # never log chat_id or message/command text here --
     # both are attacker-controlled input from an UNAUTHENTICATED sender
     # (this branch is reached precisely because the sender is NOT the
     # configured operator chat). Logging either would let any stranger
@@ -394,7 +394,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(str(exc))
             return
         except AmbiguousCompanyIdentityError as exc:
-            # FR-M-01: never show research for an arbitrarily-picked company
+            # never show research for an arbitrarily-picked company
             # when the name is ambiguous across multiple known domains.
             await update.message.reply_text(str(exc))
             return
@@ -464,7 +464,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     with the optional automatic daily digest) -- this handler only owns
     picking `account_key` and replying.
 
-    **Account scope (Codex Stage 8E HIGH finding).** Uses
+    **Account scope.** Uses
     `resolve_digest_account_key`, the SAME shared helper the automatic
     daily digest resolves its account_key through -- never re-derives
     its own normalization here, so a manual `/digest` and the automatic
@@ -922,7 +922,7 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     human operator doesn't have to be tailing server logs to notice a
     command silently failed.
     """
-    # S8E-HARDEN-001: only the exception TYPE, never exc_info/a traceback
+    # only the exception TYPE, never exc_info/a traceback
     # or str(context.error) -- PTB's own error handler contract hands us
     # whatever exception a command handler raised, which could echo back
     # untrusted upstream detail (e.g. a collector's error message) that
@@ -995,7 +995,7 @@ async def start_bot(settings: Settings) -> Application | None:
         await application.start()
         await application.updater.start_polling()
     except Exception as exc:
-        # S8E-HARDEN-001: only the exception TYPE -- a bad/revoked token
+        # only the exception TYPE -- a bad/revoked token
         # or network failure here must never log exc_info/a traceback,
         # which could otherwise surface request/response detail from the
         # underlying HTTP client.

@@ -81,7 +81,7 @@ _NEGATION_PATTERN = re.compile(
     r"\bdas\s+ist\s+keine?\b|"
     r"\bthis\s+is\s+not\s+a\b|"
     r"\bnot\s+a\s+rejection\b|"
-    # Codex round 7: "es liegt keine Absage vor" states the opposite.
+    # "es liegt keine Absage vor" states the opposite.
     r"\bkeine\s+(?:absage|ablehnung)\b|"
     r"\bnicht\s+(?:erforderlich|notwendig|zwingend)\b|"
     r"\bnot\s+(?:required|necessary|mandatory)\b|"
@@ -104,7 +104,7 @@ _AUTOMATED_PHRASE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Codex night-audit review: "Wir können Ihnen derzeit (leider) keine positive
+# "Wir können Ihnen derzeit (leider) keine positive
 # Nachricht geben; die Entscheidung fällt nächste Woche" is a pending
 # decision. The open-ended "keine positive ..." phrase only counts as a
 # rejection in a sentence without such a marker.
@@ -273,7 +273,7 @@ _CONTRADICTORY_WITH_REJECTION: frozenset[EmailCategory] = frozenset(
 # spec) applies — used by
 # app.services.gmail_message_analysis.determine_requires_human_review.
 #
-# 7B-009 (Codex remediation round 1): REQUEST_FOR_INFORMATION was
+# 7B-009: REQUEST_FOR_INFORMATION was
 # reproduced reaching HIGH confidence with requires_human_review=False —
 # unsafe, since a recruiter asking for documents/availability/salary
 # expectations/work authorization IS actionable correspondence a human
@@ -384,7 +384,7 @@ def _matched_categories(text: str) -> dict[EmailCategory, str]:
         for category, pattern in _CATEGORY_PATTERNS.items():
             if category in matches:
                 continue
-            # Every mention in the sentence is examined (Codex round 6): a
+            # Every mention in the sentence is examined: a
             # suppressed first phrase ("derzeit ... keine positive
             # Nachricht") must not hide a definitive later one ("da wir uns
             # anderweitig entschieden haben").

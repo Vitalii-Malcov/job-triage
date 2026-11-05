@@ -186,7 +186,7 @@ def claim_send_attempt(
 def retry_send_attempt(db: Session, record: FollowUpSendRecord) -> bool:
     """CAS `FAILED -> PENDING` retry claim — see
     app.db.response_draft_approval_repository.retry_send_attempt's
-    docstring. `send_attempted` is reset to False (S7E-010): a FAILED row
+    docstring. `send_attempted` is reset to False: a FAILED row
     is, by construction, always a DEFINITE pre-transmission failure (see
     `mark_send_failed`'s docstring), so a fresh retry legitimately starts
     the pre-transmission window over.
@@ -222,7 +222,7 @@ def retry_send_attempt(db: Session, record: FollowUpSendRecord) -> bool:
 
 
 def begin_transmission(db: Session, record: FollowUpSendRecord) -> bool:
-    """S7E-002/010 (Codex remediation): the SOLE exclusivity gate for "who
+    """the SOLE exclusivity gate for "who
     gets to actually call `OutboundEmailProvider.send`" — a CAS
     `send_attempted: False -> True`, guarded by `WHERE status='PENDING'
     AND send_attempted=False`. Exactly one concurrent request can ever win
@@ -230,7 +230,7 @@ def begin_transmission(db: Session, record: FollowUpSendRecord) -> bool:
     request's identical UPDATE affects 0 rows, since the first commit
     already flipped `send_attempted` to True). Must be called — and won —
     AFTER claiming/retrying the send record and BEFORE both send-time
-    revalidation (S7E-002) and the actual provider call, so that only the
+    revalidation and the actual provider call, so that only the
     single winner ever reaches either step for this proposal. See
     `FollowUpSendRecord.send_attempted`'s docstring for the crash-recovery
     semantics this enables: a row observed PENDING with `send_attempted`

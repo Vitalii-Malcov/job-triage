@@ -101,7 +101,7 @@ class CompanyResearchRecord(Base):
 
 class CompanyResearchIdentityAlias(Base):
     """DB-backed atomic coordination point for the "mixed name/domain
-    creation race" (Codex re-review finding RR-M-01).
+    creation race".
 
     CompanyResearchRecord.identity_key's UNIQUE constraint only stops two
     *identical* identity_key values from both being inserted. It does

@@ -191,7 +191,7 @@ def _layout(blocks: list[Block]) -> list[list[bytes]]:
     def height_needed(index: int) -> float:
         """Space this block needs on the current page. A heading chain
         (TITLE/HEADING/SUBHEADING ...) is kept together with the first line
-        of the block that follows it (Codex review B, P3); any other block
+        of the block that follows it; any other block
         with at least two lines (or all of a one-line block)."""
         block, lines = wrapped[index]
         style = _STYLES[block.kind]

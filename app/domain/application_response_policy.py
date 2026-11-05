@@ -14,7 +14,7 @@ Pure decision table, no I/O:
 | OTHER_APPLICATION_MESSAGE       | --                    | MEDIUM           |
 | UNKNOWN                         | --                    | MEDIUM           |
 
-**E-mail never makes an application terminal (Codex S15 P1).** Inbound mail
+**E-mail never makes an application terminal.** Inbound mail
 carries no authenticated provenance in this pipeline (no SPF/DKIM/DMARC
 evidence; sender, display name, subject and body are attacker-controllable),
 and a public vacancy reference plus the company name are enough to reach

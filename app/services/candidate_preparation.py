@@ -155,7 +155,7 @@ def prepare_candidate_cv_draft(
     Thin wrapper around `prepare_candidate_cv_draft_with_outcome` that
     discards the `created` flag — kept as its own function/signature so
     the manual `POST /jobs/{id}/cv-draft` endpoint's behavior and return
-    type are completely unchanged (S8C-CACHE-001).
+    type are completely unchanged.
     """
     result = prepare_candidate_cv_draft_with_outcome(
         db, job_id, match_id, force_recompute=force_recompute
@@ -172,7 +172,7 @@ def prepare_candidate_cv_draft_with_outcome(
     """Same computation as `prepare_candidate_cv_draft`, but additionally
     exposes the REAL `created` outcome from
     `app.db.candidate_cv_draft_repository.create_draft`'s own
-    INSERT-or-reload race handling (S8C-CACHE-001) — `created=True` only
+    INSERT-or-reload race handling — `created=True` only
     for a genuinely fresh row THIS call inserted; `created=False` for
     both an existing-cache-hit return AND for losing a concurrent
     UNIQUE-constraint race (another writer's row is reloaded and

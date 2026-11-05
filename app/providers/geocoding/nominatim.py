@@ -44,7 +44,7 @@ _LAST_REQUEST_KEY = "__last_request_epoch__"
 Precision = Literal["ADDRESS", "AREA", "STREET", "POSTCODE", "CITY", "UNKNOWN"]
 
 # Only a building-level object is an ADDRESS. An industrial / commercial
-# AREA (class=landuse) is a polygon's centre, not the workplace (Codex review).
+# AREA (class=landuse) is a polygon's centre, not the workplace.
 _ADDRESS_TYPES = {"house", "building"}
 _ADDRESS_CLASSES = {"building", "amenity", "office", "shop", "craft"}
 _AREA_TYPES = {"industrial", "commercial", "retail", "landuse", "neighbourhood"}
@@ -64,12 +64,12 @@ class GeocodeResult:
     precision: Precision
     provenance: str  # e.g. "nominatim:way/123456 (house)"
     display_name: str
-    # Codex round 10: ADDRESS precision only after the hit's street and
+    # ADDRESS precision only after the hit's street and
     # house number were compared with the request; results cached before
     # that check (False) are read back as STREET.
     building_checked: bool = False
     # Version of the hit checks this result passed; an entry cached under an
-    # older version is fetched again (Codex round 12).
+    # older version is fetched again.
     check_version: int = 0
 
     @property
@@ -177,7 +177,7 @@ def _names_requested_town(address: str, hit: dict) -> bool:
 def _verified_precision(address: str, hit: dict, precision: Precision) -> Precision:
     """The precision a hit may be used with, or GeocodingUnavailableError.
 
-    Codex round 11: a hit for another building or another postcode is an
+    a hit for another building or another postcode is an
     unrelated point. Its coordinates are never used, not even as an
     approximate destination (a route to it could make a wrong FAIL as
     easily as a wrong PASS); the distance stays unverified."""
@@ -243,7 +243,7 @@ class NominatimGeocoder:
         self.lock_timeout_seconds = lock_timeout_seconds
         self._cache: dict[str, dict] = self._load_cache()
         # Persisted with the cache, so the 1 request/s limit also holds across
-        # separate CLI runs (Codex night-audit review).
+        # separate CLI runs.
         stored = self._cache.pop(_LAST_REQUEST_KEY, None)
         self._last_request: float | None = stored if isinstance(stored, int | float) else None
 
@@ -272,7 +272,7 @@ class NominatimGeocoder:
     @contextlib.contextmanager
     def _exclusive(self) -> Iterator[None]:
         """Cross-process lock around "wait, record time, send": concurrent CLI
-        runs cannot both see no recent request (Codex review). Stale locks
+        runs cannot both see no recent request. Stale locks
         (> 60 s, a crashed run) are taken over."""
         if self.cache_path is None:
             yield
@@ -385,7 +385,7 @@ class NominatimGeocoder:
             return hit
         with self._exclusive():
             # Everything that reads or writes shared state happens under the
-            # cross-process lock (Codex round 3): another run may have cached
+            # cross-process lock: another run may have cached
             # this address meanwhile, and the save merges with the file.
             self._merge_from_disk()
             cached = self._cache.get(key)

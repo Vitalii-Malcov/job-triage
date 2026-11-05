@@ -65,7 +65,7 @@ def compute_mailbox_scope(
     new mailbox always starts fresh regardless of any UIDVALIDITY
     coincidence.
 
-    **Serialization (Codex gate follow-up, Astra R4A MEDIUM take 2).** The
+    **Serialization.** The
     four fields are encoded via `json.dumps` of an explicit list, not
     plain `":"`-joined string interpolation -- a naive
     `f"{host}:{port}:{username}:{mailbox}"` is ambiguous whenever any
@@ -121,7 +121,7 @@ def get_xing_scan_progress(
     like `uid_validity`/`confirmed_upto_uid` both being unset (scan the
     full search window, same as before this fix existed).
 
-    `mailbox_scope` (Codex gate follow-up, Astra R4A MEDIUM) restricts the
+    `mailbox_scope` restricts the
     lookup to the row for THIS configured mailbox -- see
     `compute_mailbox_scope`'s own docstring for why `source` alone is not
     a safe key.
@@ -157,7 +157,7 @@ def advance_xing_scan_progress(
     - `uid_validity != observed_uid_validity` (mailbox recreated, as THIS
       caller understood it): the old watermark is no longer meaningful for
       the new UID space -- overwrite both columns with the given values,
-      but (Codex gate follow-up, Astra R4A MEDIUM take 3: UIDVALIDITY CAS)
+      but
       ONLY if the row is still in the `observed_uid_validity` epoch this
       caller actually read -- see `_advance_existing`'s own docstring for
       why a broad "differs from the new value" check is unsafe here.
@@ -167,7 +167,7 @@ def advance_xing_scan_progress(
       previous run already persisted must never regress the watermark
       and force wasted rescanning.
 
-    Codex gate follow-up (Astra R4A MEDIUM, concurrency): both guards are
+    both guards are
     enforced by `_advance_existing`'s `UPDATE ... WHERE` clause itself,
     evaluated by the database against the row's CURRENT committed state
     at execution time -- not by this function's own `existing` snapshot,

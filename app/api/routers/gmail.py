@@ -79,7 +79,7 @@ async def run_gmail_sync(db: Session = Depends(get_db)) -> GmailSyncResult:
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     except GmailProviderError as exc:
-        # GMAIL-003: never interpolate the caught exception into the HTTP
+        # never interpolate the caught exception into the HTTP
         # response or into the log line — a provider/persistence error's
         # own message text could otherwise carry back a server-echoed
         # mailbox address, hostname, or (via a driver-level error further
@@ -103,7 +103,7 @@ def get_gmail_messages(
     db: Session = Depends(get_db),
 ) -> list[GmailMessageSummary]:
     """Pure read of already-synced messages, in compact summary form
-    (GMAIL-007) — never body_plain/full recipients/references; see
+     — never body_plain/full recipients/references; see
     GET /gmail/messages/{id} for full detail. Never triggers a sync
     itself — POST /gmail/sync is the only endpoint that reads the
     mailbox.
@@ -139,7 +139,7 @@ def get_gmail_threads(
     db: Session = Depends(get_db),
 ) -> list[GmailThread]:
     account_key = _current_gmail_account_key(common.get_settings())
-    # GMAIL-008: one grouped query for the whole page, never a per-thread
+    # one grouped query for the whole page, never a per-thread
     # COUNT query.
     pairs = list_threads_with_counts(db, account_key, limit=limit, offset=offset)
     return [to_gmail_thread(record, count) for record, count in pairs]

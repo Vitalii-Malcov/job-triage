@@ -1,4 +1,4 @@
-"""Advisory text overlap between two vacancy descriptions (Stage 22, P0-3).
+"""Advisory text overlap between two vacancy descriptions.
 
 Purpose: notice a vacancy that is the SAME job as one already applied to,
 published again under another title or by an intermediary. Measured on the

@@ -207,7 +207,7 @@ def _applications_seen_from_sender(applications, sender_seen, message) -> tuple[
 
 
 _OPERATOR_DECISIONS = frozenset({"STATUS_CHANGED", "STATUS_OVERRIDDEN"})
-# Codex Stage 19 review round 2: only a status that answers THIS mail (or a
+# only a status that answers THIS mail (or a
 # terminal one) counts as handling it; an unrelated change never hides it.
 _TERMINAL = frozenset({"REJECTED", "WITHDRAWN", "OFFER"})
 _ANSWERS = {
@@ -342,7 +342,7 @@ class ApplicationResponseProcessor:
                 if correlation.status == "AMBIGUOUS" or known
                 else None
             )
-            # Codex Stage 19 review: once the operator acted on a candidate
+            # once the operator acted on a candidate
             # application after this mail arrived, it no longer asks for a
             # decision on every scan.
             # Codex round 3 (design rethink): cleared automatically only when
@@ -433,7 +433,7 @@ class ApplicationResponseProcessor:
             classifier_confidence=classified.confidence,
         )
         if decision.action != "IGNORE" and needs_sender(correlation.signals):
-            # Night audit (Codex round 3): the sender only POINTS to an
+            # Night audit: the sender only POINTS to an
             # application; it may be another vacancy of the same employer
             # under an alias. Nothing is written; the operator decides.
             proposed = decision.target or decision.proposed_status

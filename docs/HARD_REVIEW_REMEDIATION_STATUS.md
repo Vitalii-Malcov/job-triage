@@ -23,8 +23,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 11 | Arch §3 target roles vs stored config | ACCEPTED — task 4e661ef, merge e9daa49 |
 | 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED — task 70d0910, merge 1ec31f7 |
 | 13 | Arch §3 stage-named operational scripts | ACCEPTED — task 19a2f73, merge 105f980 |
-| 14 | Arch §3 rate limiter duplication | ACCEPTED (see below; SHAs in git log) |
-| 15–19 | see task list | PENDING |
+| 14 | Arch §3 rate limiter duplication | ACCEPTED — task 7fb2b5f, merge 65861b6 |
+| 15 | Quality §4 review history in comments | ACCEPTED (see below; SHAs in git log) |
+| 16–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -187,3 +188,13 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_rate_limit_quotas.py` (17 quotas x 5 behaviours + bucket independence, alias identity, proxy identity).
 - Full pytest: 7561 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: 1 code round `VERDICT: ACCEPT` (AST-compared that limits, details, aliases and locking are unchanged; noted the improvement is narrow).
+
+## TASK 15 — Review history in production comments (Quality §4)
+
+- Confirmed: 417 `Codex`/`Astra` mentions and 590 ticket-id mentions in `app/` comments/docstrings; `app/db/session.py` spent ~35 comment lines on `connect_timeout=10`.
+- Change: dev tool `scripts/strip_review_attribution.py` (command `strip-review-attribution`, `--check` / `--write`) removes ONLY provenance-only fragments — parentheticals made solely of provenance words/ticket ids (nested too) and leading provenance labels (list numbers/bullets kept) — at the exact token spans of comments and docstrings; ticket ids are an allow-list of prefixes (`SHA-256`, `UTF-8`, `RFC-…` are untouched); matching is linear; it refuses to write a file whose AST (docstrings blanked) would change. It rewrote 103 `app/` files: Codex/Astra mentions 417 -> 143, ticket ids 590 -> 251 (remaining: prose narratives, multi-line parentheticals, prose-bearing labels — deliberately not rewritten automatically). Hand work: `app/db/session.py` comment condensed to 9 lines (rationale, 60 s+ observation, per-address 10 s, pre_ping relation, doc pointer kept), 4 dangling spots repaired. `--check` is a ratchet (`tests/test_review_attribution_hygiene.py`, 34 tests incl. SHA-256/`send()` preservation, unicode, near-match timing, overlapping spans, idempotence, CRLF).
+- Behaviour: none — Codex re-verified AST equality (docstrings blanked) HEAD vs staged for all 103 files; the only code change in the diff is the CLI registration.
+- Operational effect (same as TASK 10): comment edits change source bytes, so `fit_cache.compute_rules_hash` changes again; stored vacancy fit assessments are stale-by-design until the operator re-runs the fill script (no data deleted). One refill after deploying the whole branch covers TASK 10 and TASK 15.
+- Residual: the remaining 143 narrative mentions ("Codex reproduced ...") and 251 ids; CI file comments are TASK 16.
+- Full pytest: 7595 passed, 148 skipped, 1 failed (my TASK 07 wall-clock heartbeat test with a 0.6 s TTL lost a renewal in a 48-minute loaded run; margins widened to 3.0 s / 7.0 s, passes). Ruff clean. No schema change.
+- Codex: plan folded into 4 code rounds (R1-R3 CHANGES_REQUESTED: SHA-256 loss, ReDoS, token spans, byte/char offsets, partial annotations, idempotence, unicode prose, overlapping edits — all fixed with tests; R4 ACCEPT).

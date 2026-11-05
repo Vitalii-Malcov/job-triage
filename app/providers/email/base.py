@@ -63,7 +63,7 @@ MAX_REFERENCES = 20
 MAX_BODY_LENGTH = 20_000
 MAX_ATTACHMENTS = 20
 
-# GMAIL-009: config-level bounds, kept here (not duplicated in
+# config-level bounds, kept here (not duplicated in
 # app.core.config) so app.core.config.Settings and normalize_account_key
 # below can never drift apart on what "too long" means for the same
 # underlying value.
@@ -82,7 +82,7 @@ MAX_MAILBOX_NAME_LENGTH = 100
 IMAP_NZ_NUMBER_MAX = 2**32 - 1
 MAX_IMAP_HOST_LENGTH = 253
 
-# GMAIL-005: bounds applied BEFORE the expensive part of a fetch, not just
+# bounds applied BEFORE the expensive part of a fetch, not just
 # after decoding.
 #
 # `MAX_RAW_MESSAGE_SIZE` gates a lightweight `RFC822.SIZE` FETCH against
@@ -133,7 +133,7 @@ MAX_MIME_DEPTH = 20
 
 def normalize_account_key(username: str) -> str:
     """The stable, non-secret identity a mailbox account is scoped by
-    (GMAIL-002) — never the password, never anything else secret.
+     — never the password, never anything else secret.
 
     Deliberately simple (strip + casefold of the configured
     `GMAIL_USERNAME`): this is an account *identity* for dedup/threading
@@ -150,7 +150,7 @@ class GmailProviderError(Exception):
     "connection failed" from a persistence-layer error, mirroring
     app.collectors.base.CollectorError's role for job collectors.
 
-    GMAIL-003: every message raised anywhere in this package is a fixed,
+    every message raised anywhere in this package is a fixed,
     static string — never an f-string embedding the *upstream*
     exception/server-response text (which could otherwise carry back a
     server-echoed mailbox address or other operator-identifying text to
@@ -203,7 +203,7 @@ class ParsedGmailMessage:
 
     `account_key`/`mailbox`/`uid`/`uid_validity` together are the stable
     provider identity used for dedup (see app/db/gmail_repository.py).
-    `account_key` (GMAIL-002) scopes identity to the configured mailbox
+    `account_key` scopes identity to the configured mailbox
     account: IMAP UID/UIDVALIDITY are only meaningful within one account's
     mailbox, so switching `GMAIL_USERNAME` to a different account must
     never collide with — or silently inherit — another account's history.
@@ -267,8 +267,8 @@ class GmailFetchResult:
     the caller (app.services.gmail_inbox) tracks separately once messages
     reach the database layer.
 
-    `deadline_exceeded` (NEW-001, Astra R4A): True when the total IMAP
-    session deadline (AUD-005) fired before every candidate UID could be
+    `deadline_exceeded`: True when the total IMAP
+    session deadline fired before every candidate UID could be
     fetched. `messages` still contains every message that DID finish
     fetch+parse before that happened — this result is never discarded or
     replaced by an exception merely because the deadline expired
@@ -279,12 +279,12 @@ class GmailFetchResult:
     propagates into a truthful non-"ok" sync outcome instead of a false
     "ok" or a discarded batch).
 
-    `uid_validity` (FINAL-004, Astra R5A): this run's resolved mailbox
+    `uid_validity`: this run's resolved mailbox
     UIDVALIDITY — always set (`_read_uid_validity` runs unconditionally
     before any per-UID work), needed by the caller to scope
     `permanently_skipped` correctly.
 
-    `permanently_skipped` (FINAL-004, Astra R5A): `(uid, reason)` pairs
+    `permanently_skipped`: `(uid, reason)` pairs
     for every UID this run determined is permanently unfetchable because
     the MESSAGE'S OWN CONTENT is what's wrong (oversized past
     MAX_RAW_MESSAGE_SIZE, or a MIME structure that fails to parse) — as

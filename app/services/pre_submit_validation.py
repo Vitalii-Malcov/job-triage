@@ -117,8 +117,7 @@ def pdf_page_count(data: bytes) -> int | None:
 
     The parser's page tree is authoritative (PDF 1.5+ object streams, escaped
     names such as `/P#61ge`); the raw `/Type /Page` count is only a floor, so
-    a PDF is never counted shorter than the page objects it visibly holds
-    (Codex rounds 4-5)."""
+    a PDF is never counted shorter than the page objects it visibly holds."""
     if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-2048:]:
         return None
     if b"startxref" not in data[-4096:] or b"/Root" not in data:
@@ -188,7 +187,7 @@ def _role_covered(text: str, role: str) -> bool:
     return hits / len(words) >= 0.6
 
 
-# Codex rounds 13-15: German levels in a document are read per mention, not
+# German levels in a document are read per mention, not
 # with one regex per phrasing. After "Deutsch..." every CEFR level up to the
 # next language name or the end of the statement is claimed for German
 # ("Deutschkenntnisse: Niveau B2", "auf B2-Niveau"); before it, only a level
@@ -208,7 +207,7 @@ _GOAL_AFTER = re.compile(
 )
 _GOAL_BEFORE = re.compile(r"(?:ziel\w*|angestrebt\w*|auf\s+dem\s+weg\s+zu)\W*$", re.I)
 # The next "Label:" starts a new CV row; pdf_text joins rows, so "Deutsch:
-# B1" + "Muttersprache: Arabisch" arrive as one line (Codex round 19).
+# B1" + "Muttersprache: Arabisch" arrive as one line.
 _NEXT_LABEL = re.compile(r"\b\w+\s*:")
 _STATEMENT_END = re.compile(r"[.;•|]\s|\n")
 _LEVEL_BEFORE = re.compile(r"([ABC][12])[\s(\-–:]*(?:niveau\s*)?(?:in\s+|im\s+)?$", re.I)
@@ -266,7 +265,7 @@ def _german_claims(text: str) -> set[str]:
         if before is not None and _owned_by_german(lead[: before.start()]):
             # "Japanisch B2 Deutsch B1", "Arabisch: Niveau B2 Deutsch B1": a
             # level with a language name before it in the same row belongs to
-            # that language (Codex rounds 15-16).
+            # that language.
             claims.add(before.group(1).upper())
         descriptor = _DESCRIPTOR_BEFORE.search(lead)
         if descriptor is not None and _owned_by_german(lead[: descriptor.start()]):
@@ -276,7 +275,7 @@ def _german_claims(text: str) -> set[str]:
 
 
 def _overclaimed_german(text: str, confirmed: str | None) -> list[str]:
-    # Codex round 12: without a confirmed level (None / UNKNOWN) every
+    # without a confirmed level (None / UNKNOWN) every
     # stated claim is unconfirmed, never silently accepted.
     held = _LEVELS.get((confirmed or "").upper(), 0)
     return sorted(
@@ -329,7 +328,7 @@ def _required_text_hash(source: Path) -> str | None:
     """The text hash a Stage 20 export source names; None for any other
     source (Stage 19 HTML, in any encoding). The marker is looked for in the
     raw bytes, so a damaged (non-UTF-8) export source cannot pass as Stage 19
-    HTML (Codex review); a marker without a valid hash, or an unreadable
+    HTML; a marker without a valid hash, or an unreadable
     source, never matches."""
     try:
         raw = source.read_bytes()
@@ -387,12 +386,12 @@ def validate_package(
             continue
         if len(data) > expected.max_bytes:
             add(Finding(f"{kind.upper()}_TOO_LARGE", "BLOCK", f"{len(data)} bytes"))
-            # Codex round 3: an oversized PDF is not parsed at all.
+            # an oversized PDF is not parsed at all.
             blocked_pdfs.add(kind)
             continue
         pages = pdf_page_count(data)
         if not pages or pages > MAX_PAGES_TO_READ:
-            # Codex round 3: an oversized / already-failed PDF is not parsed.
+            # an oversized / already-failed PDF is not parsed.
             blocked_pdfs.add(kind)
         if not pages:
             add(
@@ -418,7 +417,7 @@ def validate_package(
         original = originals.get(kind)
         if original is None or kind in blocked_pdfs:
             continue
-        # Codex night-audit review P1 (round 2): the content checks read the
+        # the content checks read the
         # PDF that will be uploaded, never only the HTML it was made from.
         text = pdf_text(original)
         if text is None or len(text) < MIN_PDF_TEXT_CHARS:
@@ -434,7 +433,7 @@ def validate_package(
         binding = bindings.get(kind) if isinstance(bindings.get(kind), dict) else None
         source = package / "_quelle_html" / SOURCE_FILES[kind]
         if binding is None and manifest:
-            # Codex round 5: a manifest that binds only some documents must
+            # a manifest that binds only some documents must
             # not lend its profile-version stamp to the unbound one.
             add(
                 Finding(
@@ -505,7 +504,7 @@ def validate_package(
                 )
             )
     if not attached or "cv" not in attached:
-        # Codex round 3: comparing only the letter leaves a CV the portal
+        # comparing only the letter leaves a CV the portal
         # pre-filled from another package unchecked.
         add(
             Finding(

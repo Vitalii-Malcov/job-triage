@@ -62,7 +62,7 @@ async def run_company_research(
             status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except AmbiguousCompanyIdentityError as exc:
-        # FR-M-01: the input (job id) is itself valid, but the identity it
+        # the input (job id) is itself valid, but the identity it
         # resolves to is ambiguous relative to current DB state — 409, not
         # 422/404. Never falls back to returning an arbitrary company.
         raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -96,7 +96,7 @@ def get_company_research(job_id: int, db: Session = Depends(get_db)) -> CompanyR
     try:
         result = CompanyResearchService().get_cached(db, job)
     except AmbiguousCompanyIdentityError as exc:
-        # FR-M-01: GET is a pure cache read and must never arbitrarily pick
+        # GET is a pure cache read and must never arbitrarily pick
         # one of several known-domain companies sharing this job's
         # normalized company name — same controlled 409 as POST.
         raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc

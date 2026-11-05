@@ -40,7 +40,7 @@ COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/2|"
 # Random per web process: a restart invalidates every cookie (see module docstring).
 _PROCESS_NONCE = secrets.token_hex(16)
-# Codex review A (P2): parse a cookie only in its exact shape; anything else
+# parse a cookie only in its exact shape; anything else
 # (non-ASCII digits, odd signature) is "not logged in", never a 500.
 _TOKEN = re.compile(r"([0-9]{1,12})\.([0-9a-f]{32})\.([0-9a-f]{64})")
 
@@ -181,7 +181,7 @@ def require_same_origin(request: Request) -> None:
     """Login/logout are the only POSTs; a cross-site form post is refused
     (login CSRF). The Origin's host must equal the request's Host header --
     the scheme is not compared, because behind the documented TLS-terminating
-    proxy the browser says https while Uvicorn sees http (Codex review A, P2).
+    proxy the browser says https while Uvicorn sees http.
     `UI_PUBLIC_ORIGIN` additionally allows one configured external origin
     for a proxy that rewrites Host. A missing Origin header (non-browser
     client) is allowed: the request then still needs the key itself (login)
@@ -192,7 +192,7 @@ def require_same_origin(request: Request) -> None:
     forbidden = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="cross-origin request")
     try:
         parsed = urlsplit(origin)
-    except ValueError:  # e.g. "https://[" (Codex review A round 2)
+    except ValueError:  # e.g. "https://["
         raise forbidden from None
     public = get_settings().ui_public_origin.rstrip("/")
     if public and origin.rstrip("/").casefold() == public.casefold():

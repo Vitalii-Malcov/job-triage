@@ -422,7 +422,7 @@ async def _send_claimed_card(
         )
         return _RELEASED if manual_review else _FAILED
 
-    # Re-check immediately before networking (Codex S9A-CODEX-002): the
+    # Re-check immediately before networking: the
     # heartbeat thread may have confirmed lease loss during the claim's
     # commit/refresh or the render above. No HTTP request has started,
     # so the row is known-not-sent -- release it back to the queue

@@ -8,7 +8,7 @@ single expected head. `ALEMBIC_AUTO_UPGRADE` is off in production, so a
 schema behind (or ahead of) the code is a real "not ready" state that this
 check reports instead of repairing -- it never migrates, creates, or writes.
 
-**Bounded end to end (Codex P2-05).** The Docker healthcheck times out after
+**Bounded end to end.** The Docker healthcheck times out after
 5 seconds, and the request engine's own settings are far looser
 (`connect_timeout=10` per resolved address, a 30 s QueuePool checkout
 timeout). Wrapping those in an HTTP-level timeout would leave the check

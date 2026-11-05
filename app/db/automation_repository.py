@@ -23,7 +23,7 @@ from app.models.automation import AutomationRun, AutomationRunStepResult
 AUTOMATION_RUN_LIST_DEFAULT_LIMIT = 20
 AUTOMATION_RUN_LIST_MAX_LIMIT = 100
 
-# S8A-002: mirrors app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS's own
+# mirrors app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS's own
 # rationale — bounds how long a crashed holder (a process that died
 # mid-run, or whose heartbeat otherwise stopped) can block new
 # automation runs for that account. A live holder's heartbeat renews
@@ -101,7 +101,7 @@ def _insert_running_run(
 
 
 def reconcile_stale_run_to_failed(db: Session, record: AutomationRunRecord) -> bool:
-    """S8A-002: CAS `RUNNING -> FAILED` for a run whose lease has
+    """CAS `RUNNING -> FAILED` for a run whose lease has
     EXPIRED — the crash-recovery counterpart to Stage 7E's expired-lock
     reclaim, except here the reclaim itself is an explicit, auditable
     state transition (a stale RUNNING row becomes a terminal FAILED one
@@ -153,7 +153,7 @@ def create_running_run(
     app.services.automation.run_automation_cycle, raises
     `AutomationRunAlreadyInProgressError` in that case).
 
-    S8A-002 (Codex re-review, crash recovery): if the existing RUNNING
+    if the existing RUNNING
     row's lease has EXPIRED (its holder crashed or otherwise stopped
     renewing), this atomically reconciles it to `FAILED`
     (`reconcile_stale_run_to_failed`) and retries the insert — a crashed
@@ -209,7 +209,7 @@ def renew_run_lease(
     holder: str,
     ttl_seconds: float = AUTOMATION_RUN_LEASE_TTL_SECONDS,
 ) -> bool:
-    """S8A-002 (Codex re-review): the DEDICATED CAS a lease-renewal
+    """the DEDICATED CAS a lease-renewal
     heartbeat (`app.services.automation._RunLeaseHeartbeat`) must use —
     mirrors app.db.gmail_repository.renew_thread_lock EXACTLY, including
     why it is NOT interchangeable with `create_running_run`'s claim path:

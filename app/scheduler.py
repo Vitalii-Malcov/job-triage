@@ -52,7 +52,7 @@ from app.services.telegram_digest import resolve_digest_account_key
 
 logger = logging.getLogger(__name__)
 
-# S8B-PRE-001: a fixed, generic message only -- `Settings` holds several
+# a fixed, generic message only -- `Settings` holds several
 # credentials (Gmail app password, Telegram bot token, API keys, ...), and
 # pydantic's ValidationError.__str__ can include the offending INPUT VALUE
 # for other, unrelated fields that also failed validation in the same
@@ -72,7 +72,7 @@ class _ShutdownRequested(BaseException):
     intentional `docker stop` case into a clean logged stop instead of a
     silent hard kill.
 
-    HARD-005 (adversarial hardening r1): subclasses `BaseException`, not
+    subclasses `BaseException`, not
     `Exception` -- deliberately mirroring `KeyboardInterrupt`/`SystemExit`,
     for the exact same reason those two are BaseException subclasses. A
     signal can interrupt at any bytecode boundary, including inside
@@ -93,7 +93,7 @@ def _handle_sigterm(signum, frame) -> None:
 
 def _run_until_shutdown(coro) -> int:
     """Shared `asyncio.run` + clean-shutdown wrapper for both the real
-    poll loop and `_idle_forever` (DEPLOY-002) — both must stop the exact
+    poll loop and `_idle_forever` — both must stop the exact
     same way on Ctrl+C (SIGINT) or `docker stop` (SIGTERM), and always
     return `0` for either (see `main()`'s two call sites).
     """
@@ -109,7 +109,7 @@ def _run_until_shutdown(coro) -> int:
 
 
 async def _idle_forever() -> None:
-    """DEPLOY-002 (Codex master review): entered instead of returning
+    """entered instead of returning
     immediately when both `automation_scheduler_enabled` and
     `telegram_daily_digest_enabled` are false. Blocks until SIGINT/SIGTERM
     without doing any work.
@@ -157,7 +157,7 @@ async def _poll_loop(settings) -> None:
 
     account_key = settings.automation_scheduler_account_key
     poll_seconds = settings.automation_scheduler_poll_seconds
-    # AUD-010: account_key is an operator's real account identity
+    # account_key is an operator's real account identity
     # (derived from GMAIL_USERNAME/AUTOMATION_SCHEDULER_ACCOUNT_KEY, an
     # email address in practice -- see app.core.config's own account_key
     # docstrings) -- it must never be written to startup logs, mirroring
@@ -197,7 +197,7 @@ async def _poll_loop(settings) -> None:
                     )
             if settings.telegram_daily_digest_enabled:
                 try:
-                    # S8E ACCOUNT SCOPE (Codex finding): resolved through
+                    # S8E ACCOUNT SCOPE: resolved through
                     # the SAME shared helper the manual /digest command
                     # uses (app.services.telegram_digest.cmd_digest),
                     # never re-derived here -- see
@@ -229,7 +229,7 @@ def main() -> int:
         # (app.core.config.Settings's model_validator) as well as any
         # other Settings misconfiguration -- fail closed with a clear,
         # SANITIZED message here rather than an unhandled traceback.
-        # S8B-PRE-001: never print/log str(exc)/repr(exc) -- a
+        # never print/log str(exc)/repr(exc) -- a
         # ValidationError's own message can embed the offending input
         # value for ANY field that failed validation in this same
         # Settings() construction, which may be a credential (Gmail app
@@ -253,7 +253,7 @@ def main() -> int:
     # so a worker started for "digest only" never triggers an
     # automation cycle, and vice versa.
     if not settings.automation_scheduler_enabled and not settings.telegram_daily_digest_enabled:
-        # DEPLOY-002 (Codex master review): idle instead of exiting 0 --
+        # idle instead of exiting 0 --
         # see `_idle_forever`'s docstring for why a clean exit here is
         # exactly what makes `restart: unless-stopped` restart-loop this
         # container. Still logs the same informative message; an operator

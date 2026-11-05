@@ -595,7 +595,7 @@ class ApplicationTracker:
         ):
             raise TerminalStatusNotPermittedError("overrides are operator actions only")
         if target is not None and is_terminal(target):
-            # Codex S15 P1: the single lifecycle writer refuses a terminal
+            # the single lifecycle writer refuses a terminal
             # status from any non-operator origin -- inbound mail (GMAIL) is
             # unauthenticated, and SYSTEM/PORTAL/IMPORT never decide outcomes.
             if origin != ApplicationEventOrigin.OPERATOR:

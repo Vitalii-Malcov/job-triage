@@ -40,7 +40,7 @@ class _RateLimiter:
     docstring), not attributes of this class.
     """
 
-    # HARD-001: a distinct-host key is never removed from `self.buckets`
+    # a distinct-host key is never removed from `self.buckets`
     # just by its own deque emptying out (trimming only ever runs when
     # THAT host makes another request) -- a host that is never seen again
     # would otherwise leave its dict entry allocated for the life of the

@@ -83,6 +83,11 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "build-common-stems", "build_job_ad_common_stems.py", "rebuild the job-ad common-stem list"
     ),
+    Command(
+        "strip-review-attribution",
+        "strip_review_attribution.py",
+        "remove review provenance from comments/docstrings of app/",
+    ),
     Command("check-quality", "check_tracked_quality.py", "ruff gate over tracked sources"),
 )
 BY_NAME = {command.name: command for command in COMMANDS}

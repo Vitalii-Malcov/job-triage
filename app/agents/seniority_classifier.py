@@ -32,7 +32,7 @@ bare substring check -- "Seniorenberater" (elder-care advisor),
 must not match; regex word boundaries (`\\b`) guarantee this rather than
 `marker in title.casefold()`.
 
-**S11A-001 (Codex review): explicit positive allowlist, not a generic
+**explicit positive allowlist, not a generic
 suffix scan.** An earlier version matched ANY `\\w*leiter(?:in)?` and then
 tried to deny-list known non-leadership homonyms as they were discovered
 (Halbleiter, Wellenleiter, Flugbegleiter, ...) -- an open-ended, reactive
@@ -57,7 +57,7 @@ TitleSeniorityLevel = Literal["SENIOR", "UNKNOWN"]
 
 _JUNIOR_PATTERN = re.compile(r"\bjunior\b", re.IGNORECASE)
 
-# S11A-001: standalone "Leiter"/"Leiterin" plus an explicit, closed
+# standalone "Leiter"/"Leiterin" plus an explicit, closed
 # allowlist of organizational leadership compounds. Extend this list
 # deliberately (a real title needing it, reviewed) -- never widen back to
 # a generic "\w*leiter" suffix scan.
@@ -103,7 +103,7 @@ _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 
 
 def _is_unambiguous_junior_role(role: str) -> bool:
-    """M3 fix (Astra Stage 12 audit): a role STRING containing both an
+    """M3 fix: a role STRING containing both an
     explicit "junior" marker AND an explicit senior-level marker (e.g.
     "Senior/Junior Python Developer") is genuinely ambiguous about which
     level the candidate is targeting -- it must not count as an
@@ -119,7 +119,7 @@ def _is_unambiguous_junior_role(role: str) -> bool:
 
 
 def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSeniorityTarget:
-    """S11A-002 (Codex review): JUNIOR only if EVERY target role
+    """JUNIOR only if EVERY target role
     explicitly says "junior" -- fails open (UNKNOWN) on any ambiguity,
     including a role that states no seniority level at all.
 
@@ -137,7 +137,7 @@ def derive_candidate_target_seniority(target_roles: list[str]) -> CandidateSenio
         ["Python Backend Developer"]                            -> UNKNOWN
         []                                                      -> UNKNOWN
 
-    M3 fix (Astra Stage 12 audit): the same ambiguity check also applies
+    M3 fix: the same ambiguity check also applies
     WITHIN a single role string -- ["Senior/Junior Python Developer"] must
     not derive JUNIOR, since that one target role explicitly includes
     senior-level work too. See `_is_unambiguous_junior_role`.
@@ -164,7 +164,7 @@ def classify_title_seniority(title: str) -> TitleSeniorityClassification:
     level marker -- see the module docstring for why this never inspects
     description text or does bare substring matching.
 
-    M3 fix (Astra Stage 12 audit): a title naming BOTH an explicit senior
+    M3 fix: a title naming BOTH an explicit senior
     marker AND an explicit "junior" marker (e.g. "Senior/Junior Python
     Developer", or a junior title with a company suffix like "- Senior
     GmbH") is genuinely ambiguous, not a confident SENIOR exclusion --

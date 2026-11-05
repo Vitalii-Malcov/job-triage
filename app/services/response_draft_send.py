@@ -418,7 +418,7 @@ def _build_outbound_message(message, approval: ResponseDraftApprovalRecord) -> O
 def _resolve_existing_send_record(
     db: Session, *, account_key: str, draft, record: ResponseDraftSendRecord
 ) -> ResponseDraftSendRecord:
-    """HARD-008 (Codex master review, crash/CAS recovery): dispatch on an
+    """dispatch on an
     ALREADY-EXISTING `ResponseDraftSendRecord` found by `claim_send_attempt`'s
     losing INSERT. Exact mirror of
     `app.services.follow_up_send._resolve_existing_send_record` — see
@@ -581,7 +581,7 @@ def send_response_draft(
 
     send_record = _claim_or_retry_send(db, account_key=account_key, draft=draft, approval=approval)
 
-    # HARD-008: the exclusive gate — only the request that wins this CAS
+    # the exclusive gate — only the request that wins this CAS
     # may call the outbound provider. See module docstring's
     # "Transmission boundary / crash recovery" section.
     won_attempt = begin_transmission(db, send_record)

@@ -115,7 +115,7 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
     `record.title`/`record.url`. Idempotent no-op when the derived token
     set hasn't changed (delete+reinsert only on an actual difference).
 
-    **Round 3 (Blocker R3-001): this helper does NOT own commit/rollback.**
+    **Round 3: this helper does NOT own commit/rollback.**
     It only mutates the current `Session` (SELECT existing tokens, DELETE
     stale ones, add new ones, flush) so it can be composed into the SAME
     transaction as the `JobRecord` write it derives from. A Codex review
@@ -177,7 +177,7 @@ def _finalize_job_write(
 
 
 def _store_source_reference(db: Session, record: JobRecord, reference: str) -> None:
-    """Stage 22 P0-1: set once, never blanked, never replaced -- atomically.
+    """set once, never blanked, never replaced -- atomically.
     An existing row gets the reference only while it is still empty
     (`UPDATE ... WHERE source_reference IS NULL`), so two writers (two
     collector runs, a collector and the backfill) cannot overwrite each
@@ -247,7 +247,7 @@ def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: 
 
 
 def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
-    """HARD-007-RR1 (Codex targeted re-review): decides whether a caught
+    """decides whether a caught
     `IntegrityError` is SPECIFICALLY attributable to `uq_jobs_fingerprint`
     — `upsert_job`'s race-recovery below must never convert an unrelated
     DB invariant violation (a different unique/check/PK constraint, or a
@@ -371,7 +371,7 @@ def upsert_job_observed(
     transferred from another database, so import time is never mistaken
     for collector freshness. Insert-only: if the fingerprint already exists
     the call raises `ValueError` instead of rewriting an existing record's
-    observation history. Collectors never pass them. Concurrency (HARD-007)
+    observation history. Collectors never pass them. Concurrency
     is documented on `_upsert_job`.
 
     `commit=False` (deferred mode, Architecture 3): the write, its reference tokens and
@@ -404,7 +404,7 @@ def _upsert_job(
     *,
     commit: bool = True,
 ) -> UpsertOutcome:
-    """HARD-007 (Codex master review): two concurrent calls racing to
+    """two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
     None` above (the classic check-then-act TOCTOU window between this
     function's own SELECT and its INSERT) — `JobRecord.fingerprint`'s
@@ -421,7 +421,7 @@ def _upsert_job(
     INSERT attempt would just fail the same way again). Instead it
     rolls back immediately (clears the poisoned transaction so the
     Session stays usable), confirms — via `_is_fingerprint_unique_violation`
-    (HARD-007-RR1, Codex targeted re-review) — that the caught
+     — that the caught
     `IntegrityError` is actually attributable to `uq_jobs_fingerprint`
     specifically (a same-fingerprint winner existing after rollback does
     NOT by itself prove that; an unrelated constraint/trigger violation
@@ -497,7 +497,7 @@ def update_job_score_if_posting_type_unchanged(
     data_confidence: float,
     commit: bool = True,
 ) -> bool:
-    """S10-RR-001 (Codex Stage 10 re-review, BLOCKING): the atomic
+    """the atomic
     compare-and-swap `app.services.collector_runner.score_and_persist`
     uses to reconcile a `JobRecord`'s (score, recommendation,
     data_confidence) with its OWN currently-persisted posting_type after
@@ -580,7 +580,7 @@ def list_jobs_by_status_after_id(
 
 
 def get_jobs_by_ids_if_eligible(db: Session, job_ids: list[int]) -> list[JobRecord]:
-    """Stage 8C (S8C-POOL-001, Codex review): the FINAL DB revalidation
+    """Stage 8C: the FINAL DB revalidation
     step of the two-stage candidate-match bound (see
     app.services.automation_shortlist.prepare_shortlist_drafts) -- given
     an already bounded, already cheaply-preselected set of job ids (from
@@ -619,7 +619,7 @@ def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 
 
-# AUD-007 (Astra R2): reverse of ALLOWED_TRANSITIONS -- for a given target
+# reverse of ALLOWED_TRANSITIONS -- for a given target
 # status, the set of source statuses a transition into it may legally come
 # from. Built once at import time (the transition table is static) and used
 # to encode the allowed source state(s) directly in update_job_status's
@@ -642,7 +642,7 @@ def update_job_status(db: Session, job_id: int, new_status: ApplicationStatus) -
     change (e.g. moved the job to a terminal REJECTED/WITHDRAWN state)
     between this call's initial read and its write.
 
-    AUD-007 (Astra R2): a plain read -> validate-in-Python -> mutate ORM
+    a plain read -> validate-in-Python -> mutate ORM
     object -> commit sequence is race-prone -- a reader that saw a
     still-mutable status before commit can go on to unconditionally
     overwrite whatever the row's status has become by commit time, including
@@ -897,7 +897,7 @@ def get_known_domains_for_company_name(db: Session, normalized_company_name: str
     rows sharing this normalized_company_name — i.e. how many genuinely
     distinct, identifiable companies this display name could refer to.
 
-    Used by CompanyResearchService (FR-M-01) to detect when a name-only
+    Used by CompanyResearchService to detect when a name-only
     resolution (no domain_hint — the only kind Company Research v1 ever
     performs, see H-02) would be unsafe to resolve automatically: if 2+
     known domains share this normalized name (e.g. "Acme GmbH" at acme.de
@@ -923,7 +923,7 @@ class AmbiguousCompanyIdentityError(Exception):
     identity resolution (domain_hint is None — the only kind Company
     Research v1 ever performs, see H-02) cannot be resolved safely because
     2+ distinct known-domain companies already share this normalized
-    company name (FR-M-01) — e.g. "Acme GmbH" has separate, legitimate
+    company name — e.g. "Acme GmbH" has separate, legitimate
     research on file for both acme.de and acme.com (H-01: two different
     known non-null domains are always two different companies, never
     merged).
@@ -963,7 +963,7 @@ def resolve_name_only_company_research(
       though it doesn't match the exact "name:<x>" identity_key a naive
       domain-less lookup would use.
     - 2+ known domains share this name: raises AmbiguousCompanyIdentityError
-      (FR-M-01) — unchanged.
+       — unchanged.
 
     An exact "name:<x>" row and a known-domain row for the same
     normalized_company_name should never coexist once every writer that
@@ -1015,7 +1015,7 @@ def _claim_company_research_alias(
 def _ensure_company_research_alias(
     db: Session, record: CompanyResearchRecord, normalized_company_name: str
 ) -> None:
-    """Invariant (FR-M-02 Fix B): a successful canonical CompanyResearchRecord
+    """Invariant: a successful canonical CompanyResearchRecord
     that is safe to reach via name-only resolution must have exactly one
     CompanyResearchIdentityAlias row for its normalized_company_name,
     pointing at it — unless a *different* record already legitimately owns
@@ -1076,7 +1076,7 @@ def _resolve_stale_write(
     normalized_domain: str | None,
     normalized_company_name: str,
 ) -> tuple[CompanyResearchRecord, CompanyResearchWriteOutcome]:
-    """FR-H-01: a caller's optimistic-concurrency write lost to a concurrent
+    """a caller's optimistic-concurrency write lost to a concurrent
     writer that already committed a newer version of the same row.
 
     If the concurrent winner represents the *same* company identity (our
@@ -1176,7 +1176,7 @@ def upsert_company_research(
        The DB's UNIQUE constraint rejects the loser with IntegrityError;
        caught, rolled back, resolved by reloading the winner's row.
     2. Concurrent create, *different* identity_key for the same company
-       (RR-M-01) — one caller resolves "name:<x>" (no domain known yet),
+        — one caller resolves "name:<x>" (no domain known yet),
        another resolves "domain:<y>" for the same normalized company name.
        identity_key's UNIQUE constraint does nothing here since the two
        strings differ; see _create_company_research /
@@ -1431,8 +1431,8 @@ def _create_company_research(
     get_company_research_by_identity found nothing for.
 
     A plain INSERT + IntegrityError-on-identity_key catch (as used
-    everywhere else in this module) is NOT sufficient on its own here
-    (RR-M-01): two concurrent creators for the *same* company can
+    everywhere else in this module) is NOT sufficient on its own here:
+    two concurrent creators for the *same* company can
     legitimately resolve to two *different* identity_key values — one
     "name:<x>" (no domain known yet), one "domain:<y>" (domain known) — and
     identity_key's UNIQUE constraint does nothing to stop both inserts from
@@ -1523,7 +1523,7 @@ def record_failed_attempt(
     traceback or anything that could contain secrets — callers pass
     `str(exc)`, not `traceback.format_exc()`.
 
-    FR-M-03: when `normalized_domain` is None (v1's only live case),
+    when `normalized_domain` is None (v1's only live case),
     existence is resolved via resolve_name_only_company_research — the same
     routine CompanyResearchService.get_cached/get_or_run use — rather than
     a raw exact "name:<x>" lookup. Without this, a failed refresh attempt

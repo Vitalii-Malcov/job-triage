@@ -15,48 +15,21 @@ def _connect_args_for(database_url: str) -> dict:
     """
     if database_url.startswith("sqlite"):
         return {"check_same_thread": False}
-    # HARD-011 verification pass: `connect_timeout` is a psycopg/libpq
-    # connection parameter, not a generic SQLAlchemy one -- this `else`
-    # branch is only ever reached by PostgreSQL URLs in practice.
-    # Confirmed, not assumed: `pyproject.toml` declares exactly one
-    # non-SQLite DB driver extra (`postgres = ["psycopg[binary]>=3.1"]`,
-    # no MySQL/MariaDB/other driver anywhere in the dependency list);
-    # `.env.example` documents exactly two DATABASE_URL schemes
-    # (`sqlite:///...` and `postgresql+psycopg://...`); `compose.yaml`'s
-    # production target is explicitly PostgreSQL-only
-    # (docs/DEPLOYMENT.md: "do not use SQLite in production compose").
-    # No other dialect is supported, tested, or documented anywhere in
-    # this project -- so passing a psycopg-specific kwarg unconditionally
-    # here is safe under the project's actual, confirmed two-dialect
-    # contract. If a third dialect is ever added, this branch would need
-    # to become dialect-aware instead of a blanket `else`.
-    # HARD-011 (adversarial hardening r1): without an explicit
-    # connect_timeout, a connection attempt to a host that isn't
-    # actively refusing (DB process stopped but the port/network path
-    # still accepts a TCP handshake attempt at the OS/container level,
-    # or a firewall silently drops packets) blocks on the OS's own TCP
-    # connect timeout -- measured live during this hardening pass to
-    # exceed 60+ seconds with nothing bounding it. That turned a DB
-    # outage into an indefinitely hung request thread instead of a
-    # fast, clear error. A 10s-per-address bound converts that into a
-    # clean, finite OperationalError. Note: libpq/psycopg apply this
-    # PER resolved address, not once overall -- a hostname resolving to
-    # both an IPv6 and an IPv4 address (e.g. "localhost") can still take
-    # up to ~2x this value before failing, confirmed live during this
-    # hardening pass (~20s observed, not 10s) -- still a bounded,
-    # diagnosable failure instead of an indefinite hang, which is the
-    # actual fix; it is not a promise of an exact wall-clock number.
-    # `pool_pre_ping` (below) bounds STALE pooled connections; this
-    # bounds the separate "can't connect at all" case pre_ping alone
-    # doesn't cover, since pre_ping's own health-check query opens a
-    # connection the same unbounded way if none exists yet. See
+    # PostgreSQL (psycopg/libpq) is the only other supported dialect, so a libpq-specific
+    # option is safe here; a third dialect would need this branch to become dialect-aware.
+    #
+    # Without `connect_timeout`, connecting to a host that silently drops packets blocks on
+    # the OS TCP timeout (60+ s observed), turning a DB outage into a hung request thread.
+    # 10 s is applied PER resolved address by libpq, so "localhost" (IPv6 + IPv4) can take
+    # about twice that -- still a bounded, diagnosable failure. `pool_pre_ping` (below) covers
+    # stale pooled connections; this covers "cannot connect at all". See
     # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-011.
     return {"connect_timeout": 10}
 
 
 settings = get_settings()
 connect_args = _connect_args_for(settings.database_url)
-# AUD-007: pool_pre_ping issues a lightweight "is this connection still
+# pool_pre_ping issues a lightweight "is this connection still
 # alive" check before handing a pooled connection to a request, so a
 # connection that went stale while idle (DB restart, firewall/load-
 # balancer idle timeout, managed-Postgres connection recycling) is

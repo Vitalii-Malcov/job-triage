@@ -102,7 +102,7 @@ def patch_candidate_profile(
     same docstring for why.
 
     `body.expected_profile_version` is required (structurally enforced —
-    422 if omitted) and must match the profile's current version (CP-M-03)
+    422 if omitted) and must match the profile's current version
     — a stale value raises CandidateProfileVersionConflictError, mapped to
     409 here. The caller must GET the profile again and retry with the
     fresh version; the response detail never includes profile content.
