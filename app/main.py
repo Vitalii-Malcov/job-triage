@@ -28,7 +28,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AI Job Search Control Center",
+    title="JobTriage",
     version="0.2.0",
     lifespan=lifespan,
 )

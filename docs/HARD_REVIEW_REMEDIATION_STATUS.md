@@ -20,8 +20,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 08 | 2.4 event-loop blocking | ACCEPTED — task 5e7aa2d, merge c54164d |
 | 09 | Arch §3 repository transactions | ACCEPTED — task 6e4c0a7, merge 9604cb6 |
 | 10 | Arch §3 large modules | ACCEPTED — task 21a1eea, merge 047f88f |
-| 11 | Arch §3 target roles vs stored config | ACCEPTED (see below; SHAs in git log) |
-| 12–19 | see task list | PENDING |
+| 11 | Arch §3 target roles vs stored config | ACCEPTED — task 4e661ef, merge e9daa49 |
+| 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED (see below; SHAs in git log) |
+| 13–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -156,3 +157,13 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: +9 in `tests/test_stage24_target_role.py`, +2 CLI tests in `tests/test_stage17_candidate_config.py`.
 - Full pytest: 7432 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: 3 code rounds (R1 CHANGES_REQUESTED x2 P2 + P3: role alternatives, partial files, wording; R2 `BLOCKED` only for missing full-suite evidence; R3 ACCEPT).
+
+## TASK 12 — Naming and AI description (Architecture §3, Docs §5)
+
+- Confirmed: the package description said "AI multi-agent", the README heading "AI-Assisted ...", the FastAPI title "AI Job Search Control Center", while the code contains no LLM call (verified by Codex over `app/`, `scripts/`, Docker, Postman, CI) and `app/agents/` is regex/keyword/rule code plus template generators.
+- Change (no dangerous renames): FastAPI title -> "JobTriage" (also the Swagger/ReDoc page title); `pyproject.toml` description -> "JobTriage: rule-based job triage and approval-gated application drafting backend (no LLM at runtime)"; README heading and a "No LLM at runtime" note; `app/agents/__init__.py` docstring; `docs/ARCHITECTURE.md` new section "What is and is not AI"; portfolio notes wording aligned.
+- Deliberately NOT renamed: the Python distribution `ai-job-search-control-center` (comment in `pyproject.toml`: would change installed metadata / editable-install paths) and the Gmail draft marker domain `@ai-job-search.invalid` (stored protocol constant; a test pins it).
+- Tests: `tests/test_naming_and_ai_claims.py` (7): AST import scan of `app/`+`scripts/` for LLM SDKs (incl. Google's) with a self-test of the guard, no LLM SDK among declared dependencies, description/title/README heading/agents docstring, marker regex unchanged.
+- Residual: LLM-compatible interfaces exist for Bewerbung planning and company research (their shipped implementations are deterministic; no runtime switch selects an LLM) — "no LLM at runtime" is accurate for this tree, and the guards fail if that changes silently.
+- Full pytest: 7438 passed, 148 skipped, 1 failed (`test_follow_up_send_service::TestLeaseRenewalHeartbeat`, a wall-clock timing flake that passes in isolation 3/3 and earlier full runs; to be made deterministic in TASK 17). Ruff clean. No schema change.
+- Codex: 1 code round ACCEPT with two P3 (fixed) + final ACCEPT.

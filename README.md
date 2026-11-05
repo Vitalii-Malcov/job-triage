@@ -1,8 +1,10 @@
-# JobTriage — AI-Assisted Job Application Automation Platform
+# JobTriage — Job Application Triage and Drafting Platform
 
 An API-driven backend that collects job postings, scores them against a candidate profile, drafts CVs/cover letters/email responses, and tracks the whole application lifecycle — with every send-capable action gated behind explicit human approval. Built with FastAPI, SQLAlchemy, Alembic and SQLite (the operator's daily database); PostgreSQL is supported and tested in CI and the Docker setup.
 
 > Formerly "AI Job Search Control Center" — see `docs/DEVELOPMENT_HISTORY.md` for the full stage-by-stage build log.
+
+> **No LLM at runtime.** Matching, classification and drafting are deterministic rules and templates (see `docs/ARCHITECTURE.md`, "What is and is not AI"); AI assistants were used to *develop* the code, not to run it.
 
 ## What it does
 
