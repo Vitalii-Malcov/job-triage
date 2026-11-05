@@ -8,8 +8,8 @@ test asserting this package has no means to make an HTTP request at all.
 
 import email.errors
 import imaplib
-import inspect
 import io
+import re
 import socket
 import ssl
 import threading
@@ -457,28 +457,73 @@ async def test_disconnect_closes_and_logs_out_owned_connections(monkeypatch):
     assert fake_client.logged_out is True
 
 
-def test_module_never_imports_an_http_client():
+def test_module_never_imports_an_http_client(imported_modules):
     for module in (gmail_imap_module, email_base_module):
-        source = inspect.getsource(module)
+        imported = imported_modules(module)
         for name in ("httpx", "requests", "aiohttp", "urllib.request", "http.client"):
-            assert f"import {name}" not in source, f"module must not import {name}"
+            assert name not in imported, f"module must not import {name}"
         for name in ("httpx", "requests", "aiohttp"):
             assert not hasattr(module, name)
 
 
-def test_module_never_calls_mailbox_write_commands():
-    """No STORE/EXPUNGE/COPY/APPEND IMAP command anywhere — this provider
-    must only ever be able to read the mailbox, never mutate it. Checks
-    for the IMAP client call forms specifically (`.store(`/`.expunge(`/
-    `.copy(`/`client.append(`), not Python's unrelated `list.append`.
-    """
-    source = inspect.getsource(gmail_imap_module)
-    for forbidden in (".store(", ".expunge(", ".copy(", "client.append("):
-        assert forbidden not in source, f"module must not call {forbidden}"
-    for forbidden_uid_command in ('"store"', "'store'", '"expunge"', "'expunge'"):
-        assert forbidden_uid_command not in source, (
-            f"module must not issue IMAP UID command {forbidden_uid_command}"
-        )
+class ReadOnlyEnforcingImapClient(FakeImapClient):
+    """A FakeImapClient on which ANY mailbox-mutating call is refused AND recorded: the IMAP
+    methods that change state (STORE, EXPUNGE, COPY, APPEND, DELETE, ...) raise, and the attempt
+    is kept in `forbidden_attempts`, so a provider that swallows the exception (production code
+    catches broad exceptions around a FETCH) still cannot hide the attempt from the test."""
+
+    FORBIDDEN = (
+        "store",
+        "expunge",
+        "copy",
+        "append",
+        "delete",
+        "create",
+        "rename",
+        "move",
+        "setflags",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.forbidden_attempts: list[str] = []
+
+    def __getattr__(self, name):
+        if name in ReadOnlyEnforcingImapClient.FORBIDDEN:
+
+            def _refuse(*args, **kwargs):
+                self.forbidden_attempts.append(name.upper())
+                raise AssertionError(f"the read-only provider issued IMAP {name.upper()}")
+
+            return _refuse
+        raise AttributeError(name)
+
+
+_UNSAFE_BODY_ITEM = re.compile(
+    r"^(?:RFC822|RFC822\.TEXT|RFC822\.HEADER|BODY\[.*\]|BODY\.PEEK\[\]\w+)$"
+)
+
+
+def _fetch_items(spec: str) -> list[str]:
+    """The individual items of a FETCH specification such as '(UID BODY.PEEK[] RFC822.SIZE)'."""
+    return re.findall(r"[A-Za-z0-9.]+(?:\[[^\]]*\])?(?:<[0-9.]+>)?", spec)
+
+
+@pytest.mark.asyncio
+async def test_provider_only_ever_issues_read_commands():
+    """No STORE/EXPUNGE/COPY/APPEND anywhere: a real fetch runs against a client that refuses AND
+    records every mutating command, so the provider can only read the mailbox. The recorded wire
+    commands are checked too: read-only SELECT, and only UID SEARCH / UID FETCH."""
+    raw = b"From: a@example.com\r\nSubject: Hi\r\n\r\nBody\r\n"
+    client = ReadOnlyEnforcingImapClient(messages={1: raw, 2: raw}, search_uids=[1, 2])
+
+    result = await _provider(client).fetch()
+
+    assert client.forbidden_attempts == []  # even if production swallowed the AssertionError
+    assert len(result.messages) == 2  # the fetch really succeeded: nothing was skipped
+    assert client.select_calls and all(readonly for _mailbox, readonly in client.select_calls)
+    assert {command for command, _args in client.uid_calls} <= {"search", "fetch"}
+    assert client.uid_calls  # the provider really talked to the server
 
 
 # ---------------------------------------------------------------------------
@@ -486,16 +531,29 @@ def test_module_never_calls_mailbox_write_commands():
 # ---------------------------------------------------------------------------
 
 
-def test_body_fetch_uses_peek_never_plain_rfc822_or_bare_body():
-    """Static regression guard: if this module is ever changed back to a
-    bare `(RFC822)` or `(BODY[])` fetch item, this test fails even before
-    any runtime test does — see base.py's module docstring for why a
-    non-PEEK fetch is itself a mailbox mutation (\\Seen).
-    """
-    source = inspect.getsource(gmail_imap_module)
-    assert "BODY.PEEK[]" in source
-    assert "RFC822)" not in source
-    assert "BODY[])" not in source
+@pytest.mark.asyncio
+async def test_body_fetch_uses_peek_never_plain_rfc822_or_bare_body():
+    """A non-PEEK body fetch is itself a mailbox mutation (it sets \\Seen; see base.py). Checked
+    on EVERY FETCH specification actually sent, item by item (a size request that also asks for a
+    plain BODY[] must not slip through): bodies come only as BODY.PEEK[]."""
+    raw = b"From: a@example.com\r\nSubject: Hi\r\n\r\nBody\r\n"
+    client = FakeImapClient(messages={1: raw}, search_uids=[1])
+
+    await _provider(client).fetch()
+
+    specs = [args[1] for command, args in client.uid_calls if command == "fetch"]
+    assert any("BODY.PEEK[]" in _fetch_items(spec) for spec in specs), "no body was fetched"
+    for spec in specs:
+        for item in _fetch_items(spec):
+            assert not _UNSAFE_BODY_ITEM.match(item), f"unsafe FETCH item {item!r} in {spec!r}"
+
+
+def test_the_fetch_item_check_itself_rejects_unsafe_specifications():
+    """Meta-test of the guard above: each of these specs must be flagged."""
+    for spec in ("(UID RFC822.SIZE BODY[])", "(RFC822)", "(UID BODY[TEXT])", "(RFC822.TEXT UID)"):
+        assert any(_UNSAFE_BODY_ITEM.match(i) for i in _fetch_items(spec)), spec
+    for spec in ("(UID BODY.PEEK[] RFC822.SIZE)", "(UID RFC822.SIZE)", "(UID INTERNALDATE)"):
+        assert not any(_UNSAFE_BODY_ITEM.match(i) for i in _fetch_items(spec)), spec
 
 
 @pytest.mark.asyncio
@@ -1863,12 +1921,12 @@ async def test_unencodable_mailbox_fails_closed_before_connecting(monkeypatch):
         await provider.fetch()
 
 
-def test_mailbox_encoding_module_has_no_io_or_mailbox_write_capability():
-    source = inspect.getsource(imap_mailbox_module)
-    for forbidden in ("import imaplib", "import smtplib", "import socket", "import ssl"):
-        assert forbidden not in source
-    for forbidden in (".store(", ".expunge(", ".copy(", ".move(", "client.append("):
-        assert forbidden not in source
+def test_mailbox_encoding_module_has_no_io_or_mailbox_write_capability(imported_modules):
+    imported = imported_modules(imap_mailbox_module)
+    for forbidden in ("imaplib", "smtplib", "socket", "ssl"):
+        assert forbidden not in imported
+    for name in ("store", "expunge", "copy", "move", "append"):
+        assert not hasattr(imap_mailbox_module, name)  # no mailbox-write capability is exposed
 
 
 # ---------------------------------------------------------------------------
@@ -2300,3 +2358,12 @@ async def test_malformed_status_fails_the_sync_explicitly():
 
     with pytest.raises(GmailConnectionError):
         await provider.fetch()
+
+
+def test_the_read_only_enforcing_client_really_refuses_every_mutating_command():
+    """Meta-test: the guard used above must itself fail loudly, or it proves nothing."""
+    client = ReadOnlyEnforcingImapClient(messages={})
+    for command in ReadOnlyEnforcingImapClient.FORBIDDEN:
+        with pytest.raises(AssertionError, match=command.upper()):
+            getattr(client, command)("1", "+FLAGS", "\Seen")
+    assert client.forbidden_attempts == [c.upper() for c in ReadOnlyEnforcingImapClient.FORBIDDEN]
