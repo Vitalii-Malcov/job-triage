@@ -227,7 +227,11 @@ Quereinstieg) of stored vacancies from today's search results and, with
 `--create-new`, stores new vacancies. Dry run is the default and the database
 is opened read-only; `--apply` always needs `--snapshot DIR`. Stop the UI and
 every other process that writes the database first (a competing writer or a
-second refresh is refused).
+second refresh is refused). `--apply` also claims the same collector slot as the
+scheduler, REST `/collectors/*/run` and Telegram `/run`: while any of them (or an
+automation cycle) is running the apply is refused (exit 2, nothing written), and
+while the apply runs they are refused in turn. The slot is recorded as a
+`manual:ba_refresh` run in `/automation/runs`.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\stage22_refresh_ba.py --database runtime/job_triage_runtime.db

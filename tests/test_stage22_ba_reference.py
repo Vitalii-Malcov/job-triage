@@ -567,3 +567,16 @@ def test_codex_round_5_whitespace_chunks_are_whole(text_, expected):
 def test_codex_round_6_quoted_reply_lines_keep_their_reference(prefix):
     assert extract_ba_references(f"{prefix}{BA}{UNDERSCORE}") == {UNDERSCORE}
     assert extract_ba_references(f"{prefix}Referenznummer: {DOTTED}") == {DOTTED}
+
+
+def test_backfill_apply_is_refused_while_a_collector_run_holds_the_slot(db, db_path, capsys):
+    from app.db.automation_repository import create_running_run
+
+    _catalogue(db)
+    create_running_run(db, account_key="", holder="scheduler:1")
+    db.close()
+    before = _sha(db_path)
+
+    assert backfill_cli.run(["--database", str(db_path), "--apply"]) == 2
+    assert "holds the slot" in capsys.readouterr().err
+    assert _sha(db_path) == before  # nothing written, not even an audit row

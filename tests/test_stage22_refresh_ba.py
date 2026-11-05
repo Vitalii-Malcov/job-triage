@@ -536,6 +536,8 @@ def test_a_failed_snapshot_verification_stops_before_the_first_write(
     monkeypatch.setattr(cli, "_verify_snapshot", broken)
     before = sha(db_path)
     assert run(db_path, Api([posting()]), "--apply", snapshot=tmp_path / "s") == 2
+    # the verified backup comes BEFORE the collector slots are claimed: the database file is
+    # byte-for-byte unchanged (no audit row either)
     assert "snapshot differs" in capsys.readouterr().err and sha(db_path) == before
 
 
@@ -567,7 +569,7 @@ def test_a_change_in_a_protected_table_is_detected_and_reported(
     seed(db_path, [stored_job(posting(REF_A))])
     real = cli.write_updates
 
-    def sneaky(engine, updates):
+    def sneaky(engine, updates, **kwargs):
         connection = sqlite3.connect(db_path)
         connection.execute(
             "INSERT INTO user_profiles (name, skills_json, updated_at) "
@@ -575,7 +577,7 @@ def test_a_change_in_a_protected_table_is_detected_and_reported(
         )
         connection.commit()
         connection.close()
-        return real(engine, updates)
+        return real(engine, updates, **kwargs)
 
     monkeypatch.setattr(cli, "write_updates", sneaky)
     assert run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "s") == 3
@@ -814,3 +816,162 @@ def test_discovery_dry_run_uses_the_discovery_queries_and_writes_nothing(
     assert all(offer == 1 for _, offer, _ in seen)
     assert {days for _, _, days in seen} == {None, 7}
     assert "DRY RUN" in capsys.readouterr().out
+
+
+# --- Task 22: the apply holds the same collector slot as every other entry point -------------
+
+
+def test_apply_holds_the_collector_slot_and_records_a_completed_run(
+    db_path, tmp_path, monkeypatch, capsys
+):
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    seen = {}
+    real = cli.write_updates
+
+    def spy(engine, updates, **kwargs):
+        seen["inside"] = table(db_path, "select status, lease_holder from automation_runs")
+        return real(engine, updates, **kwargs)
+
+    monkeypatch.setattr(cli, "write_updates", spy)
+    assert run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "snap") == 0
+    assert "protected tables unchanged" in capsys.readouterr().out
+    assert len(seen["inside"]) >= 1
+    assert all(
+        status == "RUNNING" and holder.startswith("manual_collector:ba_refresh")
+        for status, holder in seen["inside"]
+    )
+    after = table(db_path, "select status, results_json from automation_runs")
+    assert {status for status, _ in after} == {"COMPLETED"}
+    assert all('"manual:ba_refresh"' in results for _, results in after)
+
+
+def test_apply_is_refused_while_a_collector_or_automation_run_holds_the_slot(
+    db_path, tmp_path, capsys
+):
+    from app.db.automation_repository import create_running_run
+
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    with sessionmaker(engine)() as session:
+        create_running_run(session, account_key="", holder="scheduler:1")
+    engine.dispose()
+    before = table(db_path, "select id, workplace_lat, source_reference from jobs")
+
+    code = run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "snap")
+
+    assert code == 2
+    assert "holds the slot" in capsys.readouterr().err
+    assert table(db_path, "select id, workplace_lat, source_reference from jobs") == before
+    # the foreign run is untouched and the refused tool left no RUNNING row of its own
+    assert table(db_path, "select status, lease_holder from automation_runs") == [
+        ("RUNNING", "scheduler:1")
+    ]
+
+
+def test_a_lost_lease_stops_the_write_between_batches(db_path):
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    before = table(db_path, "select workplace_lat from jobs")
+    with pytest.raises(cli.LeaseLostError) as lost:
+        cli.write_updates(engine, [object()], is_lease_lost=lambda: True)
+    assert lost.value.written == 0
+    engine.dispose()
+    assert table(db_path, "select workplace_lat from jobs") == before
+
+
+def test_after_the_apply_the_slot_is_free_for_other_entry_points(db_path, tmp_path):
+    from app.db.automation_repository import create_running_run
+
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    assert run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "snap") == 0
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    with sessionmaker(engine)() as session:
+        _run, created = create_running_run(session, account_key="", holder="scheduler:2")
+    engine.dispose()
+    assert created is True
+
+
+def test_a_lease_lost_between_batches_is_a_partial_write_alert_not_a_refusal(
+    db_path, tmp_path, monkeypatch, capsys
+):
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    monkeypatch.setattr(
+        cli,
+        "write_updates",
+        lambda engine, updates, **kw: (_ for _ in ()).throw(cli.LeaseLostError(written=7)),
+    )
+    code = run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "snap")
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "partial write" in err and "7 updated" in err and "nothing written" not in err
+    assert {s for (s,) in table(db_path, "select status from automation_runs")} == {"FAILED"}
+
+
+def test_create_new_checks_the_lease_before_every_fetch_and_persist(db_path):
+    import asyncio
+
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    fetched = []
+
+    class Detail:
+        async def fetch_detail(self, ref):
+            fetched.append(ref)
+            return "text"
+
+    creates = [stored_job(posting(REF_A)), stored_job(posting(REF_B))]
+    with pytest.raises(cli.LeaseLostError):
+        asyncio.run(cli.create_jobs(engine, creates, Detail(), is_lease_lost=lambda: True))
+    engine.dispose()
+    assert fetched == []
+    assert table(db_path, "select count(*) from jobs") == [(0,)]
+
+
+def test_a_protected_table_change_records_the_slot_run_as_failed(
+    db_path, tmp_path, monkeypatch, capsys
+):
+    seed(db_path, [stored_job(posting(REF_A))])
+    real = cli.write_updates
+
+    def sneaky(engine, updates, **kwargs):
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "INSERT INTO user_profiles (name, skills_json, updated_at) "
+            "VALUES ('intruder', '[]', '2026-10-31')"
+        )
+        connection.commit()
+        connection.close()
+        return real(engine, updates, **kwargs)
+
+    monkeypatch.setattr(cli, "write_updates", sneaky)
+    assert run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "s") == 3
+    assert "ALERT: protected tables changed" in capsys.readouterr().err
+    assert {s for (s,) in table(db_path, "select status from automation_runs")} == {"FAILED"}
+
+
+def test_a_post_write_integrity_failure_is_an_alert_with_counts_not_a_refusal(
+    db_path, tmp_path, monkeypatch, capsys
+):
+    seed(db_path, [stored_job(posting(REF_A), with_reference=False)])
+    calls = {"n": 0}
+    real = cli.check_integrity
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the first call is the preflight, the second runs after the writes
+            raise cli.RefusedError("integrity_check failed")
+        return real(path)
+
+    monkeypatch.setattr(cli, "check_integrity", flaky)
+    code = run(db_path, Api([posting(REF_A)]), "--apply", snapshot=tmp_path / "snap")
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "after the write" in err and "1 updated" in err and "nothing written" not in err
+    assert {s for (s,) in table(db_path, "select status from automation_runs")} == {"FAILED"}
+
+
+def test_created_vacancies_are_counted_on_the_recorded_run(db_path, tmp_path, capsys):
+    assert (
+        run(db_path, Api([posting(REF_A)]), "--apply", "--create-new", snapshot=tmp_path / "s") == 0
+    )
+    (status, results), *_ = table(db_path, "select status, results_json from automation_runs")
+    assert status == "COMPLETED" and '"created": 1' in results

@@ -513,6 +513,64 @@ def _raise_if_lease_lost(heartbeat: _RunLeaseHeartbeat, run_id: int, account_key
         )
 
 
+def _extend_lease_after_interruption(
+    db: Session, run_id: int, holder: str, heartbeat: _RunLeaseHeartbeat
+) -> None:
+    """The cycle was interrupted (cancelled or the process is shutting down) while an IMAP
+    worker thread (`asyncio.to_thread`) may still be running and still reads the shared
+    state. The heartbeat is about to stop, so extend the lease ONCE past the longest the
+    worker can live (separate session; the request session may still be in use) and leave
+    the row RUNNING: exclusion holds until the worker must be gone, then crash recovery
+    reconciles it. Same contract as `collector_exclusion._extend_after_cancel`.
+
+    The heartbeat is stopped and joined FIRST: a renewal still in flight would otherwise
+    commit AFTER the extension and shorten the expiry back to one TTL. Best effort: a
+    database failure here, or an already lost lease, leaves the normal lease-expiry
+    recovery; a hard kill (SIGKILL) never runs this at all."""
+    from app.services.collector_exclusion import CANCELLED_LEASE_EXTENSION_SECONDS
+
+    heartbeat.stop()
+    try:
+        with sessionmaker(bind=db.get_bind())() as side:
+            renew_run_lease(
+                side, run_id, holder=holder, ttl_seconds=CANCELLED_LEASE_EXTENSION_SECONDS
+            )
+    except Exception as exc:  # noqa: BLE001 - best effort, never mask the interruption
+        logger.warning("automation_cancel_extend_error error_type=%s", type(exc).__name__)
+
+
+def _yield_to_live_run_under_another_key(
+    db: Session, settings, run: AutomationRunRecord, holder: str, account_key: str
+) -> None:
+    """The REST endpoint keys a cycle by the normalized Gmail identity, the scheduler by
+    AUTOMATION_SCHEDULER_ACCOUNT_KEY as configured; manual collector runs hold BOTH keys.
+    The collectors are global, so a live run under the other actual key must exclude this
+    one. Protocol: this run's slot is already claimed; if another live run exists under
+    any other actual key, release the slot (FAILED, audited) and refuse. When two starters
+    race both may yield (retried next tick); they can never both run."""
+    from app.db.automation_repository import live_conflicting_run
+    from app.services.collector_exclusion import lock_account_keys
+
+    other_keys = [key for key in lock_account_keys(settings) if key != account_key]
+    if not other_keys:
+        return
+    conflict = live_conflicting_run(db, other_keys, exclude_run_id=run.id)
+    if conflict is None:
+        return
+    finish_run(
+        db,
+        run,
+        holder=holder,
+        status="FAILED",
+        results={},
+        error_summary="YieldedToConcurrentRun",
+    )
+    raise AutomationRunAlreadyInProgressError(
+        f"A collector or automation run is already RUNNING under another account key "
+        f"(id={conflict.id!r}); this run for account_key={account_key!r} yielded"
+    )
+
+
 async def run_automation_cycle(
     db: Session,
     *,
@@ -547,6 +605,7 @@ async def run_automation_cycle(
         raise AutomationRunAlreadyInProgressError(
             f"An automation run for account_key={account_key!r} is already RUNNING (id={run.id!r})"
         )
+    _yield_to_live_run_under_another_key(db, settings, run, holder, account_key)
 
     effective_heartbeat_interval = (
         heartbeat_interval_seconds
@@ -657,5 +716,9 @@ async def run_automation_cycle(
             overall_status,
         )
         return finished
+    except BaseException as exc:
+        if not isinstance(exc, Exception):  # cancellation, Ctrl+C, SIGTERM shutdown
+            _extend_lease_after_interruption(db, run.id, holder, heartbeat)
+        raise
     finally:
         heartbeat.stop()

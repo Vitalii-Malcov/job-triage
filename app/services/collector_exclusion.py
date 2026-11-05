@@ -13,8 +13,11 @@ crash recovery. `run_automation_cycle` is unchanged: it already holds the slot
 and calls the collectors directly (never through this wrapper).
 
 Covered entry points: REST collector endpoints, Telegram `/run`, automation
-cycles (scheduler and REST). NOT covered: operator CLIs that call lower-level
-helpers (`scripts/stage22_refresh_ba.py` has its own file lock).
+cycles (scheduler and REST) and the operator CLI that changes vacancy data
+(`scripts/stage22_refresh_ba.py --apply`, through `hold_collector_slots`; its own
+file lock stays as an additional process-local guard). Automation cycles claim ONE
+key, so after claiming they verify that no live run holds the other actual key
+(`app.services.automation._yield_to_live_run_under_another_key`).
 
 Account keys. The REST automation endpoint scopes a cycle by the normalized
 `GMAIL_USERNAME`, the scheduler by `AUTOMATION_SCHEDULER_ACCOUNT_KEY` exactly as
@@ -41,8 +44,9 @@ Ownership contract:
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -232,6 +236,50 @@ def _extend_after_cancel(db: Session, held: list[_Held]) -> None:
                 logger.warning(
                     "manual_collector_cancel_extend_error error_type=%s", type(exc).__name__
                 )
+
+
+@dataclass
+class SlotHold:
+    """What `hold_collector_slots` hands its body: `lease_lost()` (check between units of
+    work) and `stats` (counters recorded on the finished run)."""
+
+    lease_lost: Callable[[], bool]
+    stats: dict = field(default_factory=dict)
+
+
+@contextmanager
+def hold_collector_slots(db: Session, settings, collector_name: str) -> Iterator[SlotHold]:
+    """Synchronous twin of `run_collector_exclusively` for operator CLIs that change
+    vacancy data (`scripts/stage22_refresh_ba.py --apply`): the body runs while the
+    account's RUNNING slot(s) are held with a heartbeat, so the scheduler, REST and
+    Telegram runs are refused meanwhile and vice versa.
+
+    Raises `CollectorRunInProgressError` before the body runs when a slot is taken, and
+    `CollectorRunLeaseLostError` after it when exclusivity could not be proven (the run is
+    then recorded FAILED, never COMPLETED). An exception from the body finalizes the runs
+    FAILED and propagates."""
+    held = _acquire(db, settings, collector_name)
+    hold = SlotHold(lease_lost=lambda: any(item.heartbeat.lease_lost.is_set() for item in held))
+    step_name = f"{MANUAL_RESULT_PREFIX}{collector_name}"
+    try:
+        yield hold
+    except BaseException as exc:
+        error_type = type(exc).__name__
+        failed = {step_name: {"status": "failed", "counters": None, "error_type": error_type}}
+        _stop_heartbeats(held)
+        _finalize(db, held, "FAILED", failed, f"{step_name}: failed ({error_type})", rollback=True)
+        raise
+    run_status, step = _step_result(hold.stats)
+    if _stop_heartbeats(held):
+        ok = _finalize(db, held, run_status, {step_name: step}, None, rollback=False)
+    else:
+        lost = {step_name: {"status": "failed", "counters": None, "error_type": "LeaseLost"}}
+        _finalize(db, held, "FAILED", lost, f"{step_name}: failed (LeaseLost)", rollback=False)
+        ok = False
+    if not ok:
+        raise CollectorRunLeaseLostError(
+            f"{collector_name}: ownership of the run was lost before it could be recorded"
+        )
 
 
 async def run_collector_exclusively(
