@@ -18,8 +18,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 06 | 2.2 XING dedup collisions | ACCEPTED — task 22d230a, merge 818b319 |
 | 07 | 2.3 collector concurrency | ACCEPTED — task d74a1de, merge 349108d |
 | 08 | 2.4 event-loop blocking | ACCEPTED — task 5e7aa2d, merge c54164d |
-| 09 | Arch §3 repository transactions | ACCEPTED (see below; SHAs in git log) |
-| 10–19 | see task list | PENDING |
+| 09 | Arch §3 repository transactions | ACCEPTED — task 6e4c0a7, merge 9604cb6 |
+| 10 | Arch §3 large modules | ACCEPTED (see below; SHAs in git log) |
+| 11–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -133,3 +134,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_repository_transactions.py` (15), PG tests (2 new, 11 passed on postgres:16), adjusted fakes/assertions in 4 existing test files.
 - Full pytest: 7410 passed, 148 skipped, 1 failed (stale monkeypatch target, fixed; file 18 passed). Ruff clean. No schema change.
 - Codex: scope review + 3 code rounds (R1 CHANGES_REQUESTED x2 P1: BA staging vs guard, profile create-commit mid-unit; R2 `BLOCKED` only for missing full-suite evidence; R3 ACCEPT).
+
+## TASK 10 — Large modules (Architecture §3)
+
+- Confirmed: `app/db/models.py` 3,647 lines / 47 mapped classes; `app/api/routes.py` 2,155 lines / one router.
+- Change (pure move, no behaviour/ORM/API change): `app/db/models/` package (13 domain modules, largest 604 lines; `__init__` re-exports every public name plus the historical `Base`; importing the package still registers all tables for Alembic) and `app/api/routers/` (12 modules, largest 408 lines; `app/api/routes.py` is a 38-line aggregator that keeps `router` as a flat list of routes and re-exports `send_response_draft_endpoint`). Handler/class bodies are byte-identical; the only text change in handlers is `get_settings()` -> `common.get_settings()` (one patch point: `app.api.routers.common.get_settings`). Logger name `app.api.routes` kept.
+- Proof of no behaviour change: a fingerprint of the OLD vs NEW tree is identical — SQLite + PostgreSQL DDL of all 47 tables and trigger hooks, mapper columns/relationships/listeners, the complete OpenAPI document, 66 flattened routes with dependencies/response models/status codes. Codex re-derived it independently (85 model statements and 61 router functions preserved). No schema change, no migration. Only incidental module attributes (`sqlalchemy.DDL`, `datetime.UTC`) are no longer reachable as `app.db.models.X`; nothing imported them.
+- **Operational effect (act on it at deploy):** `fit_cache.compute_rules_hash` hashes the import closure of the rule modules by name+content; the closure contained the single `app.db.models` file and now contains the package modules, so the rules-hash value changes. Persisted Stage 21 vacancy fit assessments carrying the old hash become stale-by-design (never shown as current) until the operator re-runs the existing fill script; nothing is deleted. The same applies to any future edit of a closure module.
+- Tests: `tests/test_module_structure.py` (10), 26 test files retargeted from `app.api.routes.X` to the owning router module, `tests/test_stage21_vacancy_cache.py` closure expectation updated. Migrations suite (117) green.
+- Full pytest: 7420 passed, 148 skipped, 2 failed — one wrong route-count constant of mine (fixed), one wall-clock timing test (`test_follow_up_send_service::TestLeaseRenewalHeartbeat`) that passes in isolation and in 3 reruns (flaky under full-suite load, not touched by this change). Ruff clean.
+- Residual: docs/comments still mention `app/db/models.py` / `app/api/routes.py` as historical paths (TASK 18); CLAUDE.md/AGENTS.md mention `app/db/models.py` (not edited here — CLAUDE.md has uncommitted operator changes).
+- Codex: 2 code rounds: R1 CHANGES_REQUESTED (stale source-closure test), R2 `VERDICT: ACCEPT`.

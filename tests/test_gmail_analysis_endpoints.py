@@ -81,7 +81,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
@@ -275,7 +275,7 @@ class TestPrivacyAndBounds:
         def _boom(*args, **kwargs):
             raise RuntimeError(secret_marker)
 
-        monkeypatch.setattr("app.api.routes.analyze_gmail_message", _boom)
+        monkeypatch.setattr("app.api.routers.gmail.analyze_gmail_message", _boom)
 
         response = test_client.post(
             f"/api/v1/gmail/messages/{msg_id}/analyze", headers=_auth_headers()

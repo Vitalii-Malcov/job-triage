@@ -1434,7 +1434,7 @@ class TestSessionDeadlineWiring:
         mid-FETCH -- NOT caused by the session deadline -- must still
         raise a sanitized `XingConnectionError` (never the raw abort
         object/message escaping uncaught into
-        app.api.routes.run_xing_collector's generic-exception path,
+        app.api.routers.collectors.run_xing_collector's generic-exception path,
         which would otherwise reach FastAPI/Starlette's own unhandled
         -exception traceback logging -- see
         app.collectors.xing_email._fetch_sync's own except clause for

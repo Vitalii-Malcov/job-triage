@@ -343,7 +343,7 @@ class TestApplicationSmokeAgainstDestination:
         )
         monkeypatch.setattr("app.security.auth.get_settings", lambda: settings)
         monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: settings)
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: settings)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: settings)
         readiness_engine = build_readiness_engine(url)
         monkeypatch.setattr(readiness, "_default_readiness_engine", lambda: readiness_engine)
         app.dependency_overrides[get_db] = override_get_db

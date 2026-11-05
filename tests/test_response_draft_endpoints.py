@@ -86,7 +86,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
     rate_limit_module._response_draft_requests.clear()
@@ -680,7 +680,9 @@ class TestNoExternalSideEffects:
         def _boom(*args, **kwargs):
             raise RuntimeError(secret_marker)
 
-        monkeypatch.setattr("app.api.routes.generate_response_draft_for_message", _boom)
+        monkeypatch.setattr(
+            "app.api.routers.response_drafts.generate_response_draft_for_message", _boom
+        )
 
         response = _generate_draft(test_client, msg_id)
         assert response.status_code == 500
