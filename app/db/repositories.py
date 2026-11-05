@@ -140,7 +140,7 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
 
 
 def _finalize_job_write(
-    db: Session, record: JobRecord, source_reference: str | None = None
+    db: Session, record: JobRecord, source_reference: str | None = None, *, commit: bool = True
 ) -> JobRecord:
     """Single transaction boundary for a `JobRecord` write and its derived
     `job_reference_tokens` sync (Stage 7B Codex remediation round 3,
@@ -150,6 +150,10 @@ def _finalize_job_write(
     `JobRecord` mutation nor the token mutation becomes durable — the
     derived-data invariant (job_reference_tokens always reflects the
     committed JobRecord) can never observe a half-applied state.
+
+    `commit=False` (review 2.5/Architecture 3, deferred mode): flush and sync
+    but leave the transaction open for the caller, which owns the final
+    commit/rollback. See `upsert_job_observed`.
     """
     db.flush()
     try:
@@ -159,7 +163,8 @@ def _finalize_job_write(
     except Exception:
         db.rollback()
         raise
-    db.commit()
+    if commit:
+        db.commit()
     db.refresh(record)
     if source_reference is not None and record.source_reference != source_reference:
         logger.warning(
@@ -309,7 +314,13 @@ class UpsertOutcome:
 
 
 def _update_existing(
-    db: Session, existing: JobRecord, job: Job, score: JobScore, now: datetime
+    db: Session,
+    existing: JobRecord,
+    job: Job,
+    score: JobScore,
+    now: datetime,
+    *,
+    commit: bool = True,
 ) -> UpsertOutcome:
     """The "already exists" write, shared by the sequential path and HARD-007's
     race-recovery winner. For `_FREEZE_ON_CONFLICT_SOURCES` the row is locked
@@ -321,14 +332,14 @@ def _update_existing(
         collision = descriptions_conflict(existing.description, job.description)
         if collision or existing.status != "NEW":
             existing.last_seen_at = now
-            _finalize_job_write(db, existing, None)
+            _finalize_job_write(db, existing, None, commit=commit)
             if collision:
                 logger.warning(
                     "job_possible_collision source=%s job_id=%s", existing.source, existing.id
                 )
             return UpsertOutcome(existing, False, frozen=True, possible_collision=collision)
     _apply_job_update_fields(existing, job, score, now)
-    _finalize_job_write(db, existing, storable_reference(job.source_reference))
+    _finalize_job_write(db, existing, storable_reference(job.source_reference), commit=commit)
     return UpsertOutcome(existing, False)
 
 
@@ -353,6 +364,7 @@ def upsert_job_observed(
     *,
     first_seen_at: datetime | None = None,
     last_seen_at: datetime | None = None,
+    commit: bool = True,
 ) -> UpsertOutcome:
     """`first_seen_at`/`last_seen_at` (Stage 14B, keyword-only, both or
     neither): the ORIGINAL collector observation times when a job is
@@ -361,13 +373,26 @@ def upsert_job_observed(
     the call raises `ValueError` instead of rewriting an existing record's
     observation history. Collectors never pass them. Concurrency (HARD-007)
     is documented on `_upsert_job`.
+
+    `commit=False` (deferred mode, Architecture 3): the write, its reference tokens and
+    source reference are flushed but the transaction is left open; the CALLER owns the
+    final commit/rollback (`score_and_persist` uses it so the upsert and the posting-type
+    reconciliation become durable together). Contract: it must be the FIRST write of the
+    unit of work (checked for pending ORM changes), because a fingerprint-collision race
+    recovery rolls the session's transaction back before converging on the winner; that
+    discards nothing but this call's own writes.
     """
     if (first_seen_at is None) != (last_seen_at is None):
         raise ValueError("first_seen_at and last_seen_at must be given together")
     historical = first_seen_at is not None
     if historical and last_seen_at < first_seen_at:
         raise ValueError("last_seen_at must not be before first_seen_at")
-    return _upsert_job(db, job, score, first_seen_at, last_seen_at)
+    if not commit and (db.new or db.dirty or db.deleted):
+        raise ValueError(
+            "upsert_job_observed(commit=False) needs a session without pending changes: "
+            "a fingerprint-collision recovery rolls the transaction back"
+        )
+    return _upsert_job(db, job, score, first_seen_at, last_seen_at, commit=commit)
 
 
 def _upsert_job(
@@ -376,6 +401,8 @@ def _upsert_job(
     score: JobScore,
     first_seen_at: datetime | None,
     last_seen_at: datetime | None,
+    *,
+    commit: bool = True,
 ) -> UpsertOutcome:
     """HARD-007 (Codex master review): two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
@@ -418,7 +445,7 @@ def _upsert_job(
     if existing:
         if historical:
             raise ValueError("historical observation timestamps apply only to a new job record")
-        return _update_existing(db, existing, job, score, now)
+        return _update_existing(db, existing, job, score, now, commit=commit)
 
     record = JobRecord(
         fingerprint=fingerprint,
@@ -444,7 +471,7 @@ def _upsert_job(
     )
     db.add(record)
     try:
-        _finalize_job_write(db, record)
+        _finalize_job_write(db, record, commit=commit)
     except IntegrityError as exc:
         db.rollback()
         if not _is_fingerprint_unique_violation(exc):
@@ -456,7 +483,7 @@ def _upsert_job(
             raise ValueError(
                 "historical observation timestamps apply only to a new job record"
             ) from exc
-        return _update_existing(db, winner, job, score, now)
+        return _update_existing(db, winner, job, score, now, commit=commit)
     return UpsertOutcome(record, True)
 
 
@@ -468,6 +495,7 @@ def update_job_score_if_posting_type_unchanged(
     score: int,
     recommendation: str,
     data_confidence: float,
+    commit: bool = True,
 ) -> bool:
     """S10-RR-001 (Codex Stage 10 re-review, BLOCKING): the atomic
     compare-and-swap `app.services.collector_runner.score_and_persist`
@@ -489,10 +517,10 @@ def update_job_score_if_posting_type_unchanged(
     against. Returns False (0 rows affected) if it changed underneath;
     the caller re-reads and retries with a fresh observation.
 
-    Deliberately its own commit boundary (a single, self-contained
-    conditional state transition, not composed with any other write in
-    the same transaction) — callers must not wrap this in additional
-    uncommitted work expecting atomicity with it.
+    By default its own commit boundary (a single, self-contained conditional
+    state transition). `commit=False` (Architecture 3) executes the same conditional
+    UPDATE inside the caller's open transaction; the caller (`score_and_persist`) then
+    commits the upsert and this reconciliation together.
     """
     stmt = (
         update(JobRecord)
@@ -501,7 +529,8 @@ def update_job_score_if_posting_type_unchanged(
         .values(score=score, recommendation=recommendation, data_confidence=data_confidence)
     )
     result = db.execute(stmt)
-    db.commit()
+    if commit:
+        db.commit()
     return result.rowcount == 1
 
 
@@ -958,6 +987,31 @@ def resolve_name_only_company_research(
     return get_company_research_by_identity(db, None, normalized_company_name)
 
 
+def _claim_company_research_alias(
+    db: Session, company_research_id: int, normalized_company_name: str
+) -> None:
+    """Claim the name's coordination slot for `company_research_id` inside the
+    caller's open transaction, WITHOUT committing: one targeted
+    `INSERT .. ON CONFLICT (normalized_company_name) DO NOTHING`. An existing alias
+    (this record's own, or the legitimate owner of Case C) is never reassigned.
+    Unexpected database errors propagate and abort the caller's combined write."""
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:
+        raise NotImplementedError(f"unsupported database dialect: {dialect}")
+    db.execute(
+        dialect_insert(CompanyResearchIdentityAlias)
+        .values(
+            normalized_company_name=normalized_company_name,
+            company_research_id=company_research_id,
+        )
+        .on_conflict_do_nothing(index_elements=["normalized_company_name"])
+    )
+
+
 def _ensure_company_research_alias(
     db: Session, record: CompanyResearchRecord, normalized_company_name: str
 ) -> None:
@@ -1213,6 +1267,10 @@ def _update_existing_company_research(
     )
     try:
         result = db.execute(stmt)
+        if result.rowcount == 1:
+            # Architecture 3: the alias is claimed in the SAME transaction as the
+            # content/version update, so a failure here leaves neither behind.
+            _claim_company_research_alias(db, existing.id, normalized_company_name)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -1244,7 +1302,6 @@ def _update_existing_company_research(
         )
 
     db.refresh(existing)
-    _ensure_company_research_alias(db, existing, normalized_company_name)
     return existing, CompanyResearchWriteOutcome.UPDATED
 
 
