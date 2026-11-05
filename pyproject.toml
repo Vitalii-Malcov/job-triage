@@ -27,6 +27,10 @@ dependencies = [
   "tzdata>=2024.1",
 ]
 
+[project.scripts]
+# Stable operator command line (app/cli.py); needs a repository checkout for scripts/.
+jobtriage = "app.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.4",
