@@ -1,8 +1,9 @@
 # Master execution status
 
-Living hand-off file: the exact state of the Stage 21/22 work so a later
-session can continue safely. Facts only; every number names its commit.
-Last update: 2026-10-30.
+Living hand-off file. Facts only; every number names its commit. Each stage is
+reported on four separate axes: developed / merged into `main` / tested / deployed.
+Last update: 2026-11-04 (reconciled against `main@78a947b`; the 2026-10-30 text
+described PRs #18-#21 as open and is superseded).
 
 ## Ground rules (unchanged)
 
@@ -15,33 +16,34 @@ Last update: 2026-10-30.
 
 ## Where things are
 
-| Item | State |
-|---|---|
-| `main` | `4cdaacf` (Stage 20 completion, PR #17) |
-| Production DB | Alembic `b6c1e9a4d2f7`, integrity ok, not migrated |
-| Production code (working copy) | `main@4cdaacf` |
-| PR #18 Stage 21 cache | open, `stage21/vacancy-cache@4a3647c`, CI green, Codex ACCEPT, UI checked on a migrated copy |
-| PR #19 Stage 22 P0-3 repost guard | open, stacked on #18, `stage22/repost-guard@79e54e7`, CI green, Codex ACCEPT |
-| PR #20 Stage 22 P0-1/P0-2 | open, stacked on #19, `stage22/p0-ba-reference@f6dd8a2`; full local pytest 6876 passed / 138 skipped; Codex R7 ACCEPT |
-| PR #21 Stage 22 P1 | open, stacked on #20, `stage22/p1-geo-remote@6365cd6`; full local pytest 7034 passed / 138 skipped; Codex R5 ACCEPT |
-| Stage 22 P2 + docs | branch `stage22/p2-operations`, stacked on #21 (`--occurred-at`, README/portfolio corrections) |
+| Item | State | Evidence |
+|---|---|---|
+| `main` | `78a947b` (merge of PR #29); contains PRs #18-#29 (Stages 21-24 and docs PRs #14, #29) | `git log main` |
+| Production DB | last recorded: Alembic `e3b7c9d1f4a6` after the 2026-10-31 rollout (code `d5a7d27`) | operator notes; no deployment record in this repository |
+| Production code | `d5a7d27` per the same notes; PRs #23-#29 (T6 refresh CLI, fit-evidence gating, Stage 23/24) deployment NOT verified | |
+| Remediation of the hard code review | local branch `fix/hard-review-integration` (tasks 01-17 merged, 18-19 pending), not pushed, not merged, not deployed | `docs/HARD_REVIEW_REMEDIATION_STATUS.md` |
 
-Merge plan for #18/#19 (operator-approved strategy, not yet executed):
-merge commit for #18, then retarget #19 to `main` (verified locally: 11
-files / 6 commits, no force-push needed), then the same for later stacked PRs.
+Local-only remediation branches add two Alembic revisions after the Stage 22 head
+(`f1a8c3d5e7b9`, `a2b7d4f9c1e3`) and change the fit-cache rules hash (source bytes of the scoring
+modules): after a deployment the fit cache must be refilled and the schema migrated in an operator
+window. Neither has been done in production (the migrations were only run on temporary SQLite
+and a local test PostgreSQL).
 
 ## Stages
 
-| Stage | Developed | In `main` | In production | Notes |
+| Stage | Developed | In `main` | Tested | In production |
 |---|---|---|---|---|
-| 1–20 | yes | yes | yes (code `4cdaacf`, DB `b6c1e9a4d2f7`) | |
-| 21 vacancy assessment cache | yes | no (PR #18) | no | migration `c7e2a9d4f1b3` |
-| 22 P0-3 repost guard | yes | no (PR #19) | no | no migration |
-| 22 P0-1 BA reference | yes | no | no | migration `d5f1a7c3e9b2`, backfill script |
-| 22 P0-2 BA liveness | yes | no | no | read-only CLI |
-| 22 P1 geography / remote / tiers | yes | no | no | migration `e3b7c9d1f4a6`; quality check on a copy in docs/STAGE22_SEARCH_QUALITY.md |
-| 22 P1-2 vacancy identity | dry-run report only | no | no | no merge implemented (separate approved stage) |
-| 22 P2 operations | no | — | — | planned |
+| 1-20 | yes | yes | CI at merge time | yes (code `4cdaacf`, DB `b6c1e9a4d2f7`) |
+| 21 vacancy assessment cache (PR #18) | yes | yes | CI green at PR time; PostgreSQL job covers `c7e2a9d4f1b3` | reported 2026-10-31 |
+| 22 P0-P2 (PRs #19-#22): repost guard, BA reference `d5f1a7c3e9b2`, liveness, geography/remote/tiers `e3b7c9d1f4a6`, event time | yes | yes | local full runs recorded in README; PR #19 CI green | reported 2026-10-31 (head `e3b7c9d1f4a6`) |
+| 22 P1-2 vacancy identity | dry-run report only; no merge implemented | n/a | | no |
+| 22 T6 refresh CLI, fit-evidence gating (PRs #23, #24) | yes | yes | tests in the PRs | not verified |
+| 23 BA search params, domain vocabulary (PRs #25, #26) | yes | yes | tests in the PRs | not verified |
+| 24 BA discovery, target alignment (PRs #27, #28) | yes | yes | tests in the PRs | not verified |
+| Hard-review remediation, 19 planned tasks | tasks 01-17 accepted and merged locally; 18 (this documentation) under review; 19 (final audit) pending | **no** | local pytest/Ruff/PostgreSQL (Docker) per task; GitHub Actions NOT run | **no** |
+
+The merge plan formerly listed here (#18 -> #19 -> #20 -> P1) was executed: the PRs are merged as
+merge commits (`fac3829`, `5c46096`, `84407ff`, `c40bafc`, `d5a7d27`, ...).
 
 ## Repository clean-up (2026-10-30)
 
@@ -78,13 +80,10 @@ token shapes, private keys): only a test fixture string. Tracked env files are
 
 ## Next steps (in order)
 
-1. P2 PR: Codex review, full pytest, open the stacked PR.
-2. Deferred (own approved stage): follow-up snooze / deadline-aware follow-ups
-   (needs a new event type on the append-only `application_events` table).
-4. Operator approvals: merge #18 -> #19 -> #20 -> P1 (merge commits, retarget
-   each next PR to `main`); then ONE production window:
-   backup -> `alembic upgrade head` (b6c1 -> c7e2 -> d5f1 -> e3b7) ->
-   `backfill_source_reference.py --apply --snapshot` ->
-   `stage22_match_vacancies.py --apply --snapshot` ->
-   `stage21_assess_vacancies.py --apply --snapshot` -> smoke tests.
-   A collector run afterwards fills the BA facts (coordinates, home office).
+1. Operator review of `fix/hard-review-integration`; then (operator-approved) push, PR and CI.
+2. Verify and record what is actually deployed (PRs #23-#29 are not confirmed in production).
+3. Production window for the remediation: backup -> `alembic upgrade head`
+   (`e3b7` -> `f1a8c3d5e7b9` -> `a2b7d4f9c1e3`) -> fit-cache refill -> smoke tests.
+4. Deferred (own approved stage): follow-up snooze / deadline-aware follow-ups (needs a new event
+   type on the append-only `application_events` table).
+5. Open docs PRs #1 and #16 still need an operator decision (close or merge).
