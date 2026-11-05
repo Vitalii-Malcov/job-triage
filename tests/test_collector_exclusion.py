@@ -3,6 +3,7 @@ hold (app/services/collector_exclusion.py)."""
 
 import asyncio
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -53,6 +54,25 @@ def factory(tmp_path):
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, autoflush=False, autocommit=False)
     engine.dispose()
+
+
+async def _wait(event: threading.Event, timeout: float = 20.0) -> None:
+    """Await a threading.Event without blocking the test loop (the runner runs
+    on the offload worker's own loop, so asyncio primitives cannot be shared)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not event.is_set():
+        assert asyncio.get_running_loop().time() < deadline, "timed out waiting for the worker"
+        await asyncio.sleep(0.01)
+
+
+def _gated_runner(gate: threading.Event, started: threading.Event):
+    async def slow(db, settings, *, is_lease_lost=None):
+        started.set()
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return STATS
+
+    return slow
 
 
 def _runs(factory):
@@ -173,20 +193,15 @@ class TestExclusion:
 
     @pytest.mark.asyncio
     async def test_two_manual_runs_cannot_overlap_and_the_slot_returns_afterwards(self, factory):
-        gate = asyncio.Event()
-        started = asyncio.Event()
-
-        async def slow(db, settings, *, is_lease_lost=None):
-            started.set()
-            await gate.wait()
-            return STATS
+        gate, started = threading.Event(), threading.Event()
+        slow = _gated_runner(gate, started)
 
         async def first():
             with factory() as db:
                 return await run_collector_exclusively(db, _settings(), "xing", slow)
 
         task = asyncio.create_task(first())
-        await started.wait()
+        await _wait(started)
         with factory() as db, pytest.raises(CollectorRunInProgressError):
             await run_collector_exclusively(db, _settings(), "bundesagentur", _ok)
         gate.set()
@@ -201,20 +216,15 @@ class TestExclusion:
             run_automation_cycle,
         )
 
-        gate = asyncio.Event()
-        started = asyncio.Event()
-
-        async def slow(db, settings, *, is_lease_lost=None):
-            started.set()
-            await gate.wait()
-            return STATS
+        gate, started = threading.Event(), threading.Event()
+        slow = _gated_runner(gate, started)
 
         async def manual():
             with factory() as db:
                 return await run_collector_exclusively(db, _settings(), "xing", slow)
 
         task = asyncio.create_task(manual())
-        await started.wait()
+        await _wait(started)
         with factory() as db, pytest.raises(AutomationRunAlreadyInProgressError):
             await run_automation_cycle(db, account_key="me@example.com", settings=_settings())
         gate.set()
@@ -266,19 +276,15 @@ class TestMixedCaseSchedulerKey:
         )
 
         settings = _settings(automation_scheduler_account_key="ZED@Example.com")
-        gate, started = asyncio.Event(), asyncio.Event()
-
-        async def slow(db, settings, *, is_lease_lost=None):
-            started.set()
-            await gate.wait()
-            return STATS
+        gate, started = threading.Event(), threading.Event()
+        slow = _gated_runner(gate, started)
 
         async def manual():
             with factory() as db:
                 return await run_collector_exclusively(db, settings, "xing", slow)
 
         task = asyncio.create_task(manual())
-        await started.wait()
+        await _wait(started)
         with factory() as db, pytest.raises(AutomationRunAlreadyInProgressError):
             await run_automation_cycle(db, account_key="ZED@Example.com", settings=settings)
         gate.set()

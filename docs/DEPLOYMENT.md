@@ -127,6 +127,7 @@ Limits are per process (AUD-004, accepted for the initial topology): run exactly
 
 ## Scaling limitations (explicit, honest)
 
+- **Event loop (review 2.4):** the long, database-heavy API operations (collector runs, automation cycles, Gmail sync, company research, Bewerbung drafts, job scoring) run on a private event loop in a bounded worker pool (`app/services/offload.py`, 8 threads), so they no longer stall `/health`, other requests or the Telegram poller. A cancelled/disconnected request still waits for its worker before the DB session is closed. The Telegram poller stays in the web process (moving it out is a topology change, not made here); other Telegram commands that do synchronous DB work (e.g. `/research`, `/review`) still run on the poller loop.
 - **Not multi-worker safe today** (AUD-004): stay at `--workers 1` / one `web` container.
 - **Not designed for direct public internet exposure** (HARD-015, AUD-006): the API is loopback-only by default; expose it only through the reverse proxy described above.
 - **PostgreSQL production use is not yet field-tested by the author** (AUD-011) — CI proves migrations and concurrency correctness, but this compose target has not yet run as a long-lived production workload; treat an initial rollout as monitored, not "fire and forget."
