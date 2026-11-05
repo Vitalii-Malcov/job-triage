@@ -29,6 +29,12 @@ APPLICANT = "applicant@example.invalid"
 NOW = datetime(2026, 10, 26, 10, 0, tzinfo=UTC)
 
 
+def _ui_key() -> str:
+    from app.core.config import Settings
+
+    return auth.signing_key(Settings(api_key=API_KEY))
+
+
 @pytest.fixture()
 def db_url(tmp_path):
     url = f"sqlite:///{(tmp_path / 'stage20_ui.db').as_posix()}"
@@ -311,7 +317,7 @@ def test_malformed_cookie_redirects_instead_of_failing(client_factory):
     ):
         assert page(value).status_code == 303, value
     # positive control: a well-formed token sent the same way is accepted
-    assert page(auth.issue_session_token(API_KEY, hours=1)).status_code == 200
+    assert page(auth.issue_session_token(_ui_key(), hours=1)).status_code == 200
 
 
 def test_login_is_rate_limited(client_factory):
@@ -703,3 +709,51 @@ def test_long_words_wrap_instead_of_widening_the_page():
     assert "overflow-wrap: anywhere" in description
     main = next(line for line in css.splitlines() if line.startswith("main {"))
     assert "overflow-wrap: break-word" in main
+
+
+def test_ui_cookie_is_not_signed_with_the_raw_api_key_and_modes_differ():
+    from app.core.config import Settings
+
+    plain = Settings(_env_file=None, api_key=API_KEY)
+    secret = Settings(_env_file=None, api_key=API_KEY, ui_session_secret="independent-secret")
+    assert auth.signing_key(plain) not in ("", API_KEY)
+    assert auth.signing_key(plain) != auth.signing_key(secret)
+    # old-style cookie signed directly with the API key is rejected
+    legacy = auth.issue_session_token(API_KEY, hours=1)
+    assert not auth.session_token_valid(legacy, auth.signing_key(plain))
+    assert not auth.session_token_valid(legacy, auth.signing_key(secret))
+    # fallback<->explicit switch and either rotation revoke cookies
+    token = auth.issue_session_token(auth.signing_key(secret), hours=1)
+    assert auth.session_token_valid(token, auth.signing_key(secret))
+    assert not auth.session_token_valid(token, auth.signing_key(plain))
+    rotated_api = Settings(
+        _env_file=None, api_key="other-key", ui_session_secret="independent-secret"
+    )
+    assert not auth.session_token_valid(token, auth.signing_key(rotated_api))
+    rotated_secret = Settings(_env_file=None, api_key=API_KEY, ui_session_secret="new-secret")
+    assert not auth.session_token_valid(token, auth.signing_key(rotated_secret))
+
+
+def test_empty_api_key_fails_closed_even_with_a_signing_secret():
+    from app.core.config import Settings
+
+    for secret in ("", "independent-secret"):
+        settings = Settings(_env_file=None, api_key="", ui_session_secret=secret)
+        assert auth.signing_key(settings) == ""
+        assert not auth.session_token_valid(
+            auth.issue_session_token("", hours=1), auth.signing_key(settings)
+        )
+
+
+def test_login_cookie_roundtrip_with_independent_signing_secret(client_factory, monkeypatch):
+    monkeypatch.setenv("UI_SESSION_SECRET", "independent-secret")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        client = client_factory()
+        resp = client.post("/ui/login", data={"api_key": API_KEY}, follow_redirects=False)
+        assert resp.status_code == 303
+        assert client.get("/ui/", follow_redirects=False).status_code == 200
+    finally:
+        get_settings.cache_clear()

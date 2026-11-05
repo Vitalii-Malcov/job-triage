@@ -46,6 +46,7 @@ from sqlalchemy.orm import Session
 from app.agents.bewerbung_generator import BEWERBUNG_GENERATOR_VERSION
 from app.agents.candidate_job_matcher import ALGORITHM_VERSION
 from app.agents.cv_adapter import CV_ADAPTER_VERSION
+from app.core.config import reveal
 from app.db.bewerbung_repository import (
     get_bewerbung_draft_by_id,
     get_latest_bewerbung_draft,
@@ -627,7 +628,7 @@ async def _deliver(
         return "BUSY"
     try:
         result = await send(
-            settings.telegram_bot_token,
+            reveal(settings.telegram_bot_token),
             settings.telegram_chat_id,
             text,
             reply_markup=reply_markup,

@@ -62,6 +62,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import reveal
 from app.db import telegram_operator_repository as repo
 from app.db.candidate_job_match_repository import (
     compute_job_snapshot_fingerprint,
@@ -525,7 +526,7 @@ async def send_card(
     bookkeeping never changes the application."""
     if not settings.telegram_operator_control_enabled:
         return CardSendResult(CardSendCode.DISABLED)
-    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+    if not reveal(settings.telegram_bot_token) or not settings.telegram_chat_id:
         return CardSendResult(CardSendCode.NOT_CONFIGURED)
     tracker = tracker or ApplicationTracker()
     target = load_target(db, application_id, tracker=tracker)

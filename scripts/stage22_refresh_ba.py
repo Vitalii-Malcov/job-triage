@@ -55,6 +55,8 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import reveal
+
 try:
     from scripts.stage15_application_tracker import TargetRefusedError, resolve_engine
 except ModuleNotFoundError:  # run as `python scripts/...`
@@ -530,7 +532,7 @@ def _run(args, database: Path, collector_factory: Callable | None) -> int:
     get_settings.cache_clear()
     settings = get_settings()
     assert_outbound_disabled(settings)
-    if not is_configured(settings.bundesagentur_api_key):
+    if not is_configured(reveal(settings.bundesagentur_api_key)):
         raise RefusedError("BUNDESAGENTUR_API_KEY is not configured")
     if args.apply and classify_path(database) is DatabaseKind.BACKUP:
         raise RefusedError("refusing to write into a backup database")

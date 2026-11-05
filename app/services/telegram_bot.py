@@ -44,7 +44,7 @@ from telegram.ext import (
 )
 
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, get_settings, reveal
 from app.db.repositories import get_job_by_id, list_jobs, update_job_status
 from app.db.session import SessionLocal
 from app.db.telegram_vacancy_review_repository import (
@@ -576,7 +576,7 @@ async def _send_bewerbung_notice(
     if not outcome.notice:
         return
     await send_telegram_message(
-        settings.telegram_bot_token,
+        reveal(settings.telegram_bot_token),
         settings.telegram_chat_id,
         outcome.notice,
         reply_markup=markup if markup is not None else getattr(outcome, "notice_markup", None),
@@ -928,7 +928,7 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application(settings: Settings) -> Application:
-    application = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    application = ApplicationBuilder().token(reveal(settings.telegram_bot_token)).build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("jobs", cmd_jobs))
@@ -966,7 +966,7 @@ async def start_bot(settings: Settings) -> Application | None:
     never raises for a runtime start failure — callers don't need to know
     how it can fail.
     """
-    if not settings.telegram_bot_token:
+    if not reveal(settings.telegram_bot_token):
         logger.info("telegram_bot_disabled reason=no_bot_token_configured")
         return None
 

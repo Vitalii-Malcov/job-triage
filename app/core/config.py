@@ -19,6 +19,14 @@ from app.providers.email.base import (
 # INSERT time) from ever disagreeing about what a valid account_key is.
 
 
+def reveal(value: object) -> str:
+    """Plain text of a credential field: unwraps `SecretStr`, passes plain
+    strings through (test doubles, legacy callers), maps None to ''."""
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return "" if value is None else str(value)
+
+
 class Settings(BaseSettings):
     app_env: str = "development"
     # DEPLOY-001-RR1 (Codex targeted re-review): `repr=False` keeps this
@@ -84,7 +92,10 @@ class Settings(BaseSettings):
     alembic_auto_upgrade: bool = False
     # No default on purpose: an empty/unset key means require_api_key()
     # rejects every request instead of accepting a predictable value.
-    api_key: str = ""
+    api_key: SecretStr = SecretStr("")
+    # Optional independent secret for the UI session cookie signature (see
+    # app/ui/auth.py `signing_key`). Unset: a key derived from api_key is used.
+    ui_session_secret: SecretStr = SecretStr("")
     # Stage 20: the read-only browser UI under /ui (docs/STAGE20_UI_ARCHITECTURE.md).
     # Off by default: every /ui route answers 404 while False. Login uses
     # api_key above; the session cookie expires after ui_session_hours.
@@ -114,7 +125,7 @@ class Settings(BaseSettings):
     # lists exactly that address (docs/DEPLOYMENT.md "Reverse proxy").
     trusted_proxy_ips: str = ""
 
-    telegram_bot_token: str = ""
+    telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
     telegram_timeout_seconds: float = 5.0
     telegram_max_retries: int = 3
@@ -181,7 +192,7 @@ class Settings(BaseSettings):
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.
-    bundesagentur_api_key: str = ""
+    bundesagentur_api_key: SecretStr = SecretStr("")
     bundesagentur_search_keywords: str = ""
     bundesagentur_search_location: str = ""
     bundesagentur_search_radius_km: int = 25

@@ -36,8 +36,8 @@ def test_forced_environment_overrides_dotenv(tmp_path, monkeypatch, database):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     settings = Settings(_env_file=".env")  # conftest disables .env globally
-    assert settings.api_key == "from-dotenv"  # the key still comes from .env
-    assert settings.telegram_bot_token == ""  # an empty override beats .env
+    assert settings.api_key.get_secret_value() == "from-dotenv"  # the key still comes from .env
+    assert settings.telegram_bot_token.get_secret_value() == ""  # an empty override beats .env
     assert settings.ui_enabled and not settings.outbound_sending_enabled
     assert not settings.alembic_auto_upgrade
     assert settings.database_url == f"sqlite:///{database.resolve().as_posix()}"

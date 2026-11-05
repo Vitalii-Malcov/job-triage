@@ -27,6 +27,7 @@ from app.ui.auth import (
     require_same_origin,
     require_ui_enabled,
     require_ui_session,
+    signing_key,
 )
 from app.ui.readonly import get_ui_db
 
@@ -132,7 +133,7 @@ async def login(request: Request) -> Response:
     response = RedirectResponse("/ui/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         COOKIE_NAME,
-        issue_session_token(settings.api_key, hours=settings.ui_session_hours),
+        issue_session_token(signing_key(settings), hours=settings.ui_session_hours),
         max_age=settings.ui_session_hours * 3600,
         path="/ui",
         httponly=True,
