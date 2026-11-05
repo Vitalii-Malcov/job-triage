@@ -245,7 +245,7 @@ def test_repository_head_is_the_application_lifecycle_head() -> None:
     # c7e2a9d4f1b3 (job_fit_assessments cache table); Stage 22 P0-1:
     # d5f1a7c3e9b2 (jobs.source_reference); Stage 22 P1: e3b7c9d1f4a6
     # (structured job facts).
-    assert _repository_head() == "f1a8c3d5e7b9"
+    assert _repository_head() == "a2b7d4f9c1e3"
 
 
 def test_real_workflow_satisfies_the_postgres_gate() -> None:

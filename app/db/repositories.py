@@ -611,13 +611,30 @@ def is_message_processed(db: Session, source: str, message_id: str) -> bool:
 def mark_message_processed(db: Session, source: str, message_id: str) -> None:
     """Record that this source has processed an email with this Message-ID.
 
-    Idempotent: safe to call even if already marked (e.g. a duplicate
-    Message-ID seen twice in the same run), so it never raises a unique
-    constraint violation.
+    Idempotent and race-free: one `INSERT ... ON CONFLICT (source, message_id)
+    DO NOTHING`, so a duplicate Message-ID in the same run, a concurrent run,
+    or another source holding the same Message-ID never raises. The first
+    marker row (its id and processed_at) is never touched again.
+
+    Contract: when the marker already exists nothing is written and nothing is
+    committed; otherwise the helper COMMITS the session (the acknowledgement
+    must be durable before the caller advances any scan watermark), which
+    also persists whatever else the caller has pending in this session.
     """
     if is_message_processed(db, source, message_id):
         return
-    db.add(ProcessedEmailMessage(source=source, message_id=message_id))
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # the project supports SQLite and PostgreSQL only
+        raise NotImplementedError(f"unsupported database dialect: {dialect}")
+    db.execute(
+        dialect_insert(ProcessedEmailMessage)
+        .values(source=source, message_id=message_id, processed_at=datetime.now(UTC))
+        .on_conflict_do_nothing(index_elements=["source", "message_id"])
+    )
     db.commit()
 
 

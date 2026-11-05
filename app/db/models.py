@@ -288,12 +288,20 @@ class ProcessedEmailMessage(Base):
     """
 
     __tablename__ = "processed_email_messages"
+    # Review 2.1: the identity is (source, message_id) -- exactly what
+    # is_message_processed / mark_message_processed look up. Two sources may
+    # legitimately hold the same Message-ID.
+    __table_args__ = (
+        UniqueConstraint(
+            "source", "message_id", name="uq_processed_email_messages_source_message_id"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     # RFC 5322 Message-ID header, e.g. "<abc123@mail.xing.com>". 998 is the
     # RFC 5322 recommended max header line length.
-    message_id: Mapped[str] = mapped_column(String(998), unique=True, nullable=False, index=True)
+    message_id: Mapped[str] = mapped_column(String(998), nullable=False, index=True)
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
