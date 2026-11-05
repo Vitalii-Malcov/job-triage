@@ -236,7 +236,9 @@ def build_digest_text(db: Session, account_key: str) -> str:
     """
     sections: list[str] = ["Automation digest"]
 
-    latest_runs = list_runs(db, account_key, limit=1)
+    # Review 2.3: manual collector runs share the table; the digest summarizes
+    # the latest AUTOMATION cycle, so manual rows are excluded in SQL (before LIMIT).
+    latest_runs = list_runs(db, account_key, limit=1, include_manual=False)
     if not latest_runs:
         sections.append("Latest run: none yet")
     else:

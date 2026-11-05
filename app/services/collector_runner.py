@@ -1021,9 +1021,14 @@ async def run_xing(
                             )
                     notified_count += 1
 
-        if not batch_failed:
+        # Review 2.3: with the lease lost another run may own the mailbox now;
+        # persisted jobs stay (idempotent), but the acknowledgement and the scan
+        # watermark are the shared state, so they are left for the owner. The
+        # message is simply reprocessed (dedup makes that safe).
+        lease_lost_now = is_lease_lost is not None and is_lease_lost()
+        if not batch_failed and not lease_lost_now:
             mark_message_processed(db, "xing", batch.message_id)
-        batch_uid_outcomes[batch.uid] = not batch_failed
+        batch_uid_outcomes[batch.uid] = not batch_failed and not lease_lost_now
 
     # Codex gate follow-up (Astra R4A HIGH, watermark gap): compute and
     # persist how far the scan can safely resume from next run.
@@ -1048,7 +1053,7 @@ async def run_xing(
     # falsy either way) guarantees the watermark stops at the FIRST
     # unresolved/failed/unreached UID, exactly like a present-and-False
     # entry already did.
-    if collector.uid_validity is not None:
+    if collector.uid_validity is not None and not (is_lease_lost is not None and is_lease_lost()):
         handled_uids: dict[int, bool] = {uid: True for uid in collector.confirmed_uids}
         handled_uids.update(batch_uid_outcomes)
         # Codex gate follow-up (Astra R4A MEDIUM take 4, early scalar

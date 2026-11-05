@@ -15,8 +15,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 03 | 1.3 response-draft recipient pinning | ACCEPTED — task 32336e3, merge 57d58a5 |
 | 04 | 1.4 UI session revocation | ACCEPTED — task b4ec414, merge 10c69ad |
 | 05 | 2.1 processed email identity | ACCEPTED — task feff194, merge 1cf7900 |
-| 06 | 2.2 XING dedup collisions | ACCEPTED (see below; SHAs in git log) |
-| 07–19 | see task list | PENDING |
+| 06 | 2.2 XING dedup collisions | ACCEPTED — task 22d230a, merge 818b319 |
+| 07 | 2.3 collector concurrency | ACCEPTED (see below; SHAs in git log) |
+| 08–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -96,3 +97,15 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_xing_collision_protection.py`, endpoint test (count + no alert), Telegram `/run` test, PG tests (`test_upsert_job_postgres_concurrency.py`: existing blank row + 2 competing descriptions; new-row race) — 9 passed on postgres:16.
 - Full pytest: 7350 passed, 144 skipped, 0 failed. Ruff clean.
 - Codex: plan review x2 + 1 code round: `VERDICT: ACCEPT` (P3: show collisions in Telegram `/run` — implemented after the verdict, covered by a new test and the full run).
+
+## TASK 07 — Collector concurrency (2.3, MEDIUM)
+
+- Confirmed: yes (`POST /collectors/*/run` and Telegram `/run` called `run_bundesagentur`/`run_xing` with no lock; the lease protected automation cycles only).
+- GATE B: Codex plan review (PLAN_CHANGES: account-key identity, lease-loss scope, cancellation vs the IMAP worker thread, cleanup contract, history rendering, 409 presentation) — adopted.
+- Design (no schema change): `app/services/collector_exclusion.py::run_collector_exclusively` — manual runs claim the SAME per-account RUNNING slot as automation, for every distinct ACTUAL key of {normalized `GMAIL_USERNAME` (kept even when empty), `AUTOMATION_SCHEDULER_ACCOUNT_KEY` as configured}, sorted; config preflight before any slot; heartbeat per run; heartbeats stopped and verified before success is recorded (lost/stuck heartbeat => FAILED + `CollectorRunLeaseLostError`); runner exception => sanitized FAILED; cancellation => no finalization, lease extended past the IMAP deadline on a separate session (the worker thread may still use the request session). REST => 409 (in progress / lease lost), Telegram replies. `run_automation_cycle` unchanged. Manual rows are labelled (`manual:<collector>` results, `manual_collector:` lease holder) and excluded from the Telegram digest in SQL before LIMIT (`list_runs(include_manual=False)`).
+- IMAP integrity: once the lease is lost `run_xing` leaves the message unacknowledged and the scan watermark untouched (persisted jobs stay — existing documented idempotent design).
+- Covered entry points: REST collector endpoints, Telegram `/run`, scheduler and REST automation. Not covered: operator CLIs calling lower-level helpers (`stage22_refresh_ba` has its own file lock).
+- Residual: manual runs now appear in `/automation/runs`; scheduler vs REST automation with different spellings of the key are still separate slots among themselves (manual runs hold both); after a lost lease already-started persistence/notifications of the current job may finish; a cancelled manual run keeps the slot RUNNING for ~6 min (fail closed).
+- Tests: `tests/test_collector_exclusion.py` (33), lease-guard ack/watermark tests, digest tests, PG module `tests/integration/test_collector_exclusion_postgres.py` (2 passed on postgres:16; added to the ci.yml zero-skip list).
+- Full pytest: 7385 passed, 146 skipped, 0 failed. Ruff clean.
+- Codex: plan review + 4 code rounds (R1 CHANGES_REQUESTED x5 incl. P1 scheduler key spelling; R2 CHANGES_REQUESTED x3 incl. empty REST key; R3 `BLOCKED` only for missing full-suite evidence; R4 ACCEPT with evidence).

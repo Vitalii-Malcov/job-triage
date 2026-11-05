@@ -12,7 +12,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -39,6 +39,12 @@ class AutomationRepositoryConsistencyError(Exception):
     IntegrityError implies must exist comes back None. Mirrors
     app.db.follow_up_repository.FollowUpRepositoryConsistencyError.
     """
+
+
+# Review 2.3: lease holders of MANUAL collector runs start with this prefix.
+# The holder is persisted from the moment the slot is claimed, so a manual row
+# is recognizable while RUNNING, after a crash and after a cancellation alike.
+MANUAL_HOLDER_PREFIX = "manual_collector:"
 
 
 def new_run_lease_holder_token(prefix: str) -> str:
@@ -307,11 +313,19 @@ def list_runs(
     account_key: str,
     limit: int = AUTOMATION_RUN_LIST_DEFAULT_LIMIT,
     offset: int = 0,
+    *,
+    include_manual: bool = True,
 ) -> list[AutomationRunRecord]:
+    stmt = select(AutomationRunRecord).where(AutomationRunRecord.account_key == account_key)
+    if not include_manual:
+        stmt = stmt.where(
+            or_(
+                AutomationRunRecord.lease_holder.is_(None),
+                ~AutomationRunRecord.lease_holder.startswith(MANUAL_HOLDER_PREFIX),
+            )
+        )
     stmt = (
-        select(AutomationRunRecord)
-        .where(AutomationRunRecord.account_key == account_key)
-        .order_by(AutomationRunRecord.started_at.desc(), AutomationRunRecord.id.desc())
+        stmt.order_by(AutomationRunRecord.started_at.desc(), AutomationRunRecord.id.desc())
         .limit(limit)
         .offset(offset)
     )
