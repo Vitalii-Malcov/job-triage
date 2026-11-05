@@ -13,8 +13,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 01 | 1.1 API key compare / failed-auth rate limit | ACCEPTED — task 5c4646d, merge bab160d |
 | 02 | 1.2 secrets in repr / UI signing key | ACCEPTED — task d6f1494, merge 73f6bba |
 | 03 | 1.3 response-draft recipient pinning | ACCEPTED — task 32336e3, merge 57d58a5 |
-| 04 | 1.4 UI session revocation | ACCEPTED (see below; SHAs in git log) |
-| 05–19 | see task list | PENDING |
+| 04 | 1.4 UI session revocation | ACCEPTED — task b4ec414, merge 10c69ad |
+| 05 | 2.1 processed email identity | ACCEPTED (see below; SHAs in git log) |
+| 06–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -72,3 +73,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: 11 new in `tests/test_stage20_ui.py` (replay after logout, second session, idempotence, forged logout, CSRF, budget, capacity, expiry recovery, threads, restart) + launcher tests.
 - Full pytest: 7324 passed, 139 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: plan review + 3 code rounds (R1 CHANGES_REQUESTED launcher workers, R2 CHANGES_REQUESTED docs command, R3 ACCEPT).
+
+## TASK 05 — Processed email identity (2.1, MEDIUM latent)
+
+- Confirmed: yes (global unique `message_id` vs `(source, message_id)` lookups; check-then-insert).
+- GATE B: Codex plan review first (PLAN_CHANGES: no generic fallback, SQLite/PostgreSQL `ON CONFLICT` only, downgrade refuses before DDL, PG cleanup + CI list, stronger concurrency evidence) — adopted.
+- Schema: migration `a2b7d4f9c1e3` — drops the unique index, keeps a non-unique `message_id` index, adds `uq_processed_email_messages_source_message_id`. Downgrade refuses (nothing changed) while two sources share a Message-ID.
+- Code: `mark_message_processed` is one `INSERT .. ON CONFLICT (source, message_id) DO NOTHING` + commit (no commit when the marker exists; the commit also persists other pending session work — documented contract).
+- Tests: `tests/test_processed_email_identity.py` (6, incl. 8-thread SQLite and populated migration round trip), `tests/integration/test_processed_email_identity_postgres.py` (3, incl. forced overlap with an uncommitted competing insert; added to the ci.yml zero-skip list), head literals bumped.
+- PostgreSQL (throwaway postgres:16): upgrade, populated downgrade refusal, downgrade/re-upgrade with correct indexes/constraints, 3 PG tests passed.
+- Full pytest: 7330 passed, 142 skipped (3 new PG tests skip without `TEST_POSTGRES_URL`), 0 failed. Ruff clean.
+- Codex: plan review + 3 code rounds (R1 CHANGES_REQUESTED holder not released on failure; R2 `BLOCKED` only for lack of full-suite evidence; R3 ACCEPT with evidence supplied).

@@ -3309,4 +3309,4 @@ def test_alembic_has_exactly_one_head() -> None:
     # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2), then Stage 22 P1
     # structured job facts (e3b7c9d1f4a6)
     # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "f1a8c3d5e7b9"
+    assert heads[0] == "a2b7d4f9c1e3"
