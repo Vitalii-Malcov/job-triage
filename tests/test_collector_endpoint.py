@@ -326,11 +326,11 @@ class TestRunBundesagenturCollector:
         original_upsert_job = collector_runner_module.upsert_job_observed
         call_count = {"n": 0}
 
-        def flaky_upsert_job(db, job, score):
+        def flaky_upsert_job(db, job, score, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated persistence failure")
-            return original_upsert_job(db, job, score)
+            return original_upsert_job(db, job, score, **kwargs)
 
         monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", flaky_upsert_job)
 
@@ -615,7 +615,7 @@ class TestSanitizedFailureLogging:
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
 
-        def _boom(db, job, score):
+        def _boom(db, job, score, **kwargs):
             raise RuntimeError(SECRET_TEXT)
 
         monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", _boom)

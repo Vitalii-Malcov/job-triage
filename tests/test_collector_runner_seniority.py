@@ -310,8 +310,17 @@ def test_seniority_lookup_uses_pure_get_not_get_or_create(monkeypatch):
             "get_or_create_candidate_profile must not be called by the seniority lookup"
         )
 
+    # The scoring path no longer imports the create-on-miss helper at all; patch the
+    # name wherever it lives so a reintroduced call fails loudly (Architecture 3: the
+    # employment-preference lookup is a pure read too).
     monkeypatch.setattr(
-        collector_runner_module, "get_or_create_candidate_profile", _must_not_be_called
+        collector_runner_module,
+        "get_or_create_candidate_profile",
+        _must_not_be_called,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.db.candidate_profile_repository.get_or_create_candidate_profile", _must_not_be_called
     )
 
     db = _db()

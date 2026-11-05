@@ -17,8 +17,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 05 | 2.1 processed email identity | ACCEPTED — task feff194, merge 1cf7900 |
 | 06 | 2.2 XING dedup collisions | ACCEPTED — task 22d230a, merge 818b319 |
 | 07 | 2.3 collector concurrency | ACCEPTED — task d74a1de, merge 349108d |
-| 08 | 2.4 event-loop blocking | ACCEPTED (see below; SHAs in git log) |
-| 09–19 | see task list | PENDING |
+| 08 | 2.4 event-loop blocking | ACCEPTED — task 5e7aa2d, merge c54164d |
+| 09 | Arch §3 repository transactions | ACCEPTED (see below; SHAs in git log) |
+| 10–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -121,3 +122,14 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Tests: `tests/test_offload.py` (11, incl. ASGI liveness: `/health` < 0.6 s while collector/automation/score/Gmail workers block 1.2 s), exclusion tests switched to thread-safe events.
 - Full pytest: 7396 passed, 146 skipped, 0 failed. Ruff clean. No schema change.
 - Codex: plan review x2 + 1 code round: `VERDICT: ACCEPT`.
+
+## TASK 09 — Repository transactions (Architecture §3)
+
+- Confirmed (scoped): the audit counts ~15 commits in `app/db/repositories.py`. Most are intentional durable/CAS boundaries (job write + reference tokens in one commit, status CAS, score CAS, processed-message ack before watermark advance); `get_or_create_default_profile` has no application caller (legacy; left as is, documented). Two real multi-step gaps were demonstrated by Codex and reproduced: (1) `score_and_persist` committed the upsert and the posting-type reconciliation separately (a failure in between left `SELBSTAENDIGKEIT / APPLY` durable); (2) the company-research update committed content/version before claiming the identity alias (alias failure left an updated record with no alias).
+- GATE B: Codex investigation/scope review (SCOPE_CHANGES: narrow to these two, explicit exclusions) — adopted.
+- Changes: keyword-only `commit: bool = True` on `upsert_job_observed`, `update_job_score_if_posting_type_unchanged`, `_finalize_job_write`, `_update_existing` (defaults unchanged); `score_and_persist` = deferred upsert + deferred reconciliation CAS + ONE commit, rollback on any failure (a reconciliation failure now leaves the job unwritten, and its source message unacknowledged for reprocessing); deferred mode requires a session without pending changes (fingerprint-collision recovery still rolls back, discarding only this call's own writes — no savepoints); the research update claims its alias in the same transaction (`INSERT .. ON CONFLICT DO NOTHING`); `_allowed_employment_types` is a pure read (no create-and-commit of the singleton profile in the middle of the unit); the BA enrichment path no longer stages `existing.description` (redundant with the upsert).
+- Not changed (documented exclusions): other 22 repositories' commits, whole-run transactions, race-recovery code, isolation level, models, status CAS, message acknowledgement.
+- Residual: the row lock taken by the deferred upsert is held across the (short) reconciliation loop; the first-write contract of deferred mode is enforced only for pending ORM state.
+- Tests: `tests/test_repository_transactions.py` (15), PG tests (2 new, 11 passed on postgres:16), adjusted fakes/assertions in 4 existing test files.
+- Full pytest: 7410 passed, 148 skipped, 1 failed (stale monkeypatch target, fixed; file 18 passed). Ruff clean. No schema change.
+- Codex: scope review + 3 code rounds (R1 CHANGES_REQUESTED x2 P1: BA staging vs guard, profile create-commit mid-unit; R2 `BLOCKED` only for missing full-suite evidence; R3 ACCEPT).

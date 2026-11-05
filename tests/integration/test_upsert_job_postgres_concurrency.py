@@ -856,3 +856,128 @@ class TestRealConcurrentXingCollision:
                 )
                 == 1
             )
+
+
+TX_MARKER = "architecture-3-tx"
+
+
+class TestRealPostgresTransactionBoundaries:
+    """Architecture 3 on real PostgreSQL: `score_and_persist` is one transaction
+    through its reconciliation, and the research alias commits with the update."""
+
+    @pytest.fixture()
+    def tx_factory(self):
+        from app.db.models import CompanyResearchIdentityAlias, CompanyResearchRecord
+
+        engine = create_engine(TEST_POSTGRES_URL, pool_pre_ping=True)
+        factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+        def cleanup():
+            with factory() as db:
+                db.execute(delete(JobRecord).where(JobRecord.title.like(f"%{TX_MARKER}%")))
+                rows = db.scalars(
+                    select(CompanyResearchRecord).where(
+                        CompanyResearchRecord.normalized_company_name.like(f"%{TX_MARKER}%")
+                    )
+                ).all()
+                for row in rows:
+                    db.execute(
+                        delete(CompanyResearchIdentityAlias).where(
+                            CompanyResearchIdentityAlias.company_research_id == row.id
+                        )
+                    )
+                    db.delete(row)
+                db.commit()
+
+        cleanup()
+        try:
+            yield factory
+        finally:
+            cleanup()
+            engine.dispose()
+
+    @staticmethod
+    def _job(posting_type=None) -> Job:
+        return Job(
+            source="bundesagentur",
+            title=f"Tx Engineer {TX_MARKER}",
+            company="TxCo",
+            location="Berlin",
+            url=f"https://example.com/jobs/{TX_MARKER}",
+            posting_type=posting_type,
+            must_have_skills=["Python", "FastAPI", "SQLAlchemy"],
+        )
+
+    def test_failure_before_reconciliation_leaves_the_previous_consistent_row(
+        self, tx_factory, monkeypatch
+    ):
+        import app.services.collector_runner as runner
+
+        skills = ["python", "fastapi", "sqlalchemy"]
+        with tx_factory() as db:
+            score_and_persist(db, skills, self._job("SELBSTAENDIGKEIT"))
+
+        def snapshot():
+            with tx_factory() as fresh:
+                row = fresh.execute(
+                    select(JobRecord.posting_type, JobRecord.recommendation, JobRecord.score).where(
+                        JobRecord.title.like(f"%{TX_MARKER}%")
+                    )
+                ).one()
+                return tuple(row)
+
+        before = snapshot()
+        real_get = runner.get_job_by_fingerprint
+        calls = {"n": 0}
+
+        def stale_existing(db_, job_):
+            calls["n"] += 1
+            return None if calls["n"] == 1 else real_get(db_, job_)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected failure before the reconciliation CAS")
+
+        monkeypatch.setattr(runner, "get_job_by_fingerprint", stale_existing)
+        monkeypatch.setattr(runner, "update_job_score_if_posting_type_unchanged", boom)
+        with tx_factory() as db, pytest.raises(RuntimeError, match="injected"):
+            score_and_persist(db, skills, self._job(None))
+        assert snapshot() == before
+
+    def test_research_alias_failure_rolls_back_content_and_version(self, tx_factory, monkeypatch):
+        from app.db import repositories
+        from app.db.models import CompanyResearchIdentityAlias, CompanyResearchRecord
+        from app.db.repositories import record_failed_attempt, upsert_company_research
+        from app.models.company_research import CompanyResearchData, Evidence
+
+        name = f"acme {TX_MARKER}"
+        with tx_factory() as db:
+            failed = record_failed_attempt(
+                db,
+                normalized_domain=None,
+                normalized_company_name=name,
+                company_name="Acme",
+                provider_name="job_data",
+                error_message="boom",
+            )
+            failed_id, version = failed.id, failed.version
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected alias failure")
+
+        monkeypatch.setattr(repositories, "_claim_company_research_alias", boom)
+        data = CompanyResearchData(
+            company_name="Acme",
+            provider_name="job_data",
+            research_status="PARTIAL",
+            evidence=[Evidence(type="FACT", claim="c", source_url="https://example.com")],
+        )
+        with tx_factory() as db, pytest.raises(RuntimeError, match="injected alias"):
+            upsert_company_research(db, data, normalized_domain=None, normalized_company_name=name)
+        with tx_factory() as fresh:
+            row = fresh.get(CompanyResearchRecord, failed_id)
+            assert row.research_status == "FAILED" and row.version == version
+            assert not fresh.scalars(
+                select(CompanyResearchIdentityAlias).where(
+                    CompanyResearchIdentityAlias.company_research_id == failed_id
+                )
+            ).all()

@@ -55,7 +55,6 @@ from app.core.config import reveal
 from app.db.candidate_profile_repository import (
     get_candidate_profile,
     get_candidate_skills_for_scoring,
-    get_or_create_candidate_profile,
     to_candidate_profile_response,
 )
 from app.db.candidate_search_repository import load_search_config
@@ -154,7 +153,13 @@ def _allowed_employment_types(db: Session, posting_type: str | None) -> frozense
     """
     if posting_type not in POSTING_TYPE_REQUIRES_PREFERENCE:
         return frozenset()
-    profile_record = get_or_create_candidate_profile(db)
+    # Pure read (Architecture 3): scoring must never create-and-COMMIT the singleton
+    # profile in the middle of `score_and_persist`'s single transaction. A profile
+    # that does not exist yet is equivalent to a freshly created one: no stated
+    # employment-type preferences.
+    profile_record = get_candidate_profile(db)
+    if profile_record is None:
+        return frozenset()
     profile = to_candidate_profile_response(profile_record)
     return frozenset(profile.job_preferences.employment_types)
 
@@ -365,7 +370,28 @@ def score_and_persist(
     existing = get_job_by_fingerprint(db, job)
     effective_posting_type = job.posting_type or (existing.posting_type if existing else None)
     result = _score_for_posting_type(db, candidate_skills, job, effective_posting_type)
-    outcome = upsert_job_observed(db, job, result)
+    try:
+        record, result, created = _score_and_persist_composed(
+            db, candidate_skills, job, result, effective_posting_type
+        )
+    except BaseException:
+        # Architecture 3: the upsert and the posting-type reconciliation are ONE
+        # transaction; nothing of this operation stays durable on failure.
+        db.rollback()
+        raise
+    return record, result, created
+
+
+def _score_and_persist_composed(
+    db: Session,
+    candidate_skills: Collection[str],
+    job: Job,
+    result: JobScore,
+    effective_posting_type: str | None,
+) -> tuple[JobRecord, JobScore, bool]:
+    """The part of `score_and_persist` between the initial score and its single final
+    commit: deferred upsert plus the reconciliation CAS (both `commit=False`)."""
+    outcome = upsert_job_observed(db, job, result, commit=False)
     record, created = outcome.record, outcome.created
     if outcome.frozen:
         # Review 2.2: the stored row was left untouched (probable different
@@ -378,6 +404,8 @@ def score_and_persist(
             is_duplicate=True,
             possible_collision=outcome.possible_collision,
         )
+        db.commit()
+        db.refresh(record)
         return record, frozen_result, False
 
     observed_posting_type = record.posting_type
@@ -391,6 +419,7 @@ def score_and_persist(
                 score=result.score,
                 recommendation=result.recommendation,
                 data_confidence=result.data_confidence,
+                commit=False,
             )
             # S10-RR-002: reload from the DB instead of assigning onto
             # `record` -- see the docstring section above. Applies
@@ -407,6 +436,8 @@ def score_and_persist(
                 f"posting_type after {MAX_POSTING_TYPE_RECONCILE_ATTEMPTS} attempts"
             )
 
+    db.commit()
+    db.refresh(record)
     result.is_duplicate = not created
     return record, result, created
 
@@ -603,11 +634,10 @@ async def enrich_and_persist_ba_job(
             "skill_source": extraction.skill_source,
         }
     )
-    if existing is not None and description.strip():
-        # Stage the BA-only enrichment update in the same transaction
-        # committed by upsert_job. If scoring/persistence fails, the
-        # surrounding rollback also restores the previous description.
-        existing.description = description
+    # The enriched description reaches the row through `job.description` inside
+    # `score_and_persist` -> upsert (same transaction as the score), so nothing is
+    # staged on `existing` here: the deferred upsert requires a session without
+    # pending changes, and a failure leaves the previous description untouched.
     return score_and_persist(db, candidate_skills, job)
 
 
