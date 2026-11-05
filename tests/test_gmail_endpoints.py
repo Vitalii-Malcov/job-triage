@@ -124,7 +124,7 @@ def client(tmp_path, monkeypatch):
     fake_settings = _isolated_settings()
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_requests.clear()
 
@@ -154,7 +154,7 @@ class TestRunGmailSync:
             gmail_username="",
             gmail_app_password="",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
 
@@ -170,7 +170,7 @@ class TestRunGmailSync:
             gmail_username="me@example.com",
             gmail_app_password="   ",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = test_client.post("/api/v1/gmail/sync", headers=_auth_headers())
 

@@ -138,7 +138,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._collector_requests.clear()
 
@@ -175,7 +175,7 @@ class TestRunBundesagenturCollector:
 
     def test_missing_upstream_api_key_returns_503(self, client, monkeypatch):
         unconfigured = Settings(api_key=API_KEY, rate_limit_requests=1000, bundesagentur_api_key="")
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -187,7 +187,7 @@ class TestRunBundesagenturCollector:
         unconfigured = Settings(
             api_key=API_KEY, rate_limit_requests=1000, bundesagentur_api_key="   "
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/bundesagentur/run", headers=_auth_headers())
 
@@ -500,7 +500,7 @@ class TestBundesagenturCollectorNotifications:
             bundesagentur_api_key="upstream-key",
             min_job_score_to_notify=95,
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: stricter_settings)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: stricter_settings)
 
         job = _sample_job(title="Borderline Job")
         notifier = FakeTelegramNotifier()

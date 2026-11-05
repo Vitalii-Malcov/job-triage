@@ -37,7 +37,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     buckets = (
         "_requests",
         "_cv_draft_requests",

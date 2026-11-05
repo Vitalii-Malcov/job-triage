@@ -351,7 +351,14 @@ def test_excluded_job_columns_are_never_read_by_the_rules():
     # Stage 22 P1: app.models.job joins the closure (via the matcher version);
     # it only declares last_seen_at on the API response models JobListItem /
     # JobDetail, which no rule builds.
-    assert readers == {"app.db.models", "app.services.fit_cache", "app.models.job"}
+    # Architecture 3: the model package is split by domain; the column is declared in
+    # `app.db.models.jobs` (and merely mentioned in a `follow_ups` docstring).
+    assert readers == {
+        "app.db.models.jobs",
+        "app.db.models.follow_ups",
+        "app.services.fit_cache",
+        "app.models.job",
+    }
     job_models = fit_cache.rule_closure()["app.models.job"].read_text(encoding="utf-8")
     api_part = job_models[job_models.index("class JobListItem") :]
     assert "last_seen_at" not in job_models.replace(api_part, "")

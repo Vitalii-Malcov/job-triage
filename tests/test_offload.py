@@ -148,7 +148,7 @@ def api(tmp_path, monkeypatch):
         gmail_username="me@example.com",
     )
     app.dependency_overrides[get_db] = override
-    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routes"):
+    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routers.common"):
         monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
     for bucket in (
         rate_limit_module._requests,
@@ -197,7 +197,7 @@ class TestEndpointsStayResponsive:
                 "failed": 0,
             }
 
-        monkeypatch.setattr(f"app.api.routes.run_{collector}", blocking_runner)
+        monkeypatch.setattr(f"app.api.routers.collectors.run_{collector}", blocking_runner)
         elapsed, response = await _responsive_while(
             lambda c: c.post(f"/api/v1/collectors/{collector}/run", headers=HEADERS), entered
         )
@@ -215,7 +215,7 @@ class TestEndpointsStayResponsive:
             time.sleep(1.2)
             raise AutomationRunAlreadyInProgressError("busy")
 
-        monkeypatch.setattr("app.api.routes.run_automation_cycle", blocking_cycle)
+        monkeypatch.setattr("app.api.routers.automation.run_automation_cycle", blocking_cycle)
         elapsed, response = await _responsive_while(
             lambda c: c.post("/api/v1/automation/runs", headers=HEADERS), entered
         )
@@ -234,7 +234,7 @@ class TestEndpointsStayResponsive:
             result = JobScore(score=10, recommendation="SKIP")
             return SimpleNamespace(id=1), result, True
 
-        monkeypatch.setattr("app.api.routes.score_and_persist", blocking_score)
+        monkeypatch.setattr("app.api.routers.jobs.score_and_persist", blocking_score)
         body = {
             "source": "manual",
             "title": "Role",
@@ -259,7 +259,7 @@ class TestEndpointsStayResponsive:
             time.sleep(1.2)
             return GmailSyncResult(fetched=0, created=0, duplicates=0, skipped=0, failed=0)
 
-        monkeypatch.setattr("app.api.routes.run_gmail_sync_service", blocking_sync)
+        monkeypatch.setattr("app.api.routers.gmail.run_gmail_sync_service", blocking_sync)
         rate_limit_module._gmail_requests.clear()
         elapsed, response = await _responsive_while(
             lambda c: c.post("/api/v1/gmail/sync", headers=HEADERS), entered

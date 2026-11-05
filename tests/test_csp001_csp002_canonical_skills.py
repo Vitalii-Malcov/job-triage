@@ -488,7 +488,7 @@ def _endpoint_client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     from app.security import rate_limit as rate_limit_module
 
     rate_limit_module._requests.clear()

@@ -383,7 +383,7 @@ def test_patch_endpoint_maps_a_trust_downgrade_to_409(db, monkeypatch):
 
     _apply(db)
     settings = Settings(api_key="test-api-key", rate_limit_requests=1000)
-    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routes"):
+    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routers.common"):
         monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
     rate_limit_module._requests.clear()
     app.dependency_overrides[get_db] = lambda: db

@@ -125,7 +125,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
     rate_limit_module._response_draft_requests.clear()
@@ -133,7 +133,9 @@ def client(tmp_path, monkeypatch):
     rate_limit_module._response_draft_send_requests.clear()
 
     fake_provider = FakeOutboundProvider()
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", lambda **_kwargs: fake_provider)
+    monkeypatch.setattr(
+        "app.api.routers.response_drafts.GmailSmtpProvider", lambda **_kwargs: fake_provider
+    )
 
     with TestClient(app) as test_client:
         yield test_client, session_factory, fake_provider
@@ -513,7 +515,7 @@ class TestNoOtherSideEffects:
         def _boom(*args, **kwargs):
             raise RuntimeError(secret_marker)
 
-        monkeypatch.setattr("app.api.routes.send_response_draft", _boom)
+        monkeypatch.setattr("app.api.routers.response_drafts.send_response_draft", _boom)
 
         response = _send(test_client, draft_id)
         assert response.status_code == 500
@@ -554,7 +556,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
     assert fake_settings.outbound_sending_enabled is False
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
     rate_limit_module._response_draft_requests.clear()
@@ -568,7 +570,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
             "this point"
         )
 
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _fail_if_constructed)
+    monkeypatch.setattr("app.api.routers.response_drafts.GmailSmtpProvider", _fail_if_constructed)
 
     with TestClient(app) as test_client:
         yield test_client, session_factory

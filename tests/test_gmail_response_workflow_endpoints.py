@@ -71,7 +71,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: settings)
     for bucket in (
         rate_limit_module._requests,
         rate_limit_module._gmail_analysis_requests,
@@ -81,7 +81,9 @@ def client(tmp_path, monkeypatch):
     ):
         bucket.clear()
     provider = FakeOutboundProvider()
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", lambda **_kwargs: provider)
+    monkeypatch.setattr(
+        "app.api.routers.response_drafts.GmailSmtpProvider", lambda **_kwargs: provider
+    )
     with TestClient(app) as test_client:
         yield test_client, session_factory, provider
     app.dependency_overrides.clear()
@@ -194,7 +196,7 @@ class TestPendingEndpoint:
             raise AssertionError("a read endpoint must not call this")
 
         monkeypatch.setattr("app.services.response_draft.generate_response_draft", _forbidden)
-        monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _forbidden)
+        monkeypatch.setattr("app.api.routers.response_drafts.GmailSmtpProvider", _forbidden)
         response = test_client.get("/api/v1/response-drafts/pending", headers=HEADERS)
         assert response.status_code == 200
         assert provider.call_count == 0

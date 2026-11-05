@@ -147,7 +147,7 @@ def client(tmp_path, monkeypatch):
     fake_settings = _settings_for(ACCOUNT)
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._automation_run_requests.clear()
     rate_limit_module._collector_requests.clear()
@@ -236,7 +236,7 @@ class TestPartialAndFailedOutcomes:
     def test_bundesagentur_not_configured_xing_succeeds_is_partial(self, client, monkeypatch):
         test_client, _session_factory = client
         unconfigured = _settings_for(ACCOUNT, bundesagentur_api_key="")
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
         monkeypatch.setattr(
             "app.services.collector_runner.XingEmailCollector",
             lambda **kwargs: FakeXingCollector(jobs=[_xing_job()]),
@@ -279,7 +279,7 @@ class TestPartialAndFailedOutcomes:
             xing_mailbox_username="",
             xing_mailbox_app_password="",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = test_client.post("/api/v1/automation/runs", headers=_auth_headers())
 
@@ -462,10 +462,12 @@ class TestDedupRemainsCorrect:
 class TestAccountIsolation:
     def test_runs_are_scoped_to_the_current_account(self, client, monkeypatch):
         test_client, _session_factory = client
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: _settings_for(ACCOUNT))
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: _settings_for(ACCOUNT))
         first_run = test_client.post("/api/v1/automation/runs", headers=_auth_headers()).json()
 
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: _settings_for(OTHER_ACCOUNT))
+        monkeypatch.setattr(
+            "app.api.routers.common.get_settings", lambda: _settings_for(OTHER_ACCOUNT)
+        )
         second_run = test_client.post("/api/v1/automation/runs", headers=_auth_headers()).json()
 
         # Account B cannot read account A's run by id.
@@ -481,7 +483,7 @@ class TestAccountIsolation:
         assert first_run["id"] not in ids
 
         # Switching back to account A, its own run is visible again.
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: _settings_for(ACCOUNT))
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: _settings_for(ACCOUNT))
         own_get = test_client.get(
             f"/api/v1/automation/runs/{first_run['id']}", headers=_auth_headers()
         )

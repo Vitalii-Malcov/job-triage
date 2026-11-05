@@ -395,7 +395,7 @@ class TestEndpoints:
                 db.close()
 
         app.dependency_overrides[get_db] = override
-        for target in ("app.security.auth", "app.security.rate_limit", "app.api.routes"):
+        for target in ("app.security.auth", "app.security.rate_limit", "app.api.routers.common"):
             monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
         rate_limit._xing_requests.clear()
         rate_limit._collector_requests.clear()

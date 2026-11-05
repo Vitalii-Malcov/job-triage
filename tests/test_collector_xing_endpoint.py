@@ -117,7 +117,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._xing_requests.clear()
 
@@ -159,7 +159,7 @@ class TestRunXingCollector:
             xing_mailbox_username="",
             xing_mailbox_app_password="",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
 
@@ -174,7 +174,7 @@ class TestRunXingCollector:
             xing_mailbox_username="user@example.com",
             xing_mailbox_app_password="   ",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
 
@@ -476,7 +476,7 @@ class TestXingCollectorNotifications:
             xing_mailbox_app_password="app-password",
             min_job_score_to_notify=95,
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: stricter_settings)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: stricter_settings)
 
         job = _sample_job(title="Borderline Job")
         notifier = FakeTelegramNotifier()
