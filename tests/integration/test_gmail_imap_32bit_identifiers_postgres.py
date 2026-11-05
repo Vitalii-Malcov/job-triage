@@ -113,11 +113,17 @@ def _types(engine) -> dict[str, str]:
         }
 
 
+# Objects that later migrations add to these tables (they exist at head but not at
+# PRE_FIX_REVISION by design); the BIGINT migration must not change anything else.
+_ADDED_AFTER_PRE_FIX = ("sender_auth",)
+
+
 def _schema_objects(engine) -> dict[str, list[str]]:
     with engine.connect() as conn:
         return {
             table: sorted(
-                [
+                item
+                for item in [
                     *conn.execute(
                         text("SELECT indexdef FROM pg_indexes WHERE tablename = :t"), {"t": table}
                     ).scalars(),
@@ -129,6 +135,7 @@ def _schema_objects(engine) -> dict[str, list[str]]:
                         {"t": table},
                     ).scalars(),
                 ]
+                if not any(marker in item for marker in _ADDED_AFTER_PRE_FIX)
             )
             for table in TABLES
         }

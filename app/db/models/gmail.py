@@ -198,6 +198,10 @@ class GmailMessageRecord(Base):
         CheckConstraint(
             "direction IN ('INBOUND', 'OUTBOUND')", name="ck_gmail_messages_direction_valid"
         ),
+        CheckConstraint(
+            "sender_auth IS NULL OR sender_auth IN ('DMARC_ALIGNED', 'FAILED', 'UNVERIFIED')",
+            name="ck_gmail_messages_sender_auth_valid",
+        ),
         Index(
             "ix_gmail_messages_account_key_automation_processed_at",
             "account_key",
@@ -231,6 +235,11 @@ class GmailMessageRecord(Base):
     references_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
 
     from_address: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    # Task 21: what the topmost trusted Authentication-Results proved about the From
+    # DOMAIN when the message was first stored (DMARC_ALIGNED / FAILED / UNVERIFIED).
+    # NULL = stored before the column existed or never evaluated = unverified. Written
+    # once at insert, never upgraded later. See app.services.sender_authentication.
+    sender_auth: Mapped[str | None] = mapped_column(String(16), nullable=True)
     from_display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     to_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     cc_addresses_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)

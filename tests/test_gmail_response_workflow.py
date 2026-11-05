@@ -144,6 +144,7 @@ def _seed_inbound(
     record, _created = upsert_message(
         db,
         ParsedGmailMessage(
+            sender_auth="DMARC_ALIGNED",
             account_key=account_key,
             mailbox="INBOX",
             uid=uid,
@@ -689,6 +690,7 @@ def _seed_follow_up_anchor(db):
     record, _created = upsert_message(
         db,
         ParsedGmailMessage(
+            sender_auth="DMARC_ALIGNED",
             account_key=ACCOUNT,
             mailbox="INBOX",
             uid=50,

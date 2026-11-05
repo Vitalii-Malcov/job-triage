@@ -254,6 +254,10 @@ class ParsedGmailMessage:
     # see app/utils/html_text.py); "" when a text/plain part exists or
     # there is no HTML. In memory only -- never persisted by Stage 7A.
     body_html_text: str = ""
+    # Task 21: what the topmost trusted Authentication-Results proves about the
+    # From domain (app.services.sender_authentication). UNVERIFIED unless the
+    # receiving Gmail service recorded an aligned DMARC pass.
+    sender_auth: str = "UNVERIFIED"
 
 
 @dataclass(frozen=True)

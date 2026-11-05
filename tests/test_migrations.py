@@ -916,6 +916,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
         "in_reply_to",
         "references_json",
         "from_address",
+        "sender_auth",  # Task 21 (c5d8f1a3b7e2)
         "from_display_name",
         "to_addresses_json",
         "cc_addresses_json",
@@ -3358,4 +3359,32 @@ def test_identity_key_migration_keeps_existing_jobs_and_downgrades_cleanly(tmp_p
             1,
             "APPLIED",
         )
+    upgrade(cfg, "head")
+
+
+def test_sender_auth_migration_keeps_messages_unverified_and_checks_values(tmp_path: Path) -> None:
+    """Task 21 (c5d8f1a3b7e2): additive nullable column; legacy rows stay NULL (unverified)."""
+    db_path = tmp_path / "migrations_sender_auth.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "b4c7e9a1d3f5")
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection, uid=1)
+
+    upgrade(cfg, "c5d8f1a3b7e2")
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT sender_auth FROM gmail_messages")).scalar() is None
+        _insert_gmail_message(connection, uid=2)
+        connection.execute(
+            text("UPDATE gmail_messages SET sender_auth = 'DMARC_ALIGNED' WHERE uid = 2")
+        )
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE gmail_messages SET sender_auth = 'TRUSTED'"))
+
+    downgrade(cfg, "b4c7e9a1d3f5")
+    assert "sender_auth" not in {c["name"] for c in inspect(engine).get_columns("gmail_messages")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM gmail_messages")).scalar() == 2
     upgrade(cfg, "head")

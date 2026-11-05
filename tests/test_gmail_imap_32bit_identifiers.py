@@ -430,14 +430,27 @@ def _alembic_config(db_path: Path) -> Config:
     return cfg
 
 
+# Columns that LATER migrations add (they exist at head, not at PRE_FIX_REVISION, by design); this
+# test is about the BIGINT migration only.
+_ADDED_AFTER_PRE_FIX = {"sender_auth"}
+
+
 def _shape(engine):
     inspector = inspect(engine)
     return {
         table: (
-            {c["name"]: (str(c["type"]), c["nullable"]) for c in inspector.get_columns(table)},
+            {
+                c["name"]: (str(c["type"]), c["nullable"])
+                for c in inspector.get_columns(table)
+                if c["name"] not in _ADDED_AFTER_PRE_FIX
+            },
             sorted(tuple(u["column_names"]) for u in inspector.get_unique_constraints(table)),
             sorted(tuple(i["column_names"]) for i in inspector.get_indexes(table)),
-            sorted(c["sqltext"] for c in inspector.get_check_constraints(table)),
+            sorted(
+                c["sqltext"]
+                for c in inspector.get_check_constraints(table)
+                if not any(name in c["sqltext"] for name in _ADDED_AFTER_PRE_FIX)
+            ),
         )
         for table in TABLES
     }

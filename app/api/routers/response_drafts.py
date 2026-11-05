@@ -57,6 +57,7 @@ from app.services.response_draft_send import (
     ResponseDraftRecipientDriftError,
     ResponseDraftRecipientMismatchError,
     ResponseDraftRecipientNotPinnedError,
+    ResponseDraftSenderNotAuthenticatedError,
     ResponseDraftSendFailedError,
     ResponseDraftSendInProgressError,
     ResponseDraftSendOutcomeUncertainError,
@@ -70,6 +71,12 @@ from app.utils.config_flags import is_configured
 
 logger = logging.getLogger("app.api.routes")
 router = APIRouter()
+
+_SENDER_NOT_AUTHENTICATED_DETAIL = (
+    "The sender of the inbound message is not authenticated (no DMARC pass aligned with the "
+    "From domain); this system will not reply to it. Verify the sender elsewhere and answer "
+    "manually"
+)
 
 
 @router.post(
@@ -242,6 +249,11 @@ def decide_response_draft(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="The reply recipient differs from the one the operator reviewed",
         ) from exc
+    except ResponseDraftSenderNotAuthenticatedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=_SENDER_NOT_AUTHENTICATED_DETAIL,
+        ) from exc
     except ResponseDraftSupersededError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
@@ -337,6 +349,11 @@ def send_response_draft_endpoint(
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="The reply recipient changed since this draft was approved",
+        ) from exc
+    except ResponseDraftSenderNotAuthenticatedError as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=_SENDER_NOT_AUTHENTICATED_DETAIL,
         ) from exc
     except ResponseDraftAlreadySentError as exc:
         raise HTTPException(

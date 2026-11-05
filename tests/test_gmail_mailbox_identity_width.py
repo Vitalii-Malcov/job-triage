@@ -182,7 +182,11 @@ def _shape(engine):
     inspector = inspect(engine)
     return {
         table: (
-            {c["name"]: getattr(c["type"], "length", None) for c in inspector.get_columns(table)},
+            {
+                c["name"]: getattr(c["type"], "length", None)
+                for c in inspector.get_columns(table)
+                if c["name"] != "sender_auth"  # added by a later migration (Task 21)
+            },
             sorted(tuple(u["column_names"]) for u in inspector.get_unique_constraints(table)),
             sorted(tuple(i["column_names"]) for i in inspector.get_indexes(table)),
         )
