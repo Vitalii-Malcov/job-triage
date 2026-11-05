@@ -24,8 +24,9 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 | 12 | Arch §3 / Docs §5 naming and AI claims | ACCEPTED — task 70d0910, merge 1ec31f7 |
 | 13 | Arch §3 stage-named operational scripts | ACCEPTED — task 19a2f73, merge 105f980 |
 | 14 | Arch §3 rate limiter duplication | ACCEPTED — task 7fb2b5f, merge 65861b6 |
-| 15 | Quality §4 review history in comments | ACCEPTED (see below; SHAs in git log) |
-| 16–19 | see task list | PENDING |
+| 15 | Quality §4 review history in comments | ACCEPTED — task 13052fe, merge 0222b79 |
+| 16 | Quality §4 CI maintainability | ACCEPTED (see below; SHAs in git log) |
+| 17–19 | see task list | PENDING |
 
 ## TASK 01 — API authentication (1.1, HIGH)
 
@@ -198,3 +199,12 @@ Claude and reported to Codex. `runtime/job_triage_runtime.db` is never opened; `
 - Residual: the remaining 143 narrative mentions ("Codex reproduced ...") and 251 ids; CI file comments are TASK 16.
 - Full pytest: 7595 passed, 148 skipped, 1 failed (my TASK 07 wall-clock heartbeat test with a 0.6 s TTL lost a renewal in a 48-minute loaded run; margins widened to 3.0 s / 7.0 s, passes). Ruff clean. No schema change.
 - Codex: plan folded into 4 code rounds (R1-R3 CHANGES_REQUESTED: SHA-256 loss, ReDoS, token spans, byte/char offsets, partial annotations, idempotence, unicode prose, overlapping edits — all fixed with tests; R4 ACCEPT).
+
+## TASK 16 — CI maintainability (Quality §4)
+
+- Confirmed: `ci.yml` carried ~80 lines of history comments, a hand-maintained, order-dependent list of 21 PostgreSQL integration files, and the migration head id as a literal that a second test had to mirror (5 more test files pinned it too).
+- Change: `ci.yml` 215 -> 118 lines (comments -> `docs/CI.md`). The PostgreSQL job (a) migrates an empty `postgres:16` with `alembic upgrade head`, reads the single head from `alembic heads` and checks the database is at THAT head (no literal); (b) discovers `tests/integration` in two phases — `-m "not pg_migration_cycle"` at head, then `-m pg_migration_cycle` for the 6 modules that downgrade/upgrade the shared database (marker registered in `pyproject.toml`, applied in each module's `pytestmark`); (c) feeds BOTH JUnit XMLs to the zero-skip checker (fails on an empty or skipping phase). Tests no longer pin the head (`repository_head` fixture; PG modules compute it; `test_migrations` asserts a single linear head). `tests/test_ci_postgres_migration_gate.py` rewritten (34 tests): mutation tests per rule (weakened steps, hard-coded revision, module list instead of discovery, extra `-k/--deselect/--ignore`, dropped/swapped phase, migration after tests, checker ignoring a phase), the embedded checker is executed on pytest-shaped XML, and a marker-partition rule (a module that calls `downgrade(` must be marked and vice versa).
+- Evidence I could actually produce: the whole new two-phase flow run against a fresh empty local `postgres:16` — head check OK, phase 1 105 passed, phase 2 36 passed, checker exit 0 (141 tests, 0 skipped), database back at head. **GitHub Actions itself was NOT run or verified** — only the workflow text (parsed, mutation-tested, `bash -n` by Codex) and the equivalent local run.
+- Residual: the guard proves workflow text and the marker partition, not Actions behaviour; ordering between cycling modules is not enforced (each restores head in a `finally`; Codex found no remaining need for HARD-008 to run last).
+- Full pytest: 7601 passed, 148 skipped, 0 failed. Ruff clean. No schema change.
+- Codex: 1 code round `VERDICT: ACCEPT` (P3: forbid extra selectors — implemented with tests).

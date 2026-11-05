@@ -52,6 +52,9 @@ include = ["app*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+  "pg_migration_cycle: PostgreSQL integration module that cycles Alembic down/up on the shared test database; CI runs it in a second phase (see docs/CI.md)",
+]
 
 [tool.ruff]
 target-version = "py311"

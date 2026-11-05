@@ -3298,15 +3298,9 @@ def test_pinned_recipient_migration_round_trip_keeps_rows_and_never_backfills(
 
 
 def test_alembic_has_exactly_one_head() -> None:
-    cfg = _alembic_config(Path("unused-for-this-check.db"))
-    heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert len(heads) == 1
-    # Stage 16: Telegram operator control tables (e3a9c5d7f2b4, on top of
-    # the Stage 15 remediation c8e4a2f6d1b9), then OUTBOUND_MESSAGE application
-    # events (f4b8d2a6c9e1), then the Stage 17 candidate search configuration
-    # (a9d3f6b2c4e8), then search targets + car-route origin (b6c1e9a4d2f7),
-    # then the Stage 21 vacancy assessment cache (c7e2a9d4f1b3), then
-    # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2), then Stage 22 P1
-    # structured job facts (e3b7c9d1f4a6)
-    # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "a2b7d4f9c1e3"
+    """A single head and a linear history (no branches) -- the head's id is deliberately NOT pinned
+    here: every new migration would have to edit this test."""
+    script = ScriptDirectory.from_config(_alembic_config(Path("unused-for-this-check.db")))
+    assert len(script.get_heads()) == 1
+    branched = [r.revision for r in script.walk_revisions() if len(r.nextrev) > 1]
+    assert branched == []
