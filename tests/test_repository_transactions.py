@@ -218,6 +218,28 @@ class TestScoreAndPersistIsOneTransaction:
         assert _count(factory, JobRecord) == 1 and _count(factory, JobReferenceTokenRecord) >= 0
 
     def test_frozen_xing_observation_still_commits_its_last_seen_refresh(self, factory):
+        """A row the operator already acted on is only touched (last_seen_at), and that single
+        write is committed with the call."""
+        xing = Job(
+            source="xing",
+            title="Sachbearbeiter",
+            company="Co",
+            location="Leipzig",
+            url="https://www.xing.com/m/a",
+            description="Gehalt: 50.000",
+        )
+        with factory() as db:
+            first, _, _ = score_and_persist(db, SKILLS, xing)
+            first.status = "APPLIED"
+            db.commit()
+            seen = first.last_seen_at
+            _, result, created = score_and_persist(db, SKILLS, xing)
+            assert result.is_duplicate and not created and not result.possible_collision
+        with factory() as fresh:
+            row = fresh.execute(select(JobRecord)).scalar_one()
+            assert row.status == "APPLIED" and row.last_seen_at >= seen
+
+    def test_a_xing_sibling_is_one_transaction_and_leaves_the_first_posting_alone(self, factory):
         xing = Job(
             source="xing",
             title="Sachbearbeiter",
@@ -228,13 +250,12 @@ class TestScoreAndPersistIsOneTransaction:
         )
         rival = xing.model_copy(update={"description": "Gehalt: 90.000"})
         with factory() as db:
-            first, _, _ = score_and_persist(db, SKILLS, xing)
-            seen = first.last_seen_at
+            score_and_persist(db, SKILLS, xing)
             _, result, created = score_and_persist(db, SKILLS, rival)
-            assert result.possible_collision and not created
+            assert created and result.sibling_posting and not result.possible_collision
         with factory() as fresh:
-            row = fresh.execute(select(JobRecord)).scalar_one()
-            assert row.description == "Gehalt: 50.000" and row.last_seen_at >= seen
+            rows = fresh.execute(select(JobRecord).order_by(JobRecord.id)).scalars().all()
+            assert [r.description for r in rows] == ["Gehalt: 50.000", "Gehalt: 90.000"]
 
 
 def _data(**overrides) -> CompanyResearchData:
