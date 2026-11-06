@@ -118,6 +118,10 @@ def evaluate(assessment: FitAssessment, *, liveness: Liveness = "UNKNOWN") -> Ga
 
 
 # --- automatic preparation / proposal gate (the single source of the rule) ---
+#
+# Scope: vacancies not yet applied to -- the automatic shortlist / CV / Bewerbung drafts and
+# the Telegram proposals. NOT applied to follow-ups or response drafts: those concern an
+# existing application, and `ALREADY_APPLIED` makes such a job NOT_SUITABLE by design.
 
 # Fit tiers that may enter AUTOMATIC CV/Bewerbung preparation. Everything else
 # is held for the operator: NOT_SUITABLE (confirmed barrier), NEEDS_OPERATOR
