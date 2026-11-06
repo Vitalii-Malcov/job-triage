@@ -838,3 +838,67 @@ class TestRealSenderHttpClassification:
 
         assert len(client.accepted) == MAX_DELIVERY_ATTEMPTS
         assert get_review_for_job(db, job.id).state == "DELIVERY_FAILED"
+
+
+# --- fit-tier gate on the automatic proposals ----------------------------------
+
+
+class TestFitBarrierGate:
+    """A CONFIRMED barrier (NOT_SUITABLE) is never proposed automatically; the
+    operator's explicit /review is still honoured, with a visible warning."""
+
+    @pytest.fixture()
+    def barrier(self, monkeypatch):
+        state = {"value": "FIT_TIER_NOT_SUITABLE"}
+        monkeypatch.setattr(feed, "confirmed_barrier", lambda db, job_id: state["value"])
+        return state
+
+    def test_not_suitable_job_is_not_queued(self, db, barrier):
+        job = _persist_job(db)
+        feed.record_collected_job(db, job, _settings())
+        review = db.scalar(
+            select(TelegramVacancyReviewRecord).where(TelegramVacancyReviewRecord.job_id == job.id)
+        )
+        assert review is not None and review.state == "DISCOVERED"
+
+    def test_suitable_job_is_still_queued(self, db, barrier):
+        barrier["value"] = None
+        job = _persist_job(db)
+        feed.record_collected_job(db, job, _settings())
+        review = db.scalar(
+            select(TelegramVacancyReviewRecord).where(TelegramVacancyReviewRecord.job_id == job.id)
+        )
+        assert review is not None and review.state == "QUEUED_FOR_REVIEW"
+
+    @pytest.mark.asyncio
+    async def test_queued_job_that_became_not_suitable_is_dequeued_not_sent(
+        self, db, sender, barrier
+    ):
+        job = _persist_job(db)
+        review = ensure_review(db, job.id, eligible=True)
+
+        stats = await deliver_queued_vacancy_cards(db, _settings(), sleep=_no_sleep)
+
+        assert sender.calls == []
+        assert stats.dequeued == 1
+        db.refresh(review)
+        assert review.state == "DISCOVERED"
+
+    @pytest.mark.asyncio
+    async def test_barrier_appearing_during_pacing_sleep_is_not_sent(self, db, sender, barrier):
+        """The gate is rechecked after the pacing sleep, right before the claim."""
+        barrier["value"] = None
+        first = _persist_job(db, suffix="a")
+        second = _persist_job(db, suffix="b")
+        ensure_review(db, first.id, eligible=True)
+        second_review = ensure_review(db, second.id, eligible=True)
+
+        async def sleep_then_block(_seconds):
+            barrier["value"] = "FIT_TIER_NOT_SUITABLE"
+
+        stats = await deliver_queued_vacancy_cards(db, _settings(), sleep=sleep_then_block)
+
+        assert len(sender.calls) == 1
+        assert stats.sent == 1 and stats.dequeued == 1
+        db.refresh(second_review)
+        assert second_review.state == "DISCOVERED"

@@ -78,7 +78,8 @@ from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.search_strategy import bundesagentur_queries
 from app.services.telegram import TelegramNotifier
-from app.services.telegram_vacancy_feed import (
+from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
+    confirmed_barrier,
     deliver_queued_vacancy_cards,
     record_collected_job,
 )
@@ -700,8 +701,20 @@ async def _publish_persisted_job(
         # pacing sleep above" (an earlier version checked only BEFORE the sleep, so a lease lost
         # during it still let send_job() run) and, when no sleep happened, the immediate case.
         # `is_lease_lost` is None for every standalone caller, so this is then a no-op.
-        if is_lease_lost is None or not is_lease_lost():
+        barrier = (
+            confirmed_barrier(db, job_record.id)
+            if is_lease_lost is None or not is_lease_lost()
+            else None
+        )
+        if barrier is not None:
+            # Fit gate: a CONFIRMED barrier (NOT_SUITABLE) is not proposed to the operator
+            # whatever its score says; not counted as a notification.
+            logger.info(
+                "collector_alert_blocked_by_fit job_id=%s reason=%s", job_record.id, barrier
+            )
+        elif is_lease_lost is None or not is_lease_lost():
             try:
+                notifier.guard = lambda: confirmed_barrier(db, job_record.id)
                 sent = await notifier.send_job(job, result)
             except Exception as exc:
                 logger.warning(

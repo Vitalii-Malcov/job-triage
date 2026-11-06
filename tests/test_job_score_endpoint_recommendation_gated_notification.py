@@ -229,3 +229,24 @@ def test_4_duplicate_submission_apply_does_not_notify_again(client):
     # created=False on the second (duplicate fingerprint) submission --
     # notification count must remain exactly 1, not 2.
     assert len(_SpyNotifier.calls) == 1
+
+
+def test_5_apply_with_confirmed_fit_barrier_is_not_notified(client, monkeypatch):
+    """A high-score APPLY whose fit tier is NOT_SUITABLE is never proposed."""
+    monkeypatch.setattr(
+        "app.api.routers.jobs.confirmed_barrier", lambda db, job_id: "FIT_TIER_NOT_SUITABLE"
+    )
+    _seed_candidate_skills(client.session_factory, ["Python", "FastAPI", "Flask"])
+    response = client.post(
+        "/api/v1/jobs/score",
+        json=_job_payload(
+            url="https://example.com/jobs/s11e-001-test-barrier",
+            must_have_skills=["Python", "FastAPI", "Flask"],
+            nice_to_have_skills=[],
+        ),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["recommendation"] == "APPLY"
+    assert _SpyNotifier.calls == []

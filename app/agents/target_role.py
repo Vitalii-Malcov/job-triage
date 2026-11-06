@@ -54,6 +54,7 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
             r"\b\w*administrat(?:or|orin|oren|orinnen)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
             r"[\s-]*administration\b|\b(?:it|system)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
         ),
+        ("it-systemelektroniker", r"\b(?:it[\s-]*)?systemelektroniker(?:in|innen)?\b"),
         ("systemintegration", r"\bsystemintegrat(?:or|orin|ion)\b|\bit[\s-]?systemintegrat\w*"),
         # A technology name alone is no role: it needs an admin/support/consulting
         # role word next to it ("Microsoft 365 Administrator", "AD Spezialist").
