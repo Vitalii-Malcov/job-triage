@@ -82,6 +82,8 @@ class _Request:
         self.headers = {}
         self.scope = {"type": "http"}
         self.cookies = {}
+        self.path_params = {}
+        self.query_params = {}
 
 
 def _call_auth(key: str, ip: str) -> None:
