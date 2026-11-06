@@ -41,6 +41,7 @@ def test_fields_are_exactly_the_allowlist():
         "database_dialect",
         "trusted_proxy_count",
         "shared_state_backend",
+        "api_key_strength",  # SEC-02: class only (unset/placeholder/weak/strong)
     }
     assert fields["database_dialect"] == "postgresql"
     assert fields["trusted_proxy_count"] == "1"

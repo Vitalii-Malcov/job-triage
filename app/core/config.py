@@ -6,6 +6,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.core.key_strength import is_placeholder_secret
 from app.providers.email.base import (
     MAX_ADDRESS_LENGTH,
     MAX_IMAP_HOST_LENGTH,
@@ -533,6 +534,29 @@ class Settings(BaseSettings):
     # way, not just the one the standalone worker happens to call. Checks
     # the ALREADY-NORMALIZED value (field validators run before this
     # model_validator) -- no redundant .strip() here.
+    # SEC-02: the public .env.example used to ship a non-empty, well-known value for
+    # API_KEY / POSTGRES_PASSWORD, which `fail closed on empty` accepted as a real
+    # credential. A known placeholder is refused outright (empty stays the supported
+    # "closed" state). Names only -- the value is never put in the message.
+    @model_validator(mode="after")
+    def _reject_placeholder_secrets(self) -> "Settings":
+        offenders = [
+            name
+            for name, value in (
+                ("api_key", self.api_key),
+                ("ui_session_secret", self.ui_session_secret),
+                ("postgres_password", self.postgres_password),
+            )
+            if is_placeholder_secret(reveal(value))
+        ]
+        if offenders:
+            raise ValueError(
+                f"{', '.join(offenders)}: still set to a template placeholder; generate a value "
+                'with `python -c "import secrets; print(secrets.token_urlsafe(32))"` '
+                "or leave it empty"
+            )
+        return self
+
     @model_validator(mode="after")
     def _validate_scheduler_requires_account_key_when_enabled(self) -> "Settings":
         if self.automation_scheduler_enabled and not self.automation_scheduler_account_key:

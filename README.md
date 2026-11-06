@@ -95,9 +95,15 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 cp .env.example .env
+# Required: put a real secret into API_KEY in .env (empty = API closed, every call is 401).
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # paste as API_KEY=
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
+
+A template placeholder left in `API_KEY`, `UI_SESSION_SECRET` or `POSTGRES_PASSWORD`
+makes the application refuse to start. Use a key of at least 32 characters: with such a
+key a correct `X-API-Key` is never rejected because other clients sent wrong keys.
 
 Protected endpoints require:
 ```
