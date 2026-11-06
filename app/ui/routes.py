@@ -17,8 +17,9 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.core.config import get_settings
+from app.core.config import get_settings, reveal
 from app.db.datetime_utils import ensure_utc
+from app.security.key_strength import is_strong_secret
 from app.ui import queries
 from app.ui.auth import (
     COOKIE_NAME,
@@ -130,10 +131,16 @@ async def login(request: Request) -> Response:
     body = await _bounded_body(request)
     submitted = parse_qs(body.decode("utf-8", errors="replace")).get("api_key", [""])[0]
     settings = get_settings()
-    token = await run_in_threadpool(begin_auth_attempt, request)
-    if not api_key_matches(submitted, settings.api_key):
+    # SEC-03: a correct, strong key is never refused because of other clients' failures.
+    token = None
+    if not (
+        is_strong_secret(reveal(settings.api_key)) and api_key_matches(submitted, settings.api_key)
+    ):
+        token = await run_in_threadpool(begin_auth_attempt, request)
+    if token is not None and not api_key_matches(submitted, settings.api_key):
         return _render(request, "login.html", status_code=401, error="Invalid key.")
-    await run_in_threadpool(end_auth_attempt_ok, request, token)
+    if token is not None:
+        await run_in_threadpool(end_auth_attempt_ok, request, token)
     response = RedirectResponse("/ui/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         COOKIE_NAME,
