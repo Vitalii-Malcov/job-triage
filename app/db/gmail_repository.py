@@ -58,7 +58,7 @@ from app.models.gmail import (
     GmailThread,
     GmailThreadDetail,
 )
-from app.providers.email.base import ParsedGmailMessage
+from app.providers.email.base import MAX_BODY_LENGTH, ParsedGmailMessage
 from app.providers.email.imap_mailbox import (
     canonical_mailbox_identity,
     mailbox_identity_aliases,
@@ -743,8 +743,12 @@ def upsert_message(
             # INTERNALDATE — never the wall-clock fallback above.
             provider_arrival_is_trusted=parsed.provider_arrival_at is not None,
             direction=parsed.direction,
-            body_plain=parsed.body_plain,
-            body_truncated=parsed.body_truncated,
+            # FLOW-13: an HTML-only message has no text/plain part; keep the text extracted
+            # from its HTML so stored-path consumers (7B analysis, matching, follow-up, UI)
+            # see what the live IMAP path sees. `has_html` still says where the text came from.
+            body_plain=parsed.body_plain or parsed.body_html_text,
+            body_truncated=parsed.body_truncated
+            or (not parsed.body_plain and len(parsed.body_html_text) >= MAX_BODY_LENGTH),
             has_html=parsed.has_html,
             attachments_json=json.dumps(
                 [

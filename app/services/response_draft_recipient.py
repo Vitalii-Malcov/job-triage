@@ -10,10 +10,21 @@ send instead of redirecting it.
 Fails closed and never echoes the rejected address.
 """
 
+import re
 from email.utils import getaddresses
 
 from app.providers.email.base import MAX_ADDRESS_LENGTH, normalize_account_key
 from app.services.follow_up_recipient import _CONTROL_CHARS, _EMAIL_SHAPE_RE
+
+# FLOW-04: an automated sender's address is not a person: an interview confirmation sent to
+# `noreply@` is a black hole while the candidate believes the interview is confirmed. A reply
+# to such a sender is refused (fail closed) instead of being approved and sent; Reply-To is
+# not stored, so the operator answers through the sender's own channel or portal.
+_NO_REPLY_LOCAL_PART = re.compile(
+    r"(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|mailer[-_]?daemon|postmaster|bounces?)"
+    r"(?:[-_+.].*)?",
+    re.IGNORECASE,
+)
 
 
 class ReplyRecipientInvalidError(Exception):
@@ -39,4 +50,6 @@ def derive_reply_recipient(from_address: str | None, *, account_key: str) -> str
         raise ReplyRecipientInvalidError("address is malformed")
     if candidate.casefold() == normalize_account_key(account_key):
         raise ReplyRecipientInvalidError("address is the configured mailbox itself")
+    if _NO_REPLY_LOCAL_PART.fullmatch(candidate.rsplit("@", 1)[0]):
+        raise ReplyRecipientInvalidError("address is a no-reply mailbox")
     return candidate
