@@ -37,6 +37,7 @@ EXCLUDED = [
     "Systemadministration (m/w/d)",
     # plural / abbreviated / compound forms seen in the stored vacancies
     "IT-Administratoren (m/w/d)",
+    "IT-Administratorinnen (m/w/d)",
     "IT-Security Administratorinnen /Administratoren (m/w/d)",
     "Systemadmin Linux (w/m/d)",
     "Anwendungssupporter IT und Logistik (m/w/d)",
