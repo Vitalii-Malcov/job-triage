@@ -102,21 +102,20 @@ def validate_scheduler_settings(settings) -> None:
             "automation_scheduler_account_key (AUTOMATION_SCHEDULER_ACCOUNT_KEY)."
         )
 
-    # ARC-03: the Gmail and follow-up steps compare the scheduler's account key with the
-    # NORMALIZED GMAIL_USERNAME. A key that differs only by case/whitespace passed startup
-    # and then failed every hourly Gmail step (GmailAccountMismatchError) without a trace
-    # in the process status. Refuse it here (fixed message: neither value is printed).
-    uses_gmail = (
-        settings.automation_gmail_cycle_enabled or settings.automation_follow_up_cycle_enabled
-    )
+    # ARC-03: the Gmail SYNC step compares the scheduler's account key with the NORMALIZED
+    # GMAIL_USERNAME. A key that differs only by case/whitespace passed startup and then
+    # failed every hourly sync (GmailAccountMismatchError) without a trace in the process
+    # status. Refuse it here (fixed message: neither value is printed). The follow-up cycle
+    # reads already stored mail and never compares the two, so it is deliberately not part of
+    # this check (an offline follow-up configuration with no GMAIL_USERNAME stays valid).
     if (
         settings.automation_scheduler_enabled
-        and uses_gmail
+        and settings.automation_gmail_cycle_enabled
         and scheduler_account_key != normalize_account_key(settings.gmail_username)
     ):
         raise SchedulerConfigurationError(
             "AUTOMATION_SCHEDULER_ACCOUNT_KEY must equal GMAIL_USERNAME in lower case when "
-            "the Gmail or follow-up cycle is enabled."
+            "the Gmail sync cycle is enabled."
         )
 
     if settings.telegram_daily_digest_enabled:

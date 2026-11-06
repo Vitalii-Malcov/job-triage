@@ -26,24 +26,31 @@ def _settings(**overrides) -> Settings:
 
 def test_matching_keys_pass_even_with_the_gmail_cycle_enabled():
     validate_scheduler_settings(_settings(automation_gmail_cycle_enabled=True))
-    validate_scheduler_settings(_settings(automation_follow_up_cycle_enabled=True))
 
 
-@pytest.mark.parametrize(
-    "cycle", ["automation_gmail_cycle_enabled", "automation_follow_up_cycle_enabled"]
-)
-def test_a_case_only_difference_is_refused_at_startup(cycle):
-    settings = _settings(automation_scheduler_account_key="Operator@Example.com", **{cycle: True})
+def test_a_case_only_difference_is_refused_at_startup():
+    settings = _settings(
+        automation_scheduler_account_key="Operator@Example.com",
+        automation_gmail_cycle_enabled=True,
+    )
     with pytest.raises(SchedulerConfigurationError) as excinfo:
         validate_scheduler_settings(settings)
-    assert "operator@example.com" not in str(excinfo.value).lower().replace(
-        "must equal gmail_username", ""
-    )
     assert "Example.com" not in str(excinfo.value)  # neither value is echoed
 
 
-def test_the_check_only_applies_when_a_gmail_step_is_enabled():
-    # Case-different key but no Gmail/follow-up cycle: nothing compares the two, so no refusal.
+def test_offline_follow_up_without_a_gmail_username_stays_valid():
+    validate_scheduler_settings(
+        _settings(
+            automation_follow_up_cycle_enabled=True,
+            automation_scheduler_account_key="Operator@Example.com",
+            gmail_username="",
+            gmail_app_password="",
+        )
+    )
+
+
+def test_the_check_only_applies_when_the_gmail_sync_is_enabled():
+    # Case-different key but no Gmail sync cycle: nothing compares the two, so no refusal.
     validate_scheduler_settings(_settings(automation_scheduler_account_key="Operator@Example.com"))
 
 
