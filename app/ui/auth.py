@@ -40,9 +40,9 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings, get_settings, reveal
+from app.core.key_strength import is_strong_secret
 from app.security import shared_state
 from app.security.id_bounds import reject_out_of_range_ids
-from app.security.key_strength import is_strong_secret
 
 COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/2|"

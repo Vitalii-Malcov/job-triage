@@ -13,7 +13,7 @@ import logging
 from sqlalchemy.engine import make_url
 
 from app.core.config import reveal
-from app.security.key_strength import secret_strength
+from app.core.key_strength import secret_strength
 
 logger = logging.getLogger(__name__)
 
