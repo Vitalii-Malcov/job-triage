@@ -28,6 +28,7 @@ Pure: no DB, no network, no LLM. E-mail text is untrusted data, never
 instructions.
 """
 
+import bisect
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ _QUOTE_HEADER = re.compile(
     re.IGNORECASE,
 )
 _SUBJECT_PREFIX = re.compile(
-    r"^\s*(?:(?:re|aw|antw|wg|fw|fwd|tr|sv|vs)\s*(?:\[\d+\])?\s*:\s*)+", re.I
+    r"^\s*(?:(?:re|aw|antw|wg|fw|fwd|tr|sv|vs)\s*(?:\[\d+\]\s*)?:\s*)+", re.I
 )
 
 _TECHNICAL_MARKER = re.compile(
@@ -81,11 +82,20 @@ _MARKER_NEGATION = re.compile(
 
 
 def _affirmative_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    # Linear: clause boundaries and negation words are located ONCE and looked up by
+    # bisection. A marker is negated when a negation word lies fully inside the span
+    # between the last clause boundary before it and the marker itself. (Re-scanning
+    # from offset 0 / from the clause start for every marker was O(markers x length).)
+    boundaries = [m.end() for m in _CLAUSE_START.finditer(text)]
+    negations = [(m.start(), m.end()) for m in _MARKER_NEGATION.finditer(text)]
+    negation_starts = [start for start, _ in negations]
     for match in pattern.finditer(text):
-        starts = [m.end() for m in _CLAUSE_START.finditer(text, 0, match.start())]
-        clause_lead = text[(starts[-1] if starts else 0) : match.start()]
-        if not _MARKER_NEGATION.search(clause_lead):
-            return match
+        index = bisect.bisect_right(boundaries, match.start())
+        clause_start = boundaries[index - 1] if index else 0
+        first = bisect.bisect_left(negation_starts, clause_start)
+        if first < len(negations) and negations[first][1] <= match.start():
+            continue  # negated within its own clause
+        return match
     return None
 
 

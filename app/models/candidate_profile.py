@@ -27,6 +27,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.models.bounds import MAX_DB_INT
+
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
@@ -462,7 +464,7 @@ class CandidateProfilePatchRequest(BaseModel):
     silently upgraded.
     """
 
-    expected_profile_version: int = Field(ge=1)
+    expected_profile_version: int = Field(ge=1, le=MAX_DB_INT)
 
     first_name: str | None = None
     last_name: str | None = None

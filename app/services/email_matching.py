@@ -260,8 +260,14 @@ _URL_ID_PATTERN = re.compile(r"/([A-Za-z0-9][A-Za-z0-9\-]{2,19})(?=[/?]|$)")
 # of reference-token consideration: none of those strings contain a
 # `something.tld`-shaped domain, so none of them can match this pattern
 # at all, regardless of digit count.
+# API-02: every quantifier is bounded (DNS limits: label <= 63, host <= 32 labels) and a
+# match may only START at the beginning of an alphanumeric run (the look-behind), so each
+# start position costs O(1) and a long dotless/dotted chain ("a" * 20000) is linear. The
+# unbounded `(?:[a-z0-9-]+\.)+` form was O(n^2): 20 000 chars ~ 6 s with the GIL held.
+# '.' is deliberately not in the look-behind, so "...karriere.firma.de" still matches.
 _URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[\w.\-/?=&%]*)?", re.IGNORECASE
+    r"(?<![a-z0-9-])(?:https?://)?(?:[a-z0-9-]{1,63}\.){1,32}[a-z]{2,63}(?:/[\w.\-/?=&%]*)?",
+    re.IGNORECASE,
 )
 
 

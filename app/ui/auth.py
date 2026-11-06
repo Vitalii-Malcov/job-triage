@@ -41,6 +41,7 @@ from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings, get_settings, reveal
 from app.security import shared_state
+from app.security.id_bounds import reject_out_of_range_ids
 
 COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/2|"
@@ -200,6 +201,8 @@ def require_ui_session(request: Request) -> None:
     end_auth_attempt_ok(request, attempt)
     if revocations.is_revoked(parsed[1]):
         raise NotLoggedInError
+    # API-01: only a logged-in operator learns that an id is unrepresentable (422).
+    reject_out_of_range_ids(request)
 
 
 def require_same_origin(request: Request) -> None:
