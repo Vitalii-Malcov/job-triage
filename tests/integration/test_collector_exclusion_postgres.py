@@ -25,6 +25,7 @@ from app.db.models import (
     ProcessedEmailMessage,
     XingScanProgressRecord,
 )
+from app.providers.email.imap_deadline import IMAP_SESSION_DEADLINE_SECONDS
 from app.services import automation
 from app.services.automation import AutomationRunAlreadyInProgressError, run_automation_cycle
 from app.services.collector_exclusion import (
@@ -527,7 +528,6 @@ async def run_xing_healthy(db, settings, *, is_lease_lost=None):
 def test_a_cancelled_manual_run_keeps_the_slot_held_for_its_worker(factory):
     """Cancellation must not release exclusion: the slot stays RUNNING (lease extended past the
     IMAP deadline) and a new manual run is refused until the lease would expire."""
-    from app.services import collector_exclusion as ce
 
     async def cancelled(db, settings, *, is_lease_lost=None):
         raise asyncio.CancelledError
@@ -541,7 +541,7 @@ def test_a_cancelled_manual_run_keeps_the_slot_held_for_its_worker(factory):
         assert run.status == "RUNNING"
         expires = run.lease_expires_at
         expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
-        assert expires > datetime.now(UTC) + timedelta(seconds=ce.IMAP_SESSION_DEADLINE_SECONDS)
+        assert expires > datetime.now(UTC) + timedelta(seconds=IMAP_SESSION_DEADLINE_SECONDS)
 
     async def quick(db, settings, *, is_lease_lost=None):
         return dict(STATS)

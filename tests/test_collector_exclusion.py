@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.db.automation_repository import create_running_run
 from app.db.base import Base
 from app.db.models import AutomationRunRecord
+from app.providers.email.imap_deadline import IMAP_SESSION_DEADLINE_SECONDS
 from app.services import collector_exclusion as ce
 from app.services.collector_exclusion import (
     CollectorRunInProgressError,
@@ -353,7 +354,7 @@ class TestOwnership:
         expires = run.lease_expires_at
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=UTC)
-        assert expires > datetime.now(UTC) + timedelta(seconds=ce.IMAP_SESSION_DEADLINE_SECONDS)
+        assert expires > datetime.now(UTC) + timedelta(seconds=IMAP_SESSION_DEADLINE_SECONDS)
         with factory() as db, pytest.raises(CollectorRunInProgressError):
             await run_collector_exclusively(db, _settings(), "xing", _ok)
 
