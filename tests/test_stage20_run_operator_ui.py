@@ -36,8 +36,8 @@ def test_forced_environment_overrides_dotenv(tmp_path, monkeypatch, database):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     settings = Settings(_env_file=".env")  # conftest disables .env globally
-    assert settings.api_key == "from-dotenv"  # the key still comes from .env
-    assert settings.telegram_bot_token == ""  # an empty override beats .env
+    assert settings.api_key.get_secret_value() == "from-dotenv"  # the key still comes from .env
+    assert settings.telegram_bot_token.get_secret_value() == ""  # an empty override beats .env
     assert settings.ui_enabled and not settings.outbound_sending_enabled
     assert not settings.alembic_auto_upgrade
     assert settings.database_url == f"sqlite:///{database.resolve().as_posix()}"
@@ -68,7 +68,7 @@ def test_unchanged_database_and_the_server_command(database, monkeypatch, tmp_pa
 
     assert launcher.main(["--database", str(database), "--port", "8010"], run=run) == 0
     [(command, env)] = calls
-    assert command[-4:] == ["--host", "127.0.0.1", "--port", "8010"]
+    assert command[-6:] == ["--host", "127.0.0.1", "--port", "8010", "--workers", "1"]
     assert env["UI_ENABLED"] == "true" and env["TELEGRAM_BOT_TOKEN"] == ""
     out = capsys.readouterr().out
     assert "UNCHANGED" in out and "secret-launcher-key" not in out

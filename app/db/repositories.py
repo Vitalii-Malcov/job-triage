@@ -3,10 +3,11 @@ import json
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -87,7 +88,12 @@ def _fingerprint(job: Job) -> str:
 
 
 def get_job_by_fingerprint(db: Session, job: Job) -> JobRecord | None:
-    """Return the persisted record representing ``job``, if one exists."""
+    """Return the persisted record representing ``job``, if one exists.
+
+    XING observations resolve through `resolve_xing_identity` (the same contract the
+    upsert uses), so a preliminary score reads the row that will actually be written."""
+    if job.source in _FREEZE_ON_CONFLICT_SOURCES:
+        return resolve_xing_identity(db, job, lock=False).record
     return db.scalar(select(JobRecord).where(JobRecord.fingerprint == _fingerprint(job)))
 
 
@@ -114,7 +120,7 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
     `record.title`/`record.url`. Idempotent no-op when the derived token
     set hasn't changed (delete+reinsert only on an actual difference).
 
-    **Round 3 (Blocker R3-001): this helper does NOT own commit/rollback.**
+    **Round 3: this helper does NOT own commit/rollback.**
     It only mutates the current `Session` (SELECT existing tokens, DELETE
     stale ones, add new ones, flush) so it can be composed into the SAME
     transaction as the `JobRecord` write it derives from. A Codex review
@@ -139,7 +145,7 @@ def sync_job_reference_tokens(db: Session, record: JobRecord) -> None:
 
 
 def _finalize_job_write(
-    db: Session, record: JobRecord, source_reference: str | None = None
+    db: Session, record: JobRecord, source_reference: str | None = None, *, commit: bool = True
 ) -> JobRecord:
     """Single transaction boundary for a `JobRecord` write and its derived
     `job_reference_tokens` sync (Stage 7B Codex remediation round 3,
@@ -149,6 +155,10 @@ def _finalize_job_write(
     `JobRecord` mutation nor the token mutation becomes durable — the
     derived-data invariant (job_reference_tokens always reflects the
     committed JobRecord) can never observe a half-applied state.
+
+    `commit=False` (review 2.5/Architecture 3, deferred mode): flush and sync
+    but leave the transaction open for the caller, which owns the final
+    commit/rollback. See `upsert_job_observed`.
     """
     db.flush()
     try:
@@ -158,7 +168,8 @@ def _finalize_job_write(
     except Exception:
         db.rollback()
         raise
-    db.commit()
+    if commit:
+        db.commit()
     db.refresh(record)
     if source_reference is not None and record.source_reference != source_reference:
         logger.warning(
@@ -171,7 +182,7 @@ def _finalize_job_write(
 
 
 def _store_source_reference(db: Session, record: JobRecord, reference: str) -> None:
-    """Stage 22 P0-1: set once, never blanked, never replaced -- atomically.
+    """set once, never blanked, never replaced -- atomically.
     An existing row gets the reference only while it is still empty
     (`UPDATE ... WHERE source_reference IS NULL`), so two writers (two
     collector runs, a collector and the backfill) cannot overwrite each
@@ -241,7 +252,7 @@ def _apply_job_update_fields(record: JobRecord, job: Job, score: JobScore, now: 
 
 
 def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
-    """HARD-007-RR1 (Codex targeted re-review): decides whether a caught
+    """decides whether a caught
     `IntegrityError` is SPECIFICALLY attributable to `uq_jobs_fingerprint`
     — `upsert_job`'s race-recovery below must never convert an unrelated
     DB invariant violation (a different unique/check/PK constraint, or a
@@ -274,6 +285,168 @@ def _is_fingerprint_unique_violation(exc: IntegrityError) -> bool:
     return "UNIQUE constraint failed: jobs.fingerprint" in str(orig)
 
 
+# Review 2.2: sources whose dedup key is NOT a reliable per-posting identity.
+# For these, an observation that looks like a different posting, or that hits
+# a record the operator has already acted on, never rewrites the stored
+# content (see `_update_existing`). XING only: its digest e-mails carry no
+# stable reference id (the tracking link is per recipient and must never be
+# requested), so identical company/title/location postings share one record.
+_FREEZE_ON_CONFLICT_SOURCES: frozenset[str] = frozenset({"xing"})
+
+
+def _normalized_description(text_value: str | None) -> str:
+    """Comparison form only (never stored): NFKC, casefolded, whitespace collapsed."""
+    return (
+        _WHITESPACE_RUN.sub(" ", unicodedata.normalize("NFKC", text_value or "")).strip().casefold()
+    )
+
+
+def descriptions_conflict(stored: str | None, incoming: str | None) -> bool:
+    """True when both descriptions carry content and differ. A blank side never
+    conflicts (an empty scrape must not split or freeze a record)."""
+    a, b = _normalized_description(stored), _normalized_description(incoming)
+    return bool(a) and bool(b) and a != b
+
+
+@dataclass(frozen=True)
+class XingResolution:
+    """Where one XING observation belongs. `record` is the existing row it matches, or
+    None and `fingerprint`/`identity_key` describe the row to insert. `ambiguous` means
+    the observation carries no evidence (blank salary/type text) while the group holds
+    several rows, so it is attached to the base row WITHOUT being applied. `sibling`
+    marks an insert that is a distinguished sibling of an existing row."""
+
+    record: JobRecord | None
+    fingerprint: str
+    identity_key: str
+    ambiguous: bool = False
+    sibling: bool = False
+
+
+def _variant_fingerprint(base: str, evidence: str, occurrence: int) -> str:
+    canonical = f"{base}|{evidence}|{occurrence}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _lock_identity_group(db: Session, base: str) -> None:
+    """Serialize every decision about one XING identity group until the transaction ends.
+    Row locks cannot do it (an empty group has nothing to lock, and a sibling inserted
+    after a waiting statement's snapshot would be missed), so PostgreSQL gets a
+    transaction-scoped advisory lock keyed by the base fingerprint. SQLite already
+    serializes writers; the unique fingerprint covers its remaining race."""
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"jobs.identity:{base}"},
+        )
+
+
+def resolve_xing_identity(db: Session, job: Job, *, lock: bool) -> XingResolution:
+    """Single contract deciding which `jobs` row a XING observation belongs to.
+
+    Digest e-mails carry no stable posting id (the per-recipient tracking link is a
+    per-message position slot and must never be requested), so identity evidence is
+    text only: company/title/location define the group; salary + employment text
+    (`description`) and the message-local occurrence tell group members apart.
+
+    * occurrence > 1 with evidence (a further identical block with a different link in
+      ONE message): its own sibling `(evidence, occurrence)`. The occurrence is
+      evidence-based multiplicity inside one e-mail, not durable ownership of a row.
+    * evidence present: the exact sibling `(evidence, 1)` -> that row; else the base row
+      when its stored evidence is equal; else a NEW sibling. A base row stored without
+      evidence is never "adopted" (that would rewrite a row on weaker evidence).
+    * evidence blank (the occurrence is ignored: a block without salary/type text carries
+      no identity evidence, identical blank blocks therefore collapse): a one-row group ->
+      that row; empty group -> new base row; several rows -> `ambiguous`: no row is
+      written or touched and the observation is only reported.
+    An existing row is never rewritten by an observation whose evidence differs from it.
+    """
+    base = _fingerprint(job)
+    if lock:
+        _lock_identity_group(db, base)
+    rows = db.scalars(
+        select(JobRecord).where(or_(JobRecord.fingerprint == base, JobRecord.identity_key == base))
+    ).all()
+    by_fingerprint = {row.fingerprint: row for row in rows}
+    evidence = _normalized_description(job.description)
+    occurrence = job.occurrence
+    sibling_fp = _variant_fingerprint(base, evidence, occurrence)
+    if not evidence:
+        occurrence = 1
+
+    def insert(fingerprint: str, *, sibling: bool) -> XingResolution:
+        return XingResolution(None, fingerprint, base, sibling=sibling)
+
+    if occurrence > 1:  # evidence is present here (blank forced occurrence to 1)
+        row = by_fingerprint.get(sibling_fp)
+        return XingResolution(row, sibling_fp, base) if row else insert(sibling_fp, sibling=True)
+    base_row = by_fingerprint.get(base)
+    if evidence:
+        row = by_fingerprint.get(sibling_fp)
+        if row is not None:
+            return XingResolution(row, sibling_fp, base)
+        if base_row is None:
+            return insert(base, sibling=False)
+        if _normalized_description(base_row.description) == evidence:
+            return XingResolution(base_row, base, base)
+        return insert(sibling_fp, sibling=True)
+    if not rows:
+        return insert(base, sibling=False)
+    if len(rows) == 1:
+        return XingResolution(rows[0], rows[0].fingerprint, base)
+    anchor = base_row or min(rows, key=lambda r: r.id)
+    return XingResolution(anchor, anchor.fingerprint, base, ambiguous=True)
+
+
+@dataclass(frozen=True)
+class UpsertOutcome:
+    record: JobRecord
+    created: bool
+    # Existing record left untouched except `last_seen_at` (the operator already acted
+    # on it, or an evidence-free XING observation could not be placed in a multi-row
+    # group); `possible_collision` says it was the latter.
+    frozen: bool = False
+    possible_collision: bool = False
+    # XING: the row was inserted as a distinguished sibling of an existing posting.
+    sibling_created: bool = False
+
+
+def _update_existing(
+    db: Session,
+    existing: JobRecord,
+    job: Job,
+    score: JobScore,
+    now: datetime,
+    *,
+    commit: bool = True,
+    touch_only: bool = False,
+) -> UpsertOutcome:
+    """The "already exists" write, shared by the sequential path and HARD-007's
+    race-recovery winner. For `_FREEZE_ON_CONFLICT_SOURCES` the row is locked
+    (`FOR UPDATE` on PostgreSQL) and reloaded first so the decision and the
+    write are atomic with respect to other collectors; a stale identity-map
+    copy can never hide a concurrent change. `touch_only` (XING: an evidence-free
+    observation in a multi-row group) and an operator-touched row move
+    `last_seen_at` and nothing else."""
+    if job.source in _FREEZE_ON_CONFLICT_SOURCES:
+        if touch_only:
+            # An ambiguous observation changes no row at all (not even last_seen_at).
+            logger.warning(
+                "job_ambiguous_observation source=%s job_id=%s", existing.source, existing.id
+            )
+            if commit:
+                db.rollback()
+            return UpsertOutcome(existing, False, frozen=True, possible_collision=True)
+        db.refresh(existing, with_for_update=True)
+        if existing.status != "NEW":
+            existing.last_seen_at = now
+            _finalize_job_write(db, existing, None, commit=commit)
+            return UpsertOutcome(existing, False, frozen=True)
+    _apply_job_update_fields(existing, job, score, now)
+    _finalize_job_write(db, existing, storable_reference(job.source_reference), commit=commit)
+    return UpsertOutcome(existing, False)
+
+
 def upsert_job(
     db: Session,
     job: Job,
@@ -282,20 +455,48 @@ def upsert_job(
     first_seen_at: datetime | None = None,
     last_seen_at: datetime | None = None,
 ) -> tuple[JobRecord, bool]:
+    outcome = upsert_job_observed(
+        db, job, score, first_seen_at=first_seen_at, last_seen_at=last_seen_at
+    )
+    return outcome.record, outcome.created
+
+
+def upsert_job_observed(
+    db: Session,
+    job: Job,
+    score: JobScore,
+    *,
+    first_seen_at: datetime | None = None,
+    last_seen_at: datetime | None = None,
+    commit: bool = True,
+) -> UpsertOutcome:
     """`first_seen_at`/`last_seen_at` (Stage 14B, keyword-only, both or
     neither): the ORIGINAL collector observation times when a job is
     transferred from another database, so import time is never mistaken
     for collector freshness. Insert-only: if the fingerprint already exists
     the call raises `ValueError` instead of rewriting an existing record's
-    observation history. Collectors never pass them. Concurrency (HARD-007)
+    observation history. Collectors never pass them. Concurrency
     is documented on `_upsert_job`.
+
+    `commit=False` (deferred mode, Architecture 3): the write, its reference tokens and
+    source reference are flushed but the transaction is left open; the CALLER owns the
+    final commit/rollback (`score_and_persist` uses it so the upsert and the posting-type
+    reconciliation become durable together). Contract: it must be the FIRST write of the
+    unit of work (checked for pending ORM changes), because a fingerprint-collision race
+    recovery rolls the session's transaction back before converging on the winner; that
+    discards nothing but this call's own writes.
     """
     if (first_seen_at is None) != (last_seen_at is None):
         raise ValueError("first_seen_at and last_seen_at must be given together")
     historical = first_seen_at is not None
     if historical and last_seen_at < first_seen_at:
         raise ValueError("last_seen_at must not be before first_seen_at")
-    return _upsert_job(db, job, score, first_seen_at, last_seen_at)
+    if not commit and (db.new or db.dirty or db.deleted):
+        raise ValueError(
+            "upsert_job_observed(commit=False) needs a session without pending changes: "
+            "a fingerprint-collision recovery rolls the transaction back"
+        )
+    return _upsert_job(db, job, score, first_seen_at, last_seen_at, commit=commit)
 
 
 def _upsert_job(
@@ -304,8 +505,10 @@ def _upsert_job(
     score: JobScore,
     first_seen_at: datetime | None,
     last_seen_at: datetime | None,
-) -> tuple[JobRecord, bool]:
-    """HARD-007 (Codex master review): two concurrent calls racing to
+    *,
+    commit: bool = True,
+) -> UpsertOutcome:
+    """two concurrent calls racing to
     insert the SAME brand-new fingerprint can both observe `existing is
     None` above (the classic check-then-act TOCTOU window between this
     function's own SELECT and its INSERT) — `JobRecord.fingerprint`'s
@@ -322,7 +525,7 @@ def _upsert_job(
     INSERT attempt would just fail the same way again). Instead it
     rolls back immediately (clears the poisoned transaction so the
     Session stays usable), confirms — via `_is_fingerprint_unique_violation`
-    (HARD-007-RR1, Codex targeted re-review) — that the caught
+     — that the caught
     `IntegrityError` is actually attributable to `uq_jobs_fingerprint`
     specifically (a same-fingerprint winner existing after rollback does
     NOT by itself prove that; an unrelated constraint/trigger violation
@@ -339,19 +542,50 @@ def _upsert_job(
     this re-read), the original `IntegrityError` is re-raised unchanged
     rather than silently swallowed — never a blind retry of the INSERT.
     """
-    fingerprint = _fingerprint(job)
-    existing = get_job_by_fingerprint(db, job)
     now = datetime.now(UTC)
     historical = first_seen_at is not None
+    if job.source in _FREEZE_ON_CONFLICT_SOURCES:
+        return _upsert_xing_job(
+            db, job, score, now, first_seen_at, last_seen_at, historical, commit=commit
+        )
+    fingerprint = _fingerprint(job)
+    existing = get_job_by_fingerprint(db, job)
     if existing:
         if historical:
             raise ValueError("historical observation timestamps apply only to a new job record")
-        _apply_job_update_fields(existing, job, score, now)
-        _finalize_job_write(db, existing, storable_reference(job.source_reference))
-        return existing, False
+        return _update_existing(db, existing, job, score, now, commit=commit)
 
-    record = JobRecord(
+    record = _new_job_record(job, score, fingerprint, None, now, first_seen_at, last_seen_at)
+    db.add(record)
+    try:
+        _finalize_job_write(db, record, commit=commit)
+    except IntegrityError as exc:
+        db.rollback()
+        if not _is_fingerprint_unique_violation(exc):
+            raise
+        winner = get_job_by_fingerprint(db, job)
+        if winner is None:
+            raise
+        if historical:
+            raise ValueError(
+                "historical observation timestamps apply only to a new job record"
+            ) from exc
+        return _update_existing(db, winner, job, score, now, commit=commit)
+    return UpsertOutcome(record, True)
+
+
+def _new_job_record(
+    job: Job,
+    score: JobScore,
+    fingerprint: str,
+    identity_key: str | None,
+    now: datetime,
+    first_seen_at: datetime | None,
+    last_seen_at: datetime | None,
+) -> JobRecord:
+    return JobRecord(
         fingerprint=fingerprint,
+        identity_key=identity_key,
         source=job.source,
         title=job.title,
         company=job.company,
@@ -372,24 +606,60 @@ def _upsert_job(
         first_seen_at=first_seen_at or now,
         last_seen_at=last_seen_at or now,
     )
-    db.add(record)
-    try:
-        _finalize_job_write(db, record)
-    except IntegrityError as exc:
-        db.rollback()
-        if not _is_fingerprint_unique_violation(exc):
-            raise
-        winner = get_job_by_fingerprint(db, job)
-        if winner is None:
-            raise
-        if historical:
-            raise ValueError(
-                "historical observation timestamps apply only to a new job record"
-            ) from exc
-        _apply_job_update_fields(winner, job, score, now)
-        _finalize_job_write(db, winner, storable_reference(job.source_reference))
-        return winner, False
-    return record, True
+
+
+_XING_INSERT_ATTEMPTS = 3
+
+
+def _upsert_xing_job(
+    db: Session,
+    job: Job,
+    score: JobScore,
+    now: datetime,
+    first_seen_at: datetime | None,
+    last_seen_at: datetime | None,
+    historical: bool,
+    *,
+    commit: bool,
+) -> UpsertOutcome:
+    """The XING write: resolve the identity group under its lock, then update the matched
+    row or insert the row the resolution describes. A unique-fingerprint violation (a
+    concurrent writer took the same fingerprint) rolls back and re-runs the WHOLE
+    resolution, never a blind update: the winner may now conflict with this observation,
+    which then becomes a distinguished sibling instead of overwriting it."""
+    for _ in range(_XING_INSERT_ATTEMPTS):
+        resolution = resolve_xing_identity(db, job, lock=True)
+        if resolution.record is not None:
+            if historical:
+                raise ValueError("historical observation timestamps apply only to a new job record")
+            return _update_existing(
+                db,
+                resolution.record,
+                job,
+                score,
+                now,
+                commit=commit,
+                touch_only=resolution.ambiguous,
+            )
+        record = _new_job_record(
+            job,
+            score,
+            resolution.fingerprint,
+            resolution.identity_key,
+            now,
+            first_seen_at,
+            last_seen_at,
+        )
+        db.add(record)
+        try:
+            _finalize_job_write(db, record, commit=commit)
+        except IntegrityError as exc:
+            db.rollback()
+            if not _is_fingerprint_unique_violation(exc):
+                raise
+            continue
+        return UpsertOutcome(record, True, sibling_created=resolution.sibling)
+    raise RuntimeError("XING identity resolution did not settle after concurrent inserts")
 
 
 def update_job_score_if_posting_type_unchanged(
@@ -400,8 +670,9 @@ def update_job_score_if_posting_type_unchanged(
     score: int,
     recommendation: str,
     data_confidence: float,
+    commit: bool = True,
 ) -> bool:
-    """S10-RR-001 (Codex Stage 10 re-review, BLOCKING): the atomic
+    """the atomic
     compare-and-swap `app.services.collector_runner.score_and_persist`
     uses to reconcile a `JobRecord`'s (score, recommendation,
     data_confidence) with its OWN currently-persisted posting_type after
@@ -421,10 +692,10 @@ def update_job_score_if_posting_type_unchanged(
     against. Returns False (0 rows affected) if it changed underneath;
     the caller re-reads and retries with a fresh observation.
 
-    Deliberately its own commit boundary (a single, self-contained
-    conditional state transition, not composed with any other write in
-    the same transaction) — callers must not wrap this in additional
-    uncommitted work expecting atomicity with it.
+    By default its own commit boundary (a single, self-contained conditional
+    state transition). `commit=False` (Architecture 3) executes the same conditional
+    UPDATE inside the caller's open transaction; the caller (`score_and_persist`) then
+    commits the upsert and this reconciliation together.
     """
     stmt = (
         update(JobRecord)
@@ -433,7 +704,8 @@ def update_job_score_if_posting_type_unchanged(
         .values(score=score, recommendation=recommendation, data_confidence=data_confidence)
     )
     result = db.execute(stmt)
-    db.commit()
+    if commit:
+        db.commit()
     return result.rowcount == 1
 
 
@@ -483,7 +755,7 @@ def list_jobs_by_status_after_id(
 
 
 def get_jobs_by_ids_if_eligible(db: Session, job_ids: list[int]) -> list[JobRecord]:
-    """Stage 8C (S8C-POOL-001, Codex review): the FINAL DB revalidation
+    """Stage 8C: the FINAL DB revalidation
     step of the two-stage candidate-match bound (see
     app.services.automation_shortlist.prepare_shortlist_drafts) -- given
     an already bounded, already cheaply-preselected set of job ids (from
@@ -522,7 +794,7 @@ def get_job_by_id(db: Session, job_id: int) -> JobRecord | None:
     return db.get(JobRecord, job_id)
 
 
-# AUD-007 (Astra R2): reverse of ALLOWED_TRANSITIONS -- for a given target
+# reverse of ALLOWED_TRANSITIONS -- for a given target
 # status, the set of source statuses a transition into it may legally come
 # from. Built once at import time (the transition table is static) and used
 # to encode the allowed source state(s) directly in update_job_status's
@@ -545,7 +817,7 @@ def update_job_status(db: Session, job_id: int, new_status: ApplicationStatus) -
     change (e.g. moved the job to a terminal REJECTED/WITHDRAWN state)
     between this call's initial read and its write.
 
-    AUD-007 (Astra R2): a plain read -> validate-in-Python -> mutate ORM
+    a plain read -> validate-in-Python -> mutate ORM
     object -> commit sequence is race-prone -- a reader that saw a
     still-mutable status before commit can go on to unconditionally
     overwrite whatever the row's status has become by commit time, including
@@ -611,13 +883,30 @@ def is_message_processed(db: Session, source: str, message_id: str) -> bool:
 def mark_message_processed(db: Session, source: str, message_id: str) -> None:
     """Record that this source has processed an email with this Message-ID.
 
-    Idempotent: safe to call even if already marked (e.g. a duplicate
-    Message-ID seen twice in the same run), so it never raises a unique
-    constraint violation.
+    Idempotent and race-free: one `INSERT ... ON CONFLICT (source, message_id)
+    DO NOTHING`, so a duplicate Message-ID in the same run, a concurrent run,
+    or another source holding the same Message-ID never raises. The first
+    marker row (its id and processed_at) is never touched again.
+
+    Contract: when the marker already exists nothing is written and nothing is
+    committed; otherwise the helper COMMITS the session (the acknowledgement
+    must be durable before the caller advances any scan watermark), which
+    also persists whatever else the caller has pending in this session.
     """
     if is_message_processed(db, source, message_id):
         return
-    db.add(ProcessedEmailMessage(source=source, message_id=message_id))
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # the project supports SQLite and PostgreSQL only
+        raise NotImplementedError(f"unsupported database dialect: {dialect}")
+    db.execute(
+        dialect_insert(ProcessedEmailMessage)
+        .values(source=source, message_id=message_id, processed_at=datetime.now(UTC))
+        .on_conflict_do_nothing(index_elements=["source", "message_id"])
+    )
     db.commit()
 
 
@@ -783,7 +1072,7 @@ def get_known_domains_for_company_name(db: Session, normalized_company_name: str
     rows sharing this normalized_company_name — i.e. how many genuinely
     distinct, identifiable companies this display name could refer to.
 
-    Used by CompanyResearchService (FR-M-01) to detect when a name-only
+    Used by CompanyResearchService to detect when a name-only
     resolution (no domain_hint — the only kind Company Research v1 ever
     performs, see H-02) would be unsafe to resolve automatically: if 2+
     known domains share this normalized name (e.g. "Acme GmbH" at acme.de
@@ -809,7 +1098,7 @@ class AmbiguousCompanyIdentityError(Exception):
     identity resolution (domain_hint is None — the only kind Company
     Research v1 ever performs, see H-02) cannot be resolved safely because
     2+ distinct known-domain companies already share this normalized
-    company name (FR-M-01) — e.g. "Acme GmbH" has separate, legitimate
+    company name — e.g. "Acme GmbH" has separate, legitimate
     research on file for both acme.de and acme.com (H-01: two different
     known non-null domains are always two different companies, never
     merged).
@@ -849,7 +1138,7 @@ def resolve_name_only_company_research(
       though it doesn't match the exact "name:<x>" identity_key a naive
       domain-less lookup would use.
     - 2+ known domains share this name: raises AmbiguousCompanyIdentityError
-      (FR-M-01) — unchanged.
+       — unchanged.
 
     An exact "name:<x>" row and a known-domain row for the same
     normalized_company_name should never coexist once every writer that
@@ -873,10 +1162,35 @@ def resolve_name_only_company_research(
     return get_company_research_by_identity(db, None, normalized_company_name)
 
 
+def _claim_company_research_alias(
+    db: Session, company_research_id: int, normalized_company_name: str
+) -> None:
+    """Claim the name's coordination slot for `company_research_id` inside the
+    caller's open transaction, WITHOUT committing: one targeted
+    `INSERT .. ON CONFLICT (normalized_company_name) DO NOTHING`. An existing alias
+    (this record's own, or the legitimate owner of Case C) is never reassigned.
+    Unexpected database errors propagate and abort the caller's combined write."""
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:
+        raise NotImplementedError(f"unsupported database dialect: {dialect}")
+    db.execute(
+        dialect_insert(CompanyResearchIdentityAlias)
+        .values(
+            normalized_company_name=normalized_company_name,
+            company_research_id=company_research_id,
+        )
+        .on_conflict_do_nothing(index_elements=["normalized_company_name"])
+    )
+
+
 def _ensure_company_research_alias(
     db: Session, record: CompanyResearchRecord, normalized_company_name: str
 ) -> None:
-    """Invariant (FR-M-02 Fix B): a successful canonical CompanyResearchRecord
+    """Invariant: a successful canonical CompanyResearchRecord
     that is safe to reach via name-only resolution must have exactly one
     CompanyResearchIdentityAlias row for its normalized_company_name,
     pointing at it — unless a *different* record already legitimately owns
@@ -937,7 +1251,7 @@ def _resolve_stale_write(
     normalized_domain: str | None,
     normalized_company_name: str,
 ) -> tuple[CompanyResearchRecord, CompanyResearchWriteOutcome]:
-    """FR-H-01: a caller's optimistic-concurrency write lost to a concurrent
+    """a caller's optimistic-concurrency write lost to a concurrent
     writer that already committed a newer version of the same row.
 
     If the concurrent winner represents the *same* company identity (our
@@ -1037,7 +1351,7 @@ def upsert_company_research(
        The DB's UNIQUE constraint rejects the loser with IntegrityError;
        caught, rolled back, resolved by reloading the winner's row.
     2. Concurrent create, *different* identity_key for the same company
-       (RR-M-01) — one caller resolves "name:<x>" (no domain known yet),
+        — one caller resolves "name:<x>" (no domain known yet),
        another resolves "domain:<y>" for the same normalized company name.
        identity_key's UNIQUE constraint does nothing here since the two
        strings differ; see _create_company_research /
@@ -1128,6 +1442,10 @@ def _update_existing_company_research(
     )
     try:
         result = db.execute(stmt)
+        if result.rowcount == 1:
+            # Architecture 3: the alias is claimed in the SAME transaction as the
+            # content/version update, so a failure here leaves neither behind.
+            _claim_company_research_alias(db, existing.id, normalized_company_name)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -1159,7 +1477,6 @@ def _update_existing_company_research(
         )
 
     db.refresh(existing)
-    _ensure_company_research_alias(db, existing, normalized_company_name)
     return existing, CompanyResearchWriteOutcome.UPDATED
 
 
@@ -1289,8 +1606,8 @@ def _create_company_research(
     get_company_research_by_identity found nothing for.
 
     A plain INSERT + IntegrityError-on-identity_key catch (as used
-    everywhere else in this module) is NOT sufficient on its own here
-    (RR-M-01): two concurrent creators for the *same* company can
+    everywhere else in this module) is NOT sufficient on its own here:
+    two concurrent creators for the *same* company can
     legitimately resolve to two *different* identity_key values — one
     "name:<x>" (no domain known yet), one "domain:<y>" (domain known) — and
     identity_key's UNIQUE constraint does nothing to stop both inserts from
@@ -1381,7 +1698,7 @@ def record_failed_attempt(
     traceback or anything that could contain secrets — callers pass
     `str(exc)`, not `traceback.format_exc()`.
 
-    FR-M-03: when `normalized_domain` is None (v1's only live case),
+    when `normalized_domain` is None (v1's only live case),
     existence is resolved via resolve_name_only_company_research — the same
     routine CompanyResearchService.get_cached/get_or_run use — rather than
     a raw exact "name:<x>" lookup. Without this, a failed refresh attempt

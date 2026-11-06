@@ -1,8 +1,10 @@
-# JobTriage — AI-Assisted Job Application Automation Platform
+# JobTriage — Job Application Triage and Drafting Platform
 
 An API-driven backend that collects job postings, scores them against a candidate profile, drafts CVs/cover letters/email responses, and tracks the whole application lifecycle — with every send-capable action gated behind explicit human approval. Built with FastAPI, SQLAlchemy, Alembic and SQLite (the operator's daily database); PostgreSQL is supported and tested in CI and the Docker setup.
 
 > Formerly "AI Job Search Control Center" — see `docs/DEVELOPMENT_HISTORY.md` for the full stage-by-stage build log.
+
+> **No LLM at runtime.** Matching, classification and drafting are deterministic rules and templates (see `docs/ARCHITECTURE.md`, "What is and is not AI"); AI assistants were used to *develop* the code, not to run it.
 
 ## What it does
 
@@ -51,7 +53,7 @@ FastAPI · SQLAlchemy 2.x · Alembic · Pydantic v2 / pydantic-settings · SQLit
 - **Concurrency correctness**: automation runs use a partial unique index + lease + heartbeat to guarantee at most one running cycle per account; schedule claiming uses an atomic compare-and-swap `UPDATE`; both are verified under real PostgreSQL concurrency in dedicated integration tests, not just SQLite.
 - **Idempotency everywhere it matters**: unique-constraint-backed send records mean re-running a step never double-sends; ambiguous outcomes get a terminal `UNCERTAIN` state instead of a guessed retry.
 - **Retryable vs. permanent failure classification**: IMAP/SMTP/collector failures are explicitly classified so transient errors retry and structural ones don't get retried forever.
-- **About 6 900 test cases** (see *Verified test runs* below for exact, commit-pinned results), including PostgreSQL-only integration tests that self-skip locally and always run in CI.
+- **A large automated suite** (thousands of tests; the per-category breakdown and the reason for every skip are in `docs/TEST_INVENTORY.md`), including PostgreSQL-only integration tests that self-skip without `TEST_POSTGRES_URL` and are run by the CI job described in `docs/CI.md`.
 
 ## Safety / human approval
 
@@ -72,15 +74,19 @@ CI additionally runs a dedicated job against a real PostgreSQL service container
 
 ### Verified test runs
 
-Collected tests are not passed tests; these are actual results, each tied to a commit:
+A collected test is not a passed test, and a local `pytest` run is not a CI run. Numbers are only
+quoted together with what produced them:
 
-| Commit | Branch / PR | Result |
+| What | Result | Source |
 |---|---|---|
-| `79e54e7` | Stage 22 P0-3, PR #19 | CI: 6 747 passed, 140 skipped; PostgreSQL job 132 passed |
-| `f6dd8a2` | Stage 22 P0-1/P0-2, PR #20 | local full run: 6 876 passed, 138 skipped, 0 failed |
-| `6365cd6` | Stage 22 P1, PR #21 | local full run: 7 034 passed, 138 skipped, 0 failed |
+| Stage 22 P0-3 (PR #19, `79e54e7`, now in `main`) | CI: 6 747 passed, 140 skipped; PostgreSQL job 132 passed | recorded when PR #19 was open |
+| Stage 22 P1 (PR #21, `6365cd6`, now in `main`) | local full run: 7 034 passed, 138 skipped, 0 failed | recorded when PR #21 was open |
+| Hard-review remediation branches (local only, NOT in `main`) | see `docs/HARD_REVIEW_REMEDIATION_STATUS.md` per task | local runs; GitHub Actions has not run on them |
 
-`main` (`4cdaacf`, Stage 20) does not contain Stage 21/22 yet; see *Project status*.
+Current skip reasons and test categories: `docs/TEST_INVENTORY.md`. What CI does and does not prove:
+`docs/CI.md`. Operator-facing commands: `docs/OPERATOR_COMMANDS.md` (`jobtriage` / `python -m app.cli`).
+
+`main` is at `78a947b` (merge of PR #29) and contains Stages 21-24; see *Project status*.
 
 ## Quick start
 
@@ -115,11 +121,18 @@ Full deployment architecture (topology, scheduler-placement decision, scaling li
 | Stage | Developed | Merged into `main` | Deployed (operator's SQLite) |
 |---|---|---|---|
 | 1-20: collectors, scoring, lifecycle tracking, Gmail processing, drafting, Telegram, read-only operator UI | yes | yes | yes (`4cdaacf`, schema `b6c1e9a4d2f7`) |
-| 21: persistent vacancy-assessment cache | yes | no (PR #18) | no |
-| 22 P0-3: re-posted vacancy warning | yes | no (PR #19) | no |
-| 22 P0-1/P0-2: full Bundesagentur reference, read-only liveness check | yes | no (PR #20) | no |
-| 22 P1: BA facts, preliminary geography, home-office search, fit-tier rework, identity dry run | yes | no (PR #21) | no |
-| 22 P2: real event time for manual status changes | yes | no (stacked PR) | no |
+| 21: persistent vacancy-assessment cache | yes | yes (PR #18) | reported deployed 2026-10-31 (operator notes; no deployment record in this repository) |
+| 22 P0-P2: repost guard, BA reference + liveness, geography / home-office search / fit tiers, real event time (PRs #19-#22) | yes | yes (PRs #19-#22) | reported deployed 2026-10-31 together with Stage 21 (code `d5a7d27`, schema `e3b7c9d1f4a6`); same caveat |
+| 22 T6, fit-evidence gating (PRs #23-#24): safe BA refresh CLI, no fit evidence without extracted skills | yes | yes | not verified |
+| 23 (PRs #25-#26): opt-in BA `angebotsart` / `veroeffentlichtseit` filters, specialization-domain criterion | yes | yes | not verified |
+| 24 (PRs #27-#28): opt-in BA discovery queries, target-role alignment | yes | yes | not verified |
+| Docs PRs #14 (Stage 19 release report), #29 (Astra audit policy) | yes | yes | n/a |
+| Hard-review remediation (19 planned tasks; 01-17 accepted, 18 under review, 19 final audit pending, `fix/hard-review-integration`) | partly (see `docs/HARD_REVIEW_REMEDIATION_STATUS.md`) | **no, local branches only; not pushed** | **no** |
+
+"Deployed" means the operator's own statement; only the schema head of the code is checkable from
+here. Nothing on the remediation branches has been deployed or run against the production database (migrations were only exercised on temporary SQLite and a local test PostgreSQL);
+two of them change the schema (pinned response-draft recipient, processed e-mail identity) and
+change the rules hash, so a deployment needs a migration window and a fit-cache refill.
 
 Experimental / manual by design: fit tiers are a triage aid, never an instruction to apply; a commute is "verified" only by a stored car route; vacancy merging exists only as a read-only dry run; every Bewerbung is prepared, checked (`scripts/presubmit_check.py`) and sent by the operator.
 

@@ -40,7 +40,7 @@ successful persist (see `app.services.automation.run_automation_cycle`,
 which creates one fresh list per run and passes it to both collector
 steps). Only jobs present in that list are ever candidates.
 
-**Two-stage bounded candidate selection (S8C-BOUND-001, Codex review).**
+**Two-stage bounded candidate selection.**
 Stage 1 (`_preselect_candidate_job_ids`): cheap, in-memory-only —
 dedupe `touched_jobs` by job_id, keep only entries whose OWN captured
 status/recommendation looked eligible, sort by `score DESC, job_id ASC`,
@@ -56,7 +56,7 @@ a SEPARATE, later bound on how many of the MATCHED candidates actually
 get CV/Bewerbung drafts (spec section 6/7) — see module docstring's
 "final draft cap" note.
 
-**Per-job failure isolation (S8C-AUDIT-001/002, Codex review).** Every
+**Per-job failure isolation.** Every
 candidate job's match computation, and every shortlisted job's CV
 preparation and (separately) Bewerbung preparation, each run in their
 OWN try/except: one bad job's exception is rolled back, recorded as
@@ -108,7 +108,7 @@ _ELIGIBLE_RECOMMENDATIONS = frozenset({"APPLY", "MAYBE"})
 def _preselect_candidate_job_ids(
     touched_jobs: list[TouchedJob], *, max_candidates: int
 ) -> list[int]:
-    """S8C-BOUND-001/S8C-POOL-001 (Codex review): stage 1 of the two-stage
+    """stage 1 of the two-stage
     bound — cheap, in-memory-only, no DB access. Dedupes `touched_jobs`
     by `job_id` (last entry for a given id wins — later touches reflect
     more current state), keeps only entries whose OWN captured
@@ -132,29 +132,12 @@ def _preselect_candidate_job_ids(
     return [touched.job_id for touched in cheaply_eligible[:max_candidates]]
 
 
-async def prepare_shortlist_drafts(
-    db: Session, *, touched_jobs: list[TouchedJob], settings
-) -> dict:
-    """Runs Stage 8C for one automation cycle. Returns an
-    AutomationRunStepResult-shaped dict: `{"status", "counters", "items",
-    "failures", "error_type"}` — all plain, JSON-serializable values
-    (`app.db.automation_repository.finish_run` persists the whole
-    `step_results` dict via a plain `json.dumps`). `error_type` here is
-    always `None` — a step-wide aggregate of independently-sanitized
-    per-job failures has no single representative exception type of its
-    own (each failure's own type is already on its `AutomationJobFailure`/
-    `ShortlistDraftItem`); a genuinely unexpected STEP-level failure
-    (e.g. the DB revalidation query itself raising) is caught by the
-    caller (`app.services.automation._run_shortlist_drafts_step`),
-    mirroring `_run_step`'s own two-layer contract for the Stage 8A
-    collector steps.
-    """
-    candidate_ids = _preselect_candidate_job_ids(
-        touched_jobs, max_candidates=settings.automation_candidate_match_max_per_run
-    )
-    eligible_jobs = get_jobs_by_ids_if_eligible(db, candidate_ids)
-    candidate_jobs = len(eligible_jobs)
-
+def _match_eligible_jobs(
+    db: Session, eligible_jobs: list
+) -> tuple[list[tuple], int, list[AutomationJobFailure]]:
+    """Phase 1: match every eligible job against the candidate profile. A failing job is
+    rolled back, counted and reported (phase `match`); it never stops the others.
+    Returns `(matched (job, match) pairs, failed count, failures)`."""
     matched: list[tuple] = []
     failed = 0
     failures: list[AutomationJobFailure] = []
@@ -176,18 +159,17 @@ async def prepare_shortlist_drafts(
             continue
         if match is not None:
             matched.append((job, match))
+    return matched, failed, failures
 
-    shortlist_candidates = [
-        (job, match)
-        for job, match in matched
-        if match.overall_score >= settings.automation_shortlist_min_match_score
-    ]
-    # Deterministic ranking (spec section 6): match score DESC, then
-    # JobRecord.score DESC, then job id ASC as the final, always-unique
-    # tie-break. Never randomness.
-    shortlist_candidates.sort(key=lambda pair: (-pair[1].overall_score, -pair[0].score, pair[0].id))
-    shortlisted = shortlist_candidates[: settings.automation_shortlist_max_per_run]
 
+async def _prepare_shortlist_items(
+    db: Session, shortlisted: list[tuple], failures: list[AutomationJobFailure]
+) -> tuple[list[ShortlistDraftItem], int, int, int, int, int]:
+    """Phase 3: prepare (or reuse) the CV draft and the Bewerbung draft of each shortlisted
+    job. A failure in either step is rolled back, appended to `failures` and recorded as a
+    failed item; the next job still runs.
+    Returns `(items, failed, cv_created, cv_reused, bewerbung_created, bewerbung_reused)`."""
+    failed = 0
     items: list[ShortlistDraftItem] = []
     cv_created = cv_reused = bewerbung_created = bewerbung_reused = 0
 
@@ -297,6 +279,55 @@ async def prepare_shortlist_drafts(
     # (candidate_jobs after preselection/revalidation), never the raw
     # touched-job count -- a job dropped by the bound or by DB
     # revalidation was never attempted and must not count as a failure.
+    return items, failed, cv_created, cv_reused, bewerbung_created, bewerbung_reused
+
+
+async def prepare_shortlist_drafts(
+    db: Session, *, touched_jobs: list[TouchedJob], settings
+) -> dict:
+    """Runs Stage 8C for one automation cycle. Returns an
+    AutomationRunStepResult-shaped dict: `{"status", "counters", "items",
+    "failures", "error_type"}` — all plain, JSON-serializable values
+    (`app.db.automation_repository.finish_run` persists the whole
+    `step_results` dict via a plain `json.dumps`). `error_type` here is
+    always `None` — a step-wide aggregate of independently-sanitized
+    per-job failures has no single representative exception type of its
+    own (each failure's own type is already on its `AutomationJobFailure`/
+    `ShortlistDraftItem`); a genuinely unexpected STEP-level failure
+    (e.g. the DB revalidation query itself raising) is caught by the
+    caller (`app.services.automation._run_shortlist_drafts_step`),
+    mirroring `_run_step`'s own two-layer contract for the Stage 8A
+    collector steps.
+    """
+    candidate_ids = _preselect_candidate_job_ids(
+        touched_jobs, max_candidates=settings.automation_candidate_match_max_per_run
+    )
+    eligible_jobs = get_jobs_by_ids_if_eligible(db, candidate_ids)
+    candidate_jobs = len(eligible_jobs)
+
+    matched, failed, failures = _match_eligible_jobs(db, eligible_jobs)
+
+    shortlist_candidates = [
+        (job, match)
+        for job, match in matched
+        if match.overall_score >= settings.automation_shortlist_min_match_score
+    ]
+    # Deterministic ranking (spec section 6): match score DESC, then
+    # JobRecord.score DESC, then job id ASC as the final, always-unique
+    # tie-break. Never randomness.
+    shortlist_candidates.sort(key=lambda pair: (-pair[1].overall_score, -pair[0].score, pair[0].id))
+    shortlisted = shortlist_candidates[: settings.automation_shortlist_max_per_run]
+
+    (
+        items,
+        draft_failed,
+        cv_created,
+        cv_reused,
+        bewerbung_created,
+        bewerbung_reused,
+    ) = await _prepare_shortlist_items(db, shortlisted, failures)
+    failed += draft_failed
+
     if candidate_jobs == 0 or failed == 0:
         status = "ok"
     elif failed == candidate_jobs:

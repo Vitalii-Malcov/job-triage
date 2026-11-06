@@ -433,7 +433,7 @@ class Dashboard:
     tiers_all: dict[str, Metric] | None = None
     cache: "CacheOverview | None" = None
     # MISSING / EMPTY: the counts above are the Stage 20 live scan, and the
-    # dashboard tells the operator how to fill the cache (Codex audit).
+    # dashboard tells the operator how to fill the cache.
     cache_status: fit_cache.CacheStatus = "IN_USE"
 
 

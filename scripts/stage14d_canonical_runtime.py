@@ -61,7 +61,7 @@ def _resolve(raw: str) -> Path:
 def _start_server(port: int) -> None:  # pragma: no cover - exercised manually
     import uvicorn
 
-    uvicorn.run("app.main:app", host="127.0.0.1", port=port)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port, workers=1)
 
 
 def main(argv: list[str] | None = None, *, start_server=_start_server) -> int:

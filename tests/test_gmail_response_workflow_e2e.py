@@ -100,6 +100,7 @@ def _message(
 ) -> GmailMessageRecord:
     outbound = direction == "OUTBOUND"
     parsed = ParsedGmailMessage(
+        sender_auth="DMARC_ALIGNED",
         account_key=ACCOUNT,
         mailbox=mailbox or ("[Gmail]/Sent Mail" if outbound else "INBOX"),
         uid=uid,

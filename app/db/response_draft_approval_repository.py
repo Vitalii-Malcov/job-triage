@@ -16,7 +16,7 @@ in this project:**
   (`begin_transmission` also on `send_attempted`), checking
   `rowcount == 1`, exactly like `app.db.review_package_repository`'s
   `ApplicationPackageReviewRecord` status transitions.
-- `begin_transmission` (HARD-008, Codex master review) — a second CAS,
+- `begin_transmission` — a second CAS,
   `send_attempted: False -> True`, exactly mirroring
   `app.db.follow_up_approval_repository.begin_transmission`. This is the
   actual exclusivity gate for calling the outbound provider — see
@@ -100,6 +100,7 @@ def create_approval(
     decision_note: str | None,
     pinned_subject: str,
     pinned_body: str,
+    pinned_recipient: str = "",
 ) -> tuple[ResponseDraftApprovalRecord, bool]:
     """Insert-only decision write. Returns `(record, created)` —
     `created=False` means a decision ALREADY existed for this
@@ -123,6 +124,7 @@ def create_approval(
         decision_note=decision_note,
         pinned_subject=pinned_subject,
         pinned_body=pinned_body,
+        pinned_recipient=pinned_recipient,
     )
     db.add(record)
     try:
@@ -269,7 +271,7 @@ def retry_send_attempt(db: Session, record: ResponseDraftSendRecord) -> bool:
 
 
 def begin_transmission(db: Session, record: ResponseDraftSendRecord) -> bool:
-    """HARD-008 (Codex master review): the SOLE exclusivity gate for "who
+    """the SOLE exclusivity gate for "who
     gets to actually call `OutboundEmailProvider.send`" — a CAS
     `send_attempted: False -> True`, guarded by `WHERE status='PENDING'
     AND send_attempted=False`. Exactly one concurrent request can ever
@@ -408,7 +410,7 @@ def list_pending_response_drafts(
     newest first, bounded by `limit`/`offset`. Pure, account-scoped SELECT
     -- never generates, decides or sends anything.
 
-    S12-001 (Codex review): the representative is the message's CURRENT
+    the representative is the message's CURRENT
     revision whenever one exists -- the same identity
     `app.services.response_draft.is_current_response_draft_revision` uses
     (latest analysis by (`analysis_version`, `id`), plus the caller-supplied
@@ -493,6 +495,7 @@ def to_response_draft_approval(record: ResponseDraftApprovalRecord) -> ResponseD
         decision_note=record.decision_note,
         pinned_subject=record.pinned_subject,
         pinned_body=record.pinned_body,
+        pinned_recipient=record.pinned_recipient,
         decided_at=record.decided_at,
     )
 

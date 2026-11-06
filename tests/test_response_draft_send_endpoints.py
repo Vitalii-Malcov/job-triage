@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -89,6 +89,7 @@ def _parsed(
         body_truncated=False,
         has_html=False,
         attachments=(),
+        sender_auth="DMARC_ALIGNED",
     )
     data.update(overrides)
     return ParsedGmailMessage(**data)
@@ -125,7 +126,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
     rate_limit_module._response_draft_requests.clear()
@@ -133,7 +134,9 @@ def client(tmp_path, monkeypatch):
     rate_limit_module._response_draft_send_requests.clear()
 
     fake_provider = FakeOutboundProvider()
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", lambda **_kwargs: fake_provider)
+    monkeypatch.setattr(
+        "app.api.routers.response_drafts.GmailSmtpProvider", lambda **_kwargs: fake_provider
+    )
 
     with TestClient(app) as test_client:
         yield test_client, session_factory, fake_provider
@@ -160,6 +163,7 @@ def _seed_job_and_message(
     job_source: str = "bundesagentur",
     job_title: str = "Backend Engineer",
     job_company: str = "Globex",
+    sender_auth: str = "DMARC_ALIGNED",
 ):
     db = session_factory()
     try:
@@ -184,6 +188,7 @@ def _seed_job_and_message(
                 account_key=account_key,
                 body_plain=body_plain,
                 from_address=from_address,
+                sender_auth=sender_auth,
             ),
         )
         db.commit()
@@ -513,7 +518,7 @@ class TestNoOtherSideEffects:
         def _boom(*args, **kwargs):
             raise RuntimeError(secret_marker)
 
-        monkeypatch.setattr("app.api.routes.send_response_draft", _boom)
+        monkeypatch.setattr("app.api.routers.response_drafts.send_response_draft", _boom)
 
         response = _send(test_client, draft_id)
         assert response.status_code == 500
@@ -554,7 +559,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
     assert fake_settings.outbound_sending_enabled is False
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._gmail_analysis_requests.clear()
     rate_limit_module._response_draft_requests.clear()
@@ -568,7 +573,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
             "this point"
         )
 
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _fail_if_constructed)
+    monkeypatch.setattr("app.api.routers.response_drafts.GmailSmtpProvider", _fail_if_constructed)
 
     with TestClient(app) as test_client:
         yield test_client, session_factory
@@ -635,3 +640,60 @@ class TestOutboundKillSwitchOverHttp:
 
         assert response.status_code == 503
         assert response.json()["detail"] == "Outbound sending is disabled"
+
+
+class TestSenderAuthentication:
+    """Task 21: a forgeable From address is never replied to by this system."""
+
+    @pytest.mark.parametrize("sender_auth", ["UNVERIFIED", "FAILED"])
+    def test_approval_is_refused_and_nothing_is_written(self, client, sender_auth):
+        test_client, session_factory, provider = client
+        draft_id = _seed_and_generate(session_factory, test_client, sender_auth=sender_auth)
+        response = _decide(test_client, draft_id)
+        assert response.status_code == 409
+        assert "not authenticated" in response.json()["detail"]
+        assert _state(test_client, draft_id).json()["approval"] is None
+        assert provider.call_count == 0
+
+    def test_a_rejection_is_still_allowed_for_an_unverified_sender(self, client):
+        test_client, session_factory, _provider = client
+        draft_id = _seed_and_generate(session_factory, test_client, sender_auth="UNVERIFIED")
+        assert _decide(test_client, draft_id, decision="REJECTED").status_code == 200
+
+    def test_state_shows_the_status_and_a_visible_warning(self, client):
+        test_client, session_factory, _provider = client
+        draft_id = _seed_and_generate(session_factory, test_client, sender_auth="UNVERIFIED")
+        body = _state(test_client, draft_id).json()
+        assert body["sender_authentication"] == "UNVERIFIED"
+        assert "NOT authenticated" in body["sender_warning"]
+
+    def test_verified_sender_state_says_it_proves_the_domain_only(self, client):
+        test_client, session_factory, _provider = client
+        draft_id = _seed_and_generate(session_factory, test_client)
+        body = _state(test_client, draft_id).json()
+        assert body["sender_authentication"] == "DMARC_ALIGNED"
+        assert "not who" in body["sender_warning"]
+
+    def test_an_approval_cannot_be_sent_when_the_stored_evidence_is_gone(self, client):
+        """Legacy/defence in depth: the message row says NULL at send time -> refused,
+        provider never called."""
+        test_client, session_factory, provider = client
+        draft_id = _seed_and_generate(session_factory, test_client)
+        assert _decide(test_client, draft_id).status_code == 200
+        with session_factory() as db:
+            db.execute(text("UPDATE gmail_messages SET sender_auth = NULL"))
+            db.commit()
+        response = _send(test_client, draft_id)
+        assert response.status_code == 409
+        assert "not authenticated" in response.json()["detail"]
+        assert provider.call_count == 0
+
+    def test_recipient_pin_is_still_enforced_for_a_verified_sender(self, client):
+        test_client, session_factory, provider = client
+        draft_id = _seed_and_generate(session_factory, test_client)
+        assert _decide(test_client, draft_id).status_code == 200
+        with session_factory() as db:
+            db.execute(text("UPDATE gmail_messages SET from_address = 'other@acme.example.com'"))
+            db.commit()
+        assert _send(test_client, draft_id).status_code == 409
+        assert provider.call_count == 0

@@ -55,7 +55,7 @@ def _new_callback_token() -> str:
 
 
 def _new_claim_token() -> str:
-    # 128 random bits per claim (Codex S9A-CODEX-004): an identity that does
+    # 128 random bits per claim: an identity that does
     # not repeat across release/reclaim cycles, processes or restarts, so a
     # stale claim's token can never become valid again.
     return secrets.token_urlsafe(16)
@@ -193,7 +193,7 @@ def claim_for_sending(
     can never interleave between "queued" and "claimed".
 
     Returns the winner's fresh `claim_token`, or None if the claim was lost.
-    The token is this claim's identity (Codex S9A-CODEX-004): every
+    The token is this claim's identity: every
     transition out of `SENDING` must present it in its UPDATE's WHERE
     clause, and every such transition clears it. A stale caller holding an
     older claim's token can therefore never resolve or release a newer

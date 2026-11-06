@@ -623,7 +623,7 @@ def test_unrelated_integrity_error_is_reraised_even_with_matching_fingerprint_wi
         def __str__(self) -> str:
             return "NOT NULL constraint failed: jobs.company"
 
-    def _fake_finalize_job_write(_db, _record):
+    def _fake_finalize_job_write(_db, _record, *_args, **_kwargs):
         raise IntegrityError("INSERT INTO jobs ...", {}, _UnrelatedOrig())
 
     monkeypatch.setattr(repositories_module, "_finalize_job_write", _fake_finalize_job_write)

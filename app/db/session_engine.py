@@ -4,7 +4,7 @@ Kept free of import-time side effects (unlike app/db/session.py, which builds
 the application engine from settings on import) so CLIs and tests can apply
 the same rules to their own engines.
 
-**SQLite foreign keys (Codex S15 P2).** SQLite ignores FOREIGN KEY clauses,
+**SQLite foreign keys.** SQLite ignores FOREIGN KEY clauses,
 including ON DELETE RESTRICT/CASCADE, unless every connection runs
 `PRAGMA foreign_keys = ON`. Without it an `applications` row could be
 deleted while its `application_events` survive as orphans -- PostgreSQL

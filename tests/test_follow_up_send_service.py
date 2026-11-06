@@ -475,20 +475,62 @@ class TestNoOtherSideEffects:
         refreshed = db.get(JobRecord, job.id)
         assert refreshed.status == "APPLIED"
 
-    def test_no_telegram_or_url_fetch_imports_in_send_module(self):
-        import inspect
-
+    def test_no_telegram_or_url_fetch_imports_in_send_module(self, imported_modules):
         import app.services.follow_up_send as module
 
-        source = inspect.getsource(module)
-        for forbidden in (
-            "TelegramNotifier",
-            "requests.",
-            "httpx.",
-            "urllib.request",
-            "urlopen(",
-        ):
-            assert forbidden not in source
+        imported = imported_modules(module)
+        for forbidden in ("requests", "httpx", "aiohttp", "urllib.request", "http.client"):
+            assert forbidden not in imported
+        assert "app.services.telegram" not in imported  # no notifier either
+        assert not hasattr(module, "TelegramNotifier")
+
+    def test_a_full_send_makes_no_network_connection(self, db, monkeypatch):
+        """Behaviour, not text: every socket connect and every httpx send is REFUSED and RECORDED
+        (a broad `except Exception` in the code under test could swallow the refusal, so the
+        recorded attempts are asserted afterwards), and the approve -> send flow (fake provider)
+        still completes."""
+        import socket
+
+        import httpx
+
+        attempts: list[str] = []
+
+        def refuse(name):
+            def _refuse(*args, **kwargs):
+                attempts.append(name)
+                raise AssertionError(f"the follow-up send flow used the network: {name}")
+
+            return _refuse
+
+        monkeypatch.setattr(socket.socket, "connect", refuse("socket.connect"))
+        monkeypatch.setattr(httpx.Client, "send", refuse("httpx.Client.send"))
+        monkeypatch.setattr(httpx.AsyncClient, "send", refuse("httpx.AsyncClient.send"))
+        proposal, _outbound, _approval = _seed_and_approve(db)
+        provider = FakeOutboundProvider()
+
+        record = send_follow_up(db, ACCOUNT, proposal.id, provider)
+
+        assert attempts == []
+        assert record.status == "SENT" and provider.call_count == 1
+
+    def test_the_network_guard_records_an_attempt_even_inside_a_swallowing_handler(
+        self, monkeypatch
+    ):
+        """Meta-test: a helper wrapping its HTTP call in `except Exception` still leaves a trace."""
+        import httpx
+
+        attempts: list[str] = []
+
+        def refuse(*args, **kwargs):
+            attempts.append("httpx.Client.send")
+            raise AssertionError("network")
+
+        monkeypatch.setattr(httpx.Client, "send", refuse)
+        try:
+            httpx.Client().send(httpx.Request("GET", "http://example.invalid/"))
+        except Exception:  # noqa: BLE001 - the swallowing handler this meta-test is about
+            pass
+        assert attempts == ["httpx.Client.send"]
 
 
 class TestSendTimeRevalidation:
@@ -1218,7 +1260,9 @@ class TestLeaseRenewalHeartbeat:
             release_renewal.set()
             heartbeat.stop()
 
-    def test_renewal_reports_ownership_lost_when_lease_expires_with_nobody_else_acquiring(self, db):
+    def test_renewal_reports_ownership_lost_when_lease_expires_with_nobody_else_acquiring(
+        self, db, monkeypatch
+    ):
         """S7E-016 (Codex re-review, correctness fix): the heartbeat's
         renewal must fail the instant the lease has expired -- even when
         NO OTHER writer ever touched the lock. Before this fix, the
@@ -1230,7 +1274,32 @@ class TestLeaseRenewalHeartbeat:
         `renew_thread_lock` CAS instead correctly reports the gap, and
         the send result becomes UNCERTAIN, never SENT.
         """
+        import app.services.follow_up_send as send_module
+
         proposal, _outbound, _approval = _seed_and_approve(db)
+
+        # Deterministic, no timing race. The heartbeat's FIRST renewal is held back until the
+        # provider has entered send() (a slow dispatch/revalidation can no longer make it declare
+        # the lock lost before the send starts); it then waits past the 0.05 s TTL and runs the
+        # real renewal logic, which finds the lease expired with nobody else having touched it.
+        # The provider keeps the send open until the heartbeat itself reports the lock lost.
+        provider_entered = threading.Event()
+        heartbeats = []
+
+        class GatedHeartbeat(send_module._ThreadLockHeartbeat):
+            def __init__(self, db, thread_id, *, holder, ttl_seconds, interval_seconds):
+                super().__init__(
+                    db, thread_id, holder=holder, ttl_seconds=ttl_seconds, interval_seconds=0.01
+                )
+                heartbeats.append(self)
+
+            def _run(self):
+                if not provider_entered.wait(timeout=30.0):
+                    return
+                time.sleep(0.2)  # strictly longer than the TTL: the lease is expired
+                super()._run()
+
+        monkeypatch.setattr(send_module, "_ThreadLockHeartbeat", GatedHeartbeat)
 
         class SlowProvider:
             def __init__(self):
@@ -1238,12 +1307,10 @@ class TestLeaseRenewalHeartbeat:
 
             def send(self, message):
                 self.call_count += 1
-                # Sleeps well past BOTH the tiny TTL and the
-                # (deliberately even longer) heartbeat interval below, so
-                # the heartbeat's first renewal attempt fires only AFTER
-                # the lease has already, genuinely expired -- with nobody
-                # else ever attempting to touch the lock in the meantime.
-                time.sleep(0.4)
+                provider_entered.set()
+                assert heartbeats and heartbeats[0].lock_lost.wait(timeout=30.0), (
+                    "the heartbeat never reported the expired lease"
+                )
                 return OutboundSendResult(provider_message_id="msg-1")
 
         provider = SlowProvider()

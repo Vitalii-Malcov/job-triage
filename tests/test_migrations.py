@@ -50,6 +50,7 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "last_seen_at",
         "posting_type",  # Stage 10 (b2c5d8e4f7a1, "add jobs.posting_type")
         "source_reference",  # Stage 22 P0-1 (d5f1a7c3e9b2)
+        "identity_key",  # Task 20 (b4c7e9a1d3f5)
         # Stage 22 P1 structured facts (e3b7c9d1f4a6)
         "workplace_lat",
         "workplace_lon",
@@ -915,6 +916,7 @@ def test_gmail_inbox_migration_creates_tables_and_indexes(tmp_path: Path) -> Non
         "in_reply_to",
         "references_json",
         "from_address",
+        "sender_auth",  # Task 21 (c5d8f1a3b7e2)
         "from_display_name",
         "to_addresses_json",
         "cc_addresses_json",
@@ -2175,6 +2177,7 @@ def test_response_draft_approvals_table_shape(tmp_path: Path) -> None:
         "decision_note",
         "pinned_subject",
         "pinned_body",
+        "pinned_recipient",
         "decided_at",
     }
 
@@ -2851,6 +2854,9 @@ def test_automation_processed_at_migration_never_infers_completion_from_old_wate
 
     from app.db.gmail_repository import list_unprocessed_messages_for_automation
 
+    # The ORM model describes the CURRENT schema (later migrations added columns such as
+    # `sender_auth`), so the selector is exercised on the fully migrated database.
+    upgrade(cfg, "head")
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     session = session_factory()
     try:
@@ -3227,16 +3233,161 @@ def test_response_draft_sends_send_attempted_defaults_false_for_rows_created_aft
     assert value in (False, 0)
 
 
+def test_pinned_recipient_migration_round_trip_keeps_rows_and_never_backfills(
+    tmp_path: Path,
+) -> None:
+    """Review 1.3: upgrade adds `pinned_recipient` with '' for existing
+    approvals (never reconstructed -> such approvals stay unsendable),
+    downgrade drops the column without losing approval/send rows, and
+    re-upgrade restores '' (a dropped pin is never silently re-derived)."""
+    db_path = tmp_path / "migrations_pinned_recipient.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "e3b7c9d1f4a6")
+    engine = create_engine(f"sqlite:///{db_path}")
+    assert "pinned_recipient" not in {
+        c["name"] for c in inspect(engine).get_columns("response_draft_approvals")
+    }
+    with engine.begin() as connection:
+        _insert_response_draft_approval(connection, response_draft_id=7)
+        _insert_response_draft_send(connection, response_draft_id=7, approval_id=1, status="SENT")
+
+    upgrade(cfg, "head")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT id, decision, pinned_subject, pinned_recipient "
+                "FROM response_draft_approvals"
+            )
+        ).one()
+    assert (row.id, row.decision, row.pinned_subject, row.pinned_recipient) == (
+        1,
+        "APPROVED",
+        "Re: Test",
+        "",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE response_draft_approvals SET pinned_recipient = 'x@y.example'")
+        )
+
+    with engine.connect() as connection:
+        fk_before = sorted(map(tuple, connection.execute(text("PRAGMA foreign_key_check")).all()))
+    downgrade(cfg, "e3b7c9d1f4a6")
+    inspector = inspect(engine)
+    assert "pinned_recipient" not in {
+        c["name"] for c in inspector.get_columns("response_draft_approvals")
+    }
+    assert any(
+        uc["column_names"] == ["response_draft_id"]
+        for uc in inspector.get_unique_constraints("response_draft_approvals")
+    )
+    with engine.connect() as connection:
+        assert (
+            connection.execute(text("SELECT COUNT(*) FROM response_draft_approvals")).scalar() == 1
+        )
+        assert (
+            connection.execute(text("SELECT status FROM response_draft_sends")).scalar() == "SENT"
+        )
+        # the seed rows are orphans by design; the rebuild must not change that
+        after = sorted(map(tuple, connection.execute(text("PRAGMA foreign_key_check")).all()))
+        assert after == fk_before
+
+    upgrade(cfg, "head")
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT pinned_recipient FROM response_draft_approvals")
+            ).scalar()
+            == ""
+        )
+
+
 def test_alembic_has_exactly_one_head() -> None:
-    cfg = _alembic_config(Path("unused-for-this-check.db"))
-    heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert len(heads) == 1
-    # Stage 16: Telegram operator control tables (e3a9c5d7f2b4, on top of
-    # the Stage 15 remediation c8e4a2f6d1b9), then OUTBOUND_MESSAGE application
-    # events (f4b8d2a6c9e1), then the Stage 17 candidate search configuration
-    # (a9d3f6b2c4e8), then search targets + car-route origin (b6c1e9a4d2f7),
-    # then the Stage 21 vacancy assessment cache (c7e2a9d4f1b3), then
-    # Stage 22 P0-1 jobs.source_reference (d5f1a7c3e9b2), then Stage 22 P1
-    # structured job facts (e3b7c9d1f4a6)
-    # -- update this alongside every new migration's own down_revision chaining.
-    assert heads[0] == "e3b7c9d1f4a6"
+    """A single head and a linear history (no branches) -- the head's id is deliberately NOT pinned
+    here: every new migration would have to edit this test."""
+    script = ScriptDirectory.from_config(_alembic_config(Path("unused-for-this-check.db")))
+    assert len(script.get_heads()) == 1
+    branched = [r.revision for r in script.walk_revisions() if len(r.nextrev) > 1]
+    assert branched == []
+
+
+def test_identity_key_migration_keeps_existing_jobs_and_downgrades_cleanly(tmp_path: Path) -> None:
+    """Task 20 (b4c7e9a1d3f5): additive nullable column, nothing back-filled or rewritten."""
+    db_path = tmp_path / "migrations_identity_key.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "a2b7d4f9c1e3")
+    engine = create_engine(f"sqlite:///{db_path}")
+    insert = text(
+        """
+        INSERT INTO jobs (
+            fingerprint, source, title, company, location, url, description,
+            skills_json, score, recommendation, status, first_seen_at, last_seen_at
+        ) VALUES (
+            :fp, 'xing', 'Sachbearbeiter', 'Example GmbH', 'Leipzig',
+            'https://www.xing.com/m/x', :description, '[]', 60, 'MAYBE', 'APPLIED',
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(insert, {"fp": "legacy-fp", "description": "Gehalt: 50.000"})
+
+    upgrade(cfg, "b4c7e9a1d3f5")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT identity_key, status, score, description FROM jobs")
+        ).one()
+        assert tuple(row) == (None, "APPLIED", 60, "Gehalt: 50.000")
+    assert "ix_jobs_identity_key" in {ix["name"] for ix in inspect(engine).get_indexes("jobs")}
+
+    # a sibling row makes the downgrade refuse BEFORE any DDL (it would be stranded)
+    with engine.begin() as connection:
+        connection.execute(insert, {"fp": "sibling-fp", "description": "Gehalt: 90.000"})
+        connection.execute(
+            text("UPDATE jobs SET identity_key = 'legacy-fp' WHERE fingerprint = 'sibling-fp'")
+        )
+    with pytest.raises(RuntimeError, match="sibling rows"):
+        downgrade(cfg, "a2b7d4f9c1e3")
+    assert "identity_key" in {col["name"] for col in inspect(engine).get_columns("jobs")}
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM jobs WHERE fingerprint = 'sibling-fp'"))
+        # a base row created after the migration (identity_key == fingerprint) is harmless
+        connection.execute(text("UPDATE jobs SET identity_key = fingerprint"))
+
+    downgrade(cfg, "a2b7d4f9c1e3")
+    columns = {col["name"] for col in inspect(engine).get_columns("jobs")}
+    assert "identity_key" not in columns
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*), min(status) FROM jobs")).one() == (
+            1,
+            "APPLIED",
+        )
+    upgrade(cfg, "head")
+
+
+def test_sender_auth_migration_keeps_messages_unverified_and_checks_values(tmp_path: Path) -> None:
+    """Task 21 (c5d8f1a3b7e2): additive nullable column; legacy rows stay NULL (unverified)."""
+    db_path = tmp_path / "migrations_sender_auth.db"
+    cfg = _alembic_config(db_path)
+    upgrade(cfg, "b4c7e9a1d3f5")
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        _insert_gmail_thread(connection, thread_key="<root@example.com>")
+        _insert_gmail_message(connection, uid=1)
+
+    upgrade(cfg, "c5d8f1a3b7e2")
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT sender_auth FROM gmail_messages")).scalar() is None
+        _insert_gmail_message(connection, uid=2)
+        connection.execute(
+            text("UPDATE gmail_messages SET sender_auth = 'DMARC_ALIGNED' WHERE uid = 2")
+        )
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE gmail_messages SET sender_auth = 'TRUSTED'"))
+
+    downgrade(cfg, "b4c7e9a1d3f5")
+    assert "sender_auth" not in {c["name"] for c in inspect(engine).get_columns("gmail_messages")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM gmail_messages")).scalar() == 2
+    upgrade(cfg, "head")

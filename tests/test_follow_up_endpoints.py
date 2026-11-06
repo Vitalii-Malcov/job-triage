@@ -72,14 +72,16 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._follow_up_evaluate_requests.clear()
     rate_limit_module._follow_up_decision_requests.clear()
     rate_limit_module._follow_up_send_requests.clear()
 
     fake_provider = FakeOutboundProvider()
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", lambda **_kwargs: fake_provider)
+    monkeypatch.setattr(
+        "app.api.routers.follow_ups.GmailSmtpProvider", lambda **_kwargs: fake_provider
+    )
 
     with TestClient(app) as test_client:
         yield test_client, session_factory, fake_provider
@@ -379,7 +381,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
     assert fake_settings.outbound_sending_enabled is False
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._follow_up_evaluate_requests.clear()
     rate_limit_module._follow_up_decision_requests.clear()
@@ -392,7 +394,7 @@ def disabled_outbound_client(tmp_path, monkeypatch):
             "this point"
         )
 
-    monkeypatch.setattr("app.api.routes.GmailSmtpProvider", _fail_if_constructed)
+    monkeypatch.setattr("app.api.routers.follow_ups.GmailSmtpProvider", _fail_if_constructed)
 
     with TestClient(app) as test_client:
         yield test_client, session_factory

@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
+from app.core.config import reveal
 from app.db.automation_schedule_repository import (
     claim_due_schedule,
     get_or_create_schedule,
@@ -106,7 +107,7 @@ def validate_scheduler_settings(settings) -> None:
                 "telegram_daily_digest_enabled=True requires a non-blank "
                 "automation_scheduler_account_key (AUTOMATION_SCHEDULER_ACCOUNT_KEY)."
             )
-        if not settings.telegram_bot_token.strip() or not settings.telegram_chat_id.strip():
+        if not reveal(settings.telegram_bot_token).strip() or not settings.telegram_chat_id.strip():
             raise SchedulerConfigurationError(
                 "telegram_daily_digest_enabled=True requires TELEGRAM_BOT_TOKEN and "
                 "TELEGRAM_CHAT_ID to be configured."
@@ -142,7 +143,7 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
     if claimed is None:
         return False
 
-    # Codex gate follow-up (Astra R4B, AUD-010 LOW): none of this
+    # none of this
     # function's own logging below includes `account_key` -- it is a
     # normalized email address (see `AutomationScheduleRecord`'s own
     # docstring: "the same normalized identity `AutomationRunRecord.
@@ -177,7 +178,7 @@ async def run_due_cycle_if_claimed(db: Session, *, account_key: str, settings) -
         # loop, and never log/persist the raw exception text or a
         # traceback (only its type), mirroring
         # app.services.automation._run_step's identical sanitized-logging
-        # convention (S8A-004).
+        # convention.
         db.rollback()
         logger.warning(
             "automation_scheduler_unexpected_error schedule_id=%s error_type=%s",
@@ -300,7 +301,7 @@ async def run_due_digest_if_claimed(
     try:
         text = build_digest_text(db, account_key)
         outcome = await send_telegram_text(
-            settings.telegram_bot_token,
+            reveal(settings.telegram_bot_token),
             settings.telegram_chat_id,
             text,
             timeout_seconds=settings.telegram_timeout_seconds,
@@ -313,7 +314,7 @@ async def run_due_digest_if_claimed(
         # so this is recorded UNCERTAIN, never FAILED -- never
         # automatically retried, to avoid risking a duplicate send.
         db.rollback()
-        # S8E-PRIVACY-001 (Codex finding): account_key (a normalized
+        # account_key (a normalized
         # email address) must never be logged -- delivery_id +
         # digest_date are enough to locate the row without it.
         logger.warning(
@@ -323,7 +324,7 @@ async def run_due_digest_if_claimed(
             type(exc).__name__,
         )
         if not mark_uncertain(db, record, last_error=type(exc).__name__):
-            # CAS TRUTHFULNESS (Codex Stage 8E finding): the row was no
+            # CAS TRUTHFULNESS: the row was no
             # longer PENDING by the time we tried to record this --
             # e.g. a concurrent worker's stale-PENDING reconciliation
             # already won first. Never claim a persisted outcome that

@@ -10,9 +10,10 @@ IntegrityError-catch idiom for the initial exclusivity claim.
 
 import json
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,7 +24,7 @@ from app.models.automation import AutomationRun, AutomationRunStepResult
 AUTOMATION_RUN_LIST_DEFAULT_LIMIT = 20
 AUTOMATION_RUN_LIST_MAX_LIMIT = 100
 
-# S8A-002: mirrors app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS's own
+# mirrors app.db.gmail_repository.THREAD_LOCK_TTL_SECONDS's own
 # rationale — bounds how long a crashed holder (a process that died
 # mid-run, or whose heartbeat otherwise stopped) can block new
 # automation runs for that account. A live holder's heartbeat renews
@@ -39,6 +40,12 @@ class AutomationRepositoryConsistencyError(Exception):
     IntegrityError implies must exist comes back None. Mirrors
     app.db.follow_up_repository.FollowUpRepositoryConsistencyError.
     """
+
+
+# Review 2.3: lease holders of MANUAL collector runs start with this prefix.
+# The holder is persisted from the moment the slot is claimed, so a manual row
+# is recognizable while RUNNING, after a crash and after a cancellation alike.
+MANUAL_HOLDER_PREFIX = "manual_collector:"
 
 
 def new_run_lease_holder_token(prefix: str) -> str:
@@ -62,6 +69,35 @@ def get_running_run_for_account(db: Session, account_key: str) -> AutomationRunR
             AutomationRunRecord.status == "RUNNING",
         )
     )
+
+
+def live_conflicting_run(
+    db: Session, account_keys: Sequence[str], *, exclude_run_id: int
+) -> AutomationRunRecord | None:
+    """A RUNNING row with a LIVE lease under any of `account_keys` other than
+    `exclude_run_id`, or None. Callers use it AFTER claiming their own slot (claim, then
+    verify), so two starters can never both proceed unseen.
+
+    A row that merely LOOKS expired is not trusted: its holder's renewal may be committing
+    right now (a plain read can still show the old, expired value). It is reconciled through
+    the conditional `reconcile_stale_run_to_failed` CAS; when that CAS loses (the renewal
+    committed first, or someone else reconciled it) the row is re-read and judged again."""
+    rows = db.scalars(
+        select(AutomationRunRecord).where(
+            AutomationRunRecord.account_key.in_(list(account_keys)),
+            AutomationRunRecord.status == "RUNNING",
+            AutomationRunRecord.id != exclude_run_id,
+        )
+    ).all()
+    for row in rows:
+        if not _is_lease_expired(row, datetime.now(UTC)):
+            return row
+        if reconcile_stale_run_to_failed(db, row):
+            continue  # provably dead: reconciled by this call
+        db.refresh(row)
+        if row.status == "RUNNING" and not _is_lease_expired(row, datetime.now(UTC)):
+            return row
+    return None
 
 
 def _is_lease_expired(record: AutomationRunRecord, now: datetime) -> bool:
@@ -95,7 +131,7 @@ def _insert_running_run(
 
 
 def reconcile_stale_run_to_failed(db: Session, record: AutomationRunRecord) -> bool:
-    """S8A-002: CAS `RUNNING -> FAILED` for a run whose lease has
+    """CAS `RUNNING -> FAILED` for a run whose lease has
     EXPIRED — the crash-recovery counterpart to Stage 7E's expired-lock
     reclaim, except here the reclaim itself is an explicit, auditable
     state transition (a stale RUNNING row becomes a terminal FAILED one
@@ -147,7 +183,7 @@ def create_running_run(
     app.services.automation.run_automation_cycle, raises
     `AutomationRunAlreadyInProgressError` in that case).
 
-    S8A-002 (Codex re-review, crash recovery): if the existing RUNNING
+    if the existing RUNNING
     row's lease has EXPIRED (its holder crashed or otherwise stopped
     renewing), this atomically reconciles it to `FAILED`
     (`reconcile_stale_run_to_failed`) and retries the insert — a crashed
@@ -203,7 +239,7 @@ def renew_run_lease(
     holder: str,
     ttl_seconds: float = AUTOMATION_RUN_LEASE_TTL_SECONDS,
 ) -> bool:
-    """S8A-002 (Codex re-review): the DEDICATED CAS a lease-renewal
+    """the DEDICATED CAS a lease-renewal
     heartbeat (`app.services.automation._RunLeaseHeartbeat`) must use —
     mirrors app.db.gmail_repository.renew_thread_lock EXACTLY, including
     why it is NOT interchangeable with `create_running_run`'s claim path:
@@ -216,8 +252,14 @@ def renew_run_lease(
     — it fails the instant the lease has expired, even if no one else
     has claimed it yet. Returns True only if exactly one row was
     updated.
+
+    **Monotonic:** a renewal never SHORTENS the expiry (`max(current, now + ttl)`). A
+    heartbeat renewal that is still in flight when the run is interrupted may commit after
+    the deliberate cancellation/shutdown extension (and a bounded `join` cannot guarantee
+    it has finished); it must not be able to undo that extension.
     """
     now = datetime.now(UTC)
+    proposed = now + timedelta(seconds=ttl_seconds)
     result = db.execute(
         update(AutomationRunRecord)
         .where(
@@ -226,7 +268,15 @@ def renew_run_lease(
             AutomationRunRecord.status == "RUNNING",
             AutomationRunRecord.lease_expires_at >= now,
         )
-        .values(lease_expires_at=now + timedelta(seconds=ttl_seconds))
+        .values(
+            lease_expires_at=case(
+                (
+                    AutomationRunRecord.lease_expires_at > proposed,
+                    AutomationRunRecord.lease_expires_at,
+                ),
+                else_=proposed,
+            )
+        )
         .execution_options(synchronize_session=False)
     )
     db.commit()
@@ -307,11 +357,19 @@ def list_runs(
     account_key: str,
     limit: int = AUTOMATION_RUN_LIST_DEFAULT_LIMIT,
     offset: int = 0,
+    *,
+    include_manual: bool = True,
 ) -> list[AutomationRunRecord]:
+    stmt = select(AutomationRunRecord).where(AutomationRunRecord.account_key == account_key)
+    if not include_manual:
+        stmt = stmt.where(
+            or_(
+                AutomationRunRecord.lease_holder.is_(None),
+                ~AutomationRunRecord.lease_holder.startswith(MANUAL_HOLDER_PREFIX),
+            )
+        )
     stmt = (
-        select(AutomationRunRecord)
-        .where(AutomationRunRecord.account_key == account_key)
-        .order_by(AutomationRunRecord.started_at.desc(), AutomationRunRecord.id.desc())
+        stmt.order_by(AutomationRunRecord.started_at.desc(), AutomationRunRecord.id.desc())
         .limit(limit)
         .offset(offset)
     )

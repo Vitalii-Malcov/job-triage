@@ -44,11 +44,16 @@ from app.providers.email.imap_mailbox import canonical_mailbox_identity
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 
-pytestmark = pytest.mark.skipif(
-    not TEST_POSTGRES_URL,
-    reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
-    "(GitHub Actions' scheduler-postgres job sets it).",
-)
+# Cycles Alembic down/up on the shared test database (restores head in a `finally`):
+# CI runs these in the second phase, see docs/CI.md.
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_POSTGRES_URL,
+        reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
+        "(GitHub Actions' scheduler-postgres job sets it).",
+    ),
+    pytest.mark.pg_migration_cycle,
+]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRE_FIX_REVISION = "f3b8d2a6c9e1"

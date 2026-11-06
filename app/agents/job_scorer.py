@@ -24,7 +24,7 @@ ALIASES = {
     "ci/cd": "cicd",
     "ci cd": "cicd",
     "github actions": "github-actions",
-    # CSP-002: "REST"/"rest" and "REST API"/"rest-api" are the same
+    # "REST"/"rest" and "REST API"/"rest-api" are the same
     # underlying evidence signal (a RESTful HTTP API skill) -- without
     # this, "REST API" normalized to "rest-api" while bare "REST"
     # normalized to "rest", so the two never matched each other despite
@@ -47,7 +47,7 @@ class JobScorer:
         self.profile_skills = {normalize_skill(skill) for skill in profile_skills}
 
     def score(self, job: Job) -> JobScore:
-        # H1 fix (Astra Stage 12 audit, round 2): `job.skills` is the
+        # H1 fix: `job.skills` is the
         # ingestion UNION of must-have + nice-to-have + any source-provided
         # / unclassified skills (see app.services.collector_runner's
         # `all_skills = set(job.skills) | must | nice`), and

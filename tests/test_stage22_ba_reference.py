@@ -567,3 +567,54 @@ def test_codex_round_5_whitespace_chunks_are_whole(text_, expected):
 def test_codex_round_6_quoted_reply_lines_keep_their_reference(prefix):
     assert extract_ba_references(f"{prefix}{BA}{UNDERSCORE}") == {UNDERSCORE}
     assert extract_ba_references(f"{prefix}Referenznummer: {DOTTED}") == {DOTTED}
+
+
+def test_backfill_apply_is_refused_while_a_collector_run_holds_the_slot(db, db_path, capsys):
+    from app.db.automation_repository import create_running_run
+
+    _catalogue(db)
+    create_running_run(db, account_key="", holder="scheduler:1")
+    db.close()
+    before = _sha(db_path)
+
+    assert backfill_cli.run(["--database", str(db_path), "--apply"]) == 2
+    assert "holds the slot" in capsys.readouterr().err
+    assert _sha(db_path) == before  # nothing written, not even an audit row
+
+
+def test_backfill_checks_the_lease_before_the_write_and_before_the_commit(
+    db, db_path, capsys, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from app.services import collector_exclusion as ce
+
+    _catalogue(db)
+    db.close()
+    state = {"lost": True}
+
+    @contextmanager
+    def fake_hold(_db, _settings, _name):
+        yield ce.SlotHold(lease_lost=lambda: state["lost"])
+
+    monkeypatch.setattr(ce, "hold_collector_slots", fake_hold)
+    before = _sha(db_path)
+
+    # lost before the write: nothing changes
+    assert backfill_cli.run(["--database", str(db_path), "--apply"]) == 3
+    assert "lease was lost" in capsys.readouterr().err and _sha(db_path) == before
+
+    # lost DURING the write (after the updates ran, before the commit): rolled back
+    calls = {"n": 0}
+
+    def lost_second_time():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    @contextmanager
+    def fake_hold_second(_db, _settings, _name):
+        yield ce.SlotHold(lease_lost=lost_second_time)
+
+    monkeypatch.setattr(ce, "hold_collector_slots", fake_hold_second)
+    assert backfill_cli.run(["--database", str(db_path), "--apply"]) == 3
+    assert _sha(db_path) == before  # the transaction was rolled back

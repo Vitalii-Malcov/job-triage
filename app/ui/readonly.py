@@ -1,7 +1,7 @@
 """Stage 20: the read-only database session every /ui page uses.
 
 Read-only is enforced below SQLAlchemy's transaction handling, so neither a
-rollback nor a pooled connection's reuse can undo it (Codex plan review P1):
+rollback nor a pooled connection's reuse can undo it:
 
 - SQLite: `PRAGMA query_only = ON` is executed on the raw DBAPI connection
   when it is opened (a connection setting, not part of a transaction);

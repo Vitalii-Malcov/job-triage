@@ -162,6 +162,11 @@ from app.services.response_draft import (
     current_response_draft_identity,
     is_current_response_draft_revision,
 )
+from app.services.response_draft_recipient import (
+    ReplyRecipientInvalidError,
+    derive_reply_recipient,
+)
+from app.services.sender_authentication import SenderAuth, sender_auth_warning
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +253,31 @@ class ResponseDraftSendOutcomeUncertainError(Exception):
     """
 
 
+class ResponseDraftRecipientNotPinnedError(Exception):
+    """Review 1.3: the APPROVED decision carries no pinned recipient (it was
+    recorded before recipient pinning existed). It is never sendable; a
+    genuinely new draft revision needs its own approval. Mapped to 409."""
+
+
+class ResponseDraftRecipientMismatchError(Exception):
+    """Review 1.3: the recipient derivable now from the stored inbound message
+    differs from the one pinned at approval (or is no longer derivable).
+    Nothing was claimed or sent. Mapped to 409. Carries no address."""
+
+
+class ResponseDraftRecipientDriftError(Exception):
+    """Review 1.3: the decision request's `expected_recipient` is not the
+    recipient the server derives now. Nothing was written. Mapped to 409."""
+
+
+class ResponseDraftSenderNotAuthenticatedError(Exception):
+    """Task 21: the inbound message's sender is not DMARC-aligned in the stored
+    Authentication-Results (forged, unverified, legacy or unknown). A reply
+    to a forgeable address is refused (approval AND send), fail closed; the
+    operator answers such a sender manually after verifying it elsewhere.
+    Mapped to 409. Carries no address."""
+
+
 class ResponseDraftSupersededError(Exception):
     """Stage 12: the draft is no longer the CURRENT revision for its
     message (see `app.services.response_draft.is_current_response_draft_revision`)
@@ -267,12 +297,34 @@ def _other_revision_has_live_send(db: Session, account_key: str, draft) -> bool:
     return live is not None and live.response_draft_id != draft.id
 
 
+def _sender_auth_preview(db: Session, account_key: str, gmail_message_id: int) -> str:
+    """Stored sender-authentication status for display; legacy/unknown reads as UNVERIFIED."""
+    message = get_message_by_id(db, account_key, gmail_message_id)
+    value = message.sender_auth if message is not None else None
+    return (
+        value
+        if value in (SenderAuth.DMARC_ALIGNED, SenderAuth.FAILED)
+        else SenderAuth.UNVERIFIED.value
+    )
+
+
+def _preview_reply_recipient(db: Session, account_key: str, gmail_message_id: int) -> str | None:
+    message = get_message_by_id(db, account_key, gmail_message_id)
+    if message is None:
+        return None
+    try:
+        return derive_reply_recipient(message.from_address, account_key=account_key)
+    except ReplyRecipientInvalidError:
+        return None
+
+
 def approve_or_reject_response_draft(
     db: Session,
     account_key: str,
     draft_id: int,
     decision: str,
     note: str | None,
+    expected_recipient: str | None = None,
 ) -> ResponseDraftApprovalRecord:
     """Record one immutable APPROVE/REJECT decision, pinning the exact
     `subject`/`body` of the target draft at decision time. Raises
@@ -311,6 +363,28 @@ def approve_or_reject_response_draft(
                 f"response_draft_id={draft_id!r} is superseded by a newer revision"
             )
 
+    pinned_recipient = ""
+    if decision == "APPROVED":
+        # Review 1.3: pin the recipient the human is approving. Read fresh;
+        # fail closed when it cannot be derived safely.
+        message = get_message_by_id(db, account_key, draft.gmail_message_id)
+        try:
+            pinned_recipient = derive_reply_recipient(
+                message.from_address if message is not None else None, account_key=account_key
+            )
+        except ReplyRecipientInvalidError as exc:
+            raise ResponseDraftMissingRecipientError(
+                f"gmail_message_id={draft.gmail_message_id!r} has no safe reply recipient"
+            ) from exc
+        if message is None or message.sender_auth != SenderAuth.DMARC_ALIGNED:
+            raise ResponseDraftSenderNotAuthenticatedError(
+                f"gmail_message_id={draft.gmail_message_id!r}: sender is not authenticated"
+            )
+        if expected_recipient is not None and expected_recipient != pinned_recipient:
+            raise ResponseDraftRecipientDriftError(
+                f"response_draft_id={draft_id!r}: expected_recipient does not match"
+            )
+
     record, created = create_approval(
         db,
         account_key=account_key,
@@ -320,6 +394,7 @@ def approve_or_reject_response_draft(
         decision_note=note,
         pinned_subject=draft.subject,
         pinned_body=draft.body,
+        pinned_recipient=pinned_recipient,
     )
     if not created:
         raise ResponseDraftAlreadyDecidedError(
@@ -336,15 +411,31 @@ def approve_or_reject_response_draft(
 
 
 def _build_outbound_message(message, approval: ResponseDraftApprovalRecord) -> OutboundMessage:
-    if not message.from_address:
-        raise ResponseDraftMissingRecipientError(
-            f"gmail_message_id={message.id!r} has no from_address on record"
+    """Review 1.3: the recipient is ALWAYS the approval's pinned value, and
+    only after the freshly stored message still derives to exactly it."""
+    if not approval.pinned_recipient:
+        raise ResponseDraftRecipientNotPinnedError(
+            f"response_draft_id={approval.response_draft_id!r} approval has no pinned recipient"
+        )
+    try:
+        fresh = derive_reply_recipient(message.from_address, account_key=approval.account_key)
+    except ReplyRecipientInvalidError as exc:
+        raise ResponseDraftRecipientMismatchError(
+            f"response_draft_id={approval.response_draft_id!r}: recipient no longer derivable"
+        ) from exc
+    if fresh != approval.pinned_recipient:
+        raise ResponseDraftRecipientMismatchError(
+            f"response_draft_id={approval.response_draft_id!r}: recipient changed since approval"
+        )
+    if message.sender_auth != SenderAuth.DMARC_ALIGNED:
+        raise ResponseDraftSenderNotAuthenticatedError(
+            f"response_draft_id={approval.response_draft_id!r}: sender is not authenticated"
         )
     references = tuple(json.loads(message.references_json))
     if message.message_id_header and message.message_id_header not in references:
         references = (*references, message.message_id_header)
     return OutboundMessage(
-        to_address=message.from_address,
+        to_address=approval.pinned_recipient,
         subject=approval.pinned_subject,
         body=approval.pinned_body,
         in_reply_to=message.message_id_header,
@@ -355,7 +446,7 @@ def _build_outbound_message(message, approval: ResponseDraftApprovalRecord) -> O
 def _resolve_existing_send_record(
     db: Session, *, account_key: str, draft, record: ResponseDraftSendRecord
 ) -> ResponseDraftSendRecord:
-    """HARD-008 (Codex master review, crash/CAS recovery): dispatch on an
+    """dispatch on an
     ALREADY-EXISTING `ResponseDraftSendRecord` found by `claim_send_attempt`'s
     losing INSERT. Exact mirror of
     `app.services.follow_up_send._resolve_existing_send_record` — see
@@ -493,18 +584,32 @@ def send_response_draft(
             f"response_draft_id={draft_id!r} has no APPROVED decision on record"
         )
 
+    # Precedence: an already SENT / UNCERTAIN / transmission-attempted send keeps
+    # its specific outcome (and the UNCERTAIN reconciliation) regardless of the
+    # recipient pin -- those paths never call the provider.
+    existing_send = get_send_for_draft(db, account_key, draft.id)
+    if existing_send is not None and (
+        existing_send.status in ("SENT", "UNCERTAIN")
+        or (existing_send.status == "PENDING" and existing_send.send_attempted)
+    ):
+        _resolve_existing_send_record(
+            db, account_key=account_key, draft=draft, record=existing_send
+        )
+
     message = get_message_by_id(db, account_key, draft.gmail_message_id)
     if message is None:
         raise ResponseDraftMissingRecipientError(
             f"gmail_message_id={draft.gmail_message_id!r} could not be resolved"
         )
+    # Re-read the stored header from the database, never a cached ORM copy.
+    db.refresh(message)
     outbound_message = _build_outbound_message(message, approval)
 
     _refuse_if_other_revision_replied(db, account_key=account_key, draft=draft)
 
     send_record = _claim_or_retry_send(db, account_key=account_key, draft=draft, approval=approval)
 
-    # HARD-008: the exclusive gate — only the request that wins this CAS
+    # the exclusive gate — only the request that wins this CAS
     # may call the outbound provider. See module docstring's
     # "Transmission boundary / crash recovery" section.
     won_attempt = begin_transmission(db, send_record)
@@ -593,6 +698,11 @@ def get_response_draft_state(db: Session, account_key: str, draft_id: int) -> Re
     return ResponseDraftState(
         response_draft_id=draft.id,
         gmail_message_id=draft.gmail_message_id,
+        reply_recipient=_preview_reply_recipient(db, account_key, draft.gmail_message_id),
+        sender_authentication=(
+            auth := _sender_auth_preview(db, account_key, draft.gmail_message_id)
+        ),
+        sender_warning=sender_auth_warning(auth),
         draft_status=draft.status,
         is_current_revision=is_current_response_draft_revision(db, account_key, draft),
         approval=to_response_draft_approval(approval) if approval is not None else None,
@@ -620,6 +730,7 @@ def get_pending_response_drafts(
         PendingResponseDraft(
             response_draft_id=draft.id,
             gmail_message_id=draft.gmail_message_id,
+            reply_recipient=_preview_reply_recipient(db, account_key, draft.gmail_message_id),
             analysis_id=draft.analysis_id,
             matched_job_id=draft.matched_job_id,
             match_type=match_type,

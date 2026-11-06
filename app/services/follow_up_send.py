@@ -15,7 +15,7 @@ cannot reach the outbound provider unless every one of these holds:
   with `decision == "APPROVED"`;
 - that approval has not already been consumed by a prior successful send,
   and no OTHER concurrent request currently holds the send claim;
-- S7E-002 (Codex remediation): the proposal is STILL eligible at the
+- the proposal is STILL eligible at the
   instant immediately before transmission — see
   `_revalidate_or_fail_closed` and this module's "Send-time revalidation"
   section below.
@@ -36,7 +36,7 @@ that pinned value, never a live re-read (see `_build_outbound_message`).
 threading headers. Nothing in this module ever parses `body_plain`
 looking for a recipient/instruction.
 
-**Send-time revalidation (S7E-002, Codex remediation).** Winning the send
+**Send-time revalidation.** Winning the send
 claim only proves no other request is CURRENTLY attempting this exact
 proposal — it says nothing about whether the proposal is still valid NOW,
 possibly long after it was approved. Immediately before the outbound
@@ -55,7 +55,7 @@ the pinned one. Any mismatch fails closed
 FAILED (not UNCERTAIN — no transmission was attempted) rather than ever
 silently sending stale/re-targeted content.
 
-**Race safety between revalidation and send (S7E-002/010).** Revalidation
+**Race safety between revalidation and send.** Revalidation
 and the provider call are only ever performed by the request that won
 `begin_transmission` — a CAS `send_attempted: False -> True` that is
 mutually exclusive across concurrent requests for the same proposal (see
@@ -72,7 +72,7 @@ safety fix).** The CAS above is scoped entirely to `follow_up_sends` rows
 — it says nothing about, and is never touched by, `POST /gmail/sync`
 (`app.services.gmail_inbox.GmailInboxService`), which persists new
 `GmailMessageRecord` rows on its own, completely independent
-schedule/connection. An earlier remediation round (S7E-012) tried to
+schedule/connection. An earlier remediation round tried to
 close this with a second, minimal re-check positioned right before
 `provider.send` — that only NARROWED the window to the gap between that
 read returning and the provider call starting; it could never
@@ -97,7 +97,7 @@ concurrent Gmail sync's INSERT for this thread block (bounded by the
 lock's own TTL, so a crashed holder can never deadlock the mailbox
 forever) until the send releases it, by which point the send has already
 either transmitted or failed closed. `_fail_closed_if_reply_raced_dispatch`
-(S7E-012) is kept as cheap, redundant defense-in-depth inside the guarded
+ is kept as cheap, redundant defense-in-depth inside the guarded
 section — no longer the primary defense.
 
 **Generic, layer-respecting primitive — no job/application logic in
@@ -165,7 +165,7 @@ heartbeat thread dies with it, nothing renews, and the lease simply
 expires on its own schedule — exactly the crash-recovery behavior
 `THREAD_LOCK_TTL_SECONDS` was already designed around.
 
-**Crash/CAS recovery (S7E-010, Codex remediation).** `send_attempted`
+**Crash/CAS recovery.** `send_attempted`
 durably distinguishes "transmission was never attempted for this claim"
 (safe to hand to a later request) from "transmission may already be
 underway" (never blindly retried — see
@@ -295,7 +295,7 @@ class FollowUpMissingRecipientError(Exception):
 
 
 class FollowUpProposalStaleAtSendTimeError(Exception):
-    """S7E-002 (Codex remediation): send-time revalidation found the
+    """send-time revalidation found the
     proposal is no longer eligible — the job's status changed, its Stage
     7B match/thread is no longer decisive or has changed, a newer reply
     arrived, the correspondence anchor is no longer current, or the
@@ -404,7 +404,7 @@ def approve_or_reject_follow_up(
 
 
 def _build_outbound_message(anchor_message, approval: FollowUpApprovalRecord) -> OutboundMessage:
-    """S7E-008: the recipient is ALWAYS the approval's own PINNED value —
+    """the recipient is ALWAYS the approval's own PINNED value —
     never re-derived from `anchor_message` here. See module docstring for
     why (and `_revalidate_or_fail_closed` for the send-time re-check that
     the pinned value still matches a fresh derivation).
@@ -429,7 +429,7 @@ def _build_outbound_message(anchor_message, approval: FollowUpApprovalRecord) ->
 def _resolve_existing_send_record(
     db: Session, *, account_key: str, proposal: FollowUpProposalRecord, record: FollowUpSendRecord
 ) -> FollowUpSendRecord:
-    """S7E-010 (Codex remediation, crash/CAS recovery): dispatch on an
+    """dispatch on an
     ALREADY-EXISTING `FollowUpSendRecord` found by `claim_send_attempt`'s
     losing INSERT. See module docstring's "Crash/CAS recovery" section.
     """
@@ -533,7 +533,7 @@ def _revalidate_or_fail_closed(
     settings: Settings,
     now: datetime,
 ) -> None:
-    """S7E-002 (Codex remediation): the send-time revalidation gate — see
+    """the send-time revalidation gate — see
     module docstring's "Send-time revalidation" section for exactly what
     is re-checked and why. Called ONLY after this request has exclusively
     won `begin_transmission` (no TOCTOU race with another concurrent
@@ -590,7 +590,7 @@ def _fail_closed_if_reply_raced_dispatch(
     proposal: FollowUpProposalRecord,
     send_record: FollowUpSendRecord,
 ) -> None:
-    """S7E-012 (Codex re-review, MEDIUM): the LAST check before
+    """the LAST check before
     `provider.send` — see module docstring's "`begin_transmission` does
     NOT protect against a Gmail sync writer" section for the full
     rationale. Re-reads the thread's current latest-OUTBOUND/latest-
@@ -686,7 +686,7 @@ class _ThreadLockHeartbeat:
             # thread never outlives the guarded section by more than a
             # single wait tick.
             while not self._stop_event.wait(self._interval_seconds):
-                # AUD-003 (Astra R2): a renewal attempt that RAISES (a
+                # a renewal attempt that RAISES (a
                 # transient DB error, a lost connection, anything) is
                 # NOT distinguishable from "ownership lost" for this
                 # heartbeat's purposes -- either way, this thread can no
@@ -698,7 +698,7 @@ class _ThreadLockHeartbeat:
                 # renewal was still happening. Fail closed exactly like
                 # an explicit "not renewed" result below.
                 try:
-                    # S7E-016: `renew_thread_lock`, NEVER
+                    # `renew_thread_lock`, NEVER
                     # `acquire_thread_lock` — see that function's
                     # docstring for exactly why the two are not
                     # interchangeable here. A renewal must fail the
@@ -768,6 +768,71 @@ class _ThreadLockHeartbeat:
             )
 
 
+def _load_send_inputs(
+    db: Session, account_key: str, follow_up_proposal_id: int
+) -> tuple[object, object, object, OutboundMessage]:
+    """Everything a send needs that can be read without side effects, each missing piece
+    failing closed with its own error: the proposal (this account's), its APPROVED decision,
+    the anchor message, and the outbound message built from the approval's pinned values.
+    Returns `(proposal, approval, anchor_message, outbound_message)`."""
+    proposal = get_follow_up_proposal_by_id(db, account_key, follow_up_proposal_id)
+    if proposal is None:
+        raise FollowUpProposalNotFoundError(
+            f"No follow_up_proposals row for account_key={account_key!r} "
+            f"id={follow_up_proposal_id!r}"
+        )
+
+    approval = get_approval_for_proposal(db, account_key, proposal.id)
+    if approval is None or approval.decision != "APPROVED":
+        raise FollowUpNotApprovedError(
+            f"follow_up_proposal_id={follow_up_proposal_id!r} has no APPROVED decision on record"
+        )
+
+    anchor_message = get_message_by_id(db, account_key, proposal.anchor_gmail_message_id)
+    if anchor_message is None:
+        raise FollowUpMissingRecipientError(
+            f"anchor gmail_message_id={proposal.anchor_gmail_message_id!r} could not be resolved"
+        )
+    outbound_message = _build_outbound_message(anchor_message, approval)
+    return proposal, approval, anchor_message, outbound_message
+
+
+def _transmit(
+    db: Session,
+    provider: OutboundEmailProvider,
+    outbound_message: OutboundMessage,
+    send_record,
+    proposal,
+    follow_up_proposal_id: int,
+):
+    """Hand the message to the provider and record a definite failure (FAILED, safe to retry)
+    or an uncertain outcome (UNCERTAIN, terminal) exactly once; returns the provider result
+    on success. The caller marks SENT after its own post-send ownership check."""
+    try:
+        result = provider.send(outbound_message)
+    except EmailSendOutcomeUnknownError as exc:
+        mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
+        logger.warning(
+            "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
+            proposal.id,
+            type(exc).__name__,
+        )
+        raise FollowUpSendOutcomeUncertainError(
+            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
+        ) from exc
+    except EmailSendError as exc:
+        mark_send_failed(db, send_record, last_error=type(exc).__name__)
+        logger.warning(
+            "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
+            proposal.id,
+            type(exc).__name__,
+        )
+        raise FollowUpSendFailedError(
+            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
+        ) from exc
+    return result
+
+
 def send_follow_up(
     db: Session,
     account_key: str,
@@ -799,31 +864,15 @@ def send_follow_up(
     `FollowUpSendInProgressError` / `FollowUpProposalStaleAtSendTimeError`
     / `FollowUpSendFailedError` / `FollowUpSendOutcomeUncertainError`.
     """
-    proposal = get_follow_up_proposal_by_id(db, account_key, follow_up_proposal_id)
-    if proposal is None:
-        raise FollowUpProposalNotFoundError(
-            f"No follow_up_proposals row for account_key={account_key!r} "
-            f"id={follow_up_proposal_id!r}"
-        )
-
-    approval = get_approval_for_proposal(db, account_key, proposal.id)
-    if approval is None or approval.decision != "APPROVED":
-        raise FollowUpNotApprovedError(
-            f"follow_up_proposal_id={follow_up_proposal_id!r} has no APPROVED decision on record"
-        )
-
-    anchor_message = get_message_by_id(db, account_key, proposal.anchor_gmail_message_id)
-    if anchor_message is None:
-        raise FollowUpMissingRecipientError(
-            f"anchor gmail_message_id={proposal.anchor_gmail_message_id!r} could not be resolved"
-        )
-    outbound_message = _build_outbound_message(anchor_message, approval)
+    proposal, approval, anchor_message, outbound_message = _load_send_inputs(
+        db, account_key, follow_up_proposal_id
+    )
 
     send_record = _claim_or_retry_send(
         db, account_key=account_key, proposal=proposal, approval=approval
     )
 
-    # S7E-002/010: the exclusive gate — only the request that wins this
+    # the exclusive gate — only the request that wins this
     # CAS may revalidate/send. See module docstring's "Race safety".
     won_attempt = begin_transmission(db, send_record)
     if not won_attempt:
@@ -832,7 +881,7 @@ def send_follow_up(
             "already in progress"
         )
 
-    # S7E-013 (Codex re-review, final safety fix): acquire the SAME
+    # acquire the SAME
     # generic per-thread guard app.db.gmail_repository.upsert_message
     # holds while persisting a new message — see module docstring's
     # "begin_transmission does NOT protect against a Gmail sync writer"
@@ -861,7 +910,7 @@ def send_follow_up(
             f"{proposal.id!r}; a Gmail sync or another send is currently using it"
         ) from exc
 
-    # S7E-015: renew the lease periodically for as long as the guarded
+    # renew the lease periodically for as long as the guarded
     # section runs — see module docstring's "Lease renewal / heartbeat"
     # section. `heartbeat_interval_seconds` intentionally derives from
     # whatever `lock_ttl_seconds` THIS call actually uses (not the
@@ -895,14 +944,14 @@ def send_follow_up(
             now=now,
         )
 
-        # S7E-012: a cheap, redundant last check kept as defense-in-depth
+        # a cheap, redundant last check kept as defense-in-depth
         # alongside the S7E-013 thread guard above — see module docstring
         # and `_fail_closed_if_reply_raced_dispatch`'s own docstring.
         _fail_closed_if_reply_raced_dispatch(
             db, account_key=account_key, proposal=proposal, send_record=send_record
         )
 
-        # AUD-003 (Astra R2): if the heartbeat already lost the lease
+        # if the heartbeat already lost the lease
         # BEFORE the outbound provider is ever called (e.g. a slow
         # revalidation step above let a renewal tick fail first), the
         # outbound provider must never be invoked at all — calling it
@@ -923,30 +972,11 @@ def send_follow_up(
                 "was ever called; nothing was sent, safe to retry"
             )
 
-        try:
-            result = provider.send(outbound_message)
-        except EmailSendOutcomeUnknownError as exc:
-            mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
-            logger.warning(
-                "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
-                proposal.id,
-                type(exc).__name__,
-            )
-            raise FollowUpSendOutcomeUncertainError(
-                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
-            ) from exc
-        except EmailSendError as exc:
-            mark_send_failed(db, send_record, last_error=type(exc).__name__)
-            logger.warning(
-                "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
-                proposal.id,
-                type(exc).__name__,
-            )
-            raise FollowUpSendFailedError(
-                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
-            ) from exc
+        result = _transmit(
+            db, provider, outbound_message, send_record, proposal, follow_up_proposal_id
+        )
 
-        # S7E-015: the outbound provider reported success, but if the
+        # the outbound provider reported success, but if the
         # heartbeat ever lost ownership of the lease WHILE provider.send
         # was still in flight, exclusivity for this guarded window is no
         # longer provable — a concurrent Gmail sync could have committed

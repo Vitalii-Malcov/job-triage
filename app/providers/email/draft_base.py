@@ -36,7 +36,7 @@ MESSAGE_ID_PATTERN = re.compile(r"<s9d\.[0-9a-f]{32}@ai-job-search\.invalid>")
 
 # Decoded configured Drafts mailbox name bound (code points).
 MAX_DRAFTS_MAILBOX_LENGTH = 200
-# S9D-CONF-001: the quoted modified-UTF-7 wire form is bound-checked against
+# the quoted modified-UTF-7 wire form is bound-checked against
 # the ledger column (String(2048)) BEFORE any claim -- never truncated.
 MAX_DRAFTS_MAILBOX_WIRE_LENGTH = 2048
 
@@ -56,7 +56,7 @@ ALLOWED_HEADERS = frozenset(
 FORBIDDEN_HEADERS = ("To", "Cc", "Bcc", "Reply-To", "In-Reply-To", "References")
 _HEADER_UNSAFE = ("\r", "\n", "\x00")
 
-# S9D-ASTRA-001: the header registry DECODES RFC 2047 encoded-word syntax
+# the header registry DECODES RFC 2047 encoded-word syntax
 # ("=?charset?q|b?...?=") in an unstructured Subject and the folder re-emits
 # that ASCII text verbatim, so a literal approved "=?utf-8?q?X?=" would
 # arrive as "X" (or as a decoded CR/LF/NUL). Such a subject is therefore

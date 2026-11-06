@@ -125,7 +125,7 @@ footer is no longer read as unevaluated required text):
   produced no evaluated requirement becomes a REQUIRED, UNKNOWN entry —
   so unevaluated required text always keeps `required_skill_score` < 100.
 
-**v4 (Codex acceptance review):**
+**v4:**
 
 - Mixed lines: evaluated SKILL spans are removed from a requirement line
   and its material residual is the OTHER requirement ("Kenntnisse in
@@ -141,7 +141,7 @@ footer is no longer read as unevaluated required text):
   requirement is UNKNOWN (or MISSING with no experience at all), never
   MATCH. Year counts must directly modify the experience noun.
 
-**v5 (Codex final review):**
+**v5:**
 
 - Every typed requirement consumes only the span it evaluated: a language
   name + level, a degree's wording/fields/"oder vergleichbar", a duration

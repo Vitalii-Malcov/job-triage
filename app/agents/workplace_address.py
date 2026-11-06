@@ -115,7 +115,7 @@ def address_words(text: str) -> str:
 
 
 # "Bad Homburg" and "Bad Nauheim" are different towns: a generic first word
-# keeps the word after it (Codex round 13). "Frankfurt am Main" stays
+# keeps the word after it. "Frankfurt am Main" stays
 # "frankfurt" so it matches a plain "Frankfurt".
 _CITY_PREFIXES = frozenset(
     {"bad", "sankt", "st", "neu", "alt", "gross", "klein", "ober", "unter", "nieder", "hohen"}
@@ -212,7 +212,7 @@ def stated_workplace_towns(text: str) -> set[str]:
         if town is None:
             town = _LEADING_TOWN.match(rest)
             # a street with its house number ("Hauptstraße 5"), not a town --
-            # but "Heidelberg"/"Bamberg" alone are towns (Codex P1 round 2)
+            # but "Heidelberg"/"Bamberg" alone are towns
             if town is None or re.match(r"\s*\d", rest[town.end() :]):
                 continue
         name = town.group(1)

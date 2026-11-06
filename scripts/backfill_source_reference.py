@@ -157,8 +157,35 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"REFUSED: {exc}; nothing written", file=sys.stderr)
                 return 2
             print(f"snapshot: {copy} (verified)")
-        with Session(engine) as session, session.begin():
-            written = apply(session, result["updates"])
+        from app.core.config import get_settings
+        from app.services.collector_exclusion import (
+            CollectorRunInProgressError,
+            CollectorRunLeaseLostError,
+            hold_collector_slots,
+        )
+
+        # The write holds the same collector slot as every other vacancy writer.
+        try:
+            with Session(engine) as lease_db:
+                with hold_collector_slots(lease_db, get_settings(), "backfill_ref") as hold:
+                    with Session(engine) as session, session.begin():
+                        # Ownership is checked before the write AND before the commit; raising
+                        # inside `session.begin()` rolls the whole transaction back.
+                        if hold.lease_lost():
+                            raise CollectorRunLeaseLostError("lease lost before the write")
+                        written = apply(session, result["updates"])
+                        if hold.lease_lost():
+                            raise CollectorRunLeaseLostError("lease lost during the write")
+                    hold.stats.update(updated=written)
+        except CollectorRunInProgressError:
+            print(
+                "REFUSED: a collector or automation run holds the slot; nothing written",
+                file=sys.stderr,
+            )
+            return 2
+        except CollectorRunLeaseLostError:
+            print("ALERT: the collector-exclusion lease was lost", file=sys.stderr)
+            return 3
         print(f"APPLIED: {written} rows written")
         return 0
     finally:

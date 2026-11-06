@@ -144,7 +144,7 @@ _WEAKER = {
 _VERIFY = {
     ("location", "DISTANCE_UNVERIFIED"),
     ("location", "APPROXIMATE_NEAR_LIMIT"),
-    # Codex review: a workplace can lie further than the margin from the
+    # a workplace can lie further than the margin from the
     # city centre; an approximate PASS is never enough on its own.
     ("location", "PASS_APPROXIMATE"),
     ("location", "UNKNOWN"),
@@ -261,7 +261,7 @@ class FitAssessment:
         if barriers:
             return "NOT_SUITABLE", barriers
         checks = [why(c) for c in self.verifications if (c.name, c.status) not in _TIER_ACCEPTS]
-        # Stage 22 P1 (Codex): a title outside the IT vocabulary is a question
+        # Stage 22 P1: a title outside the IT vocabulary is a question
         # for the operator, never proof of an unrelated role.
         checks += [why(c) for c in self.criteria if (c.name, c.status) == ("role", "NO_IT_SIGNAL")]
         if checks:
@@ -609,7 +609,7 @@ def _same_origin(check: JobCommuteCheckRecord, settings: CandidateSearchSettings
 
 def _route_names_address(measured_to: str, posted: WorkplaceAddress) -> bool:
     """True when the stored route names the posted street, its complete
-    house number and the postcode (Codex rounds 5-6)."""
+    house number and the postcode."""
     street_and_number = address_words(posted.text.split(",", 1)[0])
     pattern = (
         r"(?<![0-9a-zäöü])"
@@ -661,7 +661,7 @@ def location_criterion(
             f"re-check from {origin} (limit {limit} km)",
         )
     if check is not None:
-        # Codex rounds 4-5: the posting may have changed since the route was
+        # the posting may have changed since the route was
         # measured (same job id, new description). A workplace address now in
         # the posting that the stored route does not name (street, number
         # and postcode) makes the route stale.
@@ -671,7 +671,7 @@ def location_criterion(
             job_location=job.location,
         )
         # Only the destination label names the point routed to; the note may
-        # carry an operator's own wording (Codex round 11).
+        # carry an operator's own wording.
         if posted is not None and not _route_names_address(check.destination_label, posted):
             return Criterion(
                 "location",
@@ -975,7 +975,7 @@ def education_criterion(text: str, quereinstieg_suitable: bool | None = None) ->
 
 def _strong_wording(requirement) -> bool:
     """Level, mandatory status and wording all from the ONE German
-    requirement the extractor selected (Codex P1 round 3)."""
+    requirement the extractor selected."""
     return bool(requirement.mandatory and requirement.level in {"C1", "C2"} and requirement.strong)
 
 
@@ -1055,7 +1055,7 @@ def _experience_missing(match: CandidateJobMatch | None) -> bool:
     as MISSING from the profile."""
     if match is None:
         return False
-    # Stage 22 P1 (Codex): only a MANDATORY requirement -- "nice to have:
+    # Stage 22 P1: only a MANDATORY requirement -- "nice to have:
     # 3 years" is PREFERRED and never a barrier.
     return any(
         r.requirement_type == "EXPERIENCE"
@@ -1074,8 +1074,8 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
     settings = config.search if config else CandidateSearchSettings()
     text = f"{job.title}\n{job.location or ''}\n{job.description or ''}"
     profile = get_candidate_profile(session)
-    # Codex Stage 19 review: an analysis of another posting or profile
-    # version is not evidence. Stage 22 P1 (Codex): the analysis of the
+    # an analysis of another posting or profile
+    # version is not evidence. Stage 22 P1: the analysis of the
     # CURRENT identity (posting, profile version, algorithm), not merely the
     # newest row -- after a posting changes A -> B -> A the newest row is B's.
     match_record = (

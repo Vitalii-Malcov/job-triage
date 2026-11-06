@@ -19,20 +19,10 @@ jobs:
       - run: ruff format --check .
       - run: pytest -q
 
-  # Stage 8B (S8B-TEST-001) + AUD-004 (Astra R3): a focused, separate job
-  # -- not the full suite -- that runs ONLY the PostgreSQL-specific
-  # concurrency integration tests against a real PostgreSQL server:
-  # app.db.automation_schedule_repository.claim_due_schedule's CAS UPDATE
-  # holding "at most one winner" on Postgres (the `test` job above
-  # already covers SQLite via tests/test_automation_schedule_repository.py
-  # -- see tests/integration/test_scheduler_postgres_concurrency.py), and
-  # app.services.automation_gmail.prepare_gmail_response_drafts never
-  # permanently skipping a message under PostgreSQL's
-  # sequence-allocation-vs-commit-order semantics (see
-  # tests/integration/test_gmail_watermark_postgres_concurrency.py).
-  # Runs unconditionally in CI (TEST_POSTGRES_URL is always set here);
-  # both test modules skip locally when that variable is unset, since
-  # this project's default dev/test setup is SQLite-only.
+  # Real-PostgreSQL job (details and the phase rule: docs/CI.md). The schema comes from the real
+  # Alembic chain on an empty database -- never Base.metadata.create_all -- and every module in
+  # tests/integration is discovered (no hand-maintained file list). The zero-skip gate makes a
+  # green job mean that the PostgreSQL tests really ran.
   scheduler-postgres:
     runs-on: ubuntu-latest
     services:
@@ -57,25 +47,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev,postgres]"
-      # NEW-007: prove a fresh, real PostgreSQL database can be created
-      # through the actual Alembic migration chain -- not through
-      # Base.metadata.create_all, which would happily create tables even
-      # if the real migration chain is broken. The postgres:16 service
-      # container above starts empty on every job run, so this always
-      # migrates from a genuinely empty database. Runs BEFORE the
-      # integration tests below, which (see
-      # tests/integration/test_scheduler_postgres_concurrency.py and
-      # tests/integration/test_gmail_watermark_postgres_concurrency.py)
-      # no longer call create_all themselves and rely entirely on this
-      # step for schema creation, so a broken migration fails loudly
-      # here instead of being silently papered over.
-      #
-      # S9D-CODEX-002: the expected revision below MUST equal the
-      # repository's single migration-script head --
-      # tests/test_ci_postgres_migration_gate.py compares it against
-      # alembic's ScriptDirectory, so adding a migration fails that test
-      # until this literal is updated. `alembic heads` additionally proves
-      # the script tree still has exactly one head.
+      # The expected head is read from the script tree (exactly one head), never hard-coded.
       - name: Alembic upgrade head against CI PostgreSQL
         shell: bash
         run: |
@@ -83,100 +55,33 @@ jobs:
           python -m alembic upgrade head
           python -m alembic heads | tee /tmp/alembic_heads.txt
           test "$(grep -c '(head)' /tmp/alembic_heads.txt)" -eq 1
+          head_id="$(awk '/\(head\)/ {print $1}' /tmp/alembic_heads.txt)"
           python -m alembic current | tee /tmp/alembic_current.txt
-          grep -q "e3b7c9d1f4a6 (head)" /tmp/alembic_current.txt
+          grep -q "${head_id} (head)" /tmp/alembic_current.txt
         env:
           DATABASE_URL: postgresql+psycopg://scheduler_test:scheduler_test@localhost:5432/scheduler_test
-      # HARD-010 (adversarial hardening r1): claim_send_attempt's
-      # UNIQUE-constraint-backed CAS -- the mechanism preventing a
-      # response-draft email from being sent twice under concurrent
-      # dispatch -- was previously proven only against SQLite. Added to
-      # this same real-PostgreSQL job rather than a new one.
-      #
-      # HARD-007 verification pass: real-PostgreSQL evidence for
-      # upsert_job's concurrent-new-fingerprint race (documented, not
-      # fixed -- reserved for Codex review; see
-      # docs/ADVERSARIAL_HARDENING_REPORT.md HARD-007). HARD-007-RR1
-      # (Codex targeted re-review) added the real-diagnostics tests in
-      # the SAME module (TestFingerprintViolationDetectionAgainstReal
-      # PostgresDiagnostics) proving `_is_fingerprint_unique_violation`
-      # correctly discriminates uq_jobs_fingerprint from an unrelated
-      # real constraint violation using psycopg's own `.diag`.
-      #
-      # S9D-CODEX-002: the Stage 9C approval and Stage 9D Gmail-draft
-      # concurrency modules are REQUIRED PostgreSQL gates (their
-      # architectures reject sequential SQLite as concurrency evidence),
-      # so they run here too -- before HARD-008, at head.
-      #
-      # Codex mailbox-width finding: test_gmail_mailbox_width_postgres.py
-      # also cycles Alembic (down to f3b8d2a6c9e1 and back) and restores
-      # head in a `finally` block, so it runs after the at-head modules.
-      # test_gmail_imap_32bit_identifiers_postgres.py does the same (down to
-      # d2f5a8c1b7e4 and back).
-      #
-      # HARD-008-RR1 (Codex targeted re-review): runs LAST, after the
-      # other PostgreSQL integration tests below -- it drives its
-      # own Alembic downgrade/upgrade cycle against this same database
-      # (down to c7d3f9a1e5b8 and back to head) to prove the legacy-
-      # PENDING backfill fail-closes to UNCERTAIN, and always restores
-      # head in a `finally` block (including on failure). Running it
-      # last means the tests before it -- which all assume the
-      # schema is already at head (see the "Alembic upgrade head" step
-      # above) -- are never affected by its own temporary downgrade.
-      #
-      # Stage 13B: test_candidate_profile_transfer_postgres.py creates and
-      # drops its OWN databases on this server (fresh `alembic upgrade head`
-      # per test), so its position only has to precede HARD-008.
-      #
-      # Stage 15: test_application_lifecycle_postgres.py ends with its own
-      # one-step downgrade/upgrade cycle (restoring head in `finally`), so it
-      # runs after the at-head modules and before HARD-008.
-      #
-      # Stage 16: test_telegram_operator_control_postgres.py and
-      # test_stage16_stage9d_arm_race_postgres.py run at head, before the
-      # Stage 15 module's downgrade/upgrade cycle.
-      #
-      # Stage 17: test_stage17_candidate_config_postgres.py runs at head,
-      # before the Stage 15 module's downgrade/upgrade cycle.
-      #
-      # Every module here skips when TEST_POSTGRES_URL is unset, so the
-      # step refuses to run without it and then fails on ANY skipped test:
-      # a green job must mean every PostgreSQL test actually executed.
+      # Phase 1 runs at head, in any order; phase 2 runs the modules marked `pg_migration_cycle`,
+      # which downgrade/upgrade the shared database and restore head in a `finally`.
       - name: PostgreSQL integration tests (zero skips)
         shell: bash
         run: |
           set -euo pipefail
           test -n "${TEST_POSTGRES_URL:-}"
-          pytest -q -rs --junitxml=/tmp/postgres-junit.xml \
-            tests/integration/test_scheduler_postgres_concurrency.py \
-            tests/integration/test_gmail_watermark_postgres_concurrency.py \
-            tests/integration/test_response_draft_send_postgres_concurrency.py \
-            tests/integration/test_upsert_job_postgres_concurrency.py \
-            tests/integration/test_telegram_bewerbung_approval_postgres.py \
-            tests/integration/test_gmail_application_draft_postgres.py \
-            tests/integration/test_gmail_alias_dedup_postgres.py \
-            tests/integration/test_live_send_uniqueness_postgres.py \
-            tests/integration/test_readiness_postgres.py \
-            tests/integration/test_candidate_profile_transfer_postgres.py \
-            tests/integration/test_gmail_mailbox_width_postgres.py \
-            tests/integration/test_gmail_imap_32bit_identifiers_postgres.py \
-            tests/integration/test_telegram_operator_control_postgres.py \
-            tests/integration/test_stage16_stage9d_arm_race_postgres.py \
-            tests/integration/test_stage17_candidate_config_postgres.py \
-            tests/integration/test_stage20_ui_readonly_postgres.py \
-            tests/integration/test_stage21_vacancy_cache_postgres.py \
-            tests/integration/test_application_lifecycle_postgres.py \
-            tests/integration/test_hard008_legacy_pending_migration_postgres.py
-          python - /tmp/postgres-junit.xml <<'PY'
+          pytest -q -rs --junitxml=/tmp/postgres-at-head.xml tests/integration -m "not pg_migration_cycle"
+          pytest -q -rs --junitxml=/tmp/postgres-migration-cycle.xml tests/integration -m pg_migration_cycle
+          python - /tmp/postgres-at-head.xml /tmp/postgres-migration-cycle.xml <<'PY'
           import sys
           import xml.etree.ElementTree as ET
 
-          root = ET.parse(sys.argv[1]).getroot()
-          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-          tests = sum(int(s.get("tests", 0)) for s in suites)
-          skipped = sum(int(s.get("skipped", 0)) for s in suites)
-          print(f"PostgreSQL integration: {tests} tests, {skipped} skipped")
-          if tests == 0 or skipped:
+          failed = False
+          for path in sys.argv[1:]:
+              root = ET.parse(path).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              tests = sum(int(s.get("tests", 0)) for s in suites)
+              skipped = sum(int(s.get("skipped", 0)) for s in suites)
+              print(f"PostgreSQL integration {path}: {tests} tests, {skipped} skipped")
+              failed = failed or tests == 0 or skipped > 0
+          if failed:
               sys.exit("PostgreSQL integration gate requires zero skipped tests")
           PY
         env:

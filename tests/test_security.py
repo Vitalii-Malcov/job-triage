@@ -17,8 +17,10 @@ def _fake_request(host: str = "1.2.3.4"):
 def _reset_rate_limit_buckets():
     """Each test starts with a clean in-memory rate-limit state."""
     rate_limit_module._requests.clear()
+    rate_limit_module._auth_failure_requests.clear()
     yield
     rate_limit_module._requests.clear()
+    rate_limit_module._auth_failure_requests.clear()
 
 
 class TestRequireApiKey:
@@ -28,7 +30,7 @@ class TestRequireApiKey:
             lambda: Settings(api_key="secret-key"),
         )
         with pytest.raises(HTTPException) as exc:
-            require_api_key(x_api_key="")
+            require_api_key(_fake_request(), x_api_key="")
         assert exc.value.status_code == 401
 
     def test_wrong_key_is_rejected(self, monkeypatch):
@@ -37,7 +39,7 @@ class TestRequireApiKey:
             lambda: Settings(api_key="secret-key"),
         )
         with pytest.raises(HTTPException) as exc:
-            require_api_key(x_api_key="wrong-key")
+            require_api_key(_fake_request(), x_api_key="wrong-key")
         assert exc.value.status_code == 401
 
     def test_correct_key_is_accepted(self, monkeypatch):
@@ -46,7 +48,7 @@ class TestRequireApiKey:
             lambda: Settings(api_key="secret-key"),
         )
         # Should not raise.
-        require_api_key(x_api_key="secret-key")
+        require_api_key(_fake_request(), x_api_key="secret-key")
 
     def test_unset_api_key_fails_closed(self, monkeypatch):
         """If API_KEY is not configured, every request must be rejected
@@ -56,7 +58,7 @@ class TestRequireApiKey:
             lambda: Settings(api_key=""),
         )
         with pytest.raises(HTTPException) as exc:
-            require_api_key(x_api_key="")
+            require_api_key(_fake_request(), x_api_key="")
         assert exc.value.status_code == 401
 
 

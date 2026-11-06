@@ -143,7 +143,7 @@ class CompanyResearchService:
     def _is_usable_research(self, record: CompanyResearchRecord) -> bool:
         """True if `record` holds genuine, previously-successful research
         content that's safe to serve as "stale but usable" after a failed
-        refresh (RR-M-02). Delegates to the repository-layer
+        refresh. Delegates to the repository-layer
         is_usable_company_research so this project has exactly one
         definition of "usable" shared by both the service (this method) and
         the repository (FR-M-02's collision-resolution helpers).
@@ -165,10 +165,10 @@ class CompanyResearchService:
         touches the network — used by GET /jobs/{id}/research, which must
         not trigger an expensive/external call (spec requirement).
 
-        Uses resolve_name_only_company_research (FR-M-03) — the same
+        Uses resolve_name_only_company_research — the same
         routine get_or_run uses — so GET and POST can never disagree about
         which record a given company name resolves to. Raises
-        AmbiguousCompanyIdentityError (FR-M-01) rather than arbitrarily
+        AmbiguousCompanyIdentityError rather than arbitrarily
         returning one of several known-domain companies sharing this job's
         normalized company name. app/api/routes.py maps it to 409.
         """
@@ -197,13 +197,13 @@ class CompanyResearchService:
         # v1 has no trusted domain source — see module docstring (H-02).
         domain_hint = None
 
-        # FR-M-03: resolve_name_only_company_research is the single
+        # resolve_name_only_company_research is the single
         # identity-resolution routine for a name-only request (also used by
         # get_cached) — it transparently resolves to the sole known-domain
         # record when exactly one exists (previously a raw exact "name:<x>"
         # lookup would miss it entirely, causing a wasted provider call and
         # a spurious "superseded" result below) and still raises
-        # AmbiguousCompanyIdentityError (FR-M-01) for 2+ known domains.
+        # AmbiguousCompanyIdentityError for 2+ known domains.
         existing = resolve_name_only_company_research(db, normalized_company_name)
         if existing is not None and not force_refresh and self._is_fresh(existing, settings):
             return CompanyResearchRunResponse(
@@ -215,7 +215,7 @@ class CompanyResearchService:
                 error=None,
             )
 
-        # FR-M-03: an already-resolved record's own identity must be
+        # an already-resolved record's own identity must be
         # retained across a refresh — never silently downgrade a sole
         # known-domain record (e.g. "domain:acme.de") back to a domain-less
         # "name:<x>" identity merely because v1's own domain_hint is always
@@ -251,7 +251,7 @@ class CompanyResearchService:
             # message (e.g. a raw ConnectionError/HTTPError embedding a
             # URL, host, or response body for a future network-based
             # provider) -- the exact leakage class already fixed for the
-            # Bundesagentur/XING collector-run log sites (HARD-002).
+            # Bundesagentur/XING collector-run log sites.
             # Only the event name + provider + sanitized type name are
             # logged now, matching that same established convention.
             logger.warning(
@@ -260,7 +260,7 @@ class CompanyResearchService:
                 job.company,
                 type(exc).__name__,
             )
-            # HARD-003 (adversarial hardening r1): this used to be
+            # this used to be
             # `str(exc) or exc.__class__.__name__` -- the ONLY
             # `last_error`-writing site in the codebase that persisted a
             # raw exception message instead of a sanitized, derived
@@ -286,7 +286,7 @@ class CompanyResearchService:
                 provider_name=getattr(provider, "name", "unknown"),
                 error_message=error_message,
             )
-            # RR-M-02: `existing` may itself be nothing more than a
+            # `existing` may itself be nothing more than a
             # FAILED/PENDING diagnostic row from an earlier failed attempt
             # (record_failed_attempt's minimal row) — that is not usable
             # prior research, and must not be reported as served_stale=True
@@ -318,7 +318,7 @@ class CompanyResearchService:
             expected_version=expected_version,
         )
         if outcome == CompanyResearchWriteOutcome.SUPERSEDED:
-            # RR-M-03: the provider call above succeeded, but a concurrent
+            # the provider call above succeeded, but a concurrent
             # refresh already committed a newer result first — our own
             # result was discarded, never persisted. This is neither a
             # provider failure nor stale cache: `record` is genuinely

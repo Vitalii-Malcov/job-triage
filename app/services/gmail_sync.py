@@ -25,14 +25,14 @@ for their enforcement):
   writes of any kind (no STORE/EXPUNGE/COPY/APPEND);
 - INBOX is always INBOUND; the configured Sent mailbox
   (`settings.gmail_sent_mailbox`) is the ONLY trusted OUTBOUND source
-  (S7E-001) -- direction is decided purely by WHICH mailbox a message
+   -- direction is decided purely by WHICH mailbox a message
   was fetched from, never by its own forgeable `From` header;
-- known-UID starvation protection (GMAIL-005/012): `get_known_uids` is
+- known-UID starvation protection: `get_known_uids` is
   bound into each provider via closure so already-persisted UIDs are
   skipped BEFORE `MAX_MESSAGES_PER_SYNC` is applied, in one bulk query
   per chunk rather than one query per UID;
 - zero HTTP/link fetching of any kind from email content;
-- account isolation (GMAIL-002): every persisted row and every
+- account isolation: every persisted row and every
   known-UID lookup is scoped by `normalize_account_key(settings.gmail_username)`.
 
 `sync_mailbox` is exposed separately (not just the combined
@@ -105,7 +105,7 @@ def _sum_gmail_sync_results(a: GmailSyncResult, b: GmailSyncResult) -> GmailSync
         duplicates=a.duplicates + b.duplicates,
         skipped=a.skipped + b.skipped,
         failed=a.failed + b.failed,
-        # NEW-001: either mailbox hitting its own session deadline makes
+        # either mailbox hitting its own session deadline makes
         # the COMBINED run non-fully-complete, even if the other mailbox
         # finished cleanly.
         deadline_exceeded=a.deadline_exceeded or b.deadline_exceeded,
@@ -124,7 +124,7 @@ async def run_gmail_sync(db: Session, settings) -> GmailSyncResult:
     fails closed on missing credentials, it just orchestrates
     fetch+persist for an already-constructed provider.
 
-    S7E-001 (Codex remediation, HIGH): syncs BOTH the primary mailbox
+    syncs BOTH the primary mailbox
     (`gmail_mailbox`, INBOUND -- `trusted_outbound=False`) and the real
     Sent-mail folder (`gmail_sent_mailbox`, `trusted_outbound=True`)
     every run, INBOX first. Only messages fetched from the Sent folder

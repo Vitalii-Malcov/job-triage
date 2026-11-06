@@ -238,7 +238,7 @@ def api(db, monkeypatch):
         yield db
 
     settings = Settings(_env_file=None, api_key=API_KEY, telegram_bot_token="")
-    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routes"):
+    for target in ("app.security.auth", "app.security.rate_limit", "app.api.routers.common"):
         monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
     app.dependency_overrides[get_db] = override_get_db
     for name in dir(rate_limit_module):

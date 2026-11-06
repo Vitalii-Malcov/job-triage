@@ -82,8 +82,8 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.TelegramNotifier", _SpyNotifier)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.jobs.TelegramNotifier", _SpyNotifier)
     rate_limit_module._requests.clear()
 
     with TestClient(app) as test_client:

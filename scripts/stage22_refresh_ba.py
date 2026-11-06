@@ -49,11 +49,14 @@ import sqlite3
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
+
+from app.core.config import reveal
 
 try:
     from scripts.stage15_application_tracker import TargetRefusedError, resolve_engine
@@ -78,7 +81,8 @@ from scripts.stage21_assess_vacancies import (
 
 BA_HOST = "rest.arbeitsagentur.de"
 # Tables this tool may write; every other table is digest-checked.
-WRITTEN_TABLES = frozenset({"jobs", "job_reference_tokens"})
+# `automation_runs` is the collector-exclusion lease this tool holds while it writes.
+WRITTEN_TABLES = frozenset({"jobs", "job_reference_tokens", "automation_runs"})
 
 # Forced for this process whatever `.env` or the shell says.
 FORCED_OFF_FLAGS = (
@@ -105,6 +109,37 @@ FORCED_EMPTY_SECRETS = (
 
 class OutboundBlockedError(RuntimeError):
     """An outbound call outside the BA search/detail API was attempted."""
+
+
+class LeaseLostError(Exception):
+    """The collector-exclusion lease was lost while writing. `written` rows were already
+    committed (partial write); the run is reported as an ALERT, never as a plain refusal."""
+
+    def __init__(self, written: int = 0, created: int = 0) -> None:
+        super().__init__("the collector-exclusion lease was lost")
+        self.written = written
+        self.created = created
+
+
+class ProtectedTablesChangedError(Exception):
+    """A table this tool must not write changed during the apply (reported as an ALERT)."""
+
+    def __init__(self, changed: list[str], copy: Path) -> None:
+        super().__init__("protected tables changed")
+        self.changed = changed
+        self.copy = copy
+
+
+class PostWriteCheckError(Exception):
+    """A validation that runs AFTER the writes failed: the changes are durable, so this is an
+    ALERT with the committed counts and the snapshot, never a no-write refusal."""
+
+    def __init__(self, reason: str, written: int, created: int, copy: Path) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.written = written
+        self.created = created
+        self.copy = copy
 
 
 class RefusedError(Exception):
@@ -406,9 +441,10 @@ def print_report(summary: dict, as_json: bool) -> None:
 # --- apply ------------------------------------------------------------------------------
 
 
-def write_updates(engine, updates) -> tuple[int, int]:
+def write_updates(engine, updates, *, is_lease_lost=None) -> tuple[int, int]:
     """Batches of BATCH_SIZE, one BEGIN IMMEDIATE transaction each. Returns
-    (rows changed, rows left by conflicts)."""
+    (rows changed, rows left by conflicts). Stops between batches when the
+    collector-exclusion lease is lost."""
     from app.services.ba_refresh import apply_updates
 
     writer = _writer_engine(engine)
@@ -416,6 +452,8 @@ def write_updates(engine, updates) -> tuple[int, int]:
     written = conflicted = 0
     try:
         for start in range(0, len(updates), BATCH_SIZE):
+            if is_lease_lost is not None and is_lease_lost():
+                raise LeaseLostError(written=written)
             batch = updates[start : start + BATCH_SIZE]
             for _attempt in range(ATTEMPTS):
                 try:
@@ -432,7 +470,7 @@ def write_updates(engine, updates) -> tuple[int, int]:
     return written, conflicted
 
 
-async def create_jobs(engine, creates, detail_collector) -> dict[str, int]:
+async def create_jobs(engine, creates, detail_collector, *, is_lease_lost=None) -> dict[str, int]:
     """Store new vacancies. Detail descriptions are fetched first, outside any
     database lock; each vacancy is then re-checked and persisted in ONE
     `BEGIN IMMEDIATE` transaction, so a writer that appears meanwhile can
@@ -444,6 +482,8 @@ async def create_jobs(engine, creates, detail_collector) -> dict[str, int]:
     counts = {"created": 0, "skipped_conflict": 0, "failed": 0}
     described: list = []
     for job in creates:
+        if is_lease_lost is not None and is_lease_lost():
+            raise LeaseLostError(created=0)
         try:
             description = await detail_collector.fetch_detail(job.source_reference)
         except Exception:  # noqa: BLE001 -- one failed detail must not stop the others
@@ -459,6 +499,8 @@ async def create_jobs(engine, creates, detail_collector) -> dict[str, int]:
         with factory() as session, session.begin():
             skills = get_candidate_skills_for_scoring(session)
         for job in described:
+            if is_lease_lost is not None and is_lease_lost():
+                raise LeaseLostError(created=counts["created"])
             with factory() as session:
                 try:
                     # the first statement takes the write reservation; the check
@@ -520,9 +562,61 @@ def run(
         return 2
 
 
+@dataclass
+class ApplyOutcome:
+    failed: int = 0
+
+
+def _apply(
+    args, engine, database: Path, plan, factory, queries, hold, before, copy
+) -> ApplyOutcome:
+    """The write phase; runs while the collector-exclusion slots are held (`hold`)."""
+    written, conflicted = write_updates(engine, plan.updates, is_lease_lost=hold.lease_lost)
+    hold.stats.update(updated=written)
+    print(f"updated: {written} vacancies ({conflicted} left by write conflicts)")
+    failed = conflicted
+    if args.create_new:
+        detail = factory(queries[0])
+        try:
+            counts = asyncio.run(
+                create_jobs(engine, plan.creates, detail, is_lease_lost=hold.lease_lost)
+            )
+        except LeaseLostError as exc:
+            exc.written = written
+            raise
+        hold.stats.update(created=counts["created"])
+        print(
+            f"created: {counts['created']} (skipped_conflict={counts['skipped_conflict']}"
+            f", failed={counts['failed']})"
+        )
+        failed += counts["failed"]
+    else:
+        print(
+            "new vacancies not stored (no --create-new): "
+            f"{len(plan.creates) + plan.deferred_creates}"
+        )
+    hold.stats.update(failed=failed)
+    try:
+        check_integrity(database)
+        after = protected_digest(database)
+    except RefusedError as exc:
+        raise PostWriteCheckError(str(exc), written, hold.stats.get("created", 0), copy) from None
+    if after != before:
+        changed = sorted(name for name in before if before.get(name) != after.get(name))
+        # raised INSIDE the hold so the audited slot run is FAILED, never COMPLETED
+        raise ProtectedTablesChangedError(changed, copy)
+    print(f"protected tables unchanged ({len(before)} tables digest-checked)")
+    return ApplyOutcome(failed=failed)
+
+
 def _run(args, database: Path, collector_factory: Callable | None) -> int:
     from app.core.config import get_settings
     from app.services.ba_refresh import fetch_postings, plan_refresh
+    from app.services.collector_exclusion import (
+        CollectorRunInProgressError,
+        CollectorRunLeaseLostError,
+        hold_collector_slots,
+    )
     from app.services.collector_runner import _candidate_search_settings, ba_query_collector
     from app.services.search_strategy import bundesagentur_queries, discovery_queries
     from app.utils.config_flags import is_configured
@@ -530,7 +624,7 @@ def _run(args, database: Path, collector_factory: Callable | None) -> int:
     get_settings.cache_clear()
     settings = get_settings()
     assert_outbound_disabled(settings)
-    if not is_configured(settings.bundesagentur_api_key):
+    if not is_configured(reveal(settings.bundesagentur_api_key)):
         raise RefusedError("BUNDESAGENTUR_API_KEY is not configured")
     if args.apply and classify_path(database) is DatabaseKind.BACKUP:
         raise RefusedError("refusing to write into a backup database")
@@ -571,37 +665,51 @@ def _run(args, database: Path, collector_factory: Callable | None) -> int:
             require_no_competing_writer(database)
             if args.create_new:
                 require_candidate_profile(database)
+            # The verified backup comes BEFORE the slots are claimed: claiming writes audit
+            # rows, and a failed backup must leave the database exactly as it was.
             before = protected_digest(database)
             copy = take_snapshot(database, Path(args.snapshot))
             print(f"snapshot: {copy} (verified)")
-            written, conflicted = write_updates(engine, plan.updates)
-            print(f"updated: {written} vacancies ({conflicted} left by write conflicts)")
-            failed = conflicted
-            if args.create_new:
-                detail = factory(queries[0])
-                counts = asyncio.run(create_jobs(engine, plan.creates, detail))
-                print(
-                    f"created: {counts['created']} (skipped_conflict={counts['skipped_conflict']}"
-                    f", failed={counts['failed']})"
-                )
-                failed += counts["failed"]
-            else:
-                print(
-                    "new vacancies not stored (no --create-new): "
-                    f"{len(plan.creates) + plan.deferred_creates}"
-                )
-            check_integrity(database)
-            after = protected_digest(database)
-            if after != before:
-                changed = sorted(name for name in before if before.get(name) != after.get(name))
-                print(
-                    f"ALERT: protected tables changed: {changed}; restore {copy}",
-                    file=sys.stderr,
-                )
-                return 3
-            print(f"protected tables unchanged ({len(before)} tables digest-checked)")
-        if failed:
-            print(f"INCOMPLETE: {failed} vacancies not written; re-run to continue")
+            with Session(engine) as lease_db:
+                try:
+                    with hold_collector_slots(lease_db, settings, "ba_refresh") as hold:
+                        outcome = _apply(
+                            args, engine, database, plan, factory, queries, hold, before, copy
+                        )
+                except CollectorRunInProgressError:
+                    raise RefusedError(
+                        "a collector or automation run holds the slot; nothing written"
+                    ) from None
+                except LeaseLostError as exc:
+                    print(
+                        f"ALERT: the collector-exclusion lease was lost; {exc.written} updated "
+                        f"and {exc.created} created before it was noticed (partial write); "
+                        f"snapshot {copy}",
+                        file=sys.stderr,
+                    )
+                    return 3
+                except PostWriteCheckError as exc:
+                    print(
+                        f"ALERT: {exc.reason} after the write ({exc.written} updated, "
+                        f"{exc.created} created); restore {exc.copy} if needed",
+                        file=sys.stderr,
+                    )
+                    return 3
+                except ProtectedTablesChangedError as exc:
+                    print(
+                        f"ALERT: protected tables changed: {exc.changed}; restore {exc.copy}",
+                        file=sys.stderr,
+                    )
+                    return 3
+                except CollectorRunLeaseLostError:
+                    print(
+                        "ALERT: the collector-exclusion lease was lost before the run could "
+                        f"be recorded; snapshot {copy}",
+                        file=sys.stderr,
+                    )
+                    return 3
+        if outcome.failed:
+            print(f"INCOMPLETE: {outcome.failed} vacancies not written; re-run to continue")
             return 1
         print("APPLIED")
         return 0

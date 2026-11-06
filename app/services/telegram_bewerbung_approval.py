@@ -56,6 +56,7 @@ from app.agents.review_package_builder import (
     ReviewVersionConflictError,
 )
 from app.agents.score_labels import SCORE_DIFFERENCE_NOTE
+from app.core.config import reveal
 from app.db.bewerbung_repository import get_bewerbung_draft_by_id, to_bewerbung_draft
 from app.db.candidate_cv_draft_repository import get_draft_by_id, to_tailored_cv_draft
 from app.db.candidate_job_match_repository import get_match_by_id, to_candidate_job_match
@@ -1091,7 +1092,7 @@ async def _display(settings, view: _ReviewView, page: int, send: Sender) -> Appr
     markup = review_page_keyboard(view.capability, page, document.total, view.mode)
     try:
         result = await send(
-            settings.telegram_bot_token,
+            reveal(settings.telegram_bot_token),
             settings.telegram_chat_id,
             text,
             reply_markup=markup,

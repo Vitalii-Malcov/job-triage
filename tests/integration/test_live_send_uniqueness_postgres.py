@@ -78,11 +78,16 @@ from app.services.gmail_message_analysis import analyze_gmail_message
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 
-pytestmark = pytest.mark.skipif(
-    not TEST_POSTGRES_URL,
-    reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
-    "(GitHub Actions' scheduler-postgres job sets it).",
-)
+# Cycles Alembic down/up on the shared test database (restores head in a `finally`):
+# CI runs these in the second phase, see docs/CI.md.
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_POSTGRES_URL,
+        reason="TEST_POSTGRES_URL not set -- PostgreSQL integration test skipped locally "
+        "(GitHub Actions' scheduler-postgres job sets it).",
+    ),
+    pytest.mark.pg_migration_cycle,
+]
 
 ACCOUNT = "me@live-send-uniqueness-postgres.example.com"
 JOB_FINGERPRINT = "stage-12-live-send-uniqueness"

@@ -1,5 +1,6 @@
 import ipaddress
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,7 +12,7 @@ from app.providers.email.base import (
     MAX_MAILBOX_NAME_LENGTH,
 )
 
-# S8B-PRE-002: automation_schedules.account_key / automation_runs.account_key
+# automation_schedules.account_key / automation_runs.account_key
 # are both String(320) -- the exact same invariant MAX_ADDRESS_LENGTH already
 # encodes for gmail_username's own DB columns (RFC 5321 4.5.3.1.3), so it is
 # reused rather than a new constant, keeping SQLite (permissive about
@@ -19,9 +20,17 @@ from app.providers.email.base import (
 # INSERT time) from ever disagreeing about what a valid account_key is.
 
 
+def reveal(value: object) -> str:
+    """Plain text of a credential field: unwraps `SecretStr`, passes plain
+    strings through (test doubles, legacy callers), maps None to ''."""
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return "" if value is None else str(value)
+
+
 class Settings(BaseSettings):
     app_env: str = "development"
-    # DEPLOY-001-RR1 (Codex targeted re-review): `repr=False` keeps this
+    # `repr=False` keeps this
     # credential-bearing connection string (either the operator-supplied
     # default/override, or the postgres_* parts assembled into it below by
     # `_build_database_url_from_postgres_parts`) out of `repr(Settings(...))`/
@@ -38,7 +47,7 @@ class Settings(BaseSettings):
     # startup by app.core.database_target.check_database_target -- a pilot
     # or backup database is refused unless the role says pilot.
     database_role: str = ""
-    # DEPLOY-001 (Codex master review): an operator-supplied discrete-parts
+    # an operator-supplied discrete-parts
     # alternative to `database_url` above, built into a PostgreSQL URL by
     # `_build_database_url_from_postgres_parts` below via
     # `sqlalchemy.engine.URL.create` rather than raw string interpolation.
@@ -63,7 +72,7 @@ class Settings(BaseSettings):
     postgres_host: str = ""
     postgres_port: int = Field(default=5432, ge=1, le=65535)
     postgres_user: str = ""
-    # DEPLOY-001-RR1 (Codex targeted re-review): `SecretStr`, not `str` —
+    # `SecretStr`, not `str` —
     # Codex reproduced the raw password appearing in `repr(Settings(...))`
     # AND in `ValidationError` text for a partially-invalid construction
     # (Pydantic's error rendering echoes each field's raw input value by
@@ -84,18 +93,33 @@ class Settings(BaseSettings):
     alembic_auto_upgrade: bool = False
     # No default on purpose: an empty/unset key means require_api_key()
     # rejects every request instead of accepting a predictable value.
-    api_key: str = ""
+    api_key: SecretStr = SecretStr("")
+    # Optional independent secret for the UI session cookie signature (see
+    # app/ui/auth.py `signing_key`). Unset: a key derived from api_key is used.
+    ui_session_secret: SecretStr = SecretStr("")
     # Stage 20: the read-only browser UI under /ui (docs/STAGE20_UI_ARCHITECTURE.md).
     # Off by default: every /ui route answers 404 while False. Login uses
     # api_key above; the session cookie expires after ui_session_hours.
     ui_enabled: bool = False
+    # Task 23: where rate limits, the failed-auth budget, UI logout revocations and the
+    # cookie nonce live. `memory` (default): this process only -- correct for exactly ONE
+    # web process (enforced by the single-process lock below). `database`: the two
+    # `shared_*` tables of the existing database, so several workers behave as one.
+    shared_state_backend: Literal["memory", "database"] = "memory"
+    # With the `memory` backend the web process takes an exclusive per-database lock at
+    # startup and a second process refuses to start (several workers would multiply the
+    # limits and reject each other's cookies). False only for tests / a deliberate override.
+    single_process_lock_enabled: bool = True
+    # Directory of that lock file; empty = the system temp directory. Processes (or
+    # containers) that must exclude each other have to share this directory.
+    single_process_lock_dir: str = ""
     ui_session_hours: int = Field(default=12, ge=1, le=168)
     # False only for plain-HTTP access from a non-localhost host.
     ui_cookie_secure: bool = True
     # Optional exact browser origin (e.g. "https://jobs.example.org") accepted
     # on login/logout when a reverse proxy rewrites the Host header.
     ui_public_origin: str = ""
-    # HARD-006: ge=1 on both -- an unvalidated 0/negative
+    # ge=1 on both -- an unvalidated 0/negative
     # rate_limit_requests made _RateLimiter.check's `len(bucket) >=
     # max_requests` always true (every request 429s, total self-lockout);
     # an unvalidated negative rate_limit_window_seconds made `cutoff = now
@@ -114,7 +138,7 @@ class Settings(BaseSettings):
     # lists exactly that address (docs/DEPLOYMENT.md "Reverse proxy").
     trusted_proxy_ips: str = ""
 
-    telegram_bot_token: str = ""
+    telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
     telegram_timeout_seconds: float = 5.0
     telegram_max_retries: int = 3
@@ -181,7 +205,7 @@ class Settings(BaseSettings):
 
     # No default on purpose: an unset key means the collector endpoint fails
     # closed (503) instead of calling the upstream API with an empty key.
-    bundesagentur_api_key: str = ""
+    bundesagentur_api_key: SecretStr = SecretStr("")
     bundesagentur_search_keywords: str = ""
     bundesagentur_search_location: str = ""
     bundesagentur_search_radius_km: int = 25
@@ -195,7 +219,7 @@ class Settings(BaseSettings):
     xing_mailbox_imap_host: str = "imap.gmail.com"
     xing_mailbox_imap_port: int = 993
     xing_mailbox_username: str = ""
-    # ASTRA-01: repr=False, same DEPLOY-001-RR1 rationale as database_url
+    # repr=False, same DEPLOY-001-RR1 rationale as database_url
     # above -- Pydantic's default model repr otherwise prints every
     # field's raw value, including this one, in repr(Settings(...))/
     # str(Settings(...)). Construction/validation/attribute access are
@@ -203,7 +227,7 @@ class Settings(BaseSettings):
     # (model_config below) separately suppresses this value from
     # ValidationError text.
     xing_mailbox_app_password: str = Field(default="", repr=False)
-    # HARD-006: bounded the same way gmail_lookback_days already is --
+    # bounded the same way gmail_lookback_days already is --
     # an unvalidated 0/negative value pushed the IMAP `since_date` into
     # the present/future, silently returning zero messages with no
     # error, inconsistent with the sibling Gmail setting below.
@@ -236,14 +260,14 @@ class Settings(BaseSettings):
     gmail_imap_host: str = "imap.gmail.com"
     gmail_imap_port: int = Field(default=993, ge=1, le=65535)
     gmail_username: str = ""
-    # ASTRA-01: repr=False -- same rationale as xing_mailbox_app_password
+    # repr=False -- same rationale as xing_mailbox_app_password
     # above and database_url's own DEPLOY-001-RR1 precedent. This is also
     # the SMTP password reused by Stage 7D outbound sending (see
     # gmail_smtp_host/gmail_smtp_port below), so the same leak applied to
     # both the IMAP read path and the SMTP send path before this fix.
     gmail_app_password: str = Field(default="", repr=False)
     gmail_mailbox: str = "INBOX"
-    # S7E-001 (Codex remediation, HIGH): the real Gmail "Sent Mail" folder —
+    # the real Gmail "Sent Mail" folder —
     # synced in ADDITION to gmail_mailbox (never instead of it). Messages
     # fetched from THIS mailbox are the only ones ever trusted as
     # OUTBOUND — see app/providers/email/imap.py's `trusted_outbound`
@@ -335,7 +359,7 @@ class Settings(BaseSettings):
     # threshold -- bounds both the DB writes and the size of the persisted
     # AutomationRun.results shortlist_drafts step per run.
     automation_shortlist_max_per_run: int = Field(default=10, ge=0, le=50)
-    # S8C-BOUND-001 (Codex review): bounds how many jobs THIS RUN touched
+    # bounds how many jobs THIS RUN touched
     # ever get a CandidateJobMatch computed at all -- a cheap, deterministic
     # JobRecord.score-DESC/id-ASC preselection (see
     # app.services.automation_shortlist.prepare_shortlist_drafts) is applied
@@ -399,7 +423,7 @@ class Settings(BaseSettings):
     # package in this project's dependencies (see pyproject.toml).
     telegram_daily_digest_timezone: str = "Europe/Berlin"
 
-    # DEPLOY-001-RR1: hide_input_in_errors=True stops Pydantic's own
+    # hide_input_in_errors=True stops Pydantic's own
     # ValidationError rendering from echoing each field's raw supplied
     # value (e.g. a partially-invalid Settings() construction that still
     # included a real postgres_password) into the error text — applies to
@@ -408,7 +432,7 @@ class Settings(BaseSettings):
     # this flag.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
-    # GMAIL-009: length/blank invariants, consistent with the DB columns
+    # length/blank invariants, consistent with the DB columns
     # and identity normalization these values ultimately feed
     # (app.db.models.GmailMessageRecord/GmailThreadRecord, and
     # app.providers.email.base.normalize_account_key). Each validator
@@ -477,7 +501,7 @@ class Settings(BaseSettings):
             raise ValueError(f"must not exceed {MAX_IMAP_HOST_LENGTH} characters")
         return stripped
 
-    # S8B-PRE-002: normalizes the same way gmail_username does (strip
+    # normalizes the same way gmail_username does (strip
     # only, no casefold -- preserves Stage 8A's existing account_key
     # identity semantics exactly, just whitespace-normalized; casefolding
     # is not part of that contract and is deliberately not invented here)
@@ -533,7 +557,7 @@ class Settings(BaseSettings):
             )
         return self
 
-    # S8C-BOUND-001 (Codex review): keeps the two-stage bound coherent --
+    # keeps the two-stage bound coherent --
     # the cheap match-computation bound must be able to cover the final
     # draft-preparation bound, or the shortlist could be silently starved
     # of otherwise-eligible higher-scoring jobs purely by a misconfigured
@@ -553,7 +577,7 @@ class Settings(BaseSettings):
             )
         return self
 
-    # DEPLOY-001 (Codex master review): builds `database_url` from the
+    # builds `database_url` from the
     # discrete `postgres_*` parts above via `sqlalchemy.engine.URL.create`
     # — see that field's docstring for why this replaces raw
     # string-interpolation of the password into a URL. Runs after every
@@ -572,7 +596,7 @@ class Settings(BaseSettings):
             name
             for name, value in (
                 ("postgres_user", self.postgres_user),
-                # DEPLOY-001-RR1: unwrap via get_secret_value() for the
+                # unwrap via get_secret_value() for the
                 # blank/missing check too — `not self.postgres_password`
                 # would always be False (a SecretStr instance is truthy
                 # regardless of the string it wraps), silently defeating
@@ -590,7 +614,7 @@ class Settings(BaseSettings):
         url = URL.create(
             drivername="postgresql+psycopg",
             username=self.postgres_user,
-            # DEPLOY-001-RR1: the only place the real secret is ever
+            # the only place the real secret is ever
             # unwrapped — immediately consumed by URL.create below, never
             # assigned to a plain str attribute or logged.
             password=self.postgres_password.get_secret_value(),

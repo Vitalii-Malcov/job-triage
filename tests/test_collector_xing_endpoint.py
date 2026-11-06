@@ -117,7 +117,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._xing_requests.clear()
 
@@ -159,7 +159,7 @@ class TestRunXingCollector:
             xing_mailbox_username="",
             xing_mailbox_app_password="",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
 
@@ -174,7 +174,7 @@ class TestRunXingCollector:
             xing_mailbox_username="user@example.com",
             xing_mailbox_app_password="   ",
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: unconfigured)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: unconfigured)
 
         response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
 
@@ -195,6 +195,9 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -213,6 +216,9 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert second.json() == {
@@ -221,6 +227,9 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -250,6 +259,9 @@ class TestRunXingCollector:
             "updated": 1,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
 
@@ -331,16 +343,16 @@ class TestRunXingCollector:
 
         import app.services.collector_runner as collector_runner_module
 
-        original_upsert_job = collector_runner_module.upsert_job
+        original_upsert_job = collector_runner_module.upsert_job_observed
         call_count = {"n": 0}
 
-        def flaky_upsert_job(db, job, score):
+        def flaky_upsert_job(db, job, score, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise RuntimeError("simulated persistence failure")
-            return original_upsert_job(db, job, score)
+            return original_upsert_job(db, job, score, **kwargs)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", flaky_upsert_job)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", flaky_upsert_job)
 
         acknowledged: set[str] = set()
         monkeypatch.setattr(
@@ -357,6 +369,9 @@ class TestRunXingCollector:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == set()
@@ -373,6 +388,9 @@ class TestRunXingCollector:
             "updated": 2,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert acknowledged == {"<fake-digest@mail.xing.com>"}
@@ -415,6 +433,72 @@ class TestXingCollectorNotifications:
         assert sent_job.title == "Senior Python Dev"
         assert sent_score.score == 90
 
+    def test_different_details_are_a_second_vacancy_and_both_notify(self, client, monkeypatch):
+        first = _sample_job(title="Sachbearbeiter (m/w/d)", description="Gehalt: 50.000")
+        rival = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="Gehalt: 90.000",
+            url="https://www.xing.com/m/BBBBBBBBBBBBBBBBBBBB2",
+        )
+        notifier = FakeTelegramNotifier()
+
+        response = self._run(
+            client,
+            monkeypatch,
+            jobs=[first, rival],
+            scores_by_title={
+                "Sachbearbeiter (m/w/d)": _job_score(score=90, recommendation="APPLY")
+            },
+            notifier=notifier,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert (body["created"], body["updated"]) == (2, 0)
+        assert (body["variant_postings"], body["ambiguous_observations"]) == (1, 0)
+        assert body["possible_collisions"] == 1
+        # two different postings: each alerts with its own link
+        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [
+            str(first.url),
+            str(rival.url),
+        ]
+
+    def test_evidence_free_observation_in_a_multi_row_group_has_no_side_effects(
+        self, client, monkeypatch
+    ):
+        first = _sample_job(title="Sachbearbeiter (m/w/d)", description="Gehalt: 50.000")
+        rival = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="Gehalt: 90.000",
+            url="https://www.xing.com/m/CCCCCCCCCCCCCCCCCCCC3",
+        )
+        blank = _sample_job(
+            title="Sachbearbeiter (m/w/d)",
+            description="",
+            url="https://www.xing.com/m/DDDDDDDDDDDDDDDDDDDD4",
+        )
+        notifier = FakeTelegramNotifier()
+
+        response = self._run(
+            client,
+            monkeypatch,
+            jobs=[first, rival, blank],
+            scores_by_title={
+                "Sachbearbeiter (m/w/d)": _job_score(score=90, recommendation="APPLY")
+            },
+            notifier=notifier,
+        )
+
+        body = response.json()
+        assert (body["created"], body["updated"]) == (2, 0)
+        assert (body["variant_postings"], body["ambiguous_observations"]) == (1, 1)
+        assert body["possible_collisions"] == 2
+        # the ambiguous block alerts nothing and touches no posting
+        assert [str(sent_job.url) for sent_job, _ in notifier.calls] == [
+            str(first.url),
+            str(rival.url),
+        ]
+
     @pytest.mark.parametrize("recommendation", ["MAYBE", "SKIP", "NEEDS_ENRICHMENT"])
     def test_does_not_notify_for_non_apply_recommendations(
         self, client, monkeypatch, recommendation
@@ -442,7 +526,7 @@ class TestXingCollectorNotifications:
             xing_mailbox_app_password="app-password",
             min_job_score_to_notify=95,
         )
-        monkeypatch.setattr("app.api.routes.get_settings", lambda: stricter_settings)
+        monkeypatch.setattr("app.api.routers.common.get_settings", lambda: stricter_settings)
 
         job = _sample_job(title="Borderline Job")
         notifier = FakeTelegramNotifier()
@@ -527,6 +611,9 @@ class TestXingCollectorNotifications:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 3
@@ -551,10 +638,10 @@ class TestSanitizedFailureLogging:
             lambda **kwargs: FakeCollector(jobs=jobs),
         )
 
-        def _boom(db, job, score):
+        def _boom(db, job, score, **kwargs):
             raise RuntimeError(SECRET_TEXT)
 
-        monkeypatch.setattr("app.services.collector_runner.upsert_job", _boom)
+        monkeypatch.setattr("app.services.collector_runner.upsert_job_observed", _boom)
 
         with caplog.at_level("DEBUG"):
             response = client.post("/api/v1/collectors/xing/run", headers=_auth_headers())
@@ -566,6 +653,9 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 1,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert SECRET_TEXT not in caplog.text
@@ -599,6 +689,9 @@ class TestSanitizedFailureLogging:
             "updated": 0,
             "skipped_invalid": 0,
             "failed": 0,
+            "possible_collisions": 0,
+            "variant_postings": 0,
+            "ambiguous_observations": 0,
             "deadline_exceeded": False,
         }
         assert len(notifier.calls) == 1

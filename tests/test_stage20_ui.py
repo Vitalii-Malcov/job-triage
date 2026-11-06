@@ -1,6 +1,7 @@
 """Stage 20: read-only operator UI (docs/STAGE20_UI_ARCHITECTURE.md)."""
 
 import socket
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -27,6 +28,12 @@ from app.ui.readonly import (
 API_KEY = "stage20-test-key-0123456789"
 APPLICANT = "applicant@example.invalid"
 NOW = datetime(2026, 10, 26, 10, 0, tzinfo=UTC)
+
+
+def _ui_key() -> str:
+    from app.core.config import Settings
+
+    return auth.signing_key(Settings(api_key=API_KEY))
 
 
 @pytest.fixture()
@@ -311,7 +318,7 @@ def test_malformed_cookie_redirects_instead_of_failing(client_factory):
     ):
         assert page(value).status_code == 303, value
     # positive control: a well-formed token sent the same way is accepted
-    assert page(auth.issue_session_token(API_KEY, hours=1)).status_code == 200
+    assert page(auth.issue_session_token(_ui_key(), hours=1)).status_code == 200
 
 
 def test_login_is_rate_limited(client_factory):
@@ -329,11 +336,19 @@ def test_session_token_expiry_tampering_and_key_rotation():
     assert auth.session_token_valid(token, API_KEY, now=1_000_000 + 3599)
     assert not auth.session_token_valid(token, API_KEY, now=1_000_000 + 3600)
     assert not auth.session_token_valid(token, "rotated-key", now=1_000_000)
-    expiry, _, signature = token.partition(".")
-    forged = f"{int(expiry) + 3600}.{signature}"
+    expiry, sid, signature = token.split(".")
+    forged = f"{int(expiry) + 3600}.{sid}.{signature}"
     assert not auth.session_token_valid(forged, API_KEY, now=1_000_000)
-    for junk in (None, "", "abc", "123.", ".abc", "-5.abc"):
+    swapped = f"{expiry}.{'0' * 32}.{signature}"
+    assert not auth.session_token_valid(swapped, API_KEY, now=1_000_000)
+    for junk in (None, "", "abc", "123.", ".abc", "-5.abc", f"{expiry}.{signature}"):
         assert not auth.session_token_valid(junk, API_KEY, now=1_000_000)
+
+
+def test_every_login_gets_a_fresh_session_id():
+    a = auth.issue_session_token(API_KEY, hours=1)
+    b = auth.issue_session_token(API_KEY, hours=1)
+    assert a != b and a.split(".")[1] != b.split(".")[1]
 
 
 def test_logout_clears_cookie(client_factory):
@@ -703,3 +718,178 @@ def test_long_words_wrap_instead_of_widening_the_page():
     assert "overflow-wrap: anywhere" in description
     main = next(line for line in css.splitlines() if line.startswith("main {"))
     assert "overflow-wrap: break-word" in main
+
+
+def test_ui_cookie_is_not_signed_with_the_raw_api_key_and_modes_differ():
+    from app.core.config import Settings
+
+    plain = Settings(_env_file=None, api_key=API_KEY)
+    secret = Settings(_env_file=None, api_key=API_KEY, ui_session_secret="independent-secret")
+    assert auth.signing_key(plain) not in ("", API_KEY)
+    assert auth.signing_key(plain) != auth.signing_key(secret)
+    # old-style cookie signed directly with the API key is rejected
+    legacy = auth.issue_session_token(API_KEY, hours=1)
+    assert not auth.session_token_valid(legacy, auth.signing_key(plain))
+    assert not auth.session_token_valid(legacy, auth.signing_key(secret))
+    # fallback<->explicit switch and either rotation revoke cookies
+    token = auth.issue_session_token(auth.signing_key(secret), hours=1)
+    assert auth.session_token_valid(token, auth.signing_key(secret))
+    assert not auth.session_token_valid(token, auth.signing_key(plain))
+    rotated_api = Settings(
+        _env_file=None, api_key="other-key", ui_session_secret="independent-secret"
+    )
+    assert not auth.session_token_valid(token, auth.signing_key(rotated_api))
+    rotated_secret = Settings(_env_file=None, api_key=API_KEY, ui_session_secret="new-secret")
+    assert not auth.session_token_valid(token, auth.signing_key(rotated_secret))
+
+
+def test_empty_api_key_fails_closed_even_with_a_signing_secret():
+    from app.core.config import Settings
+
+    for secret in ("", "independent-secret"):
+        settings = Settings(_env_file=None, api_key="", ui_session_secret=secret)
+        assert auth.signing_key(settings) == ""
+        assert not auth.session_token_valid(
+            auth.issue_session_token("", hours=1), auth.signing_key(settings)
+        )
+
+
+def test_login_cookie_roundtrip_with_independent_signing_secret(client_factory, monkeypatch):
+    monkeypatch.setenv("UI_SESSION_SECRET", "independent-secret")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        client = client_factory()
+        resp = client.post("/ui/login", data={"api_key": API_KEY}, follow_redirects=False)
+        assert resp.status_code == 303
+        assert client.get("/ui/", follow_redirects=False).status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+# --- review 1.4: server-side logout revocation ---------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_revocations():
+    auth.revocations.clear()
+    yield
+    auth.revocations.clear()
+
+
+def _cookie(client) -> str:
+    return client.cookies.get(auth.COOKIE_NAME, path="/ui")
+
+
+def test_logout_revokes_a_copied_cookie(client_factory):
+    victim = client_factory()
+    _login(victim)
+    stolen = _cookie(victim)
+    assert victim.get("/ui/", follow_redirects=False).status_code == 200
+    assert victim.post("/ui/logout", follow_redirects=False).status_code == 303
+
+    thief = client_factory()
+    thief.cookies.set(auth.COOKIE_NAME, stolen, path="/ui")
+    assert thief.get("/ui/", follow_redirects=False).status_code == 303  # to login
+
+
+def test_logout_does_not_affect_another_session(client_factory):
+    first, second = client_factory(), client_factory()
+    _login(first)
+    _login(second)
+    first.post("/ui/logout", follow_redirects=False)
+    assert second.get("/ui/", follow_redirects=False).status_code == 200
+
+
+def test_repeated_logout_is_idempotent_and_consumes_one_entry(client_factory):
+    client = client_factory()
+    _login(client)
+    cookie = _cookie(client)
+    for _ in range(3):
+        client.cookies.set(auth.COOKIE_NAME, cookie, path="/ui")
+        assert client.post("/ui/logout", follow_redirects=False).status_code == 303
+    assert len(auth.revocations._revoked) == 1
+
+
+def test_forged_or_missing_cookie_logout_never_adds_entries(client_factory):
+    client = client_factory()
+    assert client.post("/ui/logout", follow_redirects=False).status_code == 303
+    forged = auth.issue_session_token("guessed-key", hours=1)
+    client.cookies.set(auth.COOKIE_NAME, forged, path="/ui")
+    assert client.post("/ui/logout", follow_redirects=False).status_code == 303
+    assert not auth.revocations._revoked
+
+
+def test_cross_origin_logout_leaves_the_session_usable(client_factory):
+    client = client_factory()
+    _login(client)
+    refused = client.post(
+        "/ui/logout", headers={"Origin": "https://evil.example"}, follow_redirects=False
+    )
+    assert refused.status_code == 403
+    assert client.get("/ui/", follow_redirects=False).status_code == 200
+
+
+def test_revoked_cookie_does_not_burn_the_key_guess_budget(client_factory):
+    from app.security import rate_limit
+
+    client = client_factory()
+    _login(client)
+    client.post("/ui/logout", follow_redirects=False)
+    stale = auth.issue_session_token(auth.signing_key(_settings()), hours=1)
+    revoked_sid = stale.split(".")[1]
+    auth.revocations.revoke(revoked_sid, int(time.time()) + 3600)
+    client.cookies.set(auth.COOKIE_NAME, stale, path="/ui")
+    for _ in range(rate_limit.AUTH_FAILURE_LIMIT * 2):
+        assert client.get("/ui/", follow_redirects=False).status_code == 303
+    assert not rate_limit._auth_failure_requests
+
+
+def test_full_registry_refuses_instead_of_forgetting(client_factory, monkeypatch):
+    monkeypatch.setattr(auth.SessionRevocations, "CAPACITY", 2)
+    future = int(time.time()) + 3600
+    assert auth.revocations.revoke("a" * 32, future)
+    assert auth.revocations.revoke("b" * 32, future)
+    client = client_factory()
+    _login(client)
+    response = client.post("/ui/logout", follow_redirects=False)
+    assert response.status_code == 503
+    assert auth.revocations.is_revoked("a" * 32) and auth.revocations.is_revoked("b" * 32)
+    assert client.get("/ui/", follow_redirects=False).status_code == 200  # still logged in
+
+
+def test_registry_recovers_after_entries_expire():
+    registry = auth.SessionRevocations()
+    registry.CAPACITY = 2
+    assert registry.revoke("a" * 32, 100, now=10)
+    assert registry.revoke("b" * 32, 100, now=10)
+    assert not registry.revoke("c" * 32, 500, now=50)
+    assert registry.revoke("c" * 32, 500, now=101)  # a, b expired and were pruned
+    assert not registry.is_revoked("a" * 32)
+
+
+def test_registry_is_thread_safe():
+    import threading
+
+    registry = auth.SessionRevocations()
+    future = int(time.time()) + 3600
+    threads = [
+        threading.Thread(target=lambda i=i: registry.revoke(f"{i:032x}", future))
+        for i in range(200)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(registry._revoked) == 200
+
+
+def test_cookie_does_not_survive_a_process_restart(monkeypatch):
+    from app.core.config import Settings
+
+    settings = Settings(_env_file=None, api_key=API_KEY)
+    token = auth.issue_session_token(auth.signing_key(settings), hours=1)
+    assert auth.session_token_valid(token, auth.signing_key(settings))
+    monkeypatch.setattr(auth, "_PROCESS_NONCE", "a-different-process")
+    assert not auth.session_token_valid(token, auth.signing_key(settings))

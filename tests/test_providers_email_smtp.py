@@ -287,10 +287,10 @@ class TestErrorMessagesNeverLeakUpstreamText:
 
 
 class TestNoOutboundHttpOrImapCoupling:
-    def test_smtp_module_has_no_http_client_imports(self):
-        source = inspect.getsource(smtp_module)
-        for forbidden in ("requests", "httpx", "urllib.request", "urlopen("):
-            assert forbidden not in source
+    def test_smtp_module_has_no_http_client_imports(self, imported_modules):
+        imported = imported_modules(smtp_module)
+        for forbidden in ("requests", "httpx", "aiohttp", "urllib.request", "http.client"):
+            assert forbidden not in imported
 
     def test_smtp_module_never_imports_imaplib(self):
         """The outbound provider must be structurally independent of the
@@ -339,9 +339,8 @@ class TestInboundProviderContractUnweakened:
         assert "read-only" in source
         assert "never sends or drafts" in source
 
-    def test_imap_module_never_imports_smtplib(self):
-        source = inspect.getsource(email_imap_module)
-        assert "smtplib" not in source
+    def test_imap_module_never_imports_smtplib(self, imported_modules):
+        assert "smtplib" not in imported_modules(email_imap_module)
 
 
 class TestHardConnectionTimeout:

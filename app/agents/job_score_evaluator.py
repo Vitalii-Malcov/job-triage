@@ -360,7 +360,7 @@ def evaluate_job_score(
             and not senior_mismatch
             and get_candidate_target_domain() == "SOFTWARE_DEVELOPMENT"
         ):
-            # M2 fix (Astra Stage 12 audit): the same DISTINCT, cross-
+            # M2 fix: the same DISTINCT, cross-
             # category-deduplicated evidence count Stage 11E already uses
             # above -- not raw must_have_total + nice_to_have_total, which
             # let a single skill duplicated across both categories

@@ -29,7 +29,7 @@ evidence. Every consequential classification (OFFER, INTERVIEW_*,
 REJECTION, WITHDRAWAL_OR_POSITION_CLOSED) is force-flagged regardless of
 confidence — see `determine_requires_human_review`.
 
-**Round 3 (Blocker R3-002): semantic match confidence is NOT
+**Round 3: semantic match confidence is NOT
 correspondence trust.** A Codex review reproduced an attacker-controlled
 email body — a valid `Referenz-Nr:` plus copied "Vielen Dank für Ihre
 Bewerbung" acknowledgement text — resolving to `APPLICATION_RECEIVED` /
@@ -77,7 +77,7 @@ ANALYSIS_VERSION = 1
 # be confused with a field's own content when concatenated for hashing.
 _FINGERPRINT_FIELD_SEPARATOR = "\x1f"
 
-# Round 3 (Blocker R3-002): every classification with a real job/application
+# Round 3: every classification with a real job/application
 # consequence always requires review, regardless of confidence —
 # CONSEQUENTIAL_CLASSIFICATIONS plus APPLICATION_RECEIVED, which a Codex
 # review reproduced as the exploited gap (see module docstring). Not
@@ -140,7 +140,7 @@ def determine_requires_human_review(
       `_ALWAYS_REVIEW_CLASSIFICATIONS`) always requires review, regardless
       of confidence.
     - Any message associated with a tracked job/application at all
-      (`match_type != "UNMATCHED"`) always requires review (R3-002): this
+      (`match_type != "UNMATCHED"`) always requires review: this
       pipeline has no cryptographic sender authentication, so a confident
       SEMANTIC match is never grounds to treat inbound correspondence
       about that job/application as safe to leave unreviewed —

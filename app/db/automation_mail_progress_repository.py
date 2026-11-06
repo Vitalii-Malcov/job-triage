@@ -9,7 +9,7 @@ progress, or has a newer owner already moved past it". Mirrors
 `app.db.models.AutomationMailProgressRecord`'s docstring for the full
 concurrency/crash-safety rationale.
 
-**`advance_gmail_cursor`/`gmail_after_message_id` (AUD-004, Astra R3):**
+**`advance_gmail_cursor`/`gmail_after_message_id`:**
 `app.services.automation_gmail.prepare_gmail_response_drafts` no longer
 calls this -- a single per-account `id`-ordered watermark is not safe
 under PostgreSQL's commit-visibility semantics (see
@@ -41,7 +41,7 @@ class AutomationMailProgressConsistencyError(Exception):
     IntegrityError implies must exist comes back None. Mirrors
     app.db.automation_schedule_repository.AutomationScheduleRepositoryConsistencyError.
 
-    S8D-PRIVACY-001: the message never includes `account_key` (the
+    the message never includes `account_key` (the
     Gmail address) -- callers only ever log `type(exc).__name__`, never
     `str(exc)`, but the message text is kept identity-free anyway as
     defense in depth (mirrors GMAIL-002's "account_key identity strings
@@ -50,7 +50,7 @@ class AutomationMailProgressConsistencyError(Exception):
 
 
 class AutomationMailProgressCASLostError(Exception):
-    """S8D-PROGRESS-001/002 (Codex review): raised (constructed, never
+    """raised (constructed, never
     actually thrown -- see callers) when `advance_gmail_cursor`/
     `advance_follow_up_cursor` returns `False`: a newer owner already
     advanced this account's progress since the caller last observed it.

@@ -230,7 +230,7 @@ class ReviewPackagePatchRequest(BaseModel):
     expected_review_version: int = Field(ge=1)
     cv_changes: CVContentPatch | None = None
     bewerbung_changes: BewerbungContentPatch | None = None
-    # BOUND-006: max_length=2000 matches the already-established sibling
+    # max_length=2000 matches the already-established sibling
     # precedent (ResponseDraftApprovalRequest.note /
     # FollowUpApprovalRequest.note) for the same "optional human-authored
     # note attached to a decision" role.

@@ -12,12 +12,12 @@ rows for it (spec section 22).
 **Threading is neutral, not Gmail-native, and account-scoped** —
 `resolve_thread_anchor` derives a thread grouping purely from
 Message-ID/In-Reply-To/References headers, and every thread lookup is
-scoped to `account_key` (GMAIL-002) so two different configured mailbox
+scoped to `account_key` so two different configured mailbox
 accounts can never merge or collide threads merely because they
 reference the same Message-ID string.
 
 **Message-ID ownership is a DB-enforced atomic claim, not a Python
-check-then-act decision (GMAIL-011).** A message that self-anchors on
+check-then-act decision.** A message that self-anchors on
 its own Message-ID (no References/In-Reply-To) atomically claims
 `(account_key, message_id_header)` in `GmailMessageIdClaimRecord` via
 INSERT + IntegrityError-catch — never a SELECT-then-decide sequence,
@@ -86,7 +86,7 @@ class GmailRepositoryConsistencyError(Exception):
     """
 
 
-# S7E-013 (Codex re-review, final safety fix): a generic Gmail-thread
+# a generic Gmail-thread
 # mutual-exclusion primitive — see `acquire_thread_lock`'s docstring.
 # `_THREAD_LOCK_TTL_SECONDS` bounds how long a crashed holder (a sync run
 # or a follow-up send that died mid-critical-section) can block everyone
@@ -161,7 +161,7 @@ def acquire_thread_lock(
 def renew_thread_lock(
     db: Session, thread_id: int, *, holder: str, ttl_seconds: float = THREAD_LOCK_TTL_SECONDS
 ) -> bool:
-    """S7E-016 (Codex re-review, correctness fix): the DEDICATED CAS a
+    """the DEDICATED CAS a
     lease-renewal heartbeat (`app.services.follow_up_send._ThreadLockHeartbeat`)
     must use instead of `acquire_thread_lock` — the two are deliberately
     NOT interchangeable.
@@ -300,7 +300,7 @@ def is_message_known(
     return get_message_by_identity(db, account_key, mailbox, uid_validity, uid) is not None
 
 
-# GMAIL-012: chunk size for get_known_uids' bulk membership queries — kept
+# chunk size for get_known_uids' bulk membership queries — kept
 # comfortably under SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999) so a
 # single chunk's `IN (...)` clause never risks that limit, while still
 # being large enough that a real sync's candidate list (bounded well
@@ -316,9 +316,9 @@ def get_known_uids(
     uid_validity: int,
     candidate_uids: Collection[int],
 ) -> set[int]:
-    """Bulk membership check (GMAIL-012): which of `candidate_uids` should
+    """Bulk membership check: which of `candidate_uids` should
     never be fetched again for this (account_key, mailbox, uid_validity)
-    generation — either already persisted, OR (FINAL-004, Astra R5A)
+    generation — either already persisted, OR
     permanently skipped because the message's own content makes it
     unpersistable (see `GmailPermanentSkipRecord`'s docstring for the
     starvation bug this second half closes).
@@ -332,7 +332,7 @@ def get_known_uids(
     query per UID, regardless of how many UIDs IMAP SEARCH returns.
     """
     candidates = list(dict.fromkeys(candidate_uids))  # de-dup, preserve order
-    # ASTRA-GMAIL-001: every spelling of the same server mailbox (readable
+    # every spelling of the same server mailbox (readable
     # vs modified UTF-7), so a configuration spelling change never re-fetches.
     aliases = mailbox_identity_aliases(mailbox)
     known: set[int] = set()
@@ -366,7 +366,7 @@ def record_permanent_skips(
     uid_validity: int,
     skips: Collection[tuple[int, str]],
 ) -> None:
-    """FINAL-004 (Astra R5A): durably records each `(uid, reason)` in
+    """durably records each `(uid, reason)` in
     `skips` as permanently unfetchable for this (account_key, mailbox,
     uid_validity) generation — see `GmailPermanentSkipRecord`'s docstring
     for why this is required to make forward progress past a prefix of
@@ -480,7 +480,7 @@ def _get_message_id_claim(
 
 
 def _mark_claim_contested(db: Session, account_key: str, message_id_header: str) -> None:
-    """Permanently flag a Message-ID as proven ambiguous (GMAIL-011) —
+    """Permanently flag a Message-ID as proven ambiguous —
     idempotent (safe to call redundantly if multiple losers race).
     """
     stmt = (
@@ -499,7 +499,7 @@ def _same_claimant_identity(claim: GmailMessageIdClaimRecord, parsed: ParsedGmai
     """True if `claim`'s recorded owner IS `parsed`'s own provider
     identity — i.e. this is a concurrent/later retry of the exact same
     message, not a different message that happens to share a Message-ID.
-    The mailbox compares by server identity, not spelling (ASTRA-GMAIL-001).
+    The mailbox compares by server identity, not spelling.
     """
     return (
         same_mailbox(claim.claimant_mailbox, parsed.mailbox)
@@ -512,7 +512,7 @@ def _claim_message_id_or_get_collision_thread(
     db: Session, parsed: ParsedGmailMessage, anchor: str
 ) -> GmailThreadRecord:
     """Atomically claim `(account_key, anchor)` for `parsed` — the sole
-    arbiter of self-anchored Message-ID ownership (GMAIL-011).
+    arbiter of self-anchored Message-ID ownership.
 
     Reuses an existing `GmailThreadRecord` at this `thread_key` if one
     already exists (e.g. created by a reply that arrived before this
@@ -618,7 +618,7 @@ def _resolve_thread_for_message(db: Session, parsed: ParsedGmailMessage) -> Gmai
     3. The resolved anchor is this message's OWN Message-ID (no
        References/In-Reply-To of its own — it is establishing itself as
        a would-be thread root): resolved via an atomic DB claim, never a
-       Python check-then-act decision (GMAIL-011) — see
+       Python check-then-act decision — see
        `_claim_message_id_or_get_collision_thread`.
     """
     anchor = resolve_thread_anchor(parsed.message_id_header, parsed.in_reply_to, parsed.references)
@@ -669,7 +669,7 @@ def upsert_message(
     uid) constraint; caught below, rolled back, and resolved by
     re-reading the winner's row rather than raising or double-inserting.
 
-    **S7E-013 (Codex re-review, final safety fix).** The actual INSERT +
+    **S7E-013.** The actual INSERT +
     commit below only ever runs while this call holds `thread.id`'s guard
     (`app.db.gmail_repository.acquire_thread_lock`/`wait_for_thread_lock`)
     — the SAME generic per-thread lock `app.services.follow_up_send`
@@ -712,7 +712,7 @@ def upsert_message(
     )
     wait_for_thread_lock(db, thread.id, holder=holder, max_wait_seconds=lock_wait_seconds)
     try:
-        # S7E-011 (Codex re-review): a single `now` shared by both
+        # a single `now` shared by both
         # `received_at`'s fallback default and `provider_arrival_at`'s
         # fallback below — when the IMAP layer couldn't determine a real
         # INTERNALDATE (see ParsedGmailMessage.provider_arrival_at's
@@ -731,6 +731,7 @@ def upsert_message(
             in_reply_to=parsed.in_reply_to,
             references_json=json.dumps(list(parsed.references)),
             from_address=parsed.from_address,
+            sender_auth=parsed.sender_auth,
             from_display_name=parsed.from_display_name,
             to_addresses_json=json.dumps(list(parsed.to_addresses)),
             cc_addresses_json=json.dumps(list(parsed.cc_addresses)),
@@ -738,7 +739,7 @@ def upsert_message(
             sent_at=parsed.sent_at,
             received_at=now,
             provider_arrival_at=parsed.provider_arrival_at or now,
-            # S7E-013: True ONLY for a real, successfully-parsed IMAP
+            # True ONLY for a real, successfully-parsed IMAP
             # INTERNALDATE — never the wall-clock fallback above.
             provider_arrival_is_trusted=parsed.provider_arrival_at is not None,
             direction=parsed.direction,
@@ -798,7 +799,7 @@ def list_messages(
 
 
 class GmailMessageAutomationCASLostError(Exception):
-    """AUD-004 (Astra R3): raised (constructed, never actually thrown --
+    """raised (constructed, never actually thrown --
     see the one caller, `app.services.automation_gmail`) when
     `mark_message_automation_processed` returns `False`: some OTHER
     process already marked this exact message as automation-processed
@@ -845,7 +846,7 @@ def list_unprocessed_messages_for_automation(
 
 
 def mark_message_automation_processed(db: Session, message_id: int) -> bool:
-    """Atomic per-message CAS (AUD-004, Astra R3): `UPDATE gmail_messages
+    """Atomic per-message CAS: `UPDATE gmail_messages
     SET automation_processed_at = :now WHERE id = :message_id AND
     automation_processed_at IS NULL`. Returns True iff exactly one row
     was updated -- i.e. THIS call is the one that durably recorded this
@@ -884,7 +885,7 @@ def get_thread_by_id(db: Session, account_key: str, thread_id: int) -> GmailThre
 def list_threads_with_counts(
     db: Session, account_key: str, limit: int, offset: int
 ) -> list[tuple[GmailThreadRecord, int]]:
-    """GMAIL-008: one grouped/joined aggregate query for the whole page —
+    """one grouped/joined aggregate query for the whole page —
     never a separate COUNT query per thread. Returns `(record,
     message_count)` pairs; the number of SQL statements this executes
     stays constant regardless of how many threads are returned.
@@ -926,7 +927,7 @@ def list_messages_for_thread(
     section 13 "thread detail API readiness") — never unbounded, and
     always account-scoped.
 
-    S7E-011 (Codex re-review): ordered by `provider_arrival_at` (Gmail's
+    ordered by `provider_arrival_at` (Gmail's
     own IMAP INTERNALDATE), not `received_at` — see
     app.db.follow_up_repository.get_thread_message_infos's docstring for
     why `received_at` (this project's own sync wall-clock write time) can
@@ -946,7 +947,7 @@ def list_messages_for_thread(
 
 
 def to_gmail_message(record: GmailMessageRecord) -> GmailMessage:
-    """Full detail conversion — GET /gmail/messages/{id} only (GMAIL-007).
+    """Full detail conversion — GET /gmail/messages/{id} only.
     Includes body_plain/full recipients/references; never used for the
     bulk list endpoint.
     """
@@ -975,7 +976,7 @@ def to_gmail_message(record: GmailMessageRecord) -> GmailMessage:
 
 def to_gmail_message_summary(record: GmailMessageRecord) -> GmailMessageSummary:
     """Compact conversion — GET /gmail/messages (list) and
-    GET /gmail/threads/{id} (GMAIL-007). Never includes body_plain, full
+    GET /gmail/threads/{id}. Never includes body_plain, full
     recipient arrays, references, or per-attachment detail.
     """
     attachment_count = len(json.loads(record.attachments_json))
@@ -994,7 +995,7 @@ def to_gmail_message_summary(record: GmailMessageRecord) -> GmailMessageSummary:
 
 
 def to_gmail_thread(record: GmailThreadRecord, message_count: int) -> GmailThread:
-    """GMAIL-008: `message_count` is supplied by the caller (from
+    """`message_count` is supplied by the caller (from
     `list_threads_with_counts`'s single grouped query) — this function
     itself never issues a DB query.
     """

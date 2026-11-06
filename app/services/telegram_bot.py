@@ -44,7 +44,7 @@ from telegram.ext import (
 )
 
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, get_settings, reveal
 from app.db.repositories import get_job_by_id, list_jobs, update_job_status
 from app.db.session import SessionLocal
 from app.db.telegram_vacancy_review_repository import (
@@ -56,6 +56,11 @@ from app.models.application_status import ApplicationStatus
 from app.models.company_research import CompanyResearchRunResponse
 from app.providers.base import ProviderNotConfiguredError
 from app.services import gmail_application_draft as gmail_draft
+from app.services.collector_exclusion import (
+    CollectorRunInProgressError,
+    CollectorRunLeaseLostError,
+    run_collector_exclusively,
+)
 from app.services.collector_runner import (
     run_bundesagentur,
     run_company_research_for_job,
@@ -130,7 +135,7 @@ def _is_authorized(update: Update, settings: Settings) -> bool:
     if settings.telegram_chat_id and chat_id == settings.telegram_chat_id:
         return True
 
-    # S8E-HARDEN-001: never log chat_id or message/command text here --
+    # never log chat_id or message/command text here --
     # both are attacker-controlled input from an UNAUTHENTICATED sender
     # (this branch is reached precisely because the sender is NOT the
     # configured operator chat). Logging either would let any stranger
@@ -389,7 +394,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(str(exc))
             return
         except AmbiguousCompanyIdentityError as exc:
-            # FR-M-01: never show research for an arbitrarily-picked company
+            # never show research for an arbitrarily-picked company
             # when the name is ambiguous across multiple known domains.
             await update.message.reply_text(str(exc))
             return
@@ -414,12 +419,21 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = SessionLocal()
     try:
         try:
-            if collector_name == "bundesagentur":
-                stats = await run_bundesagentur(db, settings)
-            else:
-                stats = await run_xing(db, settings)
+            runner = run_bundesagentur if collector_name == "bundesagentur" else run_xing
+            stats = await run_collector_exclusively(db, settings, collector_name, runner)
         except CollectorNotConfiguredError as exc:
             await update.message.reply_text(str(exc))
+            return
+        except CollectorRunInProgressError:
+            await update.message.reply_text(
+                f"{collector_name}: a collector or automation run is already in progress."
+            )
+            return
+        except CollectorRunLeaseLostError:
+            await update.message.reply_text(
+                f"{collector_name}: the run lost its exclusivity lease and was not recorded "
+                "as complete; check the data before running again."
+            )
             return
         except CollectorError as exc:
             await update.message.reply_text(f"{collector_name} collector run failed: {exc}")
@@ -433,6 +447,16 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"updated={stats['updated']} skipped_invalid={stats['skipped_invalid']} "
         f"failed={stats['failed']}"
         + (f" failed_queries={stats['failed_queries']}" if stats.get("failed_queries") else "")
+        + (
+            f" possible_collisions={stats['possible_collisions']}"
+            if stats.get("possible_collisions")
+            else ""
+        )
+        + (
+            f" variant_postings={stats['variant_postings']}"
+            if stats.get("variant_postings")
+            else ""
+        )
     )
 
 
@@ -445,7 +469,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     with the optional automatic daily digest) -- this handler only owns
     picking `account_key` and replying.
 
-    **Account scope (Codex Stage 8E HIGH finding).** Uses
+    **Account scope.** Uses
     `resolve_digest_account_key`, the SAME shared helper the automatic
     daily digest resolves its account_key through -- never re-derives
     its own normalization here, so a manual `/digest` and the automatic
@@ -576,7 +600,7 @@ async def _send_bewerbung_notice(
     if not outcome.notice:
         return
     await send_telegram_message(
-        settings.telegram_bot_token,
+        reveal(settings.telegram_bot_token),
         settings.telegram_chat_id,
         outcome.notice,
         reply_markup=markup if markup is not None else getattr(outcome, "notice_markup", None),
@@ -903,7 +927,7 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     human operator doesn't have to be tailing server logs to notice a
     command silently failed.
     """
-    # S8E-HARDEN-001: only the exception TYPE, never exc_info/a traceback
+    # only the exception TYPE, never exc_info/a traceback
     # or str(context.error) -- PTB's own error handler contract hands us
     # whatever exception a command handler raised, which could echo back
     # untrusted upstream detail (e.g. a collector's error message) that
@@ -928,7 +952,7 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application(settings: Settings) -> Application:
-    application = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    application = ApplicationBuilder().token(reveal(settings.telegram_bot_token)).build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("jobs", cmd_jobs))
@@ -966,7 +990,7 @@ async def start_bot(settings: Settings) -> Application | None:
     never raises for a runtime start failure — callers don't need to know
     how it can fail.
     """
-    if not settings.telegram_bot_token:
+    if not reveal(settings.telegram_bot_token):
         logger.info("telegram_bot_disabled reason=no_bot_token_configured")
         return None
 
@@ -976,7 +1000,7 @@ async def start_bot(settings: Settings) -> Application | None:
         await application.start()
         await application.updater.start_polling()
     except Exception as exc:
-        # S8E-HARDEN-001: only the exception TYPE -- a bad/revoked token
+        # only the exception TYPE -- a bad/revoked token
         # or network failure here must never log exc_info/a traceback,
         # which could otherwise surface request/response detail from the
         # underlying HTTP client.

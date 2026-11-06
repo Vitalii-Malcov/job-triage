@@ -33,7 +33,7 @@ class Job(BaseModel):
     # re-score that omits this field can reuse the stored value instead
     # of losing the classification — see
     # app.services.collector_runner.score_and_persist's own docstring.
-    # S10-003: max_length matches JobRecord.posting_type's VARCHAR(64).
+    # max_length matches JobRecord.posting_type's VARCHAR(64).
     posting_type: str | None = Field(default=None, max_length=64)
     # Stage 22 P1: structured facts the source states (BA search result). All
     # optional; persisted on JobRecord and refreshed by every observation that
@@ -48,8 +48,13 @@ class Job(BaseModel):
     home_office_type: str | None = Field(default=None, max_length=40)
     home_office_percent: int | None = Field(default=None, ge=0, le=100)
     quereinstieg_suitable: bool | None = None
+    # XING only, never persisted: message-local multiplicity of an identical posting block
+    # (the n-th block with the same company/title/location/details but a different link
+    # inside ONE e-mail). 1 for everything else. See
+    # app.db.repositories.resolve_xing_identity.
+    occurrence: int = Field(default=1, ge=1, le=20)
 
-    # S10-RR-001 (Codex Stage 10 re-review, BLOCKING): normalizes BEFORE
+    # normalizes BEFORE
     # the max_length constraint above is checked (mode="before" runs
     # ahead of Pydantic's own built-in string validation) -- "" and
     # whitespace-only are collapsed to None, and surrounding whitespace on
@@ -80,6 +85,12 @@ class JobScore(BaseModel):
     recommendation: Recommendation
     data_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     is_duplicate: bool = False
+    # XING: an observation without evidence (no salary/employment text) could not be
+    # placed among several stored rows of one identity; the stored row was left untouched.
+    possible_collision: bool = False
+    # XING: this observation was stored as a distinguished sibling of an existing
+    # posting with the same company/title/location but different details.
+    sibling_posting: bool = False
 
 
 class JobListItem(BaseModel):

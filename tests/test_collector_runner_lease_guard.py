@@ -201,17 +201,17 @@ class TestBundesagenturLeaseGuard:
             _ba_job(company="First Company", url="https://example.com/jobs/first"),
             _ba_job(company="Second Company", url="https://example.com/jobs/second"),
         ]
-        # False for job 1's research check, True from job 1's own
-        # notify check onward -- so job 1 still gets its research call
-        # (lease not yet confirmed lost), but NEITHER job 1's own
-        # Telegram notification NOR ANY of job 2's calls fire.
-        is_lease_lost = _make_is_lease_lost_after_n_calls(1)
+        # Task 22: the lease is checked before every NEW vacancy write, then before
+        # research and notification. False for job 1's pre-write and research checks, True
+        # from job 1's notify check onward -- so job 1 is persisted and researched, its
+        # Telegram notification does not fire, and job 2 is never even started.
+        is_lease_lost = _make_is_lease_lost_after_n_calls(2)
 
         result = await self._run(db, monkeypatch, jobs, is_lease_lost=is_lease_lost)
 
-        # Core job persistence is completely unaffected by lease loss --
-        # both jobs scored/persisted durably.
-        assert result["created"] == 2
+        # Job 1 was already in flight and is durable; job 2 is NOT started once
+        # ownership is confirmed lost (the owner re-collects it).
+        assert result["created"] == 1
         assert result["failed"] == 0
 
         # Company Research: only job 1 (before loss was confirmed).
@@ -225,7 +225,7 @@ class TestBundesagenturLeaseGuard:
         db.expire_all()
         titles = {job.title for job in db.query(JobRecord).all()}
         assert titles == {"Python Developer"}
-        assert db.query(JobRecord).count() == 2
+        assert db.query(JobRecord).count() == 1
 
     @pytest.mark.asyncio
     async def test_lease_never_lost_makes_no_difference(self, db, monkeypatch):
@@ -289,7 +289,7 @@ class TestBundesagenturLeaseGuard:
 
 
 class TestXingLeaseGuard:
-    async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None):
+    async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None, uid_validity=None):
         CountingResearchService.calls = []
         CountingNotifier.calls = []
 
@@ -304,8 +304,9 @@ class TestXingLeaseGuard:
                 # is a legitimate value (mirrors a fake/injected client
                 # that never determined a real UIDVALIDITY) and simply
                 # makes run_xing skip the watermark-advance step.
-                self.uid_validity: int | None = None
+                self.uid_validity: int | None = uid_validity
                 self.confirmed_uids: list[int] = []
+                self.candidate_uids: list[int] = [1]
 
             async def fetch_message_batches(self, since=None):
                 from app.collectors.xing_email import XingEmailBatch
@@ -346,17 +347,63 @@ class TestXingLeaseGuard:
                 skills=[],
             ),
         ]
-        is_lease_lost = _make_is_lease_lost_after_n_calls(1)
+        is_lease_lost = _make_is_lease_lost_after_n_calls(2)
 
         result = await self._run(db, monkeypatch, jobs, is_lease_lost=is_lease_lost)
 
-        assert result["created"] == 2
+        assert result["created"] == 1
         assert result["failed"] == 0
         assert CountingResearchService.calls == ["First Company"]
         assert CountingNotifier.calls == []
 
         db.expire_all()
-        assert db.query(JobRecord).count() == 2
+        assert db.query(JobRecord).count() == 1
+
+    @pytest.mark.asyncio
+    async def test_lease_lost_leaves_the_message_unacknowledged_and_the_watermark_alone(
+        self, db, monkeypatch
+    ):
+        """Review 2.3: persisted jobs stay (idempotent), but the shared state --
+        the Message-ID acknowledgement and the scan watermark -- is left to the
+        run that owns the mailbox now."""
+        from app.db.models import XingScanProgressRecord
+        from app.db.repositories import is_message_processed
+
+        job = Job(
+            source="xing",
+            title="Backend Engineer",
+            company="Lost Lease Co",
+            url="https://www.xing.com/m/LLLLLLLLLLLLLLLLLLLL9",
+            description="",
+            skills=[],
+        )
+        result = await self._run(db, monkeypatch, [job], is_lease_lost=lambda: True, uid_validity=7)
+
+        # Task 22: ownership already lost before the first job -> no NEW vacancy write at all
+        assert result["created"] == 0
+        db.expire_all()
+        assert db.query(JobRecord).count() == 0
+        assert not is_message_processed(db, "xing", "<digest@mail.xing.com>")
+        assert db.query(XingScanProgressRecord).count() == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_lease_acknowledges_and_advances_the_watermark(self, db, monkeypatch):
+        from app.db.models import XingScanProgressRecord
+        from app.db.repositories import is_message_processed
+
+        job = Job(
+            source="xing",
+            title="Backend Engineer",
+            company="Healthy Lease Co",
+            url="https://www.xing.com/m/HHHHHHHHHHHHHHHHHHHH8",
+            description="",
+            skills=[],
+        )
+        await self._run(db, monkeypatch, [job], is_lease_lost=lambda: False, uid_validity=7)
+
+        db.expire_all()
+        assert is_message_processed(db, "xing", "<digest@mail.xing.com>")
+        assert db.query(XingScanProgressRecord).count() == 1
 
     @pytest.mark.asyncio
     async def test_standalone_caller_without_lease_guard_is_unaffected(self, db, monkeypatch):

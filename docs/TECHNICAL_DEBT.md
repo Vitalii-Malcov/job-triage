@@ -42,6 +42,17 @@ Complexity: **S** (< 1 hour), **M** (< 1 day), **L** (multi-day), **XL** (needs 
 | TD-034 | SQLite pilot archive keeps all historical operational state (jobs, approvals, send states, legacy `user_profiles`) | P3 | Historical data retained indefinitely, read-only, not migrated | — | Manual/operational retention decision; deliberately not migrated (Stage 13B) |
 | TD-035 | Transfer CLI's `source != target` check compares backend/host/port/database only | P3 | Two different host aliases for one server would not be detected | S | Mitigated by the import preflight: a non-empty or already-profiled target is always refused (Stage 13B) |
 
+## Reconciliation 2026-11-04 (hard code review remediation, local branches, not in `main`)
+
+Status below is on `fix/hard-review-integration` only; nothing is merged or deployed.
+
+| ID | Update |
+|---|---|
+| TD-001 | Still open: exception-to-HTTP translation is not centralized. Related work done: `app/api/routes.py` split into `app/api/routers/*` (route table and OpenAPI proven identical) |
+| TD-004 | Open; the limiter is now a quota factory with atomic reserve/refund but still per process |
+| TD-007 | Resolved on the branch: constant-time `api_key_matches`, auth-failure budget |
+| TD-002 | Open (`run_xing` etc. not decomposed; `score_and_persist` composition was split) |
+
 ## Notes
 
 - Items marked "FIXED this branch" were implemented under Phase 17's safe-change criteria: deployment/configuration-only, no schema change, no business-semantics change, no change to outbound/approval/trust/concurrency behavior.

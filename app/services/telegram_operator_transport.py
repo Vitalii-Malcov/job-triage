@@ -18,6 +18,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
+from app.core.config import reveal
 from app.services.telegram import (
     TELEGRAM_MESSAGE_HARD_LIMIT,
     TelegramSendOutcome,
@@ -51,9 +52,9 @@ class HttpTelegramOperatorTransport:
         sender: Callable[..., Awaitable[TelegramSendResult]] = send_telegram_message,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        if not reveal(settings.telegram_bot_token) or not settings.telegram_chat_id:
             raise OperatorTransportNotConfiguredError("telegram bot token / chat id missing")
-        self._token = settings.telegram_bot_token
+        self._token = reveal(settings.telegram_bot_token)
         self._chat_id = settings.telegram_chat_id
         self._timeout = settings.telegram_timeout_seconds
         self._max_attempts = max(1, max_attempts)

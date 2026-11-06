@@ -75,7 +75,7 @@ def get_latest_approved_review_for_job(
     DECISION wins; this is a documented, deliberate choice, not an
     ambiguity.
 
-    AUD-008 (Astra R2): "most recent" is ordered by `decided_at` (when the
+    "most recent" is ordered by `decided_at` (when the
     APPROVED decision actually happened), never by `id`/creation order —
     those two can disagree whenever reviews are created in one order but
     decided in another (e.g. review A created, then review B created, but

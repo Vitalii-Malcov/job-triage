@@ -89,7 +89,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
 
     with TestClient(app) as test_client:
@@ -129,7 +129,7 @@ def test_notification_exception_does_not_turn_successful_score_into_500(
     client, monkeypatch, caplog
 ):
     test_client, session_factory = client
-    monkeypatch.setattr("app.api.routes.TelegramNotifier", _RaisingNotifier)
+    monkeypatch.setattr("app.api.routers.jobs.TelegramNotifier", _RaisingNotifier)
 
     # S11E-001 follow-up: the notifier is now only reached for
     # recommendation=="APPLY". The original short description put
@@ -192,7 +192,7 @@ def test_notification_failure_returned_false_is_logged_without_raising(client, m
             return False
 
     _FalseNotifier.calls = []
-    monkeypatch.setattr("app.api.routes.TelegramNotifier", _FalseNotifier)
+    monkeypatch.setattr("app.api.routers.jobs.TelegramNotifier", _FalseNotifier)
 
     # S11E-002 (Codex Stage 11E review, BLOCKING) follow-up to S11E-001:
     # same principle as the RuntimeError isolation test above -- /jobs/score

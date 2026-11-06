@@ -65,10 +65,17 @@ adds a login form that takes the same `API_KEY`:
 
 - `POST /ui/login` compares the submitted key with `API_KEY` in constant time
   (rate-limited like the API) and sets a session cookie.
-- The cookie is **stateless**: `<expiry>.<HMAC-SHA256(API_KEY, "jobtriage-ui/1|" + expiry)>`.
-  It contains no key material, expires after `UI_SESSION_HOURS` (default 12),
-  and every cookie becomes invalid when `API_KEY` is rotated. No server-side
-  session table (no new state).
+- The cookie is `<expiry>.<random session id>.<HMAC-SHA256(signing key, "jobtriage-ui/2|" + expiry + "|" + id)>`.
+  The signing key is derived from `API_KEY` (or `UI_SESSION_SECRET`) and a random
+  per-process nonce; the cookie contains no key material and expires after
+  `UI_SESSION_HOURS` (default 12).
+- **Revocation (review 1.4), no database state:** `POST /ui/logout` records the
+  session id in a bounded in-process registry until the cookie's own expiry, so a
+  copied cookie stops working. A full registry answers 503 (logout not recorded)
+  rather than forgetting a revocation. A **restart of the web process invalidates
+  every cookie** (the nonce is not persisted), as does rotating `API_KEY` or
+  `UI_SESSION_SECRET` ("log out everywhere": change the value and restart/redeploy).
+  This assumes the documented single web process (`--workers 1`, one replica).
 - Cookie flags: `HttpOnly`, `SameSite=Strict`, `Path=/ui`, `Secure` unless
   `UI_COOKIE_SECURE=false` (needed only for plain-HTTP access from a
   non-localhost host).

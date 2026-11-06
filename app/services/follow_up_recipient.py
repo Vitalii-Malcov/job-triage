@@ -1,4 +1,4 @@
-"""S7E-008 (Codex remediation): canonical, validated Stage 7E follow-up
+"""canonical, validated Stage 7E follow-up
 recipient derivation.
 
 **Why this exists as its own module.** Both proposal-build time

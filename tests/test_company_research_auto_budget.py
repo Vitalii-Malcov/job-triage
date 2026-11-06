@@ -121,7 +121,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake_settings)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake_settings)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake_settings)
     rate_limit_module._requests.clear()
     rate_limit_module._collector_requests.clear()
 
@@ -197,7 +197,7 @@ def test_auto_research_disabled_by_default_makes_zero_calls(client, monkeypatch)
         company_research_auto_enabled=False,
         min_job_score_to_notify=101,
     )
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: disabled_settings)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: disabled_settings)
     CountingResearchService.call_count = 0
     monkeypatch.setattr(
         "app.services.collector_runner.CompanyResearchService", CountingResearchService

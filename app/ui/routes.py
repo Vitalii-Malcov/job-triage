@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
 from app.db.datetime_utils import ensure_utc
@@ -24,9 +25,12 @@ from app.ui.auth import (
     NotLoggedInError,
     api_key_matches,
     issue_session_token,
+    parse_session_token,
     require_same_origin,
     require_ui_enabled,
     require_ui_session,
+    revocations,
+    signing_key,
 )
 from app.ui.readonly import get_ui_db
 
@@ -92,7 +96,7 @@ def stylesheet() -> FileResponse:
 
 
 async def _bounded_body(request: Request) -> bytes:
-    """Codex review A (P2): never buffer more than MAX_LOGIN_BODY bytes of an
+    """never buffer more than MAX_LOGIN_BODY bytes of an
     unauthenticated request (declared length first, then the stream)."""
     too_large = HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
     declared = request.headers.get("content-length", "")
@@ -113,18 +117,27 @@ def login_form(request: Request) -> Response:
 
 @router.post("/login", include_in_schema=False, dependencies=[Depends(require_same_origin)])
 async def login(request: Request) -> Response:
-    from app.security.rate_limit import enforce_ui_login_rate_limit
+    from app.security.rate_limit import (
+        begin_auth_attempt,
+        end_auth_attempt_ok,
+        enforce_ui_login_rate_limit,
+    )
 
-    enforce_ui_login_rate_limit(request)
+    # The shared backend does blocking database work: keep it off the event loop.
+    await run_in_threadpool(enforce_ui_login_rate_limit, request)
+    # Body first: the failure slot is reserved right before the comparison,
+    # so a slow body cannot straddle a lockout.
     body = await _bounded_body(request)
     submitted = parse_qs(body.decode("utf-8", errors="replace")).get("api_key", [""])[0]
     settings = get_settings()
+    token = await run_in_threadpool(begin_auth_attempt, request)
     if not api_key_matches(submitted, settings.api_key):
         return _render(request, "login.html", status_code=401, error="Invalid key.")
+    await run_in_threadpool(end_auth_attempt_ok, request, token)
     response = RedirectResponse("/ui/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         COOKIE_NAME,
-        issue_session_token(settings.api_key, hours=settings.ui_session_hours),
+        issue_session_token(signing_key(settings), hours=settings.ui_session_hours),
         max_age=settings.ui_session_hours * 3600,
         path="/ui",
         httponly=True,
@@ -135,7 +148,19 @@ async def login(request: Request) -> Response:
 
 
 @router.post("/logout", include_in_schema=False, dependencies=[Depends(require_same_origin)])
-def logout() -> Response:
+def logout(request: Request) -> Response:
+    # Revoke this session's id server-side (until the cookie's own expiry) so
+    # a copied cookie stops working. Only a correctly signed, unexpired cookie
+    # can add an entry; anything else just clears the browser cookie, with the
+    # same answer (no oracle). A full registry fails closed instead of
+    # pretending the session ended.
+    parsed = parse_session_token(request.cookies.get(COOKIE_NAME), signing_key(get_settings()))
+    if parsed is not None and not revocations.revoke(parsed[1], parsed[0]):
+        return Response(
+            "Logout could not be recorded; try again later or rotate UI_SESSION_SECRET.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            media_type="text/plain",
+        )
     response = RedirectResponse("/ui/login", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(COOKIE_NAME, path="/ui")
     return response

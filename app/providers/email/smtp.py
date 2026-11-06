@@ -19,7 +19,7 @@ trusted fields (see outbound_base.py's module docstring) — this module
 does not parse MIME, does not read `body_plain`, and never touches
 `app.db.models.GmailMessageRecord` directly.
 
-**Hard connection timeout (S7E-014, Codex re-review).** `_connect()`
+**Hard connection timeout.** `_connect()`
 always opens the underlying socket with `timeout=SMTP_OPERATION_TIMEOUT_SECONDS`
 (see that constant's own docstring) — a hung/black-holed SMTP peer raises
 within a bounded time instead of blocking indefinitely, which is what
@@ -198,11 +198,11 @@ class GmailSmtpProvider:
         # Injected only by tests, to avoid a real SMTP connection —
         # mirrors GmailImapProvider._injected_client.
         self._injected_client = smtp_client
-        # S7E-014: overridable only for tests that need a much smaller
+        # overridable only for tests that need a much smaller
         # bound to keep a real-socket timeout proof fast — production
         # callers (app/api/routes.py) always use the safe module default.
         self.timeout_seconds = timeout_seconds
-        # NEW-006 (Astra R4B): same override contract as timeout_seconds
+        # same override contract as timeout_seconds
         # above, for the whole-call wall-clock deadline -- see
         # SMTP_TOTAL_DEADLINE_SECONDS's own docstring.
         self.total_deadline_seconds = total_deadline_seconds
@@ -436,14 +436,14 @@ class GmailSmtpProvider:
         way. This refactor closes the greeting-read gap specifically,
         not that pre-existing, structurally different limitation.)
         """
-        # AUD-001: an explicit verifying SSLContext -- smtplib.SMTP_SSL's
+        # an explicit verifying SSLContext -- smtplib.SMTP_SSL's
         # own default (context=None) resolves to
         # ssl._create_stdlib_context(), which sets verify_mode=CERT_NONE
         # and check_hostname=False, i.e. no certificate verification at
         # all despite the connection authenticating with a real mailbox
         # password.
         ssl_context = ssl.create_default_context()
-        # S7E-014: `timeout` bounds connect + the TLS handshake + the
+        # `timeout` bounds connect + the TLS handshake + the
         # initial greeting read (via the explicit `client.connect(...)`
         # below) — and, since it is set on the underlying socket for the
         # lifetime of the connection, every later blocking call on this

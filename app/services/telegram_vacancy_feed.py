@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from app.agents.job_scorer import normalize_skill
 from app.agents.requirement_extractor import extract_language_requirements
 from app.agents.score_labels import VACANCY_SCORE_LABEL
+from app.core.config import reveal
 from app.db.application_repository import has_application_for_job
 from app.db.candidate_profile_repository import get_candidate_skills_for_scoring
 from app.db.models import JobRecord, TelegramVacancyReviewRecord
@@ -421,7 +422,7 @@ async def _send_claimed_card(
         )
         return _RELEASED if manual_review else _FAILED
 
-    # Re-check immediately before networking (Codex S9A-CODEX-002): the
+    # Re-check immediately before networking: the
     # heartbeat thread may have confirmed lease loss during the claim's
     # commit/refresh or the render above. No HTTP request has started,
     # so the row is known-not-sent -- release it back to the queue
@@ -443,7 +444,7 @@ async def _send_claimed_card(
         return _RELEASED
 
     result = await send_telegram_message(
-        settings.telegram_bot_token,
+        reveal(settings.telegram_bot_token),
         settings.telegram_chat_id,
         text,
         reply_markup=reply_markup,
@@ -514,7 +515,7 @@ async def deliver_queued_vacancy_cards(
     queue untouched (`release_claim`).
     """
     stats = VacancyFeedDeliveryStats()
-    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+    if not reveal(settings.telegram_bot_token) or not settings.telegram_chat_id:
         logger.info("vacancy_feed_delivery_skipped reason=telegram_not_configured")
         return stats
 
@@ -642,7 +643,7 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
     never resends it, only another explicit `/review` (attempt cap applies).
     The single network call is the card to the configured operator chat.
     """
-    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+    if not reveal(settings.telegram_bot_token) or not settings.telegram_chat_id:
         return ManualReviewOutcome("NOT_CONFIGURED", "Telegram ist nicht konfiguriert.")
     job = get_job_by_id(db, job_id)
     if job is None:

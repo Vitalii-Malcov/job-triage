@@ -37,9 +37,14 @@ def _settings(**overrides) -> Settings:
 
 def test_fields_are_exactly_the_allowlist():
     fields = startup_safety_fields(_settings())
-    assert set(fields) == set(SAFETY_FLAGS) | {"database_dialect", "trusted_proxy_count"}
+    assert set(fields) == set(SAFETY_FLAGS) | {
+        "database_dialect",
+        "trusted_proxy_count",
+        "shared_state_backend",
+    }
     assert fields["database_dialect"] == "postgresql"
     assert fields["trusted_proxy_count"] == "1"
+    assert fields["shared_state_backend"] == "memory"
     assert all(fields[flag] in {"true", "false"} for flag in SAFETY_FLAGS)
 
 

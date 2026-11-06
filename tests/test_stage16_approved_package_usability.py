@@ -103,7 +103,7 @@ def api(factory, monkeypatch):
     fake = Settings(_env_file=None, api_key=API_KEY, rate_limit_requests=1000)
     monkeypatch.setattr("app.security.auth.get_settings", lambda: fake)
     monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake)
-    monkeypatch.setattr("app.api.routes.get_settings", lambda: fake)
+    monkeypatch.setattr("app.api.routers.common.get_settings", lambda: fake)
     rate_limit_module._requests.clear()
     with TestClient(app) as client:
         yield client

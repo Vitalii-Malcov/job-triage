@@ -26,7 +26,7 @@ matched, 1 genuinely missing -- NOT sparse; JUNIOR SOFTWARE DEVELOPER
 DACH: 0 must-haves AND 0 nice-to-haves extracted at all -- genuinely
 sparse).
 
-**M2 fix (Astra Stage 12 audit): DISTINCT evidence, not raw category
+**M2 fix: DISTINCT evidence, not raw category
 counts.** This module used to take two raw counts (must-have total,
 nice-to-have total) and sum them -- so a single skill duplicated across
 both categories (`must=[python], nice=[python]`) counted as 2 signals,
