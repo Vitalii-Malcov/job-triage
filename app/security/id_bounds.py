@@ -42,7 +42,11 @@ def _out_of_range(value: str) -> bool:
 
 
 def reject_out_of_range_ids(request: Request) -> None:
-    for source in (request.path_params, request.query_params):
+    # getattr: callers (and unit-test stubs) may hand over a request-like object without them
+    for source in (
+        getattr(request, "path_params", None) or {},
+        getattr(request, "query_params", None) or {},
+    ):
         for name, value in source.items():
             if _is_id_name(name) and isinstance(value, str) and _out_of_range(value):
                 raise HTTPException(
