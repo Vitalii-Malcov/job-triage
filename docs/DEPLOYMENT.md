@@ -123,7 +123,7 @@ Single default `compose` bridge network. `web` and `scheduler` both reach `db` b
 
 ## Rate-limit implications
 
-Limits are per process with the default `SHARED_STATE_BACKEND=memory` (AUD-004; Task 23 adds the opt-in shared `database` backend, see "Scaling limitations"): run exactly one `web` replica (`--workers 1`, one container; the fixed host-port mapping also makes `--scale web=2` fail) so the configured limits mean what their numbers say. Behind a proxy, buckets are per real client only once `TRUSTED_PROXY_IPS` names that proxy (see above); until then all proxied clients share the proxy's bucket. Rate limiting still runs after API-key auth (HARD-015) and the key comparison is not constant-time (AUD-006) — acceptable only because the API has no direct network exposure (loopback bind); keep it that way.
+Limits are per process with the default `SHARED_STATE_BACKEND=memory` (AUD-004; Task 23 adds the opt-in shared `database` backend, see "Scaling limitations"): run exactly one `web` replica (`--workers 1`, one container; the fixed host-port mapping also makes `--scale web=2` fail) so the configured limits mean what their numbers say. Behind a proxy, buckets are per real client only once `TRUSTED_PROXY_IPS` names that proxy (see above); until then all proxied clients share the proxy's bucket. The API key is compared in constant time and every attempt is charged to a shared failed-authentication budget BEFORE the comparison (refunded on success), so a locked-out client learns nothing more about the key; the generic request limiter still runs after authentication. The API is still not designed for direct network exposure (loopback bind); keep it that way.
 
 ## Scaling limitations (explicit, honest)
 

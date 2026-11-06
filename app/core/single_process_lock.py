@@ -47,7 +47,17 @@ def database_identity(database_url: str) -> str:
     if backend == "sqlite":
         if not url.database or url.database == ":memory:":
             return "sqlite::memory:"
-        path = str(Path(url.database).resolve())
+        database = url.database
+        if str(url.query.get("uri", "")).casefold() in {"1", "true", "yes"} and database.startswith(
+            "file:"
+        ):
+            # SQLite URI form: `file:jobs.db?...` / `file:///abs/jobs.db` name the same file
+            database = database[len("file:") :].split("?", 1)[0]
+            if database.startswith("//"):
+                database = database[2:]
+            if len(database) > 2 and database[0] == "/" and database[2] == ":":
+                database = database[1:]  # `/E:/dir/jobs.db` (file:///E:/...) -> `E:/dir/jobs.db`
+        path = str(Path(database).resolve())
         return "sqlite:" + (path.casefold() if os.name == "nt" else path)
     # The EFFECTIVE connection target: query-string overrides win over the authority part and
     # an omitted port means the dialect default (PostgreSQL 5432). No credentials.

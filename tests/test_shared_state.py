@@ -445,6 +445,26 @@ class TestLockIdentity:
         assert one == two and "secret" not in one and "alice" not in one
         assert one != database_identity("postgresql+psycopg://alice:secret@db.example:5432/other")
 
+    def test_sqlite_uri_spellings_share_a_lock_with_the_plain_path(self, tmp_path, monkeypatch):
+        from app.core.single_process_lock import database_identity
+
+        monkeypatch.chdir(tmp_path)
+        plain = database_identity("sqlite:///jobs.db")
+        assert plain == database_identity("sqlite:///file:jobs.db?uri=true&mode=rw")
+        assert plain == database_identity("sqlite:///file:jobs.db?uri=true")
+        assert plain != database_identity("sqlite:///file:other.db?uri=true")
+
+    def test_an_absolute_sqlite_uri_shares_a_lock_with_the_plain_absolute_path(self, tmp_path):
+        from app.core.single_process_lock import database_identity
+
+        absolute = (tmp_path / "jobs.db").as_posix()
+        uri_path = (
+            absolute if absolute.startswith("/") else "/" + absolute
+        )  # file:///E:/... on Windows
+        plain = database_identity(f"sqlite:///{absolute}")
+        assert plain == database_identity(f"sqlite:///file://{uri_path}?uri=true&mode=rw")
+        assert plain == database_identity(f"sqlite:///file:{absolute}?uri=true")
+
     def test_the_lock_directory_is_configurable(self, tmp_path):
         from app.core.single_process_lock import lock_path_for
 
