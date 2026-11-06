@@ -18,8 +18,8 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings, reveal
+from app.core.key_strength import is_strong_secret
 from app.db.datetime_utils import ensure_utc
-from app.security.key_strength import is_strong_secret
 from app.ui import queries
 from app.ui.auth import (
     COOKIE_NAME,

@@ -7,15 +7,15 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.core.config import Settings
-from app.core.startup_diagnostics import startup_safety_fields
-from app.security import auth as auth_module
-from app.security import rate_limit as rate_limit_module
-from app.security.key_strength import (
+from app.core.key_strength import (
     MIN_STRONG_KEY_CHARS,
     is_placeholder_secret,
     is_strong_secret,
     secret_strength,
 )
+from app.core.startup_diagnostics import startup_safety_fields
+from app.security import auth as auth_module
+from app.security import rate_limit as rate_limit_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STRONG = "Q7xT2mV9bK4nR8sW1cY6dF3gH5jL0pAz"  # 32 mixed characters, not a placeholder

@@ -3,8 +3,8 @@ import hmac
 from fastapi import Header, HTTPException, Request, status
 
 from app.core.config import get_settings, reveal
+from app.core.key_strength import is_strong_secret
 from app.security.id_bounds import reject_out_of_range_ids
-from app.security.key_strength import is_strong_secret
 from app.security.rate_limit import begin_auth_attempt, end_auth_attempt_ok, enforce_rate_limit
 
 

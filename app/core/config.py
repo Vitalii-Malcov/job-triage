@@ -6,6 +6,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.core.key_strength import is_placeholder_secret
 from app.providers.email.base import (
     MAX_ADDRESS_LENGTH,
     MAX_IMAP_HOST_LENGTH,
@@ -539,8 +540,6 @@ class Settings(BaseSettings):
     # "closed" state). Names only -- the value is never put in the message.
     @model_validator(mode="after")
     def _reject_placeholder_secrets(self) -> "Settings":
-        from app.security.key_strength import is_placeholder_secret
-
         offenders = [
             name
             for name, value in (
