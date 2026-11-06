@@ -18,7 +18,7 @@ from app.security.key_strength import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STRONG = "k" * 8 + "Zq3-" * 6 + "end0"  # 36 chars, not a placeholder
+STRONG = "Q7xT2mV9bK4nR8sW1cY6dF3gH5jL0pAz"  # 32 mixed characters, not a placeholder
 assert len(STRONG) >= MIN_STRONG_KEY_CHARS and not is_placeholder_secret(STRONG)
 
 
@@ -27,7 +27,14 @@ assert len(STRONG) >= MIN_STRONG_KEY_CHARS and not is_placeholder_secret(STRONG)
 
 @pytest.mark.parametrize(
     "value",
-    ["replace-with-a-long-random-secret", "Replace-Me", "changeme", "your-key-here", "<secret>"],
+    [
+        "replace-with-a-long-random-secret",
+        "Replace-Me",
+        "changeme",
+        "your-key-here",
+        "<secret>",
+        "change_me_please",
+    ],
 )
 @pytest.mark.parametrize("field", ["api_key", "ui_session_secret", "postgres_password"])
 def test_template_placeholders_are_refused(field, value):
@@ -38,7 +45,22 @@ def test_template_placeholders_are_refused(field, value):
     assert value not in message  # the value itself is never echoed
 
 
-@pytest.mark.parametrize("value", ["", STRONG, "k", "test-key", "upstream-key"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        STRONG,
+        "k",
+        "test-key",
+        "upstream-key",
+        # legitimate random-looking secrets that merely START like a template word
+        "todoQ7xT2mV9bK4nR8sW1cY6dF3gH5jL0pA",
+        "xxxQ7xT2mV9bK4nR8sW1cY6dF3gH5jL0pAaa",
+        "exampleQ7xT2mV9bK4nR8sW1cY6dF3gH5jL0p",
+        "replaceQ7xT2mV9bK4nR8sW1cY6dF3gH5jL0p",
+        "<Q7xT2mV9bK4nR8sW1cY6dF3gH5jL0pA!x",
+    ],
+)
 def test_empty_real_and_test_keys_are_accepted(value):
     assert Settings(api_key=value).api_key.get_secret_value() == value
 
@@ -161,3 +183,86 @@ def test_same_budget_behind_a_proxy_that_hides_clients(monkeypatch):
     _use_key(monkeypatch, STRONG)
     _burn_budget("172.18.0.1")
     _call_auth(STRONG, "172.18.0.1")
+
+
+def test_low_diversity_value_is_not_strong():
+    assert not is_strong_secret("a" * 40)
+    assert not is_strong_secret("ab" * 20)
+
+
+# ---- SEC-03 on the UI paths -------------------------------------------------
+
+
+@pytest.fixture()
+def ui_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+
+    from app.db.base import Base
+    from app.main import app
+    from app.ui.readonly import build_readonly_engine, get_ui_db, readonly_sessionmaker
+
+    url = f"sqlite:///{(tmp_path / 'ui.db').as_posix()}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    ro = build_readonly_engine(url)
+    factory = readonly_sessionmaker(ro)
+
+    def override():
+        db = factory()
+        try:
+            yield db
+        finally:
+            db.rollback()
+            db.close()
+
+    def make(api_key):
+        settings = Settings(
+            _env_file=None,
+            api_key=api_key,
+            telegram_bot_token="",
+            ui_enabled=True,
+            ui_cookie_secure=True,
+            gmail_username="",
+        )
+        for target in ("app.ui.auth", "app.ui.routes", "app.security.rate_limit"):
+            monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
+        rate_limit_module._ui_login_limiter.buckets.clear()
+        app.dependency_overrides[get_ui_db] = override
+        return TestClient(app, base_url="https://testserver")
+
+    yield make
+    app.dependency_overrides.pop(get_ui_db, None)
+    ro.dispose()
+
+
+def _wrong_logins(client, count):
+    for _ in range(count):
+        response = client.post("/ui/login", data={"api_key": "wrong"}, follow_redirects=False)
+        assert response.status_code in (401, 429)
+
+
+def test_ui_strong_key_login_and_session_survive_other_clients_failures(ui_client):
+    client = ui_client(STRONG)
+    _wrong_logins(client, rate_limit_module.AUTH_FAILURE_LIMIT + 5)  # budget + login quota spent
+    blocked = client.post("/ui/login", data={"api_key": "wrong"}, follow_redirects=False)
+    assert blocked.status_code == 429
+    ok = client.post("/ui/login", data={"api_key": STRONG}, follow_redirects=False)
+    assert ok.status_code == 303, ok.text
+    page = client.get("/ui/", follow_redirects=False)
+    assert page.status_code == 200, page.status_code  # the valid session is not refused either
+
+
+def test_ui_weak_key_keeps_the_conservative_lockout(ui_client):
+    client = ui_client("weak-ui-key")
+    _wrong_logins(client, rate_limit_module.AUTH_FAILURE_LIMIT + 5)
+    refused = client.post("/ui/login", data={"api_key": "weak-ui-key"}, follow_redirects=False)
+    assert refused.status_code == 429
+
+
+def test_ui_forged_cookies_are_still_charged_and_throttled(ui_client):
+    client = ui_client(STRONG)
+    client.cookies.set("jobtriage_ui", "forged.cookie.value", path="/ui")
+    codes = [client.get("/ui/", follow_redirects=False).status_code for _ in range(14)]
+    assert 429 in codes  # guessing a signature burns the shared budget

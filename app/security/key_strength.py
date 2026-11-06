@@ -9,33 +9,39 @@ enough that 10 guesses per 5 minutes cannot reach it.
 No secret value is ever returned, logged or placed in an exception message.
 """
 
+import re
+
 # secrets.token_urlsafe(32) is 43 characters; 32 characters of any mixed
 # alphabet is >= 160 bits when generated randomly.
 MIN_STRONG_KEY_CHARS = 32
+MIN_DISTINCT_CHARS = 12
 
-_PLACEHOLDER_PREFIXES = (
-    "replace",
-    "changeme",
-    "change-me",
-    "change_me",
-    "your-",
-    "your_",
-    "example",
-    "placeholder",
-    "todo",
-    "xxx",
-    "<",
+# Known template values / explicit placeholder syntax only. A bare prefix test ("todo...",
+# "xxx...", "example...") would refuse legitimate random secrets that merely start that way.
+_PLACEHOLDER = re.compile(
+    r"(?:replace[-_ ](?:with|me)"
+    r"|change[-_ ]?me"
+    r"|your[-_ ](?:api[-_ ]?key|secret|password|key|token)"
+    r"|insert[-_ ](?:key|secret|password)"
+    r"|placeholder"
+    r"|<[^<>]*>)"
+    r"(?:[-_ ].*)?",
+    re.IGNORECASE,
 )
 
 
 def is_placeholder_secret(value: str) -> bool:
     """True for the well-known template strings of the public repository."""
-    normalized = value.strip().lower()
-    return bool(normalized) and normalized.startswith(_PLACEHOLDER_PREFIXES)
+    return bool(_PLACEHOLDER.fullmatch(value.strip()))
 
 
 def is_strong_secret(value: str) -> bool:
-    return len(value) >= MIN_STRONG_KEY_CHARS and not is_placeholder_secret(value)
+    # length plus a minimal diversity floor: 32 x the same character is not a secret
+    return (
+        len(value) >= MIN_STRONG_KEY_CHARS
+        and len(set(value)) >= MIN_DISTINCT_CHARS
+        and not is_placeholder_secret(value)
+    )
 
 
 def secret_strength(value: str) -> str:

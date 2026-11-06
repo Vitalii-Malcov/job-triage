@@ -124,18 +124,20 @@ async def login(request: Request) -> Response:
         enforce_ui_login_rate_limit,
     )
 
-    # The shared backend does blocking database work: keep it off the event loop.
-    await run_in_threadpool(enforce_ui_login_rate_limit, request)
-    # Body first: the failure slot is reserved right before the comparison,
-    # so a slow body cannot straddle a lockout.
+    # Body first (it is size-bounded): the failure slot is reserved right before the
+    # comparison, so a slow body cannot straddle a lockout.
     body = await _bounded_body(request)
     submitted = parse_qs(body.decode("utf-8", errors="replace")).get("api_key", [""])[0]
     settings = get_settings()
-    # SEC-03: a correct, strong key is never refused because of other clients' failures.
+    # SEC-03: a correct, strong key is never refused because of other clients' failures --
+    # neither by the login quota nor by the shared failed-auth budget. Every other attempt
+    # (wrong key, weak key) is metered exactly as before.
     token = None
     if not (
         is_strong_secret(reveal(settings.api_key)) and api_key_matches(submitted, settings.api_key)
     ):
+        # The shared backend does blocking database work: keep it off the event loop.
+        await run_in_threadpool(enforce_ui_login_rate_limit, request)
         token = await run_in_threadpool(begin_auth_attempt, request)
     if token is not None and not api_key_matches(submitted, settings.api_key):
         return _render(request, "login.html", status_code=401, error="Invalid key.")
