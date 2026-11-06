@@ -42,6 +42,11 @@ EXCLUDED = [
     "Systemadmin Linux (w/m/d)",
     "Anwendungssupporter IT und Logistik (m/w/d)",
     "Mitarbeiter Client Support (m/w/d)",
+    "IT-Systemelektroniker (m/w/d)",
+    "IT-Systemelektronikerin Fachrichtung Netzwerk",
+    "Fachinformatiker/in Systemintegration",
+    "2nd-Level-Support IT",
+    "Network Administrator",
 ]
 KEPT = [
     "Junior Python Developer (m/w/d)",
@@ -57,6 +62,10 @@ KEPT = [
     "Junior KI-Entwickler",
     "Junior Python Developer - Administratoren-Portal (m/w/d)",
     "Software Developer Client Support Tools",
+    "Backend Entwickler mit Docker und Linux (m/w/d)",
+    "Python Automation Developer",
+    "Junior API Developer",
+    "Trainee Softwareentwicklung",
     "Softwareentwickler Systemadmin-Werkzeuge (m/w/d)",
     "IT-Administrator / Softwareentwickler für unser Unternehmen",
     "IT-Systemadministrator / Softwareentwickler m/w/d",

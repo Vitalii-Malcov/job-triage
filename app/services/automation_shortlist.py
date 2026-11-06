@@ -96,6 +96,7 @@ from app.services.candidate_preparation import (
     prepare_candidate_job_match,
 )
 from app.services.collector_runner import TouchedJob
+from app.services.shortlist_gate import automatic_preparation_block
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ def _match_eligible_jobs(
 
 async def _prepare_shortlist_items(
     db: Session, shortlisted: list[tuple], failures: list[AutomationJobFailure]
-) -> tuple[list[ShortlistDraftItem], int, int, int, int, int]:
+) -> tuple[list[ShortlistDraftItem], int, int, int, int, int, int]:
     """Phase 3: prepare (or reuse) the CV draft and the Bewerbung draft of each shortlisted
     job. A failure in either step is rolled back, appended to `failures` and recorded as a
     failed item; the next job still runs.
@@ -172,8 +173,16 @@ async def _prepare_shortlist_items(
     failed = 0
     items: list[ShortlistDraftItem] = []
     cv_created = cv_reused = bewerbung_created = bewerbung_reused = 0
+    blocked_at_draft = 0
 
     for job, match in shortlisted:
+        # Re-check right before the first draft is created: the tier may have
+        # changed since selection (profile, application or job update).
+        reason = automatic_preparation_block(db, job.id)
+        if reason is not None:
+            blocked_at_draft += 1
+            logger.info("automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, reason)
+            continue
         # --- CV phase (S8C-CACHE-001: race-safe created/reused via the
         # repository's own INSERT-or-reload outcome, never a separate
         # pre-check-then-call TOCTOU). ---
@@ -226,6 +235,16 @@ async def _prepare_shortlist_items(
                 bewerbung_was_reused = True
                 bewerbung_reused += 1
             else:
+                # CV preparation may have committed since the last check.
+                late_reason = automatic_preparation_block(db, job.id)
+                if late_reason is not None:
+                    blocked_at_draft += 1
+                    logger.info(
+                        "automation_shortlist_blocked_by_fit job_id=%s reason=%s",
+                        job.id,
+                        late_reason,
+                    )
+                    continue
                 bewerbung = await prepare_bewerbung_draft(db, job.id, cv_draft.id)
                 bewerbung_draft_id = bewerbung.id
                 bewerbung_was_reused = False
@@ -279,7 +298,15 @@ async def _prepare_shortlist_items(
     # (candidate_jobs after preselection/revalidation), never the raw
     # touched-job count -- a job dropped by the bound or by DB
     # revalidation was never attempted and must not count as a failure.
-    return items, failed, cv_created, cv_reused, bewerbung_created, bewerbung_reused
+    return (
+        items,
+        failed,
+        cv_created,
+        cv_reused,
+        bewerbung_created,
+        bewerbung_reused,
+        blocked_at_draft,
+    )
 
 
 async def prepare_shortlist_drafts(
@@ -307,11 +334,21 @@ async def prepare_shortlist_drafts(
 
     matched, failed, failures = _match_eligible_jobs(db, eligible_jobs)
 
-    shortlist_candidates = [
-        (job, match)
-        for job, match in matched
-        if match.overall_score >= settings.automation_shortlist_min_match_score
-    ]
+    # Fit-tier gate (fail-closed, live assessment), applied BEFORE ranking and the
+    # per-run cap so a blocked vacancy never takes a draft slot. A high score or an
+    # APPLY recommendation never bypasses it.
+    blocked_by_fit = 0
+    gated: list[tuple] = []
+    for job, match in matched:
+        if match.overall_score < settings.automation_shortlist_min_match_score:
+            continue
+        reason = automatic_preparation_block(db, job.id)
+        if reason is not None:
+            blocked_by_fit += 1
+            logger.info("automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, reason)
+            continue
+        gated.append((job, match))
+    shortlist_candidates = gated
     # Deterministic ranking (spec section 6): match score DESC, then
     # JobRecord.score DESC, then job id ASC as the final, always-unique
     # tie-break. Never randomness.
@@ -325,8 +362,10 @@ async def prepare_shortlist_drafts(
         cv_reused,
         bewerbung_created,
         bewerbung_reused,
+        blocked_at_draft,
     ) = await _prepare_shortlist_items(db, shortlisted, failures)
     failed += draft_failed
+    blocked_by_fit += blocked_at_draft
 
     if candidate_jobs == 0 or failed == 0:
         status = "ok"
@@ -343,6 +382,7 @@ async def prepare_shortlist_drafts(
         "cv_reused": cv_reused,
         "bewerbung_created": bewerbung_created,
         "bewerbung_reused": bewerbung_reused,
+        "blocked_by_fit": blocked_by_fit,
         "failed": failed,
     }
 

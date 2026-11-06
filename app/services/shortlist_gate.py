@@ -19,10 +19,15 @@ Every verdict carries its reasons. Nothing here writes, sends or changes a
 status.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from app.services.job_fit_assessment import FitAssessment
+from sqlalchemy.orm import Session
+
+from app.services.job_fit_assessment import FitAssessment, assess_job
+
+logger = logging.getLogger(__name__)
 
 GateVerdict = Literal["APPLY_CANDIDATE", "REVIEW", "SKIP"]
 Liveness = Literal["ACTIVE", "GONE", "UNKNOWN"]
@@ -108,3 +113,65 @@ def evaluate(assessment: FitAssessment, *, liveness: Liveness = "UNKNOWN") -> Ga
         tuple(questions),
         tuple(strengths),
     )
+
+
+# --- automatic preparation / proposal gate (the single source of the rule) ---
+
+# Fit tiers that may enter AUTOMATIC CV/Bewerbung preparation. Everything else
+# is held for the operator: NOT_SUITABLE (confirmed barrier), NEEDS_OPERATOR
+# (critical facts missing), STRETCH (stated gap) and any unknown tier
+# (fail-closed). A high `jobs.score` or an APPLY recommendation never bypasses
+# this. Being allowed here is NOT approval to apply.
+AUTO_PREPARE_TIERS = frozenset({"GOOD_MATCH", "PARTIAL_MATCH"})
+
+BLOCK_ASSESSMENT_UNAVAILABLE = "ASSESSMENT_UNAVAILABLE"
+
+
+def automatic_block_reason(assessment: FitAssessment) -> str | None:
+    """Pure: None when the vacancy may be prepared automatically, else a fixed
+    reason code (no vacancy text, safe to log)."""
+    tier = assessment.fit_tier
+    if tier in AUTO_PREPARE_TIERS:
+        return None
+    return (
+        f"FIT_TIER_{tier}" if isinstance(tier, str) and tier.isidentifier() else "FIT_TIER_UNKNOWN"
+    )
+
+
+def _assess_isolated(db: Session, job_id: int) -> FitAssessment:
+    """A LIVE assessment in its own short read-only session on the same engine:
+    never the `job_fit_assessments` cache (a stale or missing cache cannot admit
+    a job), never the caller's identity map (fresh rows), and a failure here
+    cannot poison or roll back the caller's transaction."""
+    with Session(bind=db.get_bind()) as read_session:
+        try:
+            return assess_job(read_session, job_id)
+        finally:
+            read_session.rollback()
+
+
+def automatic_preparation_block(db: Session, job_id: int) -> str | None:
+    """Fail-closed: None only when a fresh assessment says the vacancy may be
+    prepared automatically. Writes nothing, changes no status, sends nothing."""
+    try:
+        return automatic_block_reason(_assess_isolated(db, job_id))
+    except Exception as exc:  # noqa: BLE001 -- unknown state must hold the job back
+        logger.warning(
+            "shortlist_gate_assessment_failed job_id=%s error_type=%s", job_id, type(exc).__name__
+        )
+        return BLOCK_ASSESSMENT_UNAVAILABLE
+
+
+def confirmed_barrier(db: Session, job_id: int) -> str | None:
+    """For PROPOSALS to the operator (Telegram cards), where a human still
+    decides: only a CONFIRMED barrier (NOT_SUITABLE) or an unavailable
+    assessment holds a vacancy back. Missing facts (NEEDS_OPERATOR) are exactly
+    what the operator is asked to look at, so they are not blocked here."""
+    try:
+        tier = _assess_isolated(db, job_id).fit_tier
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "shortlist_gate_assessment_failed job_id=%s error_type=%s", job_id, type(exc).__name__
+        )
+        return BLOCK_ASSESSMENT_UNAVAILABLE
+    return "FIT_TIER_NOT_SUITABLE" if tier == "NOT_SUITABLE" else None

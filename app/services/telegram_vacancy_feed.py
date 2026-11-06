@@ -54,6 +54,7 @@ from app.db.telegram_vacancy_review_repository import (
     release_claim,
 )
 from app.models.application_status import ApplicationStatus
+from app.services.shortlist_gate import confirmed_barrier
 from app.services.telegram import TelegramSendOutcome, send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -346,9 +347,15 @@ def record_collected_job(db: Session, job_record: JobRecord, settings) -> None:
     the job itself is already committed, and the next re-collection will
     simply try again."""
     try:
-        review = ensure_review(
-            db, job_record.id, eligible=is_eligible_for_review(job_record, settings)
-        )
+        eligible = is_eligible_for_review(job_record, settings)
+        if eligible:
+            barrier = confirmed_barrier(db, job_record.id)
+            if barrier is not None:
+                eligible = False
+                logger.info(
+                    "vacancy_feed_blocked_by_fit job_id=%s reason=%s", job_record.id, barrier
+                )
+        review = ensure_review(db, job_record.id, eligible=eligible)
     except Exception as exc:
         db.rollback()
         logger.warning(
@@ -531,7 +538,12 @@ async def deliver_queued_vacancy_cards(
     attempted = 0
     for review in queued:
         job = get_job_by_id(db, review.job_id)
-        if job is None or not is_eligible_for_review(job, settings):
+        barrier = None
+        if job is not None and is_eligible_for_review(job, settings):
+            barrier = confirmed_barrier(db, job.id)
+            if barrier is not None:
+                logger.info("vacancy_feed_blocked_by_fit job_id=%s reason=%s", job.id, barrier)
+        if job is None or not is_eligible_for_review(job, settings) or barrier is not None:
             if dequeue(db, review):
                 stats.dequeued += 1
                 logger.info("vacancy_feed_dequeued review_id=%s", review.id)
@@ -715,11 +727,20 @@ async def open_manual_vacancy_review(db: Session, settings, job_id: int) -> Manu
         manual_review=True,
     )
     if result == _SENT:
+        # An explicit operator decision is honoured, but a confirmed fit barrier
+        # is never hidden from the operator.
+        barrier = confirmed_barrier(db, job_id)
+        warning = (
+            " WARNUNG: Fit-Bewertung NOT_SUITABLE (bestätigte Hürde) - nur auf deine "
+            "ausdrückliche Entscheidung geöffnet."
+            if barrier == "FIT_TIER_NOT_SUITABLE"
+            else ""
+        )
         return ManualReviewOutcome(
             "SENT",
             f"{MANUAL_REVIEW_MARKER}: Job #{job_id} (Score {job.score}/100, automatische "
             f"Empfehlung {job.recommendation} unverändert). Karte gesendet - nichts wurde "
-            "beworben oder an Arbeitgeber gesendet.",
+            f"beworben oder an Arbeitgeber gesendet.{warning}",
         )
     if result in (_FAILED, _RELEASED):
         return _manual_send_failed(job_id)

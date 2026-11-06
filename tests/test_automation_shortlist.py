@@ -75,6 +75,15 @@ TIER_0 = ('["python"]', '["docker"]')
 _fp_counter = 0
 
 
+@pytest.fixture(autouse=True)
+def _fit_gate_allows(monkeypatch):
+    """These tests cover the selection/ranking/reuse MECHANICS with synthetic
+    vacancies; the fit-tier gate itself is covered in tests/test_shortlist_fit_safety.py."""
+    monkeypatch.setattr(
+        "app.services.automation_shortlist.automatic_preparation_block", lambda db, job_id: None
+    )
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     db_path = tmp_path / "test_automation_shortlist.db"
