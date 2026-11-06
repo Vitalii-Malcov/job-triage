@@ -5,6 +5,7 @@ CV or Bewerbung draft, whatever `jobs.score` or the APPLY recommendation say; no
 sends anything or changes a status.
 """
 
+import asyncio
 import inspect
 
 import pytest
@@ -311,7 +312,12 @@ def test_late_recheck_blocks_reuse_after_the_cv_step(session_factory, monkeypatc
     result = _run_shortlist(db, _settings(), [job])
     assert result["counters"]["blocked_by_fit"] == 1
     assert result["counters"]["bewerbung_reused"] == 0
-    assert result["items"] == []
+    # the late block is audited, with the already committed CV, and is not a failure
+    assert [(i["status"], i["phase"], i["bewerbung_draft_id"]) for i in result["items"]] == [
+        ("blocked", "fit", None)
+    ]
+    assert result["items"][0]["cv_draft_id"] is not None
+    assert result["counters"]["failed"] == 0
     db.close()
 
 
@@ -366,3 +372,68 @@ def test_bare_connection_bind_fails_closed(session_factory, monkeypatch):
         _tier_by_job(monkeypatch, "GOOD_MATCH")
         assert automatic_preparation_block(db, job.id) == "ASSESSMENT_UNAVAILABLE"
         db.close()
+
+
+# --- legacy notifier: every attempt is revalidated -----------------------------
+
+
+def test_notifier_retry_is_revalidated_after_the_backoff(monkeypatch):
+    from app.models.job import Job, JobScore
+    from app.services import telegram
+    from app.services.telegram import TelegramNotifier, TelegramSendOutcome
+
+    sent = []
+
+    async def fake_send(token, chat, text, *, timeout_seconds):
+        sent.append(text)
+        return TelegramSendOutcome.FAILED
+
+    async def fake_sleep(_seconds):
+        verdict["value"] = "FIT_TIER_NOT_SUITABLE"
+
+    verdict = {"value": None}
+    monkeypatch.setattr(telegram, "send_telegram_text", fake_send)
+    monkeypatch.setattr(telegram.asyncio, "sleep", fake_sleep)
+    notifier = TelegramNotifier(bot_token="t", chat_id="c", max_retries=3)
+    notifier.guard = lambda: verdict["value"]
+    job = Job(source="x", title="IT-Administratoren", company="C", url="https://e.com/1")
+
+    result = asyncio.run(notifier.send_job(job, JobScore(score=90, recommendation="APPLY")))
+
+    assert result is False
+    assert len(sent) == 1  # the retry after the backoff was never sent
+
+
+# --- real SQL isolation ---------------------------------------------------------
+
+
+def test_isolated_read_uses_its_own_connection_and_keeps_caller_writes(
+    session_factory, monkeypatch
+):
+    db = session_factory()
+    job = _seed_job(db)
+    job_id = job.id
+    job.title = "Edited by the caller"
+    db.flush()  # the caller now holds an open write transaction
+    caller_connection = db.connection().connection.dbapi_connection
+    seen = {}
+
+    def real_read(session, jid):
+        seen["connection"] = session.connection().connection.dbapi_connection
+        seen["rows"] = session.execute(select(func.count()).select_from(JobRecord)).scalar_one()
+        seen["title"] = session.execute(
+            select(JobRecord.title).where(JobRecord.id == jid)
+        ).scalar_one()
+        return _fixed("GOOD_MATCH", jid)
+
+    monkeypatch.setattr(shortlist_gate, "assess_job", real_read)
+    assert automatic_preparation_block(db, job_id) is None
+
+    assert seen["connection"] is not caller_connection
+    assert seen["rows"] == 1
+    # uncommitted caller state is invisible to the isolated reader (committed state only)
+    assert seen["title"] != "Edited by the caller"
+    db.commit()
+    db.close()
+    with session_factory() as other:
+        assert other.get(JobRecord, job_id).title == "Edited by the caller"

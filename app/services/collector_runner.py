@@ -714,6 +714,7 @@ async def _publish_persisted_job(
             )
         elif is_lease_lost is None or not is_lease_lost():
             try:
+                notifier.guard = lambda: confirmed_barrier(db, job_record.id)
                 sent = await notifier.send_job(job, result)
             except Exception as exc:
                 logger.warning(

@@ -163,6 +163,22 @@ def _match_eligible_jobs(
     return matched, failed, failures
 
 
+def _blocked_item(job, match, *, cv_draft_id: int | None, cv_reused: bool) -> ShortlistDraftItem:
+    """The audit record of a shortlisted job the fit gate held back (never a failure)."""
+    return ShortlistDraftItem(
+        job_id=job.id,
+        match_id=match.id,
+        match_score=match.overall_score,
+        cv_draft_id=cv_draft_id,
+        bewerbung_draft_id=None,
+        cv_reused=cv_reused,
+        bewerbung_reused=False,
+        status="blocked",
+        phase="fit",
+        error_type=None,
+    )
+
+
 async def _prepare_shortlist_items(
     db: Session, shortlisted: list[tuple], failures: list[AutomationJobFailure]
 ) -> tuple[list[ShortlistDraftItem], int, int, int, int, int, int]:
@@ -182,6 +198,7 @@ async def _prepare_shortlist_items(
         if reason is not None:
             blocked_at_draft += 1
             logger.info("automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, reason)
+            items.append(_blocked_item(job, match, cv_draft_id=None, cv_reused=False))
             continue
         # --- CV phase (S8C-CACHE-001: race-safe created/reused via the
         # repository's own INSERT-or-reload outcome, never a separate
@@ -235,6 +252,9 @@ async def _prepare_shortlist_items(
                 blocked_at_draft += 1
                 logger.info(
                     "automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, late_reason
+                )
+                items.append(
+                    _blocked_item(job, match, cv_draft_id=cv_draft.id, cv_reused=cv_was_reused)
                 )
                 continue
             # Shared, strengthened reuse identity (Stage 9B) -- the same

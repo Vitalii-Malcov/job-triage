@@ -58,8 +58,10 @@ class ShortlistDraftItem(BaseModel):
     bewerbung_draft_id: int | None = None
     cv_reused: bool = False
     bewerbung_reused: bool = False
-    status: Literal["ok", "failed"]
-    phase: Literal["cv", "bewerbung"] | None = None
+    # "blocked" / phase "fit": the fit-tier gate held the job back (not a failure); a CV draft
+    # committed before a late block is still reported truthfully in `cv_draft_id`.
+    status: Literal["ok", "failed", "blocked"]
+    phase: Literal["cv", "bewerbung", "fit"] | None = None
     error_type: str | None = None
 
 
