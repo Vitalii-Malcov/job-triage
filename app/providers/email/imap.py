@@ -459,10 +459,18 @@ def _extract_html_text(msg: Message) -> str:
     fetched), bounded like `body_plain`. Kept in a separate field so
     `body_plain`'s Stage 7A meaning (text/plain only) is unchanged; never
     persisted."""
+    return _extract_html_text_bounded(msg)[0]
+
+
+def _extract_html_text_bounded(msg: Message) -> tuple[str, bool]:
+    """(text, truncated): `truncated` is True when either the markup was cut before parsing
+    or the resulting text was cut to MAX_BODY_LENGTH (FLOW-13: the flag must describe the body
+    that is actually stored)."""
     markup = _first_html_part(msg, {"parts_seen": 0})
     if not markup:
-        return ""
-    return html_to_text(markup[: MAX_BODY_LENGTH * 10])[:MAX_BODY_LENGTH]
+        return "", False
+    text = html_to_text(markup[: MAX_BODY_LENGTH * 10])
+    return text[:MAX_BODY_LENGTH], len(markup) > MAX_BODY_LENGTH * 10 or len(text) > MAX_BODY_LENGTH
 
 
 def _direction(*, trusted_outbound: bool) -> Direction:
@@ -1010,7 +1018,10 @@ class GmailImapProvider:
         subject = _decode_mime_words(msg.get("Subject", ""))[:MAX_SUBJECT_LENGTH]
         sent_at = _parse_date(msg.get("Date"))
         body_plain, body_truncated, has_html, attachments = _extract_content(msg)
-        body_html_text = _extract_html_text(msg) if has_html and not body_plain else ""
+        body_html_text, html_truncated = (
+            _extract_html_text_bounded(msg) if has_html and not body_plain else ("", False)
+        )
+        body_truncated = body_truncated or html_truncated
         direction = _direction(trusted_outbound=self.trusted_outbound)
         # Task 21: topmost-first values, each clamped; only the first is ever evaluated.
         auth_results = [

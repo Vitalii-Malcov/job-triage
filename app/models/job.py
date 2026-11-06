@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, PrivateAttr, field_validator
 
 from app.models.application_status import ApplicationStatus
 
@@ -85,12 +85,29 @@ class JobScore(BaseModel):
     recommendation: Recommendation
     data_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     is_duplicate: bool = False
+    # FLOW-01 (not part of the API schema): what the stored row held BEFORE this observation
+    # (recommendation, score), and whether the row is frozen (the operator already acted on it).
+    _prior_recommendation: str | None = PrivateAttr(default=None)
+    _prior_score: int | None = PrivateAttr(default=None)
+    _frozen: bool = PrivateAttr(default=False)
     # XING: an observation without evidence (no salary/employment text) could not be
     # placed among several stored rows of one identity; the stored row was left untouched.
     possible_collision: bool = False
     # XING: this observation was stored as a distinguished sibling of an existing
     # posting with the same company/title/location but different details.
     sibling_posting: bool = False
+
+    def already_announceable(self, min_score: int) -> bool:
+        """True when this vacancy was ALREADY announce-eligible before this observation (a frozen
+        row, or a stored APPLY at or above the notify threshold) -- announcing it now would be a
+        repeat. A row that merely crosses into APPLY/the threshold is not a repeat."""
+        if self._frozen:
+            return True
+        return (
+            self._prior_recommendation == "APPLY"
+            and self._prior_score is not None
+            and self._prior_score >= min_score
+        )
 
 
 class JobListItem(BaseModel):

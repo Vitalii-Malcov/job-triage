@@ -409,6 +409,9 @@ class UpsertOutcome:
     possible_collision: bool = False
     # XING: the row was inserted as a distinguished sibling of an existing posting.
     sibling_created: bool = False
+    # FLOW-01: the recommendation the row held BEFORE this observation (None for a new row).
+    previous_recommendation: str | None = None
+    previous_score: int | None = None
 
 
 def _update_existing(
@@ -442,9 +445,15 @@ def _update_existing(
             existing.last_seen_at = now
             _finalize_job_write(db, existing, None, commit=commit)
             return UpsertOutcome(existing, False, frozen=True)
+    previous_recommendation, previous_score = existing.recommendation, existing.score
     _apply_job_update_fields(existing, job, score, now)
     _finalize_job_write(db, existing, storable_reference(job.source_reference), commit=commit)
-    return UpsertOutcome(existing, False)
+    return UpsertOutcome(
+        existing,
+        False,
+        previous_recommendation=previous_recommendation,
+        previous_score=previous_score,
+    )
 
 
 def upsert_job(
