@@ -10,6 +10,7 @@ import inspect
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.db.models import (
@@ -276,3 +277,92 @@ def test_gate_module_has_no_send_path():
     src = inspect.getsource(shortlist_gate).lower()
     for word in ("smtp", "send_telegram", "imap", "gmail"):
         assert word not in src
+
+
+def test_tier_change_blocks_even_an_existing_current_bewerbung(session_factory, monkeypatch):
+    """Reuse of an existing Bewerbung draft is gated like creation."""
+    db = session_factory()
+    job = _seed_job(db)
+    _tier_by_job(monkeypatch, "GOOD_MATCH")
+    first = _run_shortlist(db, _settings(), [job])
+    assert first["counters"]["bewerbung_created"] == 1
+
+    _tier_by_job(monkeypatch, "NOT_SUITABLE")
+    second = _run_shortlist(db, _settings(), [job])
+    assert second["counters"]["bewerbung_reused"] == 0
+    assert second["counters"]["blocked_by_fit"] == 1
+    assert second["items"] == []
+    db.close()
+
+
+def test_late_recheck_blocks_reuse_after_the_cv_step(session_factory, monkeypatch):
+    db = session_factory()
+    job = _seed_job(db)
+    _tier_by_job(monkeypatch, "GOOD_MATCH")
+    _run_shortlist(db, _settings(), [job])
+
+    calls = {"n": 0}
+
+    def flipping(session, job_id):
+        calls["n"] += 1
+        return _fixed("GOOD_MATCH" if calls["n"] <= 2 else "NOT_SUITABLE", job_id)
+
+    monkeypatch.setattr(shortlist_gate, "assess_job", flipping)
+    result = _run_shortlist(db, _settings(), [job])
+    assert result["counters"]["blocked_by_fit"] == 1
+    assert result["counters"]["bewerbung_reused"] == 0
+    assert result["items"] == []
+    db.close()
+
+
+# --- connection isolation -----------------------------------------------------
+
+
+def test_caller_flushed_write_survives_the_gate(session_factory, monkeypatch):
+    db = session_factory()
+    job = _seed_job(db)
+    job_id = job.id
+    job.title = "Edited by the caller"
+    db.flush()  # written in the caller's open transaction, not yet committed
+
+    _tier_by_job(monkeypatch, "GOOD_MATCH")
+    assert automatic_preparation_block(db, job.id) is None
+
+    def boom(session, job_id):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(shortlist_gate, "assess_job", boom)
+    assert automatic_preparation_block(db, job.id) == "ASSESSMENT_UNAVAILABLE"
+
+    db.commit()
+    db.close()
+    with session_factory() as other:
+        assert other.get(JobRecord, job_id).title == "Edited by the caller"
+
+
+def test_shared_in_memory_connection_fails_closed(monkeypatch):
+    """A single shared connection cannot be isolated: the gate holds the job back
+    instead of letting its rollback undo the caller's flushed write."""
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False)()
+    job = _seed_job(db)
+    job.title = "Pending"
+    db.flush()
+    _tier_by_job(monkeypatch, "GOOD_MATCH")
+    assert automatic_preparation_block(db, job.id) == "ASSESSMENT_UNAVAILABLE"
+    db.commit()
+    assert db.get(JobRecord, job.id).title == "Pending"
+    db.close()
+
+
+def test_bare_connection_bind_fails_closed(session_factory, monkeypatch):
+    engine = session_factory.kw["bind"]
+    with engine.connect() as connection:
+        db = sessionmaker(bind=connection)()
+        job = _seed_job(db)
+        _tier_by_job(monkeypatch, "GOOD_MATCH")
+        assert automatic_preparation_block(db, job.id) == "ASSESSMENT_UNAVAILABLE"
+        db.close()

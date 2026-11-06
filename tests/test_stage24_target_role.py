@@ -63,6 +63,8 @@ KEPT = [
     "Junior Python Developer - Administratoren-Portal (m/w/d)",
     "Software Developer Client Support Tools",
     "Backend Entwickler mit Docker und Linux (m/w/d)",
+    "Trainee Softwareentwicklung - Systemelektronik",
+    "Softwareentwickler Embedded / Systemelektronik (m/w/d)",
     "Python Automation Developer",
     "Junior API Developer",
     "Trainee Softwareentwicklung",

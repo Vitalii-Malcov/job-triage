@@ -228,6 +228,15 @@ async def _prepare_shortlist_items(
         try:
             cv_draft_record = get_draft_by_id(db, cv_draft.id)
             existing_bewerbung = get_latest_bewerbung_draft(db, job.id)
+            # CV preparation may have committed since the last check: gate BEFORE both
+            # reusing an existing Bewerbung draft and creating a new one.
+            late_reason = automatic_preparation_block(db, job.id)
+            if late_reason is not None:
+                blocked_at_draft += 1
+                logger.info(
+                    "automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, late_reason
+                )
+                continue
             # Shared, strengthened reuse identity (Stage 9B) -- the same
             # decision the Telegram preparation path makes.
             if bewerbung_draft_is_current(existing_bewerbung, cv_draft_record, job):
@@ -235,16 +244,6 @@ async def _prepare_shortlist_items(
                 bewerbung_was_reused = True
                 bewerbung_reused += 1
             else:
-                # CV preparation may have committed since the last check.
-                late_reason = automatic_preparation_block(db, job.id)
-                if late_reason is not None:
-                    blocked_at_draft += 1
-                    logger.info(
-                        "automation_shortlist_blocked_by_fit job_id=%s reason=%s",
-                        job.id,
-                        late_reason,
-                    )
-                    continue
                 bewerbung = await prepare_bewerbung_draft(db, job.id, cv_draft.id)
                 bewerbung_draft_id = bewerbung.id
                 bewerbung_was_reused = False

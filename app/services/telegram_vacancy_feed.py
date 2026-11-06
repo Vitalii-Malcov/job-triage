@@ -538,12 +538,7 @@ async def deliver_queued_vacancy_cards(
     attempted = 0
     for review in queued:
         job = get_job_by_id(db, review.job_id)
-        barrier = None
-        if job is not None and is_eligible_for_review(job, settings):
-            barrier = confirmed_barrier(db, job.id)
-            if barrier is not None:
-                logger.info("vacancy_feed_blocked_by_fit job_id=%s reason=%s", job.id, barrier)
-        if job is None or not is_eligible_for_review(job, settings) or barrier is not None:
+        if job is None or not is_eligible_for_review(job, settings):
             if dequeue(db, review):
                 stats.dequeued += 1
                 logger.info("vacancy_feed_dequeued review_id=%s", review.id)
@@ -554,6 +549,16 @@ async def deliver_queued_vacancy_cards(
         if is_lease_lost is not None and is_lease_lost():
             logger.info("vacancy_feed_delivery_stopped reason=lease_lost")
             break
+        # Fit gate, rechecked HERE -- after the pacing sleep, immediately before the
+        # claim and the single send: a vacancy that became a confirmed barrier while
+        # waiting is dequeued, never sent.
+        barrier = confirmed_barrier(db, job.id)
+        if barrier is not None:
+            logger.info("vacancy_feed_blocked_by_fit job_id=%s reason=%s", job.id, barrier)
+            if dequeue(db, review):
+                stats.dequeued += 1
+                logger.info("vacancy_feed_dequeued review_id=%s", review.id)
+            continue
         claim_token = claim_for_sending(db, review)
         if claim_token is None:
             continue

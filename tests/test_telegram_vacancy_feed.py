@@ -883,3 +883,22 @@ class TestFitBarrierGate:
         assert stats.dequeued == 1
         db.refresh(review)
         assert review.state == "DISCOVERED"
+
+    @pytest.mark.asyncio
+    async def test_barrier_appearing_during_pacing_sleep_is_not_sent(self, db, sender, barrier):
+        """The gate is rechecked after the pacing sleep, right before the claim."""
+        barrier["value"] = None
+        first = _persist_job(db, suffix="a")
+        second = _persist_job(db, suffix="b")
+        ensure_review(db, first.id, eligible=True)
+        second_review = ensure_review(db, second.id, eligible=True)
+
+        async def sleep_then_block(_seconds):
+            barrier["value"] = "FIT_TIER_NOT_SUITABLE"
+
+        stats = await deliver_queued_vacancy_cards(db, _settings(), sleep=sleep_then_block)
+
+        assert len(sender.calls) == 1
+        assert stats.sent == 1 and stats.dequeued == 1
+        db.refresh(second_review)
+        assert second_review.state == "DISCOVERED"

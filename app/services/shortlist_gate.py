@@ -23,7 +23,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from app.services.job_fit_assessment import FitAssessment, assess_job
 
@@ -138,16 +140,22 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
     )
 
 
+class _NoIsolatedConnection(RuntimeError):
+    """The caller's engine cannot give the assessment its own connection."""
+
+
 def _assess_isolated(db: Session, job_id: int) -> FitAssessment:
-    """A LIVE assessment in its own short read-only session on the same engine:
-    never the `job_fit_assessments` cache (a stale or missing cache cannot admit
-    a job), never the caller's identity map (fresh rows), and a failure here
-    cannot poison or roll back the caller's transaction."""
-    with Session(bind=db.get_bind()) as read_session:
-        try:
-            return assess_job(read_session, job_id)
-        finally:
-            read_session.rollback()
+    """A LIVE assessment in its own short read-only session on its OWN connection:
+    never the `job_fit_assessments` cache (a stale or missing cache cannot admit a
+    job), never the caller's identity map (fresh rows), and a failure or the rollback
+    that ends this read cannot touch the caller's transaction. A bind that cannot give
+    a separate connection (a bare Connection, or a single shared in-memory SQLite
+    connection) is refused -- the gate then fails closed instead of sharing state."""
+    bind = db.get_bind()
+    if not isinstance(bind, Engine) or isinstance(bind.pool, (StaticPool, SingletonThreadPool)):
+        raise _NoIsolatedConnection(type(bind).__name__)
+    with Session(bind=bind) as read_session:
+        return assess_job(read_session, job_id)
 
 
 def automatic_preparation_block(db: Session, job_id: int) -> str | None:

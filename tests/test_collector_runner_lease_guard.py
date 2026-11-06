@@ -287,6 +287,24 @@ class TestBundesagenturLeaseGuard:
         # blocked by the recheck immediately after the (faked) sleep.
         assert CountingNotifier.calls == ["First Company"]
 
+    @pytest.mark.asyncio
+    async def test_confirmed_fit_barrier_is_not_proposed_to_telegram(self, db, monkeypatch):
+        """Feed disabled: the legacy direct alert honours the fit gate too."""
+        jobs = [
+            _ba_job(company="Barrier Company", url="https://example.com/jobs/barrier"),
+            _ba_job(company="Open Company", url="https://example.com/jobs/open"),
+        ]
+
+        def fake_barrier(session, job_id):
+            company = session.get(JobRecord, job_id).company
+            return "FIT_TIER_NOT_SUITABLE" if company == "Barrier Company" else None
+
+        monkeypatch.setattr("app.services.collector_runner.confirmed_barrier", fake_barrier)
+        result = await self._run(db, monkeypatch, jobs)
+
+        assert result["created"] == 2
+        assert CountingNotifier.calls == ["Open Company"]
+
 
 class TestXingLeaseGuard:
     async def _run(self, db, monkeypatch, jobs, *, is_lease_lost=None, uid_validity=None):
