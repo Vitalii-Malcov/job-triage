@@ -35,6 +35,13 @@ EXCLUDED = [
     "IT-Support mit Python-Entwicklungsaufgaben",
     "IT-Administration (m/w/d)",
     "Systemadministration (m/w/d)",
+    # plural / abbreviated / compound forms seen in the stored vacancies
+    "IT-Administratoren (m/w/d)",
+    "IT-Administratorinnen (m/w/d)",
+    "IT-Security Administratorinnen /Administratoren (m/w/d)",
+    "Systemadmin Linux (w/m/d)",
+    "Anwendungssupporter IT und Logistik (m/w/d)",
+    "Mitarbeiter Client Support (m/w/d)",
 ]
 KEPT = [
     "Junior Python Developer (m/w/d)",
@@ -48,6 +55,9 @@ KEPT = [
     "QA Automation Engineer Python",
     "Software Engineer Customer Support Platform",
     "Junior KI-Entwickler",
+    "Junior Python Developer - Administratoren-Portal (m/w/d)",
+    "Software Developer Client Support Tools",
+    "Softwareentwickler Systemadmin-Werkzeuge (m/w/d)",
     "IT-Administrator / Softwareentwickler für unser Unternehmen",
     "IT-Systemadministrator / Softwareentwickler m/w/d",
     "Software Development Engineer - IT-Support Tools",
