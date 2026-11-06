@@ -169,7 +169,13 @@ def run(argv: list[str] | None = None) -> int:
             with Session(engine) as lease_db:
                 with hold_collector_slots(lease_db, get_settings(), "backfill_ref") as hold:
                     with Session(engine) as session, session.begin():
+                        # Ownership is checked before the write AND before the commit; raising
+                        # inside `session.begin()` rolls the whole transaction back.
+                        if hold.lease_lost():
+                            raise CollectorRunLeaseLostError("lease lost before the write")
                         written = apply(session, result["updates"])
+                        if hold.lease_lost():
+                            raise CollectorRunLeaseLostError("lease lost during the write")
                     hold.stats.update(updated=written)
         except CollectorRunInProgressError:
             print(
