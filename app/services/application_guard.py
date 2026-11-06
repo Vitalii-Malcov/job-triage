@@ -40,6 +40,16 @@ SENT_STATUSES = frozenset(
 )
 
 
+# FLOW-02: Stage 15 outcomes after which a follow-up reminder to the employer is wrong.
+# (`JobRecord.status` vs the Stage 15 application is still two sources of truth: making a job
+# row marked APPLIED block new Bewerbungen needs a supported correction path for a wrong
+# /status first -- an operator decision, see the audit execution report.)
+_EXACT_SIGNALS = frozenset({"SAME_JOB", "SAME_REFERENCE", "SAME_URL", "SAME_FINGERPRINT"})
+FOLLOW_UP_BLOCKING_STATUSES = frozenset(
+    {S.REJECTED, S.WITHDRAWN, S.INTERVIEW, S.TECHNICAL_INTERVIEW, S.OFFER}
+)
+
+
 class AlreadyAppliedError(Exception):
     """A Bewerbung for an already-applied vacancy was refused."""
 
@@ -103,3 +113,17 @@ def ensure_not_already_applied(db: Session, job: JobRecord) -> None:
     finding = sent_duplicate(vacancy_findings(db, job))
     if finding is not None:
         raise AlreadyAppliedError(job.id, finding)
+
+
+def follow_up_blocking_application(db: Session, job: JobRecord) -> DuplicateFinding | None:
+    """An application recorded for THIS vacancy (same job row, source reference, URL or
+    fingerprint -- not merely the same employer and role, which is advisory here) whose status
+    makes a follow-up reminder wrong (rejection, withdrawal, interview, offer), or None."""
+    return next(
+        (
+            f
+            for f in vacancy_findings(db, job)
+            if f.status in FOLLOW_UP_BLOCKING_STATUSES and _EXACT_SIGNALS.intersection(f.signals)
+        ),
+        None,
+    )

@@ -71,6 +71,7 @@ from app.db.repositories import get_job_by_id, list_jobs_by_status_after_id
 from app.models.application_status import ApplicationStatus
 from app.models.candidate_profile import is_top_level_fact_usable_for_generation
 from app.models.follow_up import FollowUpEvaluationResult, FollowUpScanSummary
+from app.services.application_guard import follow_up_blocking_application
 from app.services.follow_up_eligibility import (
     FollowUpEligibilityResult,
     ThreadMessageInfo,
@@ -143,6 +144,25 @@ def compute_fresh_follow_up_state(
     latest-OUTBOUND/latest-INBOUND pair (`get_thread_message_infos`)
     rather than any bounded historical scan.
     """
+    # FLOW-02: Stage 15 is the record of what the employer answered. A confirmed rejection,
+    # withdrawal, interview or offer there ends follow-ups even while `JobRecord.status` still
+    # says APPLIED (the two are not synchronised). Re-evaluated at send time, so it also
+    # blocks a proposal that was created earlier.
+    blocking = follow_up_blocking_application(db, job)
+    if blocking is not None:
+        return FollowUpFreshState(
+            eligibility=FollowUpEligibilityResult(
+                eligibility="NOT_ELIGIBLE",
+                reason=(
+                    f"The recorded application is {blocking.status}; no follow-up reminder is "
+                    "appropriate."
+                ),
+                anchor_gmail_message_id=None,
+                due_at=None,
+            ),
+            thread_id=None,
+        )
+
     matched_thread_ids = get_matched_thread_ids_for_job(db, account_key, job.id)
 
     thread_id: int | None = None
