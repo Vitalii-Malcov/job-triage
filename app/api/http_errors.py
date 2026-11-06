@@ -21,7 +21,7 @@ Rules (identical to the hand-written blocks it replaces):
   `"<log_event> error_type=<ExceptionType>"` and answers 500 with that detail; without it the
   exception propagates.
 
-Privacy (GMAIL-003): the unexpected-error path never interpolates the caught exception into the
+Privacy: the unexpected-error path never interpolates the caught exception into the
 response or the log line - a driver-level database error's own message could embed row content
 (subject, body, addresses). Only the exception's TYPE is logged and the response detail is the fixed
 generic `failure_detail`.

@@ -157,13 +157,12 @@ def test_migration_round_trip_keeps_rows_and_swaps_the_identity(tmp_path, reposi
     with engine.connect() as c:
         assert c.execute(text("SELECT COUNT(*) FROM processed_email_messages")).scalar() == 3
 
-    # downgrade is refused BEFORE any DDL while a cross-source duplicate exists
+    # Later migrations downgrade first; the step under test is refused BEFORE any DDL while a
+    # cross-source duplicate exists, so the database stays at the revision that owns this change.
     with pytest.raises(RuntimeError, match="more than one source"):
         downgrade(cfg, "f1a8c3d5e7b9")
     with engine.connect() as c:
-        assert (
-            c.execute(text("SELECT version_num FROM alembic_version")).scalar() == repository_head
-        )
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "a2b7d4f9c1e3"
         assert c.execute(text("SELECT COUNT(*) FROM processed_email_messages")).scalar() == 3
     assert not _indexes(engine)["ix_processed_email_messages_message_id"]
     assert not any(t.startswith("_alembic_tmp") for t in inspect(engine).get_table_names())
