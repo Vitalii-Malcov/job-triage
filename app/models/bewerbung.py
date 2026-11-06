@@ -37,6 +37,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.models.bounds import BigIntId
+
 BewerbungDraftStatus = Literal["DRAFT"]
 BewerbungLanguage = Literal["de"]
 
@@ -264,4 +266,4 @@ class BewerbungDraftRequest(BaseModel):
     draft — never an implicit "latest CV draft" (spec section 3).
     """
 
-    cv_draft_id: int
+    cv_draft_id: BigIntId

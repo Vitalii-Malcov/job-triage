@@ -42,6 +42,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.bounds import MAX_DB_INT, BigIntId
+
 ReviewStatus = Literal["PENDING_REVIEW", "APPROVED", "REJECTED"]
 ContentOrigin = Literal["MACHINE", "USER_EDIT"]
 VerificationState = Literal["EVIDENCE_BOUND", "HUMAN_OVERRIDDEN"]
@@ -166,8 +168,8 @@ class ReviewPackageCreateRequest(BaseModel):
     4); the exact pair is part of the review's identity.
     """
 
-    cv_draft_id: int
-    bewerbung_draft_id: int
+    cv_draft_id: BigIntId
+    bewerbung_draft_id: BigIntId
 
 
 class BewerbungParagraphPatch(BaseModel):
@@ -177,8 +179,8 @@ class BewerbungParagraphPatch(BaseModel):
     "narrower v1 editable surface" applied to the Bewerbung body too).
     """
 
-    index: int = Field(ge=0)
-    text: str
+    index: int = Field(ge=0, le=10_000)
+    text: str = Field(max_length=20_000)
 
 
 class CVContentPatch(BaseModel):
@@ -227,7 +229,7 @@ class ReviewPackagePatchRequest(BaseModel):
     # not a live bug -- the version-mismatch check downstream already
     # rejects 0/negative via a 409, this just rejects it earlier/cheaper
     # at the schema boundary with a 422, matching the sibling).
-    expected_review_version: int = Field(ge=1)
+    expected_review_version: int = Field(ge=1, le=MAX_DB_INT)
     cv_changes: CVContentPatch | None = None
     bewerbung_changes: BewerbungContentPatch | None = None
     # max_length=2000 matches the already-established sibling
@@ -245,7 +247,7 @@ class ReviewPackageApproveRequest(BaseModel):
     approval of unverified human-authored content.
     """
 
-    expected_review_version: int = Field(ge=1)
+    expected_review_version: int = Field(ge=1, le=MAX_DB_INT)
     acknowledge_manual_overrides: bool = False
     decision_note: str | None = Field(default=None, max_length=2000)
 
@@ -253,5 +255,5 @@ class ReviewPackageApproveRequest(BaseModel):
 class ReviewPackageRejectRequest(BaseModel):
     """POST /api/v1/review-packages/{review_id}/reject body."""
 
-    expected_review_version: int = Field(ge=1)
+    expected_review_version: int = Field(ge=1, le=MAX_DB_INT)
     decision_note: str | None = Field(default=None, max_length=2000)
