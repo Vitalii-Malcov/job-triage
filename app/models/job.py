@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -73,6 +73,39 @@ class Job(BaseModel):
             stripped = value.strip()
             return stripped or None
         return value
+
+
+# API-03: size bounds for jobs arriving over HTTP. They live on this request subclass, NOT
+# on `Job` itself: `Job` is also rebuilt from stored rows and produced by the collectors,
+# where truncating or rejecting a value would change a posting's identity fingerprint
+# (title/company/location) or lose it. The string widths mirror the jobs.* VARCHARs.
+MAX_INGEST_SOURCE = 100
+MAX_INGEST_TITLE = 300
+MAX_INGEST_COMPANY = 300
+MAX_INGEST_LOCATION = 300
+MAX_INGEST_DESCRIPTION = 100_000
+MAX_INGEST_SKILLS = 200
+MAX_INGEST_SKILL_LENGTH = 200
+MAX_INGEST_SOURCE_REFERENCE = 64  # jobs.source_reference VARCHAR(64)
+
+_SkillList = Annotated[
+    list[Annotated[str, Field(max_length=MAX_INGEST_SKILL_LENGTH)]],
+    Field(max_length=MAX_INGEST_SKILLS),
+]
+
+
+class JobIngest(Job):
+    """`Job` as accepted by POST /jobs/score: same fields, bounded sizes."""
+
+    source: str = Field(min_length=1, max_length=MAX_INGEST_SOURCE)
+    title: str = Field(min_length=1, max_length=MAX_INGEST_TITLE)
+    company: str = Field(min_length=1, max_length=MAX_INGEST_COMPANY)
+    location: str = Field(default="", max_length=MAX_INGEST_LOCATION)
+    description: str = Field(default="", max_length=MAX_INGEST_DESCRIPTION)
+    source_reference: str | None = Field(default=None, max_length=MAX_INGEST_SOURCE_REFERENCE)
+    skills: _SkillList = Field(default_factory=list)
+    must_have_skills: _SkillList = Field(default_factory=list)
+    nice_to_have_skills: _SkillList = Field(default_factory=list)
 
 
 class JobScore(BaseModel):

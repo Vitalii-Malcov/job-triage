@@ -38,6 +38,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.bounds import BigIntId
 from app.models.candidate_job_match import MatchStatus, RequirementImportance
 
 CVDraftStatus = Literal["DRAFT"]
@@ -262,5 +263,5 @@ class CVDraftRequest(BaseModel):
     (section 5).
     """
 
-    match_id: int
+    match_id: BigIntId
     force_recompute: bool = False

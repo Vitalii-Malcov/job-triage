@@ -23,7 +23,7 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
-from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
+from app.models.job import Job, JobDetail, JobIngest, JobListItem, JobScore, StatusUpdateRequest
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_rate_limit,
@@ -44,7 +44,7 @@ router = APIRouter()
     response_model=JobScore,
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
-async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
+async def score_job(job: JobIngest, db: Session = Depends(get_db)) -> JobScore:
     # Review 2.4: synchronous scoring/persistence runs off the web loop.
     return await run_off_loop(lambda: _score_job_service(job, db))
 
