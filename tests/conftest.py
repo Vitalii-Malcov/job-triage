@@ -19,6 +19,10 @@ import pytest
 _TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="jobtriage-pytest-"))
 os.environ["DATABASE_URL"] = f"sqlite:///{(_TEST_DB_DIR / 'jobtriage_test.db').as_posix()}"
 os.environ["DATABASE_ROLE"] = "test"
+# Task 23: the real web server refuses a second process; the suite starts many app lifespans.
+os.environ["SINGLE_PROCESS_LOCK_ENABLED"] = "false"
+# the suite baseline is the default in-memory backend whatever the shell exports
+os.environ["SHARED_STATE_BACKEND"] = "memory"
 os.environ["POSTGRES_HOST"] = ""
 
 # The operator's `.env` holds real credentials (Bundesagentur API key, IMAP,

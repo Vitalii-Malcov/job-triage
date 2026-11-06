@@ -28,6 +28,7 @@ from collections import defaultdict, deque
 from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
+from app.security import shared_state
 from app.security.client_identity import resolve_client_identity
 
 
@@ -51,15 +52,34 @@ class _RateLimiter:
     # cost at all) -- see docs/ADVERSARIAL_HARDENING_REPORT.md HARD-001.
     _SWEEP_THRESHOLD = 512
 
-    def __init__(self, *, detail: str) -> None:
+    def __init__(self, *, name: str, detail: str) -> None:
+        self.name = name  # stable id in the shared store (Task 23)
         self.buckets: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
         self._detail = detail
+
+    # ---- Task 23: process-shared backend (SHARED_STATE_BACKEND=database) ----------------
+    def _shared_hit(self, key: str, *, max_requests: int, window_seconds: float) -> int:
+        try:
+            hit = shared_state.rate_hit(
+                self.name, key, max_requests=max_requests, window_seconds=window_seconds
+            )
+        except shared_state.SharedStateUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limit store unavailable",
+            ) from None
+        if hit is None:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=self._detail)
+        return hit
 
     def check(self, request: Request, *, max_requests: int, window_seconds: float) -> None:
         # Stage 13A: the trusted-proxy-aware identity, never a raw
         # forwarding header -- see app/security/client_identity.py.
         key = resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
+        if shared_state.enabled():
+            self._shared_hit(key, max_requests=max_requests, window_seconds=window_seconds)
+            return
         now = time.monotonic()
         cutoff = now - window_seconds
 
@@ -96,7 +116,7 @@ class _RateLimiter:
     _MIN_SWEEP_INTERVAL = 1.0
     _last_sweep = 0.0
 
-    def reserve(self, request: Request, *, max_requests: int, window_seconds: float) -> float:
+    def reserve(self, request: Request, *, max_requests: int, window_seconds: float) -> float | int:
         """Atomically refuse (429) a client already holding `max_requests`
         live entries, otherwise record one entry for it. The caller refunds
         it with `refund(request, token)` (the returned token) when the attempt
@@ -104,6 +124,8 @@ class _RateLimiter:
         key = self._failure_key(
             resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
         )
+        if shared_state.enabled():
+            return self._shared_hit(key, max_requests=max_requests, window_seconds=window_seconds)
         now = time.monotonic()
         cutoff = now - window_seconds
         with self._lock:
@@ -139,9 +161,20 @@ class _RateLimiter:
             self.buckets[key].append(now)
             return now
 
-    def refund(self, request: Request, token: float) -> None:
+    def refund(self, request: Request, token: float | int) -> None:
         """Undo exactly the `reserve` that returned `token` (a successful
         authentication). Already-expired entries are simply gone."""
+        if shared_state.enabled():
+            identity = self._failure_key(
+                resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
+            )
+            try:
+                shared_state.rate_refund(self.name, identity, int(token))
+            except shared_state.SharedStateUnavailableError:
+                # The attempt stays charged: failing to refund can only make the budget
+                # stricter, never looser.
+                return
+            return
         key = self._failure_key(
             resolve_client_identity(request, get_settings().trusted_proxy_ip_set)
         )
@@ -183,7 +216,7 @@ def _quota(name: str, limiter: "_RateLimiter", quota):
     return enforce
 
 
-_generic_limiter = _RateLimiter(detail="Rate limit exceeded")
+_generic_limiter = _RateLimiter(name="generic", detail="Rate limit exceeded")
 _requests = _generic_limiter.buckets
 
 
@@ -201,7 +234,7 @@ def enforce_rate_limit(request: Request) -> None:
 # writes to the DB in a loop, unlike a single /jobs/score call. Fixed rather
 # than Settings-driven since this endpoint is meant to be triggered manually
 # and infrequently, not tuned per deployment.
-_collector_limiter = _RateLimiter(detail="Collector rate limit exceeded")
+_collector_limiter = _RateLimiter(name="collector", detail="Collector rate limit exceeded")
 _collector_requests = _collector_limiter.buckets
 COLLECTOR_RATE_LIMIT_REQUESTS = 5
 COLLECTOR_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -223,7 +256,7 @@ enforce_collector_rate_limit = _quota(
 # is worse than a slow collector run. Kept in its own bucket rather than
 # sharing `_collector_requests` so calling the Bundesagentur collector
 # doesn't eat into the IMAP collector's (tighter) budget or vice versa.
-_xing_limiter = _RateLimiter(detail="XING collector rate limit exceeded")
+_xing_limiter = _RateLimiter(name="xing", detail="XING collector rate limit exceeded")
 _xing_requests = _xing_limiter.buckets
 XING_RATE_LIMIT_REQUESTS = 3
 XING_RATE_LIMIT_WINDOW_SECONDS = 600
@@ -241,7 +274,9 @@ enforce_xing_rate_limit = _quota(
 # plus a DB write, similar cost profile to the collector endpoints above.
 # Fixed rather than Settings-driven for the same reason as the collector
 # bucket: triggered manually/infrequently, not tuned per deployment.
-_company_research_limiter = _RateLimiter(detail="Company research rate limit exceeded")
+_company_research_limiter = _RateLimiter(
+    name="company_research", detail="Company research rate limit exceeded"
+)
 _company_research_requests = _company_research_limiter.buckets
 COMPANY_RESEARCH_RATE_LIMIT_REQUESTS = 10
 COMPANY_RESEARCH_RATE_LIMIT_WINDOW_SECONDS = 600
@@ -261,7 +296,7 @@ enforce_company_research_rate_limit = _quota(
 # the cache misses, so it gets its own bucket rather than sharing the
 # generic per-key budget, sized more generously than the network-bound
 # buckets above to reflect that lower cost.
-_match_limiter = _RateLimiter(detail="Candidate job match rate limit exceeded")
+_match_limiter = _RateLimiter(name="match", detail="Candidate job match rate limit exceeded")
 _match_requests = _match_limiter.buckets
 MATCH_RATE_LIMIT_REQUESTS = 30
 MATCH_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -278,7 +313,7 @@ enforce_match_rate_limit = _quota(
 # this is pure local computation with zero network calls, but a POST still
 # writes a new candidate_cv_drafts row when the cache misses — same
 # rationale and same generous sizing as MATCH_RATE_LIMIT above.
-_cv_draft_limiter = _RateLimiter(detail="CV draft rate limit exceeded")
+_cv_draft_limiter = _RateLimiter(name="cv_draft", detail="CV draft rate limit exceeded")
 _cv_draft_requests = _cv_draft_limiter.buckets
 CV_DRAFT_RATE_LIMIT_REQUESTS = 30
 CV_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -296,7 +331,7 @@ enforce_cv_draft_rate_limit = _quota(
 # (spec: "generation is an external/expensive operation" even though v1's
 # only shipped provider is local/deterministic — sized for a future
 # real-LLM provider's cost profile now rather than widening later).
-_bewerbung_limiter = _RateLimiter(detail="Bewerbung draft rate limit exceeded")
+_bewerbung_limiter = _RateLimiter(name="bewerbung", detail="Bewerbung draft rate limit exceeded")
 _bewerbung_requests = _bewerbung_limiter.buckets
 BEWERBUNG_RATE_LIMIT_REQUESTS = 5
 BEWERBUNG_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -315,7 +350,9 @@ enforce_bewerbung_rate_limit = _quota(
 # reuse an expensive LLM rate bucket unnecessarily") — sized identically to
 # MATCH_RATE_LIMIT/CV_DRAFT_RATE_LIMIT rather than the stricter Bewerbung
 # generation bucket.
-_review_write_limiter = _RateLimiter(detail="Review package rate limit exceeded")
+_review_write_limiter = _RateLimiter(
+    name="review_write", detail="Review package rate limit exceeded"
+)
 _review_write_requests = _review_write_limiter.buckets
 REVIEW_WRITE_RATE_LIMIT_REQUESTS = 30
 REVIEW_WRITE_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -334,7 +371,7 @@ enforce_review_write_rate_limit = _quota(
 # temporarily locking the account). Kept in its own bucket rather than
 # sharing XING's so the two independent mailboxes/credentials never
 # compete for the same budget.
-_gmail_limiter = _RateLimiter(detail="Gmail inbox sync rate limit exceeded")
+_gmail_limiter = _RateLimiter(name="gmail", detail="Gmail inbox sync rate limit exceeded")
 _gmail_requests = _gmail_limiter.buckets
 GMAIL_RATE_LIMIT_REQUESTS = 3
 GMAIL_RATE_LIMIT_WINDOW_SECONDS = 600
@@ -352,7 +389,9 @@ enforce_gmail_rate_limit = _quota(
 # regex-based matching/classification, zero network calls) with a DB
 # write on cache miss — sized identically to those buckets rather than
 # the stricter network-bound ones (XING/Gmail sync/Bewerbung).
-_gmail_analysis_limiter = _RateLimiter(detail="Gmail message analysis rate limit exceeded")
+_gmail_analysis_limiter = _RateLimiter(
+    name="gmail_analysis", detail="Gmail message analysis rate limit exceeded"
+)
 _gmail_analysis_requests = _gmail_analysis_limiter.buckets
 GMAIL_ANALYSIS_RATE_LIMIT_REQUESTS = 30
 GMAIL_ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -370,7 +409,9 @@ enforce_gmail_analysis_rate_limit = _quota(
 # template lookup, zero network calls) with a DB write on cache miss —
 # sized identically to GMAIL_ANALYSIS_RATE_LIMIT rather than the
 # stricter network-bound buckets (XING/Gmail sync/Bewerbung).
-_response_draft_limiter = _RateLimiter(detail="Response draft rate limit exceeded")
+_response_draft_limiter = _RateLimiter(
+    name="response_draft", detail="Response draft rate limit exceeded"
+)
 _response_draft_requests = _response_draft_limiter.buckets
 RESPONSE_DRAFT_RATE_LIMIT_REQUESTS = 30
 RESPONSE_DRAFT_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -387,7 +428,7 @@ enforce_response_draft_rate_limit = _quota(
 # zero network cost — sized like MATCH_RATE_LIMIT/REVIEW_WRITE_RATE_LIMIT
 # rather than the stricter network-bound buckets below.
 _response_draft_decision_limiter = _RateLimiter(
-    detail="Response draft decision rate limit exceeded"
+    name="response_draft_decision", detail="Response draft decision rate limit exceeded"
 )
 _response_draft_decision_requests = _response_draft_decision_limiter.buckets
 RESPONSE_DRAFT_DECISION_RATE_LIMIT_REQUESTS = 30
@@ -410,7 +451,9 @@ enforce_response_draft_decision_rate_limit = _quota(
 # SMTP logins risk tripping Gmail's own abuse detection on the same
 # account the read-only IMAP sync uses. Kept in its own bucket, sized
 # tightly, rather than sharing any other bucket.
-_response_draft_send_limiter = _RateLimiter(detail="Response draft send rate limit exceeded")
+_response_draft_send_limiter = _RateLimiter(
+    name="response_draft_send", detail="Response draft send rate limit exceeded"
+)
 _response_draft_send_requests = _response_draft_send_limiter.buckets
 RESPONSE_DRAFT_SEND_RATE_LIMIT_REQUESTS = 5
 RESPONSE_DRAFT_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -430,7 +473,9 @@ enforce_response_draft_send_rate_limit = _quota(
 # 7B analysis, one call scans up to FOLLOW_UP_JOB_SCAN_LIMIT tracked jobs
 # (pure local computation + a DB write per newly-eligible one) — sized
 # tighter than GMAIL_ANALYSIS_RATE_LIMIT to reflect that bulk-scan cost.
-_follow_up_evaluate_limiter = _RateLimiter(detail="Follow-up evaluation rate limit exceeded")
+_follow_up_evaluate_limiter = _RateLimiter(
+    name="follow_up_evaluate", detail="Follow-up evaluation rate limit exceeded"
+)
 _follow_up_evaluate_requests = _follow_up_evaluate_limiter.buckets
 FOLLOW_UP_EVALUATE_RATE_LIMIT_REQUESTS = 10
 FOLLOW_UP_EVALUATE_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -446,7 +491,9 @@ enforce_follow_up_evaluate_rate_limit = _quota(
 # Bucket for Stage 7E follow-up approve/reject decisions: pure local DB
 # read+write, zero network cost — sized like
 # RESPONSE_DRAFT_DECISION_RATE_LIMIT.
-_follow_up_decision_limiter = _RateLimiter(detail="Follow-up decision rate limit exceeded")
+_follow_up_decision_limiter = _RateLimiter(
+    name="follow_up_decision", detail="Follow-up decision rate limit exceeded"
+)
 _follow_up_decision_requests = _follow_up_decision_limiter.buckets
 FOLLOW_UP_DECISION_RATE_LIMIT_REQUESTS = 30
 FOLLOW_UP_DECISION_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -462,7 +509,9 @@ enforce_follow_up_decision_rate_limit = _quota(
 # Separate, stricter bucket for Stage 7E follow-up SEND — same rationale
 # as RESPONSE_DRAFT_SEND_RATE_LIMIT: this transmits a real outbound email
 # over the same account's SMTP credentials.
-_follow_up_send_limiter = _RateLimiter(detail="Follow-up send rate limit exceeded")
+_follow_up_send_limiter = _RateLimiter(
+    name="follow_up_send", detail="Follow-up send rate limit exceeded"
+)
 _follow_up_send_requests = _follow_up_send_limiter.buckets
 FOLLOW_UP_SEND_RATE_LIMIT_REQUESTS = 5
 FOLLOW_UP_SEND_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -483,7 +532,9 @@ enforce_follow_up_send_rate_limit = _quota(
 # bucket rather than sharing either collector's so a manual single-
 # collector run and an orchestrated run never compete for the same
 # budget.
-_automation_run_limiter = _RateLimiter(detail="Automation run rate limit exceeded")
+_automation_run_limiter = _RateLimiter(
+    name="automation_run", detail="Automation run rate limit exceeded"
+)
 _automation_run_requests = _automation_run_limiter.buckets
 AUTOMATION_RUN_RATE_LIMIT_REQUESTS = 3
 AUTOMATION_RUN_RATE_LIMIT_WINDOW_SECONDS = 600
@@ -507,13 +558,15 @@ enforce_automation_run_rate_limit = _quota(
 # on success); once a client holds AUTH_FAILURE_LIMIT of them inside
 # the window it is refused with 429 BEFORE its key is compared, so a locked-out
 # client learns nothing more about the key -- not even from a correct guess.
-_auth_failure_limiter = _RateLimiter(detail="Too many failed authentication attempts")
+_auth_failure_limiter = _RateLimiter(
+    name="auth_failure", detail="Too many failed authentication attempts"
+)
 _auth_failure_requests = _auth_failure_limiter.buckets
 AUTH_FAILURE_LIMIT = 10
 AUTH_FAILURE_WINDOW_SECONDS = 300
 
 
-def begin_auth_attempt(request: Request) -> float:
+def begin_auth_attempt(request: Request) -> float | int:
     """Charge one failure slot for this attempt (429 if none left). Atomic:
     concurrent attempts cannot overshoot the limit. The caller MUST call
     `end_auth_attempt_ok` if the credential turns out to be valid."""
@@ -524,13 +577,13 @@ def begin_auth_attempt(request: Request) -> float:
     )
 
 
-def end_auth_attempt_ok(request: Request, token: float) -> None:
+def end_auth_attempt_ok(request: Request, token: float | int) -> None:
     _auth_failure_limiter.refund(request, token)
 
 
 # Stage 20: the browser login form compares a submitted API key, so it gets
 # its own small bucket (a password-guessing surface, unlike a read).
-_ui_login_limiter = _RateLimiter(detail="Login rate limit exceeded")
+_ui_login_limiter = _RateLimiter(name="ui_login", detail="Login rate limit exceeded")
 UI_LOGIN_RATE_LIMIT_REQUESTS = 10
 UI_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 

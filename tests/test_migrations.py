@@ -2854,6 +2854,9 @@ def test_automation_processed_at_migration_never_infers_completion_from_old_wate
 
     from app.db.gmail_repository import list_unprocessed_messages_for_automation
 
+    # The ORM model describes the CURRENT schema (later migrations added columns such as
+    # `sender_auth`), so the selector is exercised on the fully migrated database.
+    upgrade(cfg, "head")
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     session = session_factory()
     try:

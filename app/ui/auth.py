@@ -14,13 +14,18 @@ per-process nonce, so:
   every cookie once the web process is restarted with the new value;
 - a RESTART of the web process also invalidates every cookie (the nonce is
   not persisted): a logged-out cookie can therefore not come back to life;
-- LOGOUT revokes this session's id in an in-process registry until the
-  cookie's own expiry (bounded; a full registry fails the logout with 503
-  instead of forgetting a revocation).
+- LOGOUT revokes this session's id in a registry until the cookie's own
+  expiry (bounded; a full registry fails the logout with 503 instead of
+  forgetting a revocation).
 
-This relies on the documented topology of ONE web process (`--workers 1`, one
-replica): the nonce and the registry are per process, and the UI never writes
-to the database. An empty `API_KEY` refuses every login and every cookie
+Two backends (`SHARED_STATE_BACKEND`, app/security/shared_state.py). `memory`
+(default) relies on the documented topology of ONE web process (`--workers 1`,
+one replica; a second process refuses to start): the nonce and the registry are
+per process. `database`: the registry is a table of the existing database and the
+nonce is a constant, so any number of workers accept each other's cookies and honour
+every logout, and a restart no longer invalidates cookies (the revocations persist).
+The UI request session stays read-only in both modes; the shared tables are written
+through their own engine. An empty `API_KEY` refuses every login and every cookie
 (same fail-closed rule as `require_api_key`).
 """
 
@@ -35,6 +40,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings, get_settings, reveal
+from app.security import shared_state
 
 COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/2|"
@@ -50,6 +56,13 @@ class NotLoggedInError(Exception):
 
 
 _KEY_CONTEXT = b"jobtriage-ui-session-key/1|"
+
+
+def _nonce() -> str:
+    """Per-process random nonce (a restart invalidates every cookie), or - with the shared
+    backend, where several workers must accept each other's cookies - a constant: the logout
+    revocations are then persistent and shared, so a restart no longer needs to invalidate."""
+    return "shared" if shared_state.enabled() else _PROCESS_NONCE
 
 
 def signing_key(settings: Settings) -> str:
@@ -70,7 +83,7 @@ def signing_key(settings: Settings) -> str:
     secret = reveal(settings.ui_session_secret) or api_key
     return hmac.new(
         secret.encode("utf-8"),
-        _KEY_CONTEXT + api_key.encode("utf-8") + b"|" + _PROCESS_NONCE.encode("ascii"),
+        _KEY_CONTEXT + api_key.encode("utf-8") + b"|" + _nonce().encode("ascii"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -121,11 +134,21 @@ class SessionRevocations:
         self._revoked: dict[str, int] = {}
 
     def is_revoked(self, sid: str) -> bool:
+        if shared_state.enabled():
+            try:
+                return shared_state.session_is_revoked(sid)
+            except shared_state.SharedStateUnavailableError:
+                return True  # fail closed: when revocation cannot be checked, the cookie is refused
         with self._lock:
             return sid in self._revoked
 
     def revoke(self, sid: str, expiry: int, *, now: float | None = None) -> bool:
         moment = time.time() if now is None else now
+        if shared_state.enabled():
+            try:
+                return shared_state.session_revoke(sid, expiry, capacity=self.CAPACITY, now=moment)
+            except shared_state.SharedStateUnavailableError:
+                return False  # the logout is reported as failed (503), never silently dropped
         with self._lock:
             if sid in self._revoked:
                 return True
@@ -140,6 +163,8 @@ class SessionRevocations:
     def clear(self) -> None:
         with self._lock:
             self._revoked.clear()
+        if shared_state.enabled():
+            shared_state.session_clear()
 
 
 revocations = SessionRevocations()
