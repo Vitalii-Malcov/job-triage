@@ -23,6 +23,7 @@ from app.agents.review_package_builder import (
     ReviewSourceMismatchError,
     ReviewVersionConflictError,
 )
+from app.api.http_errors import http_errors
 from app.api.routers.common import _already_applied_detail
 from app.db.repositories import (
     get_job_by_id,
@@ -82,44 +83,37 @@ def create_review_package(
     `body.bewerbung_draft_id` — both required, no "latest" fallback
     (section 4). Never auto-approves.
     """
-    try:
+    with http_errors(
+        (
+            (
+                AlreadyAppliedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: _already_applied_detail(exc),
+            ),
+            (ReviewCVDraftNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (ReviewBewerbungDraftNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (ReviewCVDraftJobMismatchError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
+            (ReviewBewerbungDraftJobMismatchError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
+            (
+                ReviewSourceMismatchError,
+                http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+                lambda exc: {"message": str(exc), "mismatched_fields": exc.mismatched_fields},
+            ),
+            (ReviewCurrentProfileMissingError, http_status.HTTP_409_CONFLICT, str),
+            (
+                ReviewProfileChangedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "pinned_profile_version": exc.pinned_profile_version,
+                    "current_profile_version": exc.current_profile_version,
+                },
+            ),
+            (ReviewCurrentJobMissingError, http_status.HTTP_409_CONFLICT, str),
+            (ReviewJobChangedError, http_status.HTTP_409_CONFLICT, str),
+        )
+    ):
         result = _run_create_review_package(db, job_id, body.cv_draft_id, body.bewerbung_draft_id)
-    except AlreadyAppliedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT, detail=_already_applied_detail(exc)
-        ) from exc
-    except ReviewCVDraftNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ReviewBewerbungDraftNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ReviewCVDraftJobMismatchError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except ReviewBewerbungDraftJobMismatchError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except ReviewSourceMismatchError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"message": str(exc), "mismatched_fields": exc.mismatched_fields},
-        ) from exc
-    except ReviewCurrentProfileMissingError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ReviewProfileChangedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "pinned_profile_version": exc.pinned_profile_version,
-                "current_profile_version": exc.current_profile_version,
-            },
-        ) from exc
-    except ReviewCurrentJobMissingError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ReviewJobChangedError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     if result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -184,7 +178,26 @@ def patch_review_package(
     28). Never edits the pinned source `candidate_cv_drafts`/
     `bewerbung_drafts` rows.
     """
-    try:
+    with http_errors(
+        (
+            (ReviewNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (
+                ReviewNotPendingError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "current_status": exc.current_status},
+            ),
+            (ReviewParagraphIndexError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
+            (
+                ReviewVersionConflictError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "expected_review_version": exc.expected_review_version,
+                    "current_review_version": exc.current_review_version,
+                },
+            ),
+        )
+    ):
         result = ReviewPackageService().patch(
             db,
             review_id,
@@ -193,26 +206,6 @@ def patch_review_package(
             body.bewerbung_changes,
             body.edit_note,
         )
-    except ReviewNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ReviewNotPendingError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "current_status": exc.current_status},
-        ) from exc
-    except ReviewParagraphIndexError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except ReviewVersionConflictError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "expected_review_version": exc.expected_review_version,
-                "current_review_version": exc.current_review_version,
-            },
-        ) from exc
     return result
 
 
@@ -231,7 +224,42 @@ def approve_review_package(
     ApplicationStatus (section 3) — approval means only "the human
     approved this exact package".
     """
-    try:
+    with http_errors(
+        (
+            (ReviewNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (
+                ReviewNotPendingError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "current_status": exc.current_status},
+            ),
+            (ReviewCurrentProfileMissingError, http_status.HTTP_409_CONFLICT, str),
+            (
+                ReviewProfileChangedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "pinned_profile_version": exc.pinned_profile_version,
+                    "current_profile_version": exc.current_profile_version,
+                },
+            ),
+            (ReviewCurrentJobMissingError, http_status.HTTP_409_CONFLICT, str),
+            (ReviewJobChangedError, http_status.HTTP_409_CONFLICT, str),
+            (
+                ReviewManualOverrideAcknowledgmentRequiredError,
+                http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+                str,
+            ),
+            (
+                ReviewVersionConflictError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "expected_review_version": exc.expected_review_version,
+                    "current_review_version": exc.current_review_version,
+                },
+            ),
+        )
+    ):
         result = ReviewPackageService().approve(
             db,
             review_id,
@@ -239,41 +267,6 @@ def approve_review_package(
             body.acknowledge_manual_overrides,
             body.decision_note,
         )
-    except ReviewNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ReviewNotPendingError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "current_status": exc.current_status},
-        ) from exc
-    except ReviewCurrentProfileMissingError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ReviewProfileChangedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "pinned_profile_version": exc.pinned_profile_version,
-                "current_profile_version": exc.current_profile_version,
-            },
-        ) from exc
-    except ReviewCurrentJobMissingError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ReviewJobChangedError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ReviewManualOverrideAcknowledgmentRequiredError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except ReviewVersionConflictError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "expected_review_version": exc.expected_review_version,
-                "current_review_version": exc.current_review_version,
-            },
-        ) from exc
     return result
 
 
@@ -290,31 +283,33 @@ def reject_review_package(
     """PENDING_REVIEW -> REJECTED. Never mutates the source drafts, never
     touches ApplicationStatus. Refused (409) while a linked application is
     APPROVED (Stage 16)."""
-    try:
+    with http_errors(
+        (
+            (ReviewNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (
+                ReviewApplicationApprovedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "application_id": exc.application_id},
+            ),
+            (
+                ReviewNotPendingError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "current_status": exc.current_status},
+            ),
+            (
+                ReviewVersionConflictError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "expected_review_version": exc.expected_review_version,
+                    "current_review_version": exc.current_review_version,
+                },
+            ),
+        )
+    ):
         result = ReviewPackageService().reject(
             db, review_id, body.expected_review_version, body.decision_note
         )
-    except ReviewNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ReviewApplicationApprovedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "application_id": exc.application_id},
-        ) from exc
-    except ReviewNotPendingError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "current_status": exc.current_status},
-        ) from exc
-    except ReviewVersionConflictError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "expected_review_version": exc.expected_review_version,
-                "current_review_version": exc.current_review_version,
-            },
-        ) from exc
     return result
 
 

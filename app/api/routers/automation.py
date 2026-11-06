@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import MAX_OFFSET, _current_gmail_account_key
 from app.db.automation_repository import (
@@ -52,14 +53,15 @@ async def start_automation_run(db: Session = Depends(get_db)) -> AutomationRun:
     """
     settings = common.get_settings()
     account_key = _current_gmail_account_key(settings)
-    try:
+    with http_errors(
+        (
+            (AutomationRunAlreadyInProgressError, http_status.HTTP_409_CONFLICT, str),
+            (AutomationRunLeaseLostError, http_status.HTTP_409_CONFLICT, str),
+        )
+    ):
         run = await run_off_loop(
             lambda: run_automation_cycle(db, account_key=account_key, settings=settings)
         )
-    except AutomationRunAlreadyInProgressError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except AutomationRunLeaseLostError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return to_automation_run(run)
 
 

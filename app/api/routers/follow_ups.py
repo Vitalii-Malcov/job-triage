@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import MAX_OFFSET, _current_gmail_account_key
 from app.db.follow_up_approval_repository import to_follow_up_approval, to_follow_up_send_status
@@ -104,12 +105,10 @@ def evaluate_follow_up_for_single_job(
     single-job counterpart to `POST /follow-ups/evaluate`'s bounded scan.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        ((FollowUpJobNotFoundError, http_status.HTTP_404_NOT_FOUND, "Job not found"),)
+    ):
         return evaluate_follow_up_for_job(db, account_key, job_id)
-    except FollowUpJobNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found"
-        ) from exc
 
 
 @router.get(
@@ -161,31 +160,31 @@ def decide_follow_up(
     endpoint that does, and only once this decision is APPROVED.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        (
+            (
+                FollowUpProposalNotFoundError,
+                http_status.HTTP_404_NOT_FOUND,
+                "Follow-up proposal not found",
+            ),
+            (
+                FollowUpAlreadyDecidedError,
+                http_status.HTTP_409_CONFLICT,
+                "Follow-up proposal already has a recorded decision",
+            ),
+            (
+                FollowUpAnchorAlreadyFollowedUpError,
+                http_status.HTTP_409_CONFLICT,
+                "Another follow-up for this correspondence is already in progress or sent",
+            ),
+        ),
+        db=db,
+        log_event="follow_up_decision_failed",
+        failure_detail="Follow-up decision failed",
+    ):
         record = approve_or_reject_follow_up(
             db, account_key, follow_up_id, body.decision, body.note
         )
-    except FollowUpProposalNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
-        ) from exc
-    except FollowUpAlreadyDecidedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Follow-up proposal already has a recorded decision",
-        ) from exc
-    except FollowUpAnchorAlreadyFollowedUpError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Another follow-up for this correspondence is already in progress or sent",
-        ) from exc
-    except Exception as exc:
-        db.rollback()
-        logger.warning("follow_up_decision_failed error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Follow-up decision failed",
-        ) from exc
     return to_follow_up_approval(record)
 
 
@@ -294,9 +293,13 @@ def get_follow_up_state_endpoint(follow_up_id: int, db: Session = Depends(get_db
     proposal — never triggers a decision or a send.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        (
+            (
+                FollowUpProposalNotFoundError,
+                http_status.HTTP_404_NOT_FOUND,
+                "Follow-up proposal not found",
+            ),
+        )
+    ):
         return get_follow_up_state(db, account_key, follow_up_id)
-    except FollowUpProposalNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Follow-up proposal not found"
-        ) from exc

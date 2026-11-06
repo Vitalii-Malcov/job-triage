@@ -21,6 +21,7 @@ from app.agents.cv_adapter import (
     CVDraftMatchNotFoundError,
     CVDraftProfileChangedError,
 )
+from app.api.http_errors import http_errors
 from app.api.routers.common import _already_applied_detail
 from app.db.bewerbung_repository import (
     get_bewerbung_draft_by_id,
@@ -107,21 +108,21 @@ def patch_candidate_profile(
     409 here. The caller must GET the profile again and retry with the
     fresh version; the response detail never includes profile content.
     """
-    try:
+    with http_errors(
+        (
+            (
+                CandidateProfileVersionConflictError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "current_profile_version": exc.current_version},
+            ),
+            (
+                CandidateProfileTrustDowngradeError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {"message": str(exc), "fields": exc.fields},
+            ),
+        )
+    ):
         record = apply_candidate_profile_patch(db, body)
-    except CandidateProfileVersionConflictError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "current_profile_version": exc.current_version,
-            },
-        ) from exc
-    except CandidateProfileTrustDowngradeError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "fields": exc.fields},
-        ) from exc
     return to_candidate_profile_response(record)
 
 
@@ -189,27 +190,25 @@ def run_candidate_cv_draft(
     trusted facts yields a sparse draft plus explicit warnings, never a
     failure merely because the profile is sparse.
     """
-    try:
+    with http_errors(
+        (
+            (CVDraftMatchNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (CVDraftMatchJobMismatchError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
+            (
+                CVDraftProfileChangedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "match_profile_version": exc.match_profile_version,
+                    "current_profile_version": exc.current_profile_version,
+                },
+            ),
+            (CVDraftJobChangedError, http_status.HTTP_409_CONFLICT, str),
+        )
+    ):
         result = _run_candidate_cv_draft(
             db, job_id, body.match_id, force_recompute=body.force_recompute
         )
-    except CVDraftMatchNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except CVDraftMatchJobMismatchError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except CVDraftProfileChangedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "match_profile_version": exc.match_profile_version,
-                "current_profile_version": exc.current_profile_version,
-            },
-        ) from exc
-    except CVDraftJobChangedError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     if result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -269,48 +268,37 @@ async def run_bewerbung_draft(
     Every successful call creates a NEW immutable draft row (section 35) —
     never reused/cached, unlike POST .../match or .../cv-draft.
     """
-    try:
+    with http_errors(
+        (
+            (
+                AlreadyAppliedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: _already_applied_detail(exc),
+            ),
+            (BewerbungCVDraftNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
+            (BewerbungCVDraftJobMismatchError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
+            (
+                BewerbungProfileChangedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: {
+                    "message": str(exc),
+                    "cv_draft_profile_version": exc.cv_draft_profile_version,
+                    "current_profile_version": exc.current_profile_version,
+                },
+            ),
+            (BewerbungJobChangedError, http_status.HTTP_409_CONFLICT, str),
+            (BewerbungMatchNotFoundError, http_status.HTTP_500_INTERNAL_SERVER_ERROR, str),
+            (BewerbungMatchInconsistentError, http_status.HTTP_500_INTERNAL_SERVER_ERROR, str),
+            (BewerbungProviderNotConfiguredError, http_status.HTTP_503_SERVICE_UNAVAILABLE, str),
+            (BewerbungProviderError, http_status.HTTP_502_BAD_GATEWAY, str),
+            (
+                BewerbungPlanRejectedError,
+                http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+                lambda exc: {"message": str(exc), "codes": exc.codes},
+            ),
+        )
+    ):
         result = await run_off_loop(lambda: _run_bewerbung_draft(db, job_id, body.cv_draft_id))
-    except AlreadyAppliedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT, detail=_already_applied_detail(exc)
-        ) from exc
-    except BewerbungCVDraftNotFoundError as exc:
-        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except BewerbungCVDraftJobMismatchError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except BewerbungProfileChangedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail={
-                "message": str(exc),
-                "cv_draft_profile_version": exc.cv_draft_profile_version,
-                "current_profile_version": exc.current_profile_version,
-            },
-        ) from exc
-    except BewerbungJobChangedError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except BewerbungMatchNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
-        ) from exc
-    except BewerbungMatchInconsistentError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
-        ) from exc
-    except BewerbungProviderNotConfiguredError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
-    except BewerbungProviderError as exc:
-        raise HTTPException(status_code=http_status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    except BewerbungPlanRejectedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"message": str(exc), "codes": exc.codes},
-        ) from exc
 
     if result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")
