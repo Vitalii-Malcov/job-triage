@@ -1,5 +1,6 @@
 import ipaddress
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -100,6 +101,18 @@ class Settings(BaseSettings):
     # Off by default: every /ui route answers 404 while False. Login uses
     # api_key above; the session cookie expires after ui_session_hours.
     ui_enabled: bool = False
+    # Task 23: where rate limits, the failed-auth budget, UI logout revocations and the
+    # cookie nonce live. `memory` (default): this process only -- correct for exactly ONE
+    # web process (enforced by the single-process lock below). `database`: the two
+    # `shared_*` tables of the existing database, so several workers behave as one.
+    shared_state_backend: Literal["memory", "database"] = "memory"
+    # With the `memory` backend the web process takes an exclusive per-database lock at
+    # startup and a second process refuses to start (several workers would multiply the
+    # limits and reject each other's cookies). False only for tests / a deliberate override.
+    single_process_lock_enabled: bool = True
+    # Directory of that lock file; empty = the system temp directory. Processes (or
+    # containers) that must exclude each other have to share this directory.
+    single_process_lock_dir: str = ""
     ui_session_hours: int = Field(default=12, ge=1, le=168)
     # False only for plain-HTTP access from a non-localhost host.
     ui_cookie_secure: bool = True

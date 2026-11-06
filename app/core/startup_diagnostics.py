@@ -42,6 +42,7 @@ def startup_safety_fields(settings) -> dict[str, str]:
     fields = {name: str(bool(getattr(settings, name))).lower() for name in SAFETY_FLAGS}
     fields["database_dialect"] = _database_dialect(settings.database_url)
     fields["trusted_proxy_count"] = str(len(settings.trusted_proxy_ip_set))
+    fields["shared_state_backend"] = str(settings.shared_state_backend)
     return fields
 
 

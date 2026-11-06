@@ -6,6 +6,7 @@ from app.api.routes import router
 from app.core.config import get_settings
 from app.core.database_target import check_database_target
 from app.core.logging import configure_logging
+from app.core.single_process_lock import acquire_if_required
 from app.core.startup_diagnostics import log_startup_safety_state
 from app.db.session import run_migrations_if_enabled
 from app.services.telegram_bot import start_bot, stop_bot
@@ -18,13 +19,19 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     # Stage 17A: refuse a pilot/backup database before anything uses it.
     check_database_target(settings)
-    log_startup_safety_state(settings, process="web")
-    run_migrations_if_enabled()
-    telegram_application = await start_bot(settings)
+    # Task 23: with process-local state a second web process is refused (fail closed).
+    process_lock = acquire_if_required(settings)
     try:
-        yield
+        log_startup_safety_state(settings, process="web")
+        run_migrations_if_enabled()
+        telegram_application = await start_bot(settings)
+        try:
+            yield
+        finally:
+            await stop_bot(telegram_application)
     finally:
-        await stop_bot(telegram_application)
+        if process_lock is not None:
+            process_lock.release()
 
 
 app = FastAPI(

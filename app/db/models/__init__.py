@@ -96,6 +96,10 @@ from app.db.models.response_drafts import (  # noqa: F401
     ResponseDraftRecord,
     ResponseDraftSendRecord,
 )
+from app.db.models.shared_state import (  # noqa: F401
+    SharedRateLimitHit,
+    SharedUiSessionRevocation,
+)
 from app.db.models.telegram import (  # noqa: F401
     LIFECYCLE_NOTIFICATION_CHECKS,
     OPERATOR_CARD_CHECKS,

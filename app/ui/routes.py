@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
 from app.db.datetime_utils import ensure_utc
@@ -122,16 +123,17 @@ async def login(request: Request) -> Response:
         enforce_ui_login_rate_limit,
     )
 
-    enforce_ui_login_rate_limit(request)
+    # The shared backend does blocking database work: keep it off the event loop.
+    await run_in_threadpool(enforce_ui_login_rate_limit, request)
     # Body first: the failure slot is reserved right before the comparison,
     # so a slow body cannot straddle a lockout.
     body = await _bounded_body(request)
     submitted = parse_qs(body.decode("utf-8", errors="replace")).get("api_key", [""])[0]
     settings = get_settings()
-    token = begin_auth_attempt(request)
+    token = await run_in_threadpool(begin_auth_attempt, request)
     if not api_key_matches(submitted, settings.api_key):
         return _render(request, "login.html", status_code=401, error="Invalid key.")
-    end_auth_attempt_ok(request, token)
+    await run_in_threadpool(end_auth_attempt_ok, request, token)
     response = RedirectResponse("/ui/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         COOKIE_NAME,
