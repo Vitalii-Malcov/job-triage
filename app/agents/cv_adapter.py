@@ -203,10 +203,22 @@ def _select_skills(match: CandidateJobMatch, profile: CandidateProfile) -> list[
     ordered = sorted(candidates, key=lambda r: _TOP_LEVEL_IMPORTANCE_ORDER.get(r.importance, 99))
 
     items: list[CVSkillItem] = []
+    # FLOW-12: one trusted skill can satisfy an individual requirement ("Django") AND a
+    # category example group ("Python-Frameworks z. B. Django, Flask"). It is listed once,
+    # on its strongest requirement (`ordered` is REQUIRED before PREFERRED); a repeated
+    # source_id also made every Bewerbung for that vacancy fail with DUPLICATE_CLAIM_ID.
+    # CV_ADAPTER_VERSION is deliberately NOT bumped: that would mark every stored review
+    # package STALE_CV_ADAPTER_VERSION. Existing cached drafts are NOT rewritten (the cache
+    # key (match_id, version) is unique, so `force_recompute` returns the stored row): a
+    # duplicate-bearing cached draft needs a separate, operator-approved repair. Measured on a
+    # copy of the production DB: 2 cached drafts, none with a duplicate skill.
+    seen_skill_ids: set[int] = set()
     for requirement in ordered:
         if not requirement.candidate_evidence:
             continue
         skill_id = requirement.candidate_evidence[0].entity_id
+        if skill_id in seen_skill_ids:
+            continue
         skill = skills_by_id.get(skill_id)
         if skill is None:
             # Defensive only: the pinned match's profile_version must equal
@@ -215,6 +227,7 @@ def _select_skills(match: CandidateJobMatch, profile: CandidateProfile) -> list[
             # guaranteed to exist. Skipped rather than raised, matching this
             # module's "never fail a draft over one unresolved line" stance.
             continue
+        seen_skill_ids.add(skill_id)
         items.append(
             CVSkillItem(
                 text=skill.name,
