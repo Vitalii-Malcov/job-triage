@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import (
     GMAIL_ANALYSES_DEFAULT_LIST_LIMIT,
@@ -191,24 +192,13 @@ def run_gmail_message_analysis(
     revision rather than creating a duplicate.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        ((GmailMessageNotFoundError, http_status.HTTP_404_NOT_FOUND, "Gmail message not found"),),
+        db=db,
+        log_event="gmail_message_analysis_run_failed",
+        failure_detail="Gmail message analysis failed",
+    ):
         record, _created = analyze_gmail_message(db, account_key, message_id)
-    except GmailMessageNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
-        ) from exc
-    except Exception as exc:
-        # Mirrors GMAIL-003 (POST /gmail/sync): never interpolate a
-        # caught exception into the HTTP response or the log line — a
-        # driver-level DB error's own message text could in principle
-        # embed row content (subject/body/addresses). Log only the
-        # exception's type; respond with a fixed, generic detail string.
-        db.rollback()
-        logger.warning("gmail_message_analysis_run_failed error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Gmail message analysis failed",
-        ) from exc
     return to_gmail_message_analysis(record)
 
 

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, MAX_OFFSET
 from app.core.config import reveal
@@ -188,10 +189,8 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> JobDetail:
 def patch_job_status(
     job_id: int, body: StatusUpdateRequest, db: Session = Depends(get_db)
 ) -> JobDetail:
-    try:
+    with http_errors(((InvalidStatusTransitionError, http_status.HTTP_409_CONFLICT, str),)):
         record = update_job_status(db, job_id, body.status)
-    except InvalidStatusTransitionError as exc:
-        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     if record is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Job not found")

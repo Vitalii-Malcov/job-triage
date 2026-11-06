@@ -93,6 +93,7 @@ from app.db.automation_repository import (
     AUTOMATION_RUN_LEASE_TTL_SECONDS,
     create_running_run,
     finish_run,
+    live_conflicting_run,
     new_run_lease_holder_token,
     renew_run_lease,
 )
@@ -107,6 +108,7 @@ from app.services.collector_runner import (
     run_bundesagentur,
     run_xing,
 )
+from app.services.run_leases import CANCELLED_LEASE_EXTENSION_SECONDS, lock_account_keys
 
 logger = logging.getLogger(__name__)
 
@@ -527,8 +529,6 @@ def _extend_lease_after_interruption(
     commit AFTER the extension and shorten the expiry back to one TTL. Best effort: a
     database failure here, or an already lost lease, leaves the normal lease-expiry
     recovery; a hard kill (SIGKILL) never runs this at all."""
-    from app.services.collector_exclusion import CANCELLED_LEASE_EXTENSION_SECONDS
-
     heartbeat.stop()
     try:
         with sessionmaker(bind=db.get_bind())() as side:
@@ -548,9 +548,6 @@ def _yield_to_live_run_under_another_key(
     one. Protocol: this run's slot is already claimed; if another live run exists under
     any other actual key, release the slot (FAILED, audited) and refuse. When two starters
     race both may yield (retried next tick); they can never both run."""
-    from app.db.automation_repository import live_conflicting_run
-    from app.services.collector_exclusion import lock_account_keys
-
     other_keys = [key for key in lock_account_keys(settings) if key != account_key]
     if not other_keys:
         return

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
+from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import MAX_OFFSET, _current_gmail_account_key
 from app.db.gmail_repository import (
@@ -99,26 +100,24 @@ def create_gmail_message_response_draft(
     never re-derives matching/classification itself.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        (
+            (
+                ResponseDraftMessageNotFoundError,
+                http_status.HTTP_404_NOT_FOUND,
+                "Gmail message not found",
+            ),
+            (
+                ResponseDraftAnalysisNotFoundError,
+                http_status.HTTP_409_CONFLICT,
+                "Gmail message has not been analyzed yet",
+            ),
+        ),
+        db=db,
+        log_event="response_draft_generation_failed",
+        failure_detail="Response draft generation failed",
+    ):
         record, _created = generate_response_draft_for_message(db, account_key, message_id)
-    except ResponseDraftMessageNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Gmail message not found"
-        ) from exc
-    except ResponseDraftAnalysisNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Gmail message has not been analyzed yet",
-        ) from exc
-    except Exception as exc:
-        # Mirrors POST /gmail/messages/{id}/analyze: never interpolate a
-        # caught exception into the HTTP response or the log line.
-        db.rollback()
-        logger.warning("response_draft_generation_failed error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Response draft generation failed",
-        ) from exc
     return to_response_draft(record)
 
 
@@ -221,56 +220,56 @@ def decide_response_draft(
     REJECTED is always accepted for a PROPOSED revision.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        (
+            (
+                ResponseDraftNotFoundError,
+                http_status.HTTP_404_NOT_FOUND,
+                "Response draft not found",
+            ),
+            (
+                ResponseDraftNotApprovableError,
+                http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "Response draft has no content to approve or reject",
+            ),
+            (
+                ResponseDraftAlreadyDecidedError,
+                http_status.HTTP_409_CONFLICT,
+                "Response draft already has a recorded decision",
+            ),
+            (
+                ResponseDraftMissingRecipientError,
+                http_status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "No safe reply recipient is available for this message",
+            ),
+            (
+                ResponseDraftRecipientDriftError,
+                http_status.HTTP_409_CONFLICT,
+                "The reply recipient differs from the one the operator reviewed",
+            ),
+            (
+                ResponseDraftSenderNotAuthenticatedError,
+                http_status.HTTP_409_CONFLICT,
+                _SENDER_NOT_AUTHENTICATED_DETAIL,
+            ),
+            (
+                ResponseDraftSupersededError,
+                http_status.HTTP_409_CONFLICT,
+                "Response draft is superseded by a newer revision",
+            ),
+            (
+                ResponseDraftMessageAlreadyRepliedError,
+                http_status.HTTP_409_CONFLICT,
+                "Another revision for this message already has a reply in progress or sent",
+            ),
+        ),
+        db=db,
+        log_event="response_draft_decision_failed",
+        failure_detail="Response draft decision failed",
+    ):
         record = approve_or_reject_response_draft(
             db, account_key, draft_id, body.decision, body.note, body.expected_recipient
         )
-    except ResponseDraftNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
-        ) from exc
-    except ResponseDraftNotApprovableError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Response draft has no content to approve or reject",
-        ) from exc
-    except ResponseDraftAlreadyDecidedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Response draft already has a recorded decision",
-        ) from exc
-    except ResponseDraftMissingRecipientError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="No safe reply recipient is available for this message",
-        ) from exc
-    except ResponseDraftRecipientDriftError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="The reply recipient differs from the one the operator reviewed",
-        ) from exc
-    except ResponseDraftSenderNotAuthenticatedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail=_SENDER_NOT_AUTHENTICATED_DETAIL,
-        ) from exc
-    except ResponseDraftSupersededError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Response draft is superseded by a newer revision",
-        ) from exc
-    except ResponseDraftMessageAlreadyRepliedError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_409_CONFLICT,
-            detail="Another revision for this message already has a reply in progress or sent",
-        ) from exc
-    except Exception as exc:
-        db.rollback()
-        logger.warning("response_draft_decision_failed error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Response draft decision failed",
-        ) from exc
     return to_response_draft_approval(record)
 
 
@@ -417,9 +416,7 @@ def get_response_draft_state_endpoint(
     response-draft revision — never triggers a decision or a send.
     """
     account_key = _current_gmail_account_key(common.get_settings())
-    try:
+    with http_errors(
+        ((ResponseDraftNotFoundError, http_status.HTTP_404_NOT_FOUND, "Response draft not found"),)
+    ):
         return get_response_draft_state(db, account_key, draft_id)
-    except ResponseDraftNotFoundError as exc:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND, detail="Response draft not found"
-        ) from exc

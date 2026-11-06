@@ -768,6 +768,71 @@ class _ThreadLockHeartbeat:
             )
 
 
+def _load_send_inputs(
+    db: Session, account_key: str, follow_up_proposal_id: int
+) -> tuple[object, object, object, OutboundMessage]:
+    """Everything a send needs that can be read without side effects, each missing piece
+    failing closed with its own error: the proposal (this account's), its APPROVED decision,
+    the anchor message, and the outbound message built from the approval's pinned values.
+    Returns `(proposal, approval, anchor_message, outbound_message)`."""
+    proposal = get_follow_up_proposal_by_id(db, account_key, follow_up_proposal_id)
+    if proposal is None:
+        raise FollowUpProposalNotFoundError(
+            f"No follow_up_proposals row for account_key={account_key!r} "
+            f"id={follow_up_proposal_id!r}"
+        )
+
+    approval = get_approval_for_proposal(db, account_key, proposal.id)
+    if approval is None or approval.decision != "APPROVED":
+        raise FollowUpNotApprovedError(
+            f"follow_up_proposal_id={follow_up_proposal_id!r} has no APPROVED decision on record"
+        )
+
+    anchor_message = get_message_by_id(db, account_key, proposal.anchor_gmail_message_id)
+    if anchor_message is None:
+        raise FollowUpMissingRecipientError(
+            f"anchor gmail_message_id={proposal.anchor_gmail_message_id!r} could not be resolved"
+        )
+    outbound_message = _build_outbound_message(anchor_message, approval)
+    return proposal, approval, anchor_message, outbound_message
+
+
+def _transmit(
+    db: Session,
+    provider: OutboundEmailProvider,
+    outbound_message: OutboundMessage,
+    send_record,
+    proposal,
+    follow_up_proposal_id: int,
+):
+    """Hand the message to the provider and record a definite failure (FAILED, safe to retry)
+    or an uncertain outcome (UNCERTAIN, terminal) exactly once; returns the provider result
+    on success. The caller marks SENT after its own post-send ownership check."""
+    try:
+        result = provider.send(outbound_message)
+    except EmailSendOutcomeUnknownError as exc:
+        mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
+        logger.warning(
+            "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
+            proposal.id,
+            type(exc).__name__,
+        )
+        raise FollowUpSendOutcomeUncertainError(
+            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
+        ) from exc
+    except EmailSendError as exc:
+        mark_send_failed(db, send_record, last_error=type(exc).__name__)
+        logger.warning(
+            "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
+            proposal.id,
+            type(exc).__name__,
+        )
+        raise FollowUpSendFailedError(
+            f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
+        ) from exc
+    return result
+
+
 def send_follow_up(
     db: Session,
     account_key: str,
@@ -799,25 +864,9 @@ def send_follow_up(
     `FollowUpSendInProgressError` / `FollowUpProposalStaleAtSendTimeError`
     / `FollowUpSendFailedError` / `FollowUpSendOutcomeUncertainError`.
     """
-    proposal = get_follow_up_proposal_by_id(db, account_key, follow_up_proposal_id)
-    if proposal is None:
-        raise FollowUpProposalNotFoundError(
-            f"No follow_up_proposals row for account_key={account_key!r} "
-            f"id={follow_up_proposal_id!r}"
-        )
-
-    approval = get_approval_for_proposal(db, account_key, proposal.id)
-    if approval is None or approval.decision != "APPROVED":
-        raise FollowUpNotApprovedError(
-            f"follow_up_proposal_id={follow_up_proposal_id!r} has no APPROVED decision on record"
-        )
-
-    anchor_message = get_message_by_id(db, account_key, proposal.anchor_gmail_message_id)
-    if anchor_message is None:
-        raise FollowUpMissingRecipientError(
-            f"anchor gmail_message_id={proposal.anchor_gmail_message_id!r} could not be resolved"
-        )
-    outbound_message = _build_outbound_message(anchor_message, approval)
+    proposal, approval, anchor_message, outbound_message = _load_send_inputs(
+        db, account_key, follow_up_proposal_id
+    )
 
     send_record = _claim_or_retry_send(
         db, account_key=account_key, proposal=proposal, approval=approval
@@ -923,28 +972,9 @@ def send_follow_up(
                 "was ever called; nothing was sent, safe to retry"
             )
 
-        try:
-            result = provider.send(outbound_message)
-        except EmailSendOutcomeUnknownError as exc:
-            mark_send_uncertain(db, send_record, last_error=type(exc).__name__)
-            logger.warning(
-                "follow_up_send_outcome_uncertain follow_up_proposal_id=%s error_type=%s",
-                proposal.id,
-                type(exc).__name__,
-            )
-            raise FollowUpSendOutcomeUncertainError(
-                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} had an uncertain outcome"
-            ) from exc
-        except EmailSendError as exc:
-            mark_send_failed(db, send_record, last_error=type(exc).__name__)
-            logger.warning(
-                "follow_up_send_failed follow_up_proposal_id=%s error_type=%s",
-                proposal.id,
-                type(exc).__name__,
-            )
-            raise FollowUpSendFailedError(
-                f"Sending follow_up_proposal_id={follow_up_proposal_id!r} failed"
-            ) from exc
+        result = _transmit(
+            db, provider, outbound_message, send_record, proposal, follow_up_proposal_id
+        )
 
         # the outbound provider reported success, but if the
         # heartbeat ever lost ownership of the lease WHILE provider.send
