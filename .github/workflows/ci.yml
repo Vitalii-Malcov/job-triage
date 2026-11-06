@@ -4,9 +4,15 @@ on:
   push:
   pull_request:
 
+# OPS-05: least privilege for the default token.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # the full suite takes ~45-55 min on a loaded machine; coverage adds overhead
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,7 +23,15 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest -q
+      # TEST-06: a per-test timeout kills a hung (thread/async) test instead of holding the job;
+      # coverage is REPORTED (no threshold yet: measured 96 % on 2026-11-06).
+      - run: pytest -q --timeout=600 --cov=app --cov-report=term --cov-report=xml:coverage.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
 
   # Real-PostgreSQL job (details and the phase rule: docs/CI.md). The schema comes from the real
   # Alembic chain on an empty database -- never Base.metadata.create_all -- and every module in
@@ -25,6 +39,7 @@ jobs:
   # green job mean that the PostgreSQL tests really ran.
   scheduler-postgres:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
@@ -100,6 +115,7 @@ jobs:
   # at the end of the job.
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build image
