@@ -113,6 +113,13 @@ class FakeCollector:
         return self._details.get(referenznummer)
 
 
+@pytest.fixture(autouse=True)
+def _fit_gate_open(monkeypatch):
+    """These tests cover the notification mechanics of synthetic vacancies; the fit gate
+    itself is covered in tests/test_shortlist_fit_safety.py and the lease-guard suite."""
+    monkeypatch.setattr("app.services.collector_runner.confirmed_barrier", lambda db, job_id: None)
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     db_path = tmp_path / "test_collector_endpoint.db"

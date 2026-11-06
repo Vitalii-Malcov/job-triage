@@ -77,9 +77,9 @@ from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.search_strategy import bundesagentur_queries
-from app.services.shortlist_gate import confirmed_barrier
 from app.services.telegram import TelegramNotifier
-from app.services.telegram_vacancy_feed import (
+from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
+    confirmed_barrier,
     deliver_queued_vacancy_cards,
     record_collected_job,
 )
