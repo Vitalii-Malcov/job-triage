@@ -100,17 +100,42 @@ def support_admin_family(title: str) -> str | None:
     return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
 
 
+# Gender markers ("(m/w/d)", "m/w/x") must not split a title into segments.
+_GENDER_MARKER = re.compile(
+    r"\([^)]*\)|\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b|\b[mwdfx]\s*\*\s*[mwdfx]\b",
+    re.IGNORECASE,
+)
+# "/", "|", "&", "+", ",", " - ", "und", "and": two role names side by side.
+_ROLE_SEPARATOR = re.compile(r"\s*[/|&+,;]\s*|\s+[-–—]\s+|\s+(?:und|and|oder|or)\s+", re.I)
+
+
 def hybrid_support_admin_family(title: str) -> str | None:
     """The support/administration family of a HYBRID title, or None.
 
-    A title naming both an administration/support role and a developer role
-    ("IT-Administrator / Softwareentwickler") is not excluded (see
-    `support_admin_family`) but the main profession is unclear: the operator reads it
-    and it is never prepared automatically."""
-    text = title or ""
+    Hybrid = the title names an administration/support ROLE and, as a separate
+    alternative, a developer role ("IT-Administrator / Softwareentwickler"). It is not
+    excluded (see `support_admin_family`) but the main profession is unclear: the
+    operator reads it and it is never prepared automatically. Support that merely
+    describes the software being built stays a developer title ("Python Entwickler
+    Service Desk Tools"): the two words must sit in different segments."""
+    text = _GENDER_MARKER.sub(" ", title or "")
     if not _DEV_ROLE.search(text):
         return None
-    return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
+    segments = [part for part in _ROLE_SEPARATOR.split(text) if part.strip()]
+    for segment in segments:
+        if _DEV_ROLE.search(segment):
+            continue
+        family = next((name for name, pattern in _FAMILIES if pattern.search(segment)), None)
+        if family is not None:
+            return family
+    return None
+
+
+def is_developer_title(title: str) -> bool:
+    """Title-only: does the title name a software-development role? Independent of the
+    candidate's configured role priorities and never true for a support/administration
+    title without a separate developer alternative."""
+    return _DEV_ROLE.search(title or "") is not None
 
 
 def is_support_admin_term(term: str) -> bool:

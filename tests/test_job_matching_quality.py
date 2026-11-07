@@ -10,7 +10,6 @@ import pytest
 
 from app.services.job_fit_assessment import Criterion, FitAssessment
 from app.services.shortlist_gate import (
-    PreparationCheck,
     automatic_block_reason,
     automatic_preparation_check,
 )
@@ -28,6 +27,7 @@ from app.services.triage_category import (
 
 def _assessment(
     *,
+    title="Junior Python Developer (m/w/d)",
     role="PRIMARY",
     skills="STRONG",
     location="ESTIMATE_WITHIN",
@@ -37,7 +37,7 @@ def _assessment(
     start="UNKNOWN",
     experience="UNKNOWN",
 ) -> FitAssessment:
-    a = FitAssessment(job_id=1, company="Example GmbH", title="Job")
+    a = FitAssessment(job_id=1, company="Example GmbH", title=title)
     a.criteria = [
         Criterion("role", role, "r"),
         Criterion("skills", skills, "s"),
@@ -113,19 +113,26 @@ class TestMissingSecondaryFacts:
 
 class TestRoleFamily:
     def test_python_developer_is_primary_and_ranks_first(self):
-        assert classify(_assessment(role="PRIMARY")).rank < classify(_assessment(role="OTHER")).rank
+        assert (
+            classify(_assessment(role="PRIMARY")).rank
+            < classify(_assessment(title="Datenanalyst (m/w/d)", role="OTHER")).rank
+        )
 
     def test_data_or_devops_title_is_adjacent_not_primary(self):
-        result = classify(_assessment(role="OTHER", skills="STRONG"))
+        result = classify(
+            _assessment(title="DevOps Engineer (m/w/d)", role="OTHER", skills="STRONG")
+        )
         assert result.category == "ADJACENT"
 
     def test_other_role_without_skill_evidence_is_excluded(self):
-        result = classify(_assessment(role="OTHER", skills="WEAK"))
+        result = classify(_assessment(title="Datenanalyst (m/w/d)", role="OTHER", skills="WEAK"))
         assert (result.category, result.code) == ("EXCLUDED", NOT_TARGET_ROLE)
 
     @pytest.mark.parametrize("skills", ["STRONG", "PARTIAL"])
     def test_title_without_it_signal_is_a_question_not_a_verdict(self, skills):
-        result = classify(_assessment(role="NO_IT_SIGNAL", skills=skills))
+        result = classify(
+            _assessment(title="Sachbearbeiter (m/w/d)", role="NO_IT_SIGNAL", skills=skills)
+        )
         assert (result.category, result.code) == ("MANUAL_REVIEW", ROLE_UNCLEAR)
 
     def test_administration_and_support_are_excluded(self):
@@ -201,23 +208,27 @@ def db(tmp_path):
 
 
 def test_primary_role_is_not_displaced_by_a_higher_scoring_adjacent_role(db, monkeypatch):
-    monkeypatch.setattr(
-        "app.services.automation_shortlist.automatic_preparation_block", lambda d, job_id: None
-    )
-    adjacent = _seed_job(db, tier=TIER_0, title="Datenanalyst (m/w/d)")  # higher match score
-    primary = _seed_job(db, tier=TIER_60, title="Junior Python Developer (m/w/d)")
-    ranks = {adjacent.id: 1, primary.id: 0}
-    monkeypatch.setattr(
-        "app.services.automation_shortlist.automatic_preparation_check",
-        lambda d, job_id: PreparationCheck(None, ranks[job_id]),
-    )
-    settings = _settings(automation_shortlist_max_per_run=1)
+    from app.services import shortlist_gate
+
+    adjacent = _seed_job(db, tier=TIER_60, title="Datenanalyst (m/w/d)")  # higher match score
+    primary = _seed_job(db, tier=TIER_0, title="Junior Python Developer (m/w/d)")
+    by_id = {
+        adjacent.id: _assessment(title=adjacent.title, role="OTHER"),
+        primary.id: _assessment(title=primary.title, role="PRIMARY"),
+    }
+    # the REAL check runs: assessment -> block reason and category rank (no stubbed ranks)
+    monkeypatch.setattr(shortlist_gate, "_assess_isolated", lambda d, job_id: by_id[job_id])
     result = asyncio.run(
         prepare_shortlist_drafts(
-            db, touched_jobs=[_touch(adjacent), _touch(primary)], settings=settings
+            db,
+            touched_jobs=[_touch(adjacent), _touch(primary)],
+            settings=_settings(automation_shortlist_max_per_run=2),
         )
     )
-    assert [item["job_id"] for item in result["items"]] == [primary.id]
+    items = {item["job_id"]: item for item in result["items"]}
+    # precondition: score-only ordering would have put the adjacent role first
+    assert items[adjacent.id]["match_score"] > items[primary.id]["match_score"]
+    assert [item["job_id"] for item in result["items"]] == [primary.id, adjacent.id]
     # drafts only: no application row is created or changed by the shortlist step
     assert db.scalar(select(func.count()).select_from(ApplicationRecord)) == 0
 
@@ -279,3 +290,47 @@ def test_course_skills_cover_the_skill_but_never_count_as_professional_years():
     assert years, "the multi-year requirement must be extracted"
     assert all(r.match_status == "MISSING" for r in years)
     assert result.experience_support_score == 0
+
+
+# --- the professional direction comes from the title, not from configured priorities ---------
+
+
+def _from_real_role_criterion(title, *, primary, secondary):
+    from app.models.candidate_search import CandidateSearchSettings
+    from app.services.job_fit_assessment import role_criterion
+
+    settings = CandidateSearchSettings(primary_roles=primary, secondary_roles=secondary)
+    a = _assessment(title=title)
+    a.criteria = [c for c in a.criteria if c.name != "role"] + [role_criterion(title, settings)]
+    return a
+
+
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("Junior Python Entwickler (m/w/d)", "PRIMARY"),
+        ("Backend Entwickler (m/w/d)", "PRIMARY"),
+        ("FastAPI Developer", "PRIMARY"),
+        ("DevOps Engineer (m/w/d)", "ADJACENT"),
+        ("Datenanalyst (m/w/d)", "ADJACENT"),
+    ],
+)
+@pytest.mark.parametrize(
+    "primary,secondary",
+    [
+        (["Junior Python Developer"], ["DevOps Engineer", "Datenanalyst"]),  # adjacent configured
+        ([], []),  # nothing configured
+        (["DevOps Engineer", "Datenanalyst"], []),  # adjacent configured as the priority
+    ],
+)
+def test_direction_follows_the_title_whatever_roles_are_configured(
+    title, expected, primary, secondary
+):
+    a = _from_real_role_criterion(title, primary=primary, secondary=secondary)
+    assert classify(a).category == expected
+
+
+def test_developer_title_with_weak_skills_and_a_gap_stays_a_manual_review():
+    a = _assessment(title="Softwareentwickler (m/w/d)", role="OTHER", skills="WEAK", language="GAP")
+    assert a.fit_tier == "STRETCH"
+    assert classify(a).category == "MANUAL_REVIEW"

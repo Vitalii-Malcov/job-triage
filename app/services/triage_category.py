@@ -24,7 +24,7 @@ the only rule that admits automatic preparation.
 from dataclasses import dataclass
 from typing import Literal
 
-from app.agents.target_role import hybrid_support_admin_family
+from app.agents.target_role import hybrid_support_admin_family, is_developer_title
 from app.services.job_fit_assessment import FitAssessment
 
 Category = Literal["PRIMARY", "ADJACENT", "MANUAL_REVIEW", "EXCLUDED"]
@@ -38,7 +38,9 @@ CONFIRMED_BARRIER = "CONFIRMED_BARRIER"
 HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
 STATED_GAP = "STATED_GAP"
 
-_DEVELOPER_ROLES = frozenset({"PRIMARY", "SECONDARY"})
+# configured role statuses (or none configured): a title outside them still counts as adjacent
+# when the skills match
+_CONFIGURED_ROLES = frozenset({"PRIMARY", "SECONDARY", "OTHER", "NOT_CONFIGURED"})
 _SKILL_EVIDENCE = frozenset({"STRONG", "PARTIAL"})
 # Location outcomes that leave the car route open (the tier sends them to the operator).
 _ROUTE_OPEN = frozenset(
@@ -86,25 +88,20 @@ def classify(assessment: FitAssessment) -> TriageCategory:
             HYBRID_ADMIN_ROLE,
             f"title mixes a {family} role with a developer role; the operator reads the posting",
         )
-    if tier == "STRETCH" and (role in _DEVELOPER_ROLES or (role == "OTHER" and skills_ok)):
-        return TriageCategory(
-            "MANUAL_REVIEW",
-            STATED_GAP,
-            assessment.tier_reasons[0] if assessment.tier_reasons else "",
-        )
 
-    if role in _DEVELOPER_ROLES:
+    # The professional direction comes from the TITLE, not from which role names happen to be
+    # configured as priorities: DevOps or a data analyst stays ADJACENT even if configured.
+    developer = is_developer_title(assessment.title)
+    if developer or (role in _CONFIGURED_ROLES and skills_ok):
+        if tier == "STRETCH":
+            reason = assessment.tier_reasons[0] if assessment.tier_reasons else "stated gap"
+            return TriageCategory("MANUAL_REVIEW", STATED_GAP, reason)
         if tier == "NEEDS_OPERATOR":
             return _manual(assessment, status)
-        return TriageCategory("PRIMARY", f"TIER_{tier}", f"developer role, fit tier {tier}")
-
-    if role == "OTHER" and skills_ok:
-        if tier == "NEEDS_OPERATOR":
-            return _manual(assessment, status)
+        if developer:
+            return TriageCategory("PRIMARY", f"TIER_{tier}", f"developer role, fit tier {tier}")
         return TriageCategory(
-            "ADJACENT",
-            f"TIER_{tier}",
-            "title is not a target role; skills match, ranked after PRIMARY",
+            "ADJACENT", f"TIER_{tier}", "not a developer title; skills match, ranked after PRIMARY"
         )
 
     if role == "NO_IT_SIGNAL" and skills_ok:
