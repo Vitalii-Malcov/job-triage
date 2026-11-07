@@ -274,16 +274,49 @@ class TestAdversarialPostings:
         "description",
         [
             "Vollzeit. 100% Remote in Germany. We are a UK-based company.",
-            "Vollzeit. 100% Remote UK or Germany.",
-            "Vollzeit. 100% Remote Poland / Deutschland.",
+            "Vollzeit. 100% Remote in Germany. Our software serves UK residents.",
+            "Vollzeit. 100% Remote in Germany. We have UK-based employees.",
+            "Vollzeit. 100% Remote in the UK or in Germany.",
             "Vollzeit. Fully remote within the EU, incl. Germany.",
             "Vollzeit. 100% Remote. Keine Präsenzpflicht.",
+            "Vollzeit. 100% Remote. Büropräsenz ist nicht erforderlich.",
+            "Full-time. Fully remote. No hybrid work.",
+            "Vollzeit. 100% Remote. Arbeitszeit: 5 Tage pro Woche.",
+            "100% Remote. Du kannst optional im Büro arbeiten.",
         ],
     )
-    def test_company_location_or_a_german_alternative_is_not_a_restriction(self, description):
+    def test_company_location_negated_or_optional_presence_is_still_full_remote(self, description):
         a = _assessment(description)
         assert _status(a, "remote") == "COMPATIBLE"
         assert automatic_block_reason(a) is None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Vollzeit. 100% Remote UK or Germany.",
+            "Vollzeit. 100% Remote Poland / Deutschland.",
+            "Full-time. Fully remote. Offices in Poland and Spain.",
+        ],
+    )
+    def test_an_unresolved_foreign_country_sends_remote_to_manual_review(self, description):
+        """Not a hard exclusion, but never a skipped commute gate either."""
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "PARTIAL_REMOTE"
+        assert _status(a, "location") != "REMOTE_OK"
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Full-time. Fully remote. Only candidates based in Austria are eligible.",
+            "Vollzeit. 100% Remote US only, Germany is our largest customer market.",
+            "Vollzeit. 100% Remote US only, global customer base.",
+        ],
+    )
+    def test_customer_markets_do_not_cancel_a_country_restriction(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") == "INCOMPATIBLE"
+        assert automatic_block_reason(a) == "FIT_TIER_NOT_SUITABLE"
 
     @pytest.mark.parametrize(
         "description,mode",
@@ -295,6 +328,10 @@ class TestAdversarialPostings:
             ("100% Remote. Teilzeit, keine Vollzeit möglich.", "PART_TIME"),
             ("100% Remote. Arbeitszeit: 40 Stunden/Woche. Teilzeit ist nicht möglich.", "UNKNOWN"),
             ("Vollzeit, Teilzeit ist möglich.", "FULL_TIME"),
+            (
+                "100% Remote. Teilzeit (20 Stunden/Woche). Vollzeit bieten wir nicht an.",
+                "PART_TIME",
+            ),
         ],
     )
     def test_working_time_ignores_headcounts_and_negations(self, description, mode):

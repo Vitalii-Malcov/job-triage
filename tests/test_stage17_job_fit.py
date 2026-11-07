@@ -347,6 +347,7 @@ def test_assess_job_end_to_end(db):
         "language": "MAJOR_GAP",
         "location": "DISTANCE_UNVERIFIED",
         "remote": "HYBRID",
+        "work_time": "UNKNOWN",  # remote work eligibility
         "salary": "MATCH",
         "entry_level": "OPEN",
         "education": "NO_REQUIREMENT",  # Stage 22 P1
