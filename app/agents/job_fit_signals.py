@@ -148,6 +148,15 @@ _OFFICE_OPTIONAL = re.compile(
 )
 
 
+# Wording that makes office presence an obligation ("must attend", "jeden Dienstag", "2x pro Woche")
+_OBLIGATION = re.compile(
+    r"\bmust\b|\bmandatory\b|\brequired?\b|\bpflicht\w*|\bzwingend\b|\berforderlich\b"
+    r"|\battend\w*|\b(?:jeden|every|each)\b|\b\d\s*(?:x|times|mal|tage?|days?)\b|\btwice\b"
+    r"|\bweekly\b|\bw(?:ö|oe)chentlich\b",
+    re.IGNORECASE,
+)
+
+
 def _presence(text: str) -> re.Match[str] | None:
     for match in _PRESENCE.finditer(text):
         before, after = _clause(text, match.start(), match.end())
@@ -305,13 +314,21 @@ def classify_remote(text: str) -> RemoteSignal:
     if some and _remote_denied(text):
         # remote work is denied somewhere in the text: whatever else it says, it is on-site
         return done("ONSITE", some)
-    hybrid = _affirmed(_HYBRID, text) or _presence(text)
+    hybrid = _affirmed(_HYBRID, text)
     if hybrid:
         return done("HYBRID", hybrid, unresolved)
     full = _affirmed(_FULLY_REMOTE, text)
     regional = _affirmed(_REMOTE_REGIONAL, text)
     if full or regional:
         confirmed = full or regional
+        presence = _presence(text)
+        if presence:
+            # office vocabulary next to a full-remote claim vetoes it (never labels an ad on
+            # its own): a stated obligation is HYBRID, a bare mention stays unverified remote
+            near_before, near_after = _clause(text, presence.start(), presence.end())
+            clause = f"{near_before} {presence.group(0)} {near_after}"
+            mode: RemoteMode = "HYBRID" if _OBLIGATION.search(clause) else "PARTIAL_REMOTE"
+            return done(mode, presence, unresolved)
         german = bool(regional or _GERMAN_REMOTE.search(text))
         foreign = bool(_FOREIGN_MENTION.search(text)) and not german
         if unresolved or foreign:

@@ -314,7 +314,7 @@ class TestAdversarialPostings:
     )
     def test_office_vocabulary_keeps_the_commute_gate(self, description):
         a = _assessment(description, place=BERLIN)
-        assert _status(a, "remote") == "HYBRID"
+        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE"}
         assert _status(a, "location") != "REMOTE_OK"
         assert automatic_block_reason(a) is not None
 
