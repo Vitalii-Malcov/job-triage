@@ -643,3 +643,42 @@ def test_obligations_tied_to_a_site_veto_the_remote_claim(description):
     a = _assessment(description, place=BERLIN)
     assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE", "UNVERIFIED_ELIGIBILITY"}
     assert _status(a, "location") != "REMOTE_OK"
+
+
+class TestRound9Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "100% Remote. Die Einarbeitung erfolgt vor Ort in Berlin.",
+            "Fully remote in Germany. You are expected to work from our office in Berlin.",
+            "Fully remote in Germany. Office attendance can be required at short notice.",
+            "Fully remote in Germany. Remote working is no longer an option for this position.",
+            "100% Remote. Homeoffice ist für diese Position keine Option.",
+            "Fully remote. This position is restricted to Estonia.",
+            "Fully remote in Germany. No exceptions to mandatory office attendance.",
+        ],
+    )
+    def test_realistic_presence_denial_and_restriction_wording(self, description):
+        near = {"location": "Offenbach", "workplace_lat": 50.1, "workplace_lon": 8.77}
+        for place in (BERLIN, near):
+            a = _assessment(description, place=place)
+            # never treated as remote, wherever the employer is
+            assert _status(a, "remote") != "COMPATIBLE", description
+            assert _status(a, "location") != "REMOTE_OK", description
+        # far away the commute gate (or the review) holds it; a hybrid job near home is legitimate
+        assert automatic_block_reason(_assessment(description, place=BERLIN)) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. Weekly yoga classes in our office.",
+            "100% Remote in Deutschland. Jeden Mittwoch bieten wir Yogakurse im Büro an.",
+            "Fully remote in Germany. Free on-site parking is available.",
+            "Fully remote in Germany. No mandatory office attendance.",
+            "Fully remote in Germany. You can visit the office if you like.",
+        ],
+    )
+    def test_benefits_and_negated_obligations_do_not_veto_remote(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "COMPATIBLE", description
+        assert automatic_block_reason(a) is None

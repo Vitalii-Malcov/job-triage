@@ -163,7 +163,7 @@ _PRESENCE_WEAK = re.compile(
 _OFFICE_OPTIONAL = re.compile(
     r"\boptional\w*|\bfreiwillig\w*|\bvoluntar\w*|\bauf\s+wunsch\b|\bnach\s+wunsch\b"
     r"|\bif\s+you\s+(?:want|like|wish|prefer)\b|\bwenn\s+du\s+(?:willst|m(?:ö|oe)chtest)\b"
-    r"|\bkannst\b|\bk(?:ö|oe)nnen\b|\bcan\b|\bmay\b",
+    r"|\bkannst\b|\bsie\s+k(?:ö|oe)nnen\b|\byou\s+(?:can|may)\b|\bdu\s+kannst\b",
     re.IGNORECASE,
 )
 
@@ -174,7 +174,9 @@ _OBLIGATION = re.compile(
     r"|\battend\w*|\b(?:jeden|every|each)\b|\b\d\s*(?:x|times|mal|tage?|days?)\b|\btwice\b"
     r"|\bweekly\b|\bw(?:ö|oe)chentlich\b|\bmonatlich\w*|\bmonthly\b|\bquartals\w*|\bquarterly\b"
     r"|\bregelm(?:ä|ae)(?:ß|ss)ig\w*|\bregularly\b|\bfindet\b[^.;\n]{0,60}\bstatt\b"
-    r"|\btakes?\s+place\b|\bverpflichtend\b",
+    r"|\btakes?\s+place\b|\bverpflichtend\b|\berfolgt\b|\bexpected\b|\bwird\s+erwartet\b"
+    r"|\berwarten\b|\bmuss\w*|\bm(?:ü|ue)ssen\b|\bsollst\b|\bsollten?\b|\bshould\b"
+    r"|\b(?:have|has|need|needs)\s+to\b|\bshort\s+notice\b|\bkurzfristig\w*",
     re.IGNORECASE,
 )
 
@@ -202,6 +204,21 @@ _STRONG_OBLIGATION = re.compile(
 )
 
 
+# A negator directly before a strong obligation word cancels that word ("kein zwingender Büro...").
+_NEGATED_STRONG = re.compile(
+    r"\b(?:no|not|kein\w*|nicht|ohne|without)\s+(?:\w+\s+)?(?:mandatory|zwingend\w*"
+    r"|verpflichtend\w*|must)\b",
+    re.IGNORECASE,
+)
+# Perks and facilities, not working arrangements.
+_BENEFIT = re.compile(
+    r"\byoga\b|\bkurs\w*|\bclasses\b|\bparking\b|\bparkplatz\w*|\bfitness\w*|\bmassage\w*"
+    r"|\bkantine\b|\bcanteen\b|\bsnacks?\b|\bobst\b|\bfruit\b|\bgetr(?:ä|ae)nke\b|\bbenefits?\b"
+    r"|\bgratis\b|\bkostenlos\w*|\bfree\b|\bperks?\b|\bbieten\b|\banbieten\b|\bangebot\w*|\bwe\s+offer\b|\bwe\s+provide\b",
+    re.IGNORECASE,
+)
+
+
 def _presence(text: str) -> re.Match[str] | None:
     """Office vocabulary that stands. Negation or optionality must sit right next to the phrase
     ("keine Büropräsenz", "no office attendance required", "kannst optional ins Büro"); an
@@ -213,9 +230,12 @@ def _presence(text: str) -> re.Match[str] | None:
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
         after_head = " ".join(after.split()[:6])
         clause = f"{before} {match.group(0)} {after}"
+        if _BENEFIT.search(clause):
+            continue  # "Weekly yoga classes in our office": a perk, not a working arrangement
         if not strong and not _OBLIGATION.search(clause):
-            continue  # a perk, a site or customer travel with no obligation cue
-        if _STRONG_OBLIGATION.search(clause):
+            continue  # a site or customer travel with no obligation cue
+        # "No mandatory attendance" is not mandatory; "No exceptions to mandatory ..." still is
+        if _STRONG_OBLIGATION.search(_NEGATED_STRONG.sub(" ", clause)):
             return match  # "mandatory", "not optional": nothing else in the clause cancels it
         if (
             _has_negator(near_before)
@@ -292,7 +312,8 @@ _ELIGIBILITY_WORDING = re.compile(
 )
 _ELIGIBILITY_SUBJECT = re.compile(
     r"remote|home\s*-?\s*office|candidates?|applicants?|bewerb\w*|resident|resid|wohn|based|located"
-    r"|work\b|arbeit\w*|eligible|permit|visa|citizen|liv(?:e|ing)|you\b|du\b|sie\b|erlaubt|allowed",
+    r"|work\b|arbeit\w*|eligible|permit|visa|citizen|liv(?:e|ing)|you\b|du\b|sie\b|erlaubt|allowed"
+    r"|position|stelle|\brole\b|\bjob\b|vacancy|rolle",
     re.IGNORECASE,
 )
 # A broad region named in the SAME clause resolves the wording ("only within the EU").
@@ -358,6 +379,7 @@ _DENIAL_AFTER = re.compile(
     r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
     r"|der\s+fall|permitted|gestattet|infrage|in\s+frage)\b"
     r"|\bunavailable\b|\bnicht\s+(?:\w+\s+){0,3}?(?:infrage|in\s+frage)\b"
+    r"|\bno\s+longer\b|\bnot\s+an\s+option\b|\bkeine\s+option\b|\bnicht\s+mehr\b"
     # a prohibition carries its own negation: "Remote work is prohibited / ist ausgeschlossen"
     r"|\b(?:prohibited|forbidden|banned|ausgeschlossen|untersagt|verboten)\b",
     re.IGNORECASE,
