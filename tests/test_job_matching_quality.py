@@ -152,6 +152,9 @@ class TestRoleFamily:
         [
             "IT-Administrator / Softwareentwickler (m/w/d)",
             "IT-Systemadministrator / Softwareentwickler m/w/d",
+            "IT-Administrator / (Softwareentwickler)",
+            "IT-Support für Softwareentwickler",
+            "Systemadministrator und Python Entwickler",
         ],
     )
     def test_hybrid_admin_and_developer_title_is_never_prepared_automatically(self, title):

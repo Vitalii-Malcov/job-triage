@@ -100,34 +100,50 @@ def support_admin_family(title: str) -> str | None:
     return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
 
 
-# Gender markers ("(m/w/d)", "m/w/x") must not split a title into segments.
+# Gender markers ("(m/w/d)", "m/w/x") are noise; parenthesised ROLE words are kept.
 _GENDER_MARKER = re.compile(
-    r"\([^)]*\)|\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b|\b[mwdfx]\s*\*\s*[mwdfx]\b",
+    r"\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b|\b[mwdfx]\s*\*\s*[mwdfx]\b", re.IGNORECASE
+)
+_PARENTHESIS = re.compile(r"\(([^)]*)\)")
+# The support/admin word names the PRODUCT being built ("... IT-Support Tools"), not the job.
+_PRODUCT_NOUN = re.compile(
+    r"(?:tools?|software|plattform\w*|platform\w*|systems?|systeme\w*|portal\w*|anwendung\w*|"
+    r"applikation\w*|l(?:ö|oe)sung\w*|produkt\w*|app|apps)\b",
     re.IGNORECASE,
 )
-# "/", "|", "&", "+", ",", " - ", "und", "and": two role names side by side.
-_ROLE_SEPARATOR = re.compile(r"\s*[/|&+,;]\s*|\s+[-–—]\s+|\s+(?:und|and|oder|or)\s+", re.I)
+
+
+def _strip_noise(title: str) -> str:
+    text = _PARENTHESIS.sub(
+        lambda m: (
+            m.group(1)
+            if (_DEV_ROLE.search(m.group(1)) or any(p.search(m.group(1)) for _, p in _FAMILIES))
+            else " "
+        ),
+        title or "",
+    )
+    return _GENDER_MARKER.sub(" ", text)
 
 
 def hybrid_support_admin_family(title: str) -> str | None:
     """The support/administration family of a HYBRID title, or None.
 
-    Hybrid = the title names an administration/support ROLE and, as a separate
-    alternative, a developer role ("IT-Administrator / Softwareentwickler"). It is not
-    excluded (see `support_admin_family`) but the main profession is unclear: the
-    operator reads it and it is never prepared automatically. Support that merely
-    describes the software being built stays a developer title ("Python Entwickler
-    Service Desk Tools"): the two words must sit in different segments."""
-    text = _GENDER_MARKER.sub(" ", title or "")
+    Hybrid = the title names a developer role AND an administration/support role term
+    ("IT-Administrator / Softwareentwickler", "IT-Support für Softwareentwickler"). It is not
+    excluded (see `support_admin_family`) but the main profession is unclear: the operator
+    reads it and it is never prepared automatically. Fails safe: a false positive only
+    costs a manual look, a false negative would let an admin job through. The one
+    exemption is support that names the software being built ("Python Entwickler Service
+    Desk Tools"): the term is directly followed by a product noun."""
+    text = _strip_noise(title)
     if not _DEV_ROLE.search(text):
         return None
-    segments = [part for part in _ROLE_SEPARATOR.split(text) if part.strip()]
-    for segment in segments:
-        if _DEV_ROLE.search(segment):
-            continue
-        family = next((name for name, pattern in _FAMILIES if pattern.search(segment)), None)
-        if family is not None:
-            return family
+    for name, pattern in _FAMILIES:
+        for match in pattern.finditer(text):
+            tail = text[match.end() :].lstrip(" -")
+            if _PRODUCT_NOUN.match(tail):
+                continue
+            return name
     return None
 
 
