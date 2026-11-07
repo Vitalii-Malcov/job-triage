@@ -69,6 +69,7 @@ from app.services.collector_runner import (
     run_xing,
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
+from app.services.component_health import BotState, set_telegram_state
 from app.services.telegram import send_telegram_message
 from app.services.telegram_bewerbung import (
     BewerbungOutcome,
@@ -1090,6 +1091,7 @@ BOT_START_RETRY_MAX_SECONDS = 300.0
 
 async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
     delay = BOT_START_RETRY_INITIAL_SECONDS
+    set_telegram_state(BotState.STARTING)
     while True:
         try:
             application, failure = await _start_bot_attempt(settings)
@@ -1104,13 +1106,17 @@ async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
                 "telegram_bot_start_aborted reason=%s (fix TELEGRAM_BOT_TOKEN and restart)",
                 failure,
             )
+            set_telegram_state(BotState.FAILED)
             return
         if application is not None:
+            set_telegram_state(BotState.RUNNING)
             try:
                 await asyncio.Event().wait()  # runs until the task is cancelled by shutdown
             finally:
+                set_telegram_state(BotState.STOPPED)
                 await _run_to_completion(stop_bot(application))
             return
+        set_telegram_state(BotState.RETRYING)
         logger.warning("telegram_bot_start_retry in_seconds=%s", delay)
         await sleep(delay)
         delay = min(delay * 2, BOT_START_RETRY_MAX_SECONDS)
@@ -1120,8 +1126,10 @@ async def start_bot_supervised(settings: Settings) -> asyncio.Task | None:
     """Like `start_bot`, but the returned task retries a failed start until it succeeds (or
     `stop_bot_supervised` cancels it). None when no token is configured."""
     if not reveal(settings.telegram_bot_token):
+        set_telegram_state(BotState.DISABLED)
         logger.info("telegram_bot_disabled reason=no_bot_token_configured")
         return None
+    set_telegram_state(BotState.STARTING)
     task = asyncio.create_task(_run_bot_supervised(settings), name="telegram-bot")
     task.add_done_callback(_log_supervisor_end)
     return task
@@ -1133,12 +1141,14 @@ def _log_supervisor_end(task: asyncio.Task) -> None:
         return
     exc = task.exception()
     if exc is not None:
+        set_telegram_state(BotState.FAILED)
         logger.error("telegram_bot_supervisor_crashed error_type=%s", type(exc).__name__)
 
 
 async def stop_bot_supervised(task: asyncio.Task | None) -> None:
     if task is None:
         return
+    set_telegram_state(BotState.STOPPED)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
