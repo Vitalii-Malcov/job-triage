@@ -100,6 +100,7 @@ def analyse(db: Session, settings: Settings) -> dict:
                 "gate": verdict.verdict,
                 "category": category.category,
                 "category_code": category.code,
+                "work_format": category.work_format,
                 "criteria": {c.name: c.status for c in assessment.criteria},
                 "auto": auto,
                 "has_open_points": bool(verdict.questions),
@@ -133,6 +134,10 @@ def analyse(db: Session, settings: Settings) -> dict:
         ),
         "eligible_by_category": dict(Counter(r["category"] for r in eligible)),
         "automatic_shortlist_by_category": dict(Counter(r["category"] for r in auto)),
+        "work_format_all": dict(Counter(r["work_format"] for r in rows)),
+        "work_format_primary_adjacent": dict(
+            Counter(r["work_format"] for r in rows if r["category"] in {"PRIMARY", "ADJACENT"})
+        ),
         "held_for_route": sum(1 for r in rows if r["category_code"] == "ROUTE_REVIEW_REQUIRED"),
         "would_enter_automatic_shortlist": len(auto),
         "min_match_score": settings.automation_shortlist_min_match_score,
