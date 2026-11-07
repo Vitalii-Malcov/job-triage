@@ -49,7 +49,11 @@ from app.agents.role_relevance_classifier import derive_candidate_target_domain
 from app.agents.seniority_classifier import derive_candidate_target_seniority
 from app.agents.skill_extractor import extract_skills
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
-from app.collectors.bundesagentur import BundesagenturCollector, is_api_key_configured
+from app.collectors.bundesagentur import (
+    BundesagenturAPIError,
+    BundesagenturCollector,
+    is_api_key_configured,
+)
 from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailCollector
 from app.core.config import reveal
 from app.db.candidate_profile_repository import (
@@ -78,7 +82,8 @@ from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.search_strategy import bundesagentur_queries
 from app.services.telegram import TelegramNotifier
-from app.services.telegram_vacancy_feed import (
+from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
+    confirmed_barrier,
     deliver_queued_vacancy_cards,
     record_collected_job,
 )
@@ -404,6 +409,7 @@ def _score_and_persist_composed(
             is_duplicate=True,
             possible_collision=outcome.possible_collision,
         )
+        frozen_result._frozen = True  # the operator already acted on it: never announce
         db.commit()
         db.refresh(record)
         return record, frozen_result, False
@@ -439,6 +445,8 @@ def _score_and_persist_composed(
     db.commit()
     db.refresh(record)
     result.is_duplicate = not created
+    result._prior_recommendation = outcome.previous_recommendation
+    result._prior_score = outcome.previous_score
     result.sibling_posting = outcome.sibling_created
     return record, result, created
 
@@ -584,6 +592,14 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
     )
 
 
+class DetailBreaker:
+    """Per-run circuit breaker for the BA detail endpoint (FLOW-05): open after the first
+    exhausted failure, so one outage costs one ~33 s attempt per run, not one per vacancy."""
+
+    def __init__(self) -> None:
+        self.open = False
+
+
 async def enrich_and_persist_ba_job(
     db: Session,
     collector: BundesagenturCollector,
@@ -591,13 +607,22 @@ async def enrich_and_persist_ba_job(
     job: Job,
     *,
     fetch_detail: bool = True,
+    detail_breaker: DetailBreaker | None = None,
 ) -> tuple[JobRecord, JobScore, bool]:
     """Detail enrichment (live BA description, or the stored one), skill
     extraction, scoring and persistence of ONE Bundesagentur posting -- the
     per-job core of `run_bundesagentur`, shared with the Stage 22 refresh CLI
     so both apply the same rules. Sends nothing; the caller owns rollback.
     `fetch_detail=False` never calls the BA detail API (the caller already put
-    the description on `job`, e.g. to keep the network out of a write lock)."""
+    the description on `job`, e.g. to keep the network out of a write lock).
+
+    FLOW-05: a BA detail-API failure (429/5xx/network, after the collector's own retries)
+    no longer discards the posting. It is saved WITHOUT a description -- exactly what a
+    404 already did -- and the next run fetches the detail again (an empty stored
+    description is re-enriched), so nothing is lost and nothing is retried forever. After
+    the first exhausted failure `detail_breaker` stops further detail calls for the rest
+    of the run (each costs ~33 s), instead of paying that per new vacancy. A rejected
+    key (`BundesagenturAuthError`) still aborts the job as before."""
     existing = get_job_by_fingerprint(db, job)
     description = job.description
     if not description.strip() and existing is not None and existing.description.strip():
@@ -613,9 +638,25 @@ async def enrich_and_persist_ba_job(
             job.source_reference,
         )
     elif not description.strip() and job.source_reference and fetch_detail:
-        detail_description = await collector.fetch_detail(job.source_reference)
-        if detail_description is not None:
-            description = detail_description
+        if detail_breaker is not None and detail_breaker.open:
+            logger.info(
+                "bundesagentur_detail_skipped reason=breaker_open referenznummer=%s",
+                job.source_reference,
+            )
+        else:
+            try:
+                detail_description = await collector.fetch_detail(job.source_reference)
+            except BundesagenturAPIError as exc:
+                logger.warning(
+                    "bundesagentur_detail_failed referenznummer=%s error_type=%s",
+                    job.source_reference,
+                    type(exc).__name__,
+                )
+                if detail_breaker is not None:
+                    detail_breaker.open = True
+                detail_description = None
+            if detail_description is not None:
+                description = detail_description
     elif not description.strip() and fetch_detail:
         logger.warning(
             "bundesagentur_detail_skipped reason=missing_referenznummer url=%s",
@@ -693,15 +734,37 @@ async def _publish_persisted_job(
         # Stage 9A: persist review state only; cards are delivered by the sweep after the loop
         # (see _deliver_vacancy_feed).
         record_collected_job(db, job_record, settings)
-    elif result.recommendation == "APPLY" and result.score >= settings.min_job_score_to_notify:
+    elif (
+        # FLOW-01: announce a vacancy once -- when it is NEW, or when a stored row first BECOMES
+        # announce-eligible (APPLY at/above the notify threshold, e.g. enriched after a detail
+        # outage or its score crossing the threshold). Not on every run for as long as the source
+        # keeps returning it (hourly, also for jobs already applied to), and never for a frozen
+        # row the operator already acted on. A failed first delivery is not retried (best-effort
+        # notifications; remembering delivery would need a persisted flag -- see the audit docs).
+        not (result.is_duplicate and result.already_announceable(settings.min_job_score_to_notify))
+        and result.recommendation == "APPLY"
+        and result.score >= settings.min_job_score_to_notify
+    ):
         if tally.notified > 0:
             await asyncio.sleep(1)
         # Rechecked HERE, immediately before send_job(): it covers both "lease lost during the
         # pacing sleep above" (an earlier version checked only BEFORE the sleep, so a lease lost
         # during it still let send_job() run) and, when no sleep happened, the immediate case.
         # `is_lease_lost` is None for every standalone caller, so this is then a no-op.
-        if is_lease_lost is None or not is_lease_lost():
+        barrier = (
+            confirmed_barrier(db, job_record.id)
+            if is_lease_lost is None or not is_lease_lost()
+            else None
+        )
+        if barrier is not None:
+            # Fit gate: a CONFIRMED barrier (NOT_SUITABLE) is not proposed to the operator
+            # whatever its score says; not counted as a notification.
+            logger.info(
+                "collector_alert_blocked_by_fit job_id=%s reason=%s", job_record.id, barrier
+            )
+        elif is_lease_lost is None or not is_lease_lost():
             try:
+                notifier.guard = lambda: confirmed_barrier(db, job_record.id)
                 sent = await notifier.send_job(job, result)
             except Exception as exc:
                 logger.warning(
@@ -1009,6 +1072,7 @@ async def run_bundesagentur(
         max_retries=settings.telegram_max_retries,
     )
     tally = _RunTally()
+    detail_breaker = DetailBreaker()
     research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for collector, job in work:
         if is_lease_lost is not None and is_lease_lost():
@@ -1018,7 +1082,7 @@ async def run_bundesagentur(
             break
         try:
             job_record, result, created = await enrich_and_persist_ba_job(
-                db, collector, candidate_skills, job
+                db, collector, candidate_skills, job, detail_breaker=detail_breaker
             )
         except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB

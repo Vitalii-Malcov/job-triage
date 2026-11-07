@@ -142,7 +142,11 @@ _TRACKING_LINE_RE = re.compile(r"^=>\s*(https?://\S+)\s*$")
 # concatenated directly onto this line with no separator — those are
 # decorative and have no stable schema, so they're deliberately ignored
 # rather than parsed as structured fields.
-_SALARY_RE = re.compile(r"\d[\d.,]*\s*€\s*-\s*\d[\d.,]*\s*€")
+# Bounded digit runs + a start anchor: the unbounded form rescanned a long digit run from
+# every start position (O(n^2)); whitespace stays unbounded as before (a literal separates
+# every pair of `\s*`, so it cannot backtrack against itself).
+# "ca.60.000 € - 80.000 €" still matches ("." is allowed before the number).
+_SALARY_RE = re.compile(r"(?<!\d)\d[\d.,]{0,20}\s*€\s*-\s*\d[\d.,]{0,20}\s*€")
 
 # Closed set of real XING/German-job-board employment-type values. When a
 # posting has no salary line, its decorative tail badges (e.g.

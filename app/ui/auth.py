@@ -40,7 +40,9 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings, get_settings, reveal
+from app.core.key_strength import is_strong_secret
 from app.security import shared_state
+from app.security.id_bounds import reject_out_of_range_ids
 
 COOKIE_NAME = "jobtriage_ui"
 _CONTEXT = "jobtriage-ui/2|"
@@ -191,15 +193,23 @@ def require_ui_session(request: Request) -> None:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         raise NotLoggedInError
-    attempt = begin_auth_attempt(request)
-    parsed = parse_session_token(token, signing_key(get_settings()))
-    if parsed is None:
-        raise NotLoggedInError
-    # Correctly signed and unexpired: not a key guess, whatever happens next
-    # (a stale tab with a logged-out cookie must not burn the guess budget).
-    end_auth_attempt_ok(request, attempt)
+    settings = get_settings()
+    signing = signing_key(settings)
+    parsed = parse_session_token(token, signing)
+    # SEC-03: a validly signed session (the signing key derives from a strong secret) is
+    # not a guess, so other clients' failures cannot refuse it; anything else is charged.
+    strong = is_strong_secret(reveal(settings.ui_session_secret) or reveal(settings.api_key))
+    if parsed is None or not strong:
+        attempt = begin_auth_attempt(request)
+        if parsed is None:
+            raise NotLoggedInError
+        # Correctly signed and unexpired: not a key guess, whatever happens next
+        # (a stale tab with a logged-out cookie must not burn the guess budget).
+        end_auth_attempt_ok(request, attempt)
     if revocations.is_revoked(parsed[1]):
         raise NotLoggedInError
+    # API-01: only a logged-in operator learns that an id is unrepresentable (422).
+    reject_out_of_range_ids(request)
 
 
 def require_same_origin(request: Request) -> None:

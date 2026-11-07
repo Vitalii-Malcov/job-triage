@@ -1,0 +1,4 @@
+# OPS-01: shell scripts run inside the Linux image; a CRLF checkout (Windows autocrlf) makes
+# the container die with "exec /entrypoint.sh: no such file or directory".
+*.sh text eol=lf
+docker/entrypoint.sh text eol=lf

@@ -9,7 +9,10 @@ from app.core.logging import configure_logging
 from app.core.single_process_lock import acquire_if_required
 from app.core.startup_diagnostics import log_startup_safety_state
 from app.db.session import run_migrations_if_enabled
-from app.services.telegram_bot import start_bot, stop_bot
+
+# ARC-02: the supervised variants (retry a failed start); the names stay `start_bot`/`stop_bot`.
+from app.services.telegram_bot import start_bot_supervised as start_bot
+from app.services.telegram_bot import stop_bot_supervised as stop_bot
 from app.ui.routes import install_ui
 
 

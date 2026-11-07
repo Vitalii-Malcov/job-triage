@@ -30,6 +30,8 @@ silence hides the difference between "no bot exists here" and "rejected"
 from a stranger probing the bot.
 """
 
+import asyncio
+import contextlib
 import functools
 import logging
 
@@ -67,6 +69,7 @@ from app.services.collector_runner import (
     run_xing,
 )
 from app.services.company_research import AmbiguousCompanyIdentityError, InvalidCompanyIdentityError
+from app.services.component_health import BotState, set_telegram_state
 from app.services.telegram import send_telegram_message
 from app.services.telegram_bewerbung import (
     BewerbungOutcome,
@@ -99,6 +102,11 @@ from app.services.telegram_vacancy_feed import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A decision the review state does not allow is final for this card (FLOW-15): no retry hint.
+VACANCY_NOT_DECIDABLE_ANSWER = (
+    "Für diese Stelle nicht möglich: der Status lässt keine Entscheidung zu. Nichts geändert."
+)
 
 # Telegram messages are capped at 4096 characters. JOBS_LIST_LIMIT and the
 # per-field truncation in _format_job_line keep a *typical* /jobs reply well
@@ -850,7 +858,7 @@ async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(already_reply)
         result = "unchanged"
     else:
-        await query.answer("Für diese Stelle gerade nicht möglich.")
+        await query.answer(VACANCY_NOT_DECIDABLE_ANSWER)
         result = "not_decidable"
     logger.info(
         "telegram_vacancy_callback action=%s review_id=%s result=%s",
@@ -973,6 +981,80 @@ def build_application(settings: Settings) -> Application:
     return application
 
 
+async def _run_to_completion(coro) -> None:
+    """Await `coro` to the end even if this task is cancelled (repeatedly) meanwhile; the
+    cancellation is re-raised only AFTER the work finished (used for cleanup)."""
+    task = asyncio.ensure_future(coro)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _teardown(application: Application) -> None:
+    """Best-effort unwind of a (partially) started application; never raises.
+
+    Order matters: `Application.shutdown()` refuses a running application and returns at once
+    for one whose `initialize()` never completed (leaving the bot's HTTP clients open), so the
+    updater and the application are stopped first and the request clients are closed
+    explicitly afterwards."""
+    steps = [
+        ("updater_stop", lambda: application.updater.running, application.updater.stop),
+        ("application_stop", lambda: application.running, application.stop),
+        ("shutdown", lambda: True, application.shutdown),
+    ]
+    # The python-telegram-bot request objects (get_updates + general) are not closed by a
+    # shutdown that skipped an unfinished initialize(); close them explicitly (guarded: this
+    # touches a private attribute of the library).
+    for index, request in enumerate(getattr(application.bot, "_request", ()) or ()):
+        steps.append((f"request_{index}_shutdown", lambda: True, request.shutdown))
+    for name, needed, action in steps:
+        try:
+            if needed():
+                await action()
+        except Exception as exc:  # noqa: BLE001 -- cleanup must not mask the original failure
+            logger.warning(
+                "telegram_bot_cleanup_failed step=%s error_type=%s", name, type(exc).__name__
+            )
+
+
+async def _start_bot_attempt(settings: Settings) -> tuple[Application | None, str | None]:
+    """One start attempt: (running application, None) or (None, failure exception TYPE name).
+    The failure classification travels with the attempt's own result (no shared state)."""
+    if not reveal(settings.telegram_bot_token):
+        logger.info("telegram_bot_disabled reason=no_bot_token_configured")
+        return None, None
+
+    application = build_application(settings)
+    try:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+    except asyncio.CancelledError:
+        # shutdown while still starting: unwind whatever already started, to the end even if
+        # cancelled again, then let the cancellation continue.
+        await _run_to_completion(_teardown(application))
+        raise
+    except Exception as exc:
+        # only the exception TYPE -- a bad/revoked token
+        # or network failure here must never log exc_info/a traceback,
+        # which could otherwise surface request/response detail from the
+        # underlying HTTP client.
+        failure = type(exc).__name__
+        logger.error("telegram_bot_start_failed error_type=%s", failure)
+        # Unwind EVERYTHING that got as far as running, to the end even if cancelled meanwhile
+        # (otherwise one failed attempt leaks a live update fetcher per retry -- ARC-02).
+        await _run_to_completion(_teardown(application))
+        return None, failure
+
+    logger.info("telegram_bot_started")
+    return application, None
+
+
 async def start_bot(settings: Settings) -> Application | None:
     """Start the Telegram control center bot, or do nothing if unconfigured
     or unable to start.
@@ -990,36 +1072,7 @@ async def start_bot(settings: Settings) -> Application | None:
     never raises for a runtime start failure — callers don't need to know
     how it can fail.
     """
-    if not reveal(settings.telegram_bot_token):
-        logger.info("telegram_bot_disabled reason=no_bot_token_configured")
-        return None
-
-    application = build_application(settings)
-    try:
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-    except Exception as exc:
-        # only the exception TYPE -- a bad/revoked token
-        # or network failure here must never log exc_info/a traceback,
-        # which could otherwise surface request/response detail from the
-        # underlying HTTP client.
-        logger.error("telegram_bot_start_failed error_type=%s", type(exc).__name__)
-        try:
-            # Best-effort cleanup of whatever partially started (e.g. the
-            # Bot's HTTP client) so a failed start doesn't leak resources
-            # nobody will ever call stop_bot() on. Safe even if initialize()
-            # itself never completed — Application.shutdown() no-ops when
-            # not yet initialized.
-            await application.shutdown()
-        except Exception as cleanup_exc:
-            logger.warning(
-                "telegram_bot_cleanup_after_failed_start_failed error_type=%s",
-                type(cleanup_exc).__name__,
-            )
-        return None
-
-    logger.info("telegram_bot_started")
+    application, _failure = await _start_bot_attempt(settings)
     return application
 
 
@@ -1030,3 +1083,109 @@ async def stop_bot(application: Application | None) -> None:
     await application.stop()
     await application.shutdown()
     logger.info("telegram_bot_stopped")
+
+
+# ARC-02: `start_bot` is a single attempt. A transient failure at web start (network or DNS not
+# up yet after a reboot, Telegram briefly unavailable) used to disable the operator channel for
+# the life of the process while `/ready` stayed green. The supervised variant below keeps
+# trying with exponential back-off; the API start never waits for Telegram.
+_TERMINAL_START_FAILURES = frozenset({"InvalidToken"})  # retrying cannot help
+BOT_START_RETRY_INITIAL_SECONDS = 5.0
+BOT_START_RETRY_MAX_SECONDS = 300.0
+BOT_POLL_CHECK_SECONDS = 10.0
+
+
+def _polling_stopped(application) -> bool:
+    """True once the update poller is no longer working. PTB keeps `updater.running` True when
+    its polling task dies (e.g. InvalidToken), so the task itself is checked too; the attribute
+    is a private name-mangled one, read defensively."""
+    updater = getattr(application, "updater", None)
+    if updater is None:
+        return False
+    if getattr(updater, "running", True) is False:
+        return True
+    task = getattr(updater, "_Updater__polling_task", None)
+    return task is not None and task.done()
+
+
+async def _stop_best_effort(application) -> None:
+    """Normal stop; if the poller is already dead `stop()` refuses, so fall back to the
+    guarded teardown that completes whatever is still open."""
+    try:
+        await stop_bot(application)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_bot_stop_failed error_type=%s", type(exc).__name__)
+        await _teardown(application)
+
+
+async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
+    delay = BOT_START_RETRY_INITIAL_SECONDS
+    set_telegram_state(BotState.STARTING)
+    while True:
+        try:
+            application, failure = await _start_bot_attempt(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # e.g. building the HTTP client failed: retry, don't die
+            failure = type(exc).__name__
+            logger.error("telegram_bot_start_crashed error_type=%s", failure)
+            application = None
+        if application is None and failure in _TERMINAL_START_FAILURES:
+            logger.error(
+                "telegram_bot_start_aborted reason=%s (fix TELEGRAM_BOT_TOKEN and restart)",
+                failure,
+            )
+            set_telegram_state(BotState.FAILED)
+            return
+        if application is not None:
+            set_telegram_state(BotState.RUNNING)
+            try:
+                # runs until shutdown cancels the task, or the update poller dies on its own
+                # (e.g. a revoked token): then readiness must go red and the start is retried.
+                while not _polling_stopped(application):
+                    await asyncio.sleep(BOT_POLL_CHECK_SECONDS)
+            except BaseException:
+                set_telegram_state(BotState.STOPPED)
+                await _run_to_completion(_stop_best_effort(application))
+                raise
+            set_telegram_state(BotState.RETRYING)
+            logger.error("telegram_bot_polling_stopped restarting")
+            await _run_to_completion(_stop_best_effort(application))
+            delay = BOT_START_RETRY_INITIAL_SECONDS
+            continue
+        set_telegram_state(BotState.RETRYING)
+        logger.warning("telegram_bot_start_retry in_seconds=%s", delay)
+        await sleep(delay)
+        delay = min(delay * 2, BOT_START_RETRY_MAX_SECONDS)
+
+
+async def start_bot_supervised(settings: Settings) -> asyncio.Task | None:
+    """Like `start_bot`, but the returned task retries a failed start until it succeeds (or
+    `stop_bot_supervised` cancels it). None when no token is configured."""
+    if not reveal(settings.telegram_bot_token):
+        set_telegram_state(BotState.DISABLED)
+        logger.info("telegram_bot_disabled reason=no_bot_token_configured")
+        return None
+    set_telegram_state(BotState.STARTING)
+    task = asyncio.create_task(_run_bot_supervised(settings), name="telegram-bot")
+    task.add_done_callback(_log_supervisor_end)
+    return task
+
+
+def _log_supervisor_end(task: asyncio.Task) -> None:
+    """Report a crashed supervisor at once (type only) instead of at shutdown."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        set_telegram_state(BotState.FAILED)
+        logger.error("telegram_bot_supervisor_crashed error_type=%s", type(exc).__name__)
+
+
+async def stop_bot_supervised(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    set_telegram_state(BotState.STOPPED)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task

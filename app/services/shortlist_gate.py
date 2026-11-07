@@ -19,10 +19,17 @@ Every verdict carries its reasons. Nothing here writes, sends or changes a
 status.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from app.services.job_fit_assessment import FitAssessment
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
+
+from app.services.job_fit_assessment import FitAssessment, assess_job
+
+logger = logging.getLogger(__name__)
 
 GateVerdict = Literal["APPLY_CANDIDATE", "REVIEW", "SKIP"]
 Liveness = Literal["ACTIVE", "GONE", "UNKNOWN"]
@@ -108,3 +115,75 @@ def evaluate(assessment: FitAssessment, *, liveness: Liveness = "UNKNOWN") -> Ga
         tuple(questions),
         tuple(strengths),
     )
+
+
+# --- automatic preparation / proposal gate (the single source of the rule) ---
+#
+# Scope: vacancies not yet applied to -- the automatic shortlist / CV / Bewerbung drafts and
+# the Telegram proposals. NOT applied to follow-ups or response drafts: those concern an
+# existing application, and `ALREADY_APPLIED` makes such a job NOT_SUITABLE by design.
+
+# Fit tiers that may enter AUTOMATIC CV/Bewerbung preparation. Everything else
+# is held for the operator: NOT_SUITABLE (confirmed barrier), NEEDS_OPERATOR
+# (critical facts missing), STRETCH (stated gap) and any unknown tier
+# (fail-closed). A high `jobs.score` or an APPLY recommendation never bypasses
+# this. Being allowed here is NOT approval to apply.
+AUTO_PREPARE_TIERS = frozenset({"GOOD_MATCH", "PARTIAL_MATCH"})
+
+BLOCK_ASSESSMENT_UNAVAILABLE = "ASSESSMENT_UNAVAILABLE"
+
+
+def automatic_block_reason(assessment: FitAssessment) -> str | None:
+    """Pure: None when the vacancy may be prepared automatically, else a fixed
+    reason code (no vacancy text, safe to log)."""
+    tier = assessment.fit_tier
+    if tier in AUTO_PREPARE_TIERS:
+        return None
+    return (
+        f"FIT_TIER_{tier}" if isinstance(tier, str) and tier.isidentifier() else "FIT_TIER_UNKNOWN"
+    )
+
+
+class _NoIsolatedConnection(RuntimeError):
+    """The caller's engine cannot give the assessment its own connection."""
+
+
+def _assess_isolated(db: Session, job_id: int) -> FitAssessment:
+    """A LIVE assessment in its own short read-only session on its OWN connection:
+    never the `job_fit_assessments` cache (a stale or missing cache cannot admit a
+    job), never the caller's identity map (fresh rows), and a failure or the rollback
+    that ends this read cannot touch the caller's transaction. A bind that cannot give
+    a separate connection (a bare Connection, or a single shared in-memory SQLite
+    connection) is refused -- the gate then fails closed instead of sharing state."""
+    bind = db.get_bind()
+    if not isinstance(bind, Engine) or isinstance(bind.pool, (StaticPool, SingletonThreadPool)):
+        raise _NoIsolatedConnection(type(bind).__name__)
+    with Session(bind=bind) as read_session:
+        return assess_job(read_session, job_id)
+
+
+def automatic_preparation_block(db: Session, job_id: int) -> str | None:
+    """Fail-closed: None only when a fresh assessment says the vacancy may be
+    prepared automatically. Writes nothing, changes no status, sends nothing."""
+    try:
+        return automatic_block_reason(_assess_isolated(db, job_id))
+    except Exception as exc:  # noqa: BLE001 -- unknown state must hold the job back
+        logger.warning(
+            "shortlist_gate_assessment_failed job_id=%s error_type=%s", job_id, type(exc).__name__
+        )
+        return BLOCK_ASSESSMENT_UNAVAILABLE
+
+
+def confirmed_barrier(db: Session, job_id: int) -> str | None:
+    """For PROPOSALS to the operator (Telegram cards), where a human still
+    decides: only a CONFIRMED barrier (NOT_SUITABLE) or an unavailable
+    assessment holds a vacancy back. Missing facts (NEEDS_OPERATOR) are exactly
+    what the operator is asked to look at, so they are not blocked here."""
+    try:
+        tier = _assess_isolated(db, job_id).fit_tier
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "shortlist_gate_assessment_failed job_id=%s error_type=%s", job_id, type(exc).__name__
+        )
+        return BLOCK_ASSESSMENT_UNAVAILABLE
+    return "FIT_TIER_NOT_SUITABLE" if tier == "NOT_SUITABLE" else None

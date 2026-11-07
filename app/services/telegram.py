@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -194,6 +195,11 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
+    # Optional: returns a block reason when the vacancy must no longer be proposed. It is
+    # evaluated before EVERY attempt, so a retry after the backoff sleep is revalidated too;
+    # a blocked send returns False and sends nothing. Set by the caller around one send.
+    guard: Callable[[], str | None] | None = None
+
     async def send_job(self, job: Job, score: JobScore) -> bool:
         if not self.enabled:
             return False
@@ -209,6 +215,11 @@ class TelegramNotifier:
         )
 
         for attempt in range(1, self.max_retries + 1):
+            if self.guard is not None:
+                reason = self.guard()
+                if reason is not None:
+                    logger.info("telegram_notification_blocked reason=%s", reason)
+                    return False
             outcome = await send_telegram_text(
                 self.bot_token, self.chat_id, text, timeout_seconds=self.timeout_seconds
             )

@@ -10,12 +10,13 @@ WORKDIR /app
 # Only what's needed to install and run the app — no tests/, docs/, or
 # dev tooling. psycopg[binary] (the "postgres" extra) ships a prebuilt
 # wheel, so no compiler or system libpq package is required here.
-COPY pyproject.toml ./
+COPY pyproject.toml constraints.txt ./
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
 
-RUN pip install --upgrade pip && pip install ".[postgres]"
+# constraints.txt pins the versions the suite was validated with (audit DEP-01).
+RUN pip install --upgrade pip && pip install -c constraints.txt ".[postgres]"
 
 COPY --chmod=755 docker/entrypoint.sh /entrypoint.sh
 
