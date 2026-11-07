@@ -145,6 +145,10 @@ def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
 _PRESENCE = re.compile(
     r"\bon-?\s?site\b|\bvor\s+ort\b|\bb(?:ü|ue)ros?\b|(?<!home )(?<!home-)\boffices?\b"
     r"|\bpr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*|\bheadquarters?\b|\bhauptsitz\b"
+    # onboarding / meetings / travel tied to a physical place
+    r"|\bonboarding\b|\beinarbeitung\b|\bteam[\s-]?(?:meetings?|events?|treffen|tage?)\b"
+    r"|\bkick-?off\b|\b(?:unser(?:em|er)?|our)\s+(?:standort|site|location)\b"
+    r"|\bdienstreisen?\b|\bbusiness\s+trips?\b|\breisebereitschaft\b"
     r"|\b(?:jeden|every|each)\s+(?:montag|dienstag|mittwoch|donnerstag|freitag"
     r"|monday|tuesday|wednesday|thursday|friday)\b",
     re.IGNORECASE,
@@ -243,6 +247,11 @@ _COUNTRY_RESTRICTION = re.compile(
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\bonly\s+(?:from|in)\s+(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\b(?:restricted|limited|beschr(?:ä|ae)nkt)\s+(?:to|auf)\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    # nationality adjective + residency/citizenship ("Polish residency is required")
+    r"|\b(?:polish|british|american|french|spanish|italian|dutch|swiss|austrian|belgian|czech"
+    r"|irish|portuguese|romanian|canadian|indian|polnische\w*|britische\w*|franz(?:ö|oe)sische\w*"
+    r"|(?:ö|oe)sterreichische\w*|schweizer\w*)\s+(?:residen\w*|citizen\w*|staatsb(?:ü|ue)rger\w*"
+    r"|nationality|work\s+permit|wohnsitz)"
     rf"|\b(?:requires?|erfordert)\s+(?:residen(?:cy|ce)|wohnsitz)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
     re.IGNORECASE,
 )
@@ -310,7 +319,7 @@ def _unresolved_eligibility(text: str) -> bool:
     permitted only from Poland.")."""
     for match in _ELIGIBILITY_WORDING.finditer(text):
         before, after = _clause(text, match.start(), match.end())
-        clause = before + " " + after
+        clause = before + " " + match.group(0) + " " + after
         if _negated(text, match) or _BROAD_REGION.search(clause):
             continue
         if _ELIGIBILITY_SUBJECT.search(clause):
@@ -336,7 +345,8 @@ class RemoteSignal:
 _DENIAL_AFTER = re.compile(
     r"\b(?:nicht|not|kein\w*|never|nie)\b\W+(?:\w+\W+){0,2}?(?:m(?:ö|oe)glich|possible|available"
     r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
-    r"|der\s+fall|permitted|gestattet)\b"
+    r"|der\s+fall|permitted|gestattet|infrage|in\s+frage)\b"
+    r"|\bunavailable\b|\bnicht\s+(?:\w+\s+){0,3}?(?:infrage|in\s+frage)\b"
     # a prohibition carries its own negation: "Remote work is prohibited / ist ausgeschlossen"
     r"|\b(?:prohibited|forbidden|banned|ausgeschlossen|untersagt|verboten)\b",
     re.IGNORECASE,

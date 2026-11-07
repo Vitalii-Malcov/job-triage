@@ -274,7 +274,6 @@ class TestAdversarialPostings:
         "description",
         [
             "Vollzeit. 100% Remote in Germany. We are a UK-based company.",
-            "Vollzeit. 100% Remote in Germany. Our software serves UK residents.",
             "Vollzeit. 100% Remote in Germany. We have UK-based employees.",
             "Vollzeit. 100% Remote in the UK or in Germany.",
             "Vollzeit. Fully remote within the EU, incl. Germany.",
@@ -549,3 +548,39 @@ class TestRound7Postings:
         a = _assessment("Fully remote in Germany. No exceptions: only from Poland.")
         assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
         assert automatic_block_reason(a) is not None
+
+
+class TestRound8Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote work is unavailable for this position.",
+            "100% Remote kommt für diese Stelle nicht infrage.",
+            "100% Remote nach der Einarbeitung. Die Einarbeitung findet an unserem Standort in "
+            "Berlin statt.",
+            "100% Remote. Monatliche Team-Meetings in Berlin.",
+        ],
+    )
+    def test_realistic_denial_and_onboarding_wording_keeps_the_commute_gate(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") != "COMPATIBLE"
+        assert _status(a, "location") != "REMOTE_OK"
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote. Polish residency is required.",
+            "100% Remote. Polnische Staatsbürgerschaft.",
+        ],
+    )
+    def test_nationality_adjectives_restrict_eligibility(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None
+
+
+def test_customer_residents_wording_goes_to_review_but_is_never_a_hard_exclusion():
+    a = _assessment("Vollzeit. 100% Remote in Germany. Our software serves UK residents.")
+    assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"  # the operator confirms in a second
+    assert a.fit_tier == "NEEDS_OPERATOR"
