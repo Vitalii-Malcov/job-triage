@@ -110,7 +110,7 @@ _GENDER_ONLY = re.compile(r"^(?:[mwdfx]|gn|divers|all|genders|[\*/|:_,\s])+$", r
 # Whole words only; a developer-role phrase ("Software-Entwickler") is never a product.
 _PRODUCT_NOUN = re.compile(
     r"(?:tools?|software|plattform(?:en)?|platforms?|systems?|systeme|portale?|anwendung(?:en)?|"
-    r"applikation(?:en)?|l(?:ö|oe)sung(?:en)?|produkte?|apps?)\b",
+    r"applikation(?:en)?|l(?:ö|oe)sung(?:en)?|produkte?|apps?|dashboards?|tooling)\b",
     re.IGNORECASE,
 )
 

@@ -179,6 +179,7 @@ class TestRoleFamily:
             "Junior Python Entwickler Service Desk Tools (m/w/d)",
             "Junior Software Developer IT-Support Tools",
             "Software Development Engineer - IT-Support Tools",
+            "Junior Python Entwickler für Linux-Admin-Dashboard",
             "Junior Python Entwickler für IT-Support-Plattform",
             "Junior Python Entwickler Applikation für Service Desk Lösung",
         ],
