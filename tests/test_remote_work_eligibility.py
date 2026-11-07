@@ -295,15 +295,67 @@ class TestAdversarialPostings:
         [
             "Vollzeit. 100% Remote UK or Germany.",
             "Vollzeit. 100% Remote Poland / Deutschland.",
-            "Full-time. Fully remote. Offices in Poland and Spain.",
+            "Full-time. Fully remote in Poland or Germany.",
         ],
     )
-    def test_an_unresolved_foreign_country_sends_remote_to_manual_review(self, description):
-        """Not a hard exclusion, but never a skipped commute gate either."""
+    def test_germany_named_as_a_place_of_work_is_compatible(self, description):
         a = _assessment(description, place=BERLIN)
-        assert _status(a, "remote") == "PARTIAL_REMOTE"
+        assert _status(a, "remote") == "COMPATIBLE"
+        assert automatic_block_reason(a) is None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Full-time. Fully remote. Offices in Poland and Spain.",
+            "Full-time. Fully remote. Office attendance in Berlin is mandatory and Python "
+            "experience is preferred.",
+            "Full-time. Fully remote. You must attend our Berlin office twice a week.",
+        ],
+    )
+    def test_office_vocabulary_keeps_the_commute_gate(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "HYBRID"
         assert _status(a, "location") != "REMOTE_OK"
         assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Full-time. We cannot offer 100% remote.",
+            "Vollzeit. 100% Remote. Homeoffice ist nicht möglich.",
+        ],
+    )
+    def test_a_denial_of_remote_work_wins_over_an_affirmative_phrase(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "ONSITE"
+        assert _status(a, "location") != "REMOTE_OK"
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Full-time. Fully remote in Belgium only.",
+            "Full-time. Fully remote. Only residents of Poland may apply.",
+        ],
+    )
+    def test_unlisted_or_residency_restrictions_never_confirm_german_eligibility(self, description):
+        near = {"location": "Offenbach", "workplace_lat": 50.1, "workplace_lon": 8.77}
+        a = _assessment(description, place=near)  # commute would pass: the posting still bars
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None
+
+    def test_unclear_eligibility_is_a_manual_review_even_for_a_near_job(self):
+        near = {"location": "Offenbach", "workplace_lat": 50.1, "workplace_lon": 8.77}
+        a = _assessment("Full-time. Fully remote. Applicants must be eligible to work.", place=near)
+        assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"
+        result = classify(a)
+        assert (result.category, result.code) == ("MANUAL_REVIEW", "REMOTE_UNVERIFIED")
+        assert automatic_block_reason(a) == "FIT_TIER_NEEDS_OPERATOR"
+
+    def test_a_negated_country_requirement_is_no_restriction(self):
+        a = _assessment(
+            "Full-time. 100% Remote in Germany. Candidates need not be based in the UK."
+        )
+        assert _status(a, "remote") == "COMPATIBLE"
 
     @pytest.mark.parametrize(
         "description",
