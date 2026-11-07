@@ -32,6 +32,7 @@ from app.services.candidate_preparation import prepare_candidate_job_match
 from app.services.collector_runner import TouchedJob
 from app.services.job_fit_assessment import assess_job
 from app.services.shortlist_gate import automatic_block_reason, evaluate
+from app.services.triage_category import classify
 
 ELIGIBLE_STATUSES = frozenset({"NEW", "SAVED"})
 ELIGIBLE_RECOMMENDATIONS = frozenset({"APPLY", "MAYBE"})
@@ -77,6 +78,7 @@ def analyse(db: Session, settings: Settings) -> dict:
         verdict = evaluate(assessment, liveness="UNKNOWN")
         gate[verdict.verdict] += 1
         block = automatic_block_reason(assessment)
+        category = classify(assessment)
         auto = (
             eligible_pre
             and match_score is not None
@@ -96,6 +98,9 @@ def analyse(db: Session, settings: Settings) -> dict:
                 "tier": assessment.fit_tier,
                 "block": block,
                 "gate": verdict.verdict,
+                "category": category.category,
+                "category_code": category.code,
+                "criteria": {c.name: c.status for c in assessment.criteria},
                 "auto": auto,
                 "has_open_points": bool(verdict.questions),
                 "reason": _first_reason(assessment),
@@ -122,6 +127,13 @@ def analyse(db: Session, settings: Settings) -> dict:
         "eligible_tier_needs_operator_or_stretch": sum(
             1 for r in eligible if r["tier"] in {"NEEDS_OPERATOR", "STRETCH"}
         ),
+        "triage_category_all": dict(Counter(r["category"] for r in rows)),
+        "manual_review_codes": dict(
+            Counter(r["category_code"] for r in rows if r["category"] == "MANUAL_REVIEW")
+        ),
+        "eligible_by_category": dict(Counter(r["category"] for r in eligible)),
+        "automatic_shortlist_by_category": dict(Counter(r["category"] for r in auto)),
+        "held_for_route": sum(1 for r in rows if r["category_code"] == "ROUTE_REVIEW_REQUIRED"),
         "would_enter_automatic_shortlist": len(auto),
         "min_match_score": settings.automation_shortlist_min_match_score,
         "max_per_run": settings.automation_shortlist_max_per_run,
