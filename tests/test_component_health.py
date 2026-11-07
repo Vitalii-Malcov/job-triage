@@ -187,8 +187,15 @@ def test_a_poller_that_dies_after_start_turns_readiness_red_and_restarts(monkeyp
     applications = []
     states_when_stopped = []
 
+    async def _alive():
+        await asyncio.Event().wait()
+
     async def attempt(_settings):
-        app_ = SimpleNamespace(updater=SimpleNamespace(running=True))
+        app_ = SimpleNamespace(
+            updater=SimpleNamespace(
+                running=True, _Updater__polling_task=asyncio.ensure_future(_alive())
+            )
+        )
         applications.append(app_)
         return app_, None
 
@@ -199,7 +206,8 @@ def test_a_poller_that_dies_after_start_turns_readiness_red_and_restarts(monkeyp
 
     async def fast_sleep(_delay):
         if len(applications) == 1:
-            applications[0].updater.running = False  # token revoked: poller exits
+            applications[0].updater._Updater__polling_task.cancel()  # poller task ends
+            await real_sleep(0)
         await real_sleep(0)
 
     monkeypatch.setattr(telegram_bot, "_start_bot_attempt", attempt)
@@ -218,3 +226,21 @@ def test_a_poller_that_dies_after_start_turns_readiness_red_and_restarts(monkeyp
 
     asyncio.run(scenario())
     assert states_when_stopped[0] == (applications[0], BotState.RETRYING)
+
+
+def test_stop_failure_on_a_dead_poller_falls_back_to_teardown(monkeypatch):
+    from app.services import telegram_bot
+
+    calls = []
+
+    async def refusing_stop(_application):
+        raise RuntimeError("This Updater is not running!")
+
+    async def teardown(application):
+        calls.append(application)
+
+    monkeypatch.setattr(telegram_bot, "stop_bot", refusing_stop)
+    monkeypatch.setattr(telegram_bot, "_teardown", teardown)
+    application = SimpleNamespace()
+    asyncio.run(telegram_bot._stop_best_effort(application))
+    assert calls == [application]

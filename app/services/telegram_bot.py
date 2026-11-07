@@ -1096,8 +1096,26 @@ BOT_POLL_CHECK_SECONDS = 10.0
 
 
 def _polling_stopped(application) -> bool:
+    """True once the update poller is no longer working. PTB keeps `updater.running` True when
+    its polling task dies (e.g. InvalidToken), so the task itself is checked too; the attribute
+    is a private name-mangled one, read defensively."""
     updater = getattr(application, "updater", None)
-    return updater is not None and getattr(updater, "running", True) is False
+    if updater is None:
+        return False
+    if getattr(updater, "running", True) is False:
+        return True
+    task = getattr(updater, "_Updater__polling_task", None)
+    return task is not None and task.done()
+
+
+async def _stop_best_effort(application) -> None:
+    """Normal stop; if the poller is already dead `stop()` refuses, so fall back to the
+    guarded teardown that completes whatever is still open."""
+    try:
+        await stop_bot(application)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram_bot_stop_failed error_type=%s", type(exc).__name__)
+        await _teardown(application)
 
 
 async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
@@ -1128,11 +1146,11 @@ async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
                     await asyncio.sleep(BOT_POLL_CHECK_SECONDS)
             except BaseException:
                 set_telegram_state(BotState.STOPPED)
-                await _run_to_completion(stop_bot(application))
+                await _run_to_completion(_stop_best_effort(application))
                 raise
             set_telegram_state(BotState.RETRYING)
             logger.error("telegram_bot_polling_stopped restarting")
-            await _run_to_completion(stop_bot(application))
+            await _run_to_completion(_stop_best_effort(application))
             delay = BOT_START_RETRY_INITIAL_SECONDS
             continue
         set_telegram_state(BotState.RETRYING)
