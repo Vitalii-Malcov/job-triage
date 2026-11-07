@@ -171,23 +171,51 @@ def _thread_hashes(db: Session, message: InboundMessage) -> dict[int, frozenset[
     return {app_id: frozenset(values) for app_id, values in by_app.items()}
 
 
-def _sender_lookup(db: Session, message: InboundMessage):
+class _ReadCache:
+    """Reads that cannot change while it is alive (PERF-02).
+
+    A dry run writes nothing, so one cache serves the whole batch. When applying, a message's
+    own writes (a recorded event, a status change) can alter what the next message sees, so
+    each message gets a fresh cache: the candidate scan then runs once per message instead of
+    twice, and a per-application event list is read once per message. Results are identical to
+    reading everything every time (tests/test_audit_correlation_reads.py)."""
+
+    def __init__(self, tracker: ApplicationTracker, only_ids: frozenset[int] | None) -> None:
+        self._tracker = tracker
+        self._only_ids = only_ids
+        self._candidates: list[Application] | None = None
+        self._events: dict[int, list] = {}
+
+    def candidates(self, db: Session) -> list[Application]:
+        if self._candidates is None:
+            self._candidates = list(
+                self._tracker.iter_correlation_candidates(db, only_ids=self._only_ids)
+            )
+        return self._candidates
+
+    def events(self, db: Session, application_id: int) -> list:
+        if application_id not in self._events:
+            self._events[application_id] = list(repo.list_events(db, application_id))
+        return self._events[application_id]
+
+
+def _sender_lookup(db: Session, message: InboundMessage, cache: _ReadCache):
     """SENDER signal: has this exact sender already had a message correlated
     to the application? Called only for candidates that already match on
     COMPANY; each call is one indexed per-application event read, cached."""
     sender_hash = message.sender_address_hash
     if sender_hash is None:
         return None
-    cache: dict[int, bool] = {}
+    memo: dict[int, bool] = {}
 
     def seen(application_id: int) -> bool:
-        if application_id not in cache:
-            cache[application_id] = any(
+        if application_id not in memo:
+            memo[application_id] = any(
                 json.loads(event.metadata_json or "{}").get("sender_address_hash") == sender_hash
-                for event in repo.list_events(db, application_id)
+                for event in cache.events(db, application_id)
                 if event.origin == ApplicationEventOrigin.GMAIL.value
             )
-        return cache[application_id]
+        return memo[application_id]
 
     return seen
 
@@ -220,7 +248,9 @@ _ANSWERS = {
 }
 
 
-def _operator_acted_since(db: Session, application_ids, occurred_at, classification) -> bool:
+def _operator_acted_since(
+    db: Session, application_ids, occurred_at, classification, cache: _ReadCache
+) -> bool:
     """The operator moved one of these applications, after the mail, to a
     status that answers it (or to a terminal status)."""
     since = normalize_occurred_at(occurred_at)
@@ -228,7 +258,7 @@ def _operator_acted_since(db: Session, application_ids, occurred_at, classificat
         return False
     answers = _ANSWERS.get(classification, frozenset()) | _TERMINAL
     for application_id in application_ids:
-        for event in repo.list_events(db, application_id):
+        for event in cache.events(db, application_id):
             recorded = normalize_occurred_at(event.recorded_at)
             if (
                 event.origin == ApplicationEventOrigin.OPERATOR.value
@@ -267,12 +297,14 @@ class ApplicationResponseProcessor:
         `monitored_account_keys` are all mailbox accounts being processed:
         a message already recorded under any of them is a duplicate."""
         results: list[ResponseTrackingResult] = []
+        batch_cache = None if apply else _ReadCache(self.tracker, only_application_ids)
         try:
             for message in messages:
                 results.append(
                     self._process_one(
                         db,
                         message,
+                        cache=batch_cache or _ReadCache(self.tracker, only_application_ids),
                         apply=apply,
                         applicant_addresses=applicant_addresses,
                         only_application_ids=only_application_ids,
@@ -289,6 +321,7 @@ class ApplicationResponseProcessor:
         db: Session,
         message: InboundMessage,
         *,
+        cache: _ReadCache,
         apply: bool,
         applicant_addresses: Sequence[str],
         only_application_ids: frozenset[int] | None,
@@ -297,10 +330,10 @@ class ApplicationResponseProcessor:
         ref = message.correlation_key.removeprefix("gmail:")[:12]
         # Complete candidate set via a batched keyset scan (bounded memory);
         # never a single page that could silently drop application #201+.
-        sender_seen = _sender_lookup(db, message)
+        sender_seen = _sender_lookup(db, message, cache)
         correlation = correlate_message(
             message,
-            self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
+            cache.candidates(db),
             applicant_addresses=applicant_addresses,
             thread_hashes_by_application=_thread_hashes(db, message),
             sender_seen=sender_seen,
@@ -328,7 +361,7 @@ class ApplicationResponseProcessor:
             # it was silently dropped before. Still nothing is written.
             known = (
                 _applications_seen_from_sender(
-                    self.tracker.iter_correlation_candidates(db, only_ids=only_application_ids),
+                    cache.candidates(db),
                     sender_seen,
                     message,
                 )
@@ -352,7 +385,7 @@ class ApplicationResponseProcessor:
                 len(known) == 1
                 and ambiguous is not None
                 and _operator_acted_since(
-                    db, known, message.occurred_at, ambiguous.classification.value
+                    db, known, message.occurred_at, ambiguous.classification.value, cache
                 )
             )
             return ResponseTrackingResult(
