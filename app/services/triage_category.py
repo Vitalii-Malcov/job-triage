@@ -114,6 +114,9 @@ def classify(assessment: FitAssessment) -> TriageCategory:
 def _manual(assessment: FitAssessment, status: dict[str, str]) -> TriageCategory:
     reasons = assessment.tier_reasons
     first = reasons[0] if reasons else "facts to verify"
+    if status.get("skills") == "WEAK":
+        # the tier shows the open fact first; the operator must also see the skill gap
+        first += " [skills WEAK: low required-skill coverage]"
     if status.get("location") in _ROUTE_OPEN:
         return TriageCategory("MANUAL_REVIEW", ROUTE_REVIEW_REQUIRED, first)
     return TriageCategory("MANUAL_REVIEW", DATA_REVIEW_REQUIRED, first)

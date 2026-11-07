@@ -77,6 +77,12 @@ class TestUnconfirmedRoute:
         assert automatic_block_reason(a) is None  # still no approval to apply
 
 
+def test_weak_skills_are_visible_in_the_review_reason_but_do_not_exclude():
+    result = classify(_assessment(location="DISTANCE_UNVERIFIED", skills="WEAK"))
+    assert (result.category, result.code) == ("MANUAL_REVIEW", ROUTE_REVIEW_REQUIRED)
+    assert "skills WEAK" in result.reason
+
+
 class TestGeographyAndRemote:
     def test_remote_developer_role_is_primary(self):
         a = _assessment(location="REMOTE_OK")
