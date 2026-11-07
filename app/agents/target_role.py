@@ -105,21 +105,21 @@ _GENDER_MARKER = re.compile(
     r"\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b|\b[mwdfx]\s*\*\s*[mwdfx]\b", re.IGNORECASE
 )
 _PARENTHESIS = re.compile(r"\(([^)]*)\)")
+_GENDER_ONLY = re.compile(r"^(?:[mwdfx]|gn|divers|all|genders|[\*/|:_,\s])+$", re.IGNORECASE)
 # The support/admin word names the PRODUCT being built ("... IT-Support Tools"), not the job.
+# Whole words only; a developer-role phrase ("Software-Entwickler") is never a product.
 _PRODUCT_NOUN = re.compile(
-    r"(?:tools?|software|plattform\w*|platform\w*|systems?|systeme\w*|portal\w*|anwendung\w*|"
-    r"applikation\w*|l(?:ö|oe)sung\w*|produkt\w*|app|apps)\b",
+    r"(?:tools?|software|plattformen?|platforms?|systems?|systeme|portale?|anwendungen|anwendung|"
+    r"applikationen?|l(?:ö|oe)sungen?|produkte?|apps?)\b",
     re.IGNORECASE,
 )
 
 
 def _strip_noise(title: str) -> str:
+    """Drop gender markers; keep any other parenthesised text, set off by ';' so it can
+    never make two words look adjacent."""
     text = _PARENTHESIS.sub(
-        lambda m: (
-            m.group(1)
-            if (_DEV_ROLE.search(m.group(1)) or any(p.search(m.group(1)) for _, p in _FAMILIES))
-            else " "
-        ),
+        lambda m: " " if _GENDER_ONLY.match(m.group(1).strip()) else f" ; {m.group(1)} ; ",
         title or "",
     )
     return _GENDER_MARKER.sub(" ", text)
@@ -141,7 +141,7 @@ def hybrid_support_admin_family(title: str) -> str | None:
     for name, pattern in _FAMILIES:
         for match in pattern.finditer(text):
             tail = text[match.end() :].lstrip(" -")
-            if _PRODUCT_NOUN.match(tail):
+            if _PRODUCT_NOUN.match(tail) and not _DEV_ROLE.match(tail):
                 continue
             return name
     return None

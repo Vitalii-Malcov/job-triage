@@ -154,6 +154,9 @@ class TestRoleFamily:
             "IT-Systemadministrator / Softwareentwickler m/w/d",
             "IT-Administrator / (Softwareentwickler)",
             "IT-Support für Softwareentwickler",
+            "IT-Support - Anwendungsentwickler",
+            "IT-Support - Software-Entwickler",
+            "IT-Support (für unsere) Plattform / Python Entwickler",
             "Systemadministrator und Python Entwickler",
         ],
     )
