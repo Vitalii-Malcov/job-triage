@@ -313,7 +313,7 @@ class TestAdversarialPostings:
     )
     def test_office_vocabulary_keeps_the_commute_gate(self, description):
         a = _assessment(description, place=BERLIN)
-        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE"}
+        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE", "UNVERIFIED_ELIGIBILITY"}
         assert _status(a, "location") != "REMOTE_OK"
         assert automatic_block_reason(a) is not None
 
@@ -456,7 +456,7 @@ class TestRound5Postings:
     )
     def test_unrelated_negation_or_optional_wording_does_not_cancel_presence(self, description):
         a = _assessment(description, place=BERLIN)
-        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE"}
+        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE", "UNVERIFIED_ELIGIBILITY"}
         assert _status(a, "location") != "REMOTE_OK"
         assert automatic_block_reason(a) is not None
 
@@ -583,4 +583,34 @@ class TestRound8Postings:
 def test_customer_residents_wording_goes_to_review_but_is_never_a_hard_exclusion():
     a = _assessment("Vollzeit. 100% Remote in Germany. Our software serves UK residents.")
     assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"  # the operator confirms in a second
-    assert a.fit_tier == "NEEDS_OPERATOR"
+    assert a.fit_tier == "NEEDS_OPERATOR"  # reviewed, not excluded, whatever the employer location
+
+
+class TestUnclearRemoteIsReviewedNotExcluded:
+    """REMOTE_UNVERIFIED: a full-remote claim with unclear terms goes to the operator even when the
+    employer is far away; a plain on-site job that merely allows home office stays excluded."""
+
+    def test_far_job_with_a_vetoed_full_remote_claim_is_a_manual_review(self):
+        a = _assessment("Vollzeit. 100% Remote. Gelegentlich Team-Events im Büro.", place=BERLIN)
+        assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"
+        assert a.fit_tier == "NEEDS_OPERATOR"
+        result = classify(a)
+        assert (result.category, result.code) == ("MANUAL_REVIEW", "REMOTE_UNVERIFIED")
+        assert automatic_block_reason(a) == "FIT_TIER_NEEDS_OPERATOR"
+
+    def test_far_job_with_unclear_eligibility_is_a_manual_review(self):
+        a = _assessment("Fully remote. Applicants must reside in Estonia.", place=BERLIN)
+        assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"
+        assert a.fit_tier == "NEEDS_OPERATOR"
+
+    def test_far_onsite_job_that_only_allows_home_office_stays_excluded(self):
+        a = _assessment("Vollzeit. Homeoffice möglich.", place=BERLIN)
+        assert _status(a, "remote") == "PARTIAL_REMOTE"
+        assert a.fit_tier == "NOT_SUITABLE"
+
+    def test_an_explicit_presence_obligation_keeps_the_commute_gate(self):
+        a = _assessment(
+            "Vollzeit. 100% Remote, aber Büropräsenz in Berlin ist zwingend.", place=BERLIN
+        )
+        assert _status(a, "remote") == "HYBRID"
+        assert a.fit_tier == "NOT_SUITABLE"

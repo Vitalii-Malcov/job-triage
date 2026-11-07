@@ -690,6 +690,14 @@ def location_criterion(
 ) -> Criterion:
     if remote.status == "COMPATIBLE":
         return Criterion("location", "REMOTE_OK", "fully remote and compatible; no commute")
+    if remote.status == "UNVERIFIED_ELIGIBILITY":
+        # a full-remote claim whose terms are unclear: neither confirmed (no commute bypass) nor
+        # disproved, so the commute is not held against it -- the operator reads the posting
+        return Criterion(
+            "location",
+            "DISTANCE_UNVERIFIED",
+            "remote work claimed but unconfirmed; commute not held against it until checked",
+        )
     if settings.max_commute_km is None or settings.commute_measure != "CAR_ROUTE":
         return Criterion("location", "NOT_CONFIGURED", "no car-route commute limit configured")
     limit = settings.max_commute_km

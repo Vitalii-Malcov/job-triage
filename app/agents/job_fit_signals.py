@@ -143,8 +143,9 @@ def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
 # Any office / presence vocabulary. Remote work is "100 %" only if every such clause is negated
 # ("keine Büropräsenz") or made optional ("kannst optional ins Büro") in ITS OWN clause.
 _PRESENCE = re.compile(
-    r"\bon-?\s?site\b|\bvor\s+ort\b|\bb(?:ü|ue)ros?\b|(?<!home )(?<!home-)\boffices?\b"
-    r"|\bpr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*|\bheadquarters?\b|\bhauptsitz\b"
+    r"\bon-?\s?site\b|\bvor[\s-]+ort\b|\b\w*b(?:ü|ue)ro\w*|(?<!home )(?<!home-)\boffices?\b"
+    r"|\b\w*pr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*|\bheadquarters?\b"
+    r"|\bhauptsitz\b"
     # onboarding / meetings / travel tied to a physical place
     r"|\bonboarding\b|\beinarbeitung\b|\bteam[\s-]?(?:meetings?|events?|treffen|tage?)\b"
     r"|\bkick-?off\b|\b(?:unser(?:em|er)?|our)\s+(?:standort|site|location)\b"
@@ -428,7 +429,8 @@ def classify_remote(text: str) -> RemoteSignal:
             near_before, near_after = _clause(text, presence.start(), presence.end())
             clause = f"{near_before} {presence.group(0)} {near_after}"
             mode: RemoteMode = "HYBRID" if _OBLIGATION.search(clause) else "PARTIAL_REMOTE"
-            return done(mode, presence, unresolved)
+            # a bare mention leaves a full-remote CLAIM unconfirmed: the operator reads it
+            return done(mode, presence, unresolved or mode == "PARTIAL_REMOTE")
         german = bool(regional or _GERMAN_REMOTE.search(text))
         foreign = bool(_FOREIGN_MENTION.search(text)) and not german
         if unresolved or foreign:
