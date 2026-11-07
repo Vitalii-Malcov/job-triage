@@ -2,12 +2,14 @@
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi import status as http_status
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
+from app.security.auth import require_api_key
+from app.security.rate_limit import enforce_rate_limit
 from app.services.component_health import components_report, telegram_ready
 from app.services.readiness import check_readiness
 
@@ -36,10 +38,12 @@ def ready() -> JSONResponse:
     )
 
 
-@router.get("/health/components")
+@router.get(
+    "/health/components", dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)]
+)
 def health_components() -> JSONResponse:
-    """Coarse per-component states for an operator (OPS-02). Always 200 -- readiness
-    stays the pass/fail signal. States only: no exception text, keys or data."""
+    """Coarse per-component states for an operator (OPS-02); API key required. Always 200;
+    readiness stays the pass/fail signal. States only: no exception text, keys or data."""
     database_ready = check_readiness()
     db = SessionLocal() if database_ready else None
     try:

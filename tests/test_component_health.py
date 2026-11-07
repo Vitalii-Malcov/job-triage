@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.routers import health as health_module
+from app.core.config import Settings
 from app.main import app
 from app.services import component_health as ch
 from app.services.component_health import BotState
@@ -169,7 +170,12 @@ def test_components_report_has_states_only_and_survives_db_errors():
 def test_components_endpoint_never_leaks_detail(monkeypatch):
     monkeypatch.setattr(health_module, "check_readiness", lambda: False)
     ch.set_telegram_state(BotState.FAILED)
-    response = TestClient(app).get("/api/v1/health/components")
+    fake = Settings(api_key="k" * 24, rate_limit_requests=1000, rate_limit_window_seconds=60)
+    monkeypatch.setattr("app.security.auth.get_settings", lambda: fake)
+    monkeypatch.setattr("app.security.rate_limit.get_settings", lambda: fake)
+    client = TestClient(app)
+    assert client.get("/api/v1/health/components").status_code == 401
+    response = client.get("/api/v1/health/components", headers={"X-API-Key": "k" * 24})
     assert response.status_code == 200
     assert response.json()["telegram"] == "failed"
     assert response.json()["database"] == "down"
