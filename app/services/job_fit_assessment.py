@@ -163,6 +163,9 @@ _VERIFY = {
     ("location", "LOCATION_UNVERIFIED"),
     ("duplicate", "POSSIBLE_DUPLICATE"),
     ("skills", "NOT_EVALUATED"),
+    # remote work stated but who may do it is unclear: the operator reads the posting, however
+    # short the commute is
+    ("remote", "UNVERIFIED_ELIGIBILITY"),
 }
 
 
@@ -580,6 +583,15 @@ def remote_criterion(
             "INCOMPATIBLE",
             f"remote work is restricted to {signal.country_restriction}; "
             f"the candidate works from {settings.remote_work_from_region or 'Germany'}",
+            signal.evidence,
+        )
+    if signal.eligibility_unverified:
+        # remote work stated, but who may do it is unclear (a foreign country is named, or the
+        # posting limits eligibility without saying work from Germany is allowed)
+        return Criterion(
+            "remote",
+            "UNVERIFIED_ELIGIBILITY",
+            "remote work stated but eligibility from Germany is unclear; read the posting",
             signal.evidence,
         )
     if signal.mode != "FULLY_REMOTE":

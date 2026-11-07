@@ -70,6 +70,7 @@ _REMOTE_FORMAT = {
     "HYBRID": "HYBRID",
     "ONSITE": "ONSITE",
     "PARTIAL_REMOTE": REMOTE_UNVERIFIED,
+    "UNVERIFIED_ELIGIBILITY": REMOTE_UNVERIFIED,
     "INCOMPATIBLE": "REMOTE_RESTRICTED",
 }
 
@@ -141,11 +142,13 @@ def _manual(assessment: FitAssessment, status: dict[str, str]) -> TriageCategory
     if status.get("skills") == "WEAK":
         # the tier shows the open fact first; the operator must also see the skill gap
         first += " [skills WEAK: low required-skill coverage]"
+    remote = status.get("remote")
+    if remote == "UNVERIFIED_ELIGIBILITY":
+        # remote work stated, but who may do it is unclear: needs a human whatever the route
+        return TriageCategory("MANUAL_REVIEW", REMOTE_UNVERIFIED, first)
     if status.get("location") in _ROUTE_OPEN:
         # remote work was stated but its terms are unclear: the operator may settle the route
         # question by reading the remote conditions instead
-        code = (
-            REMOTE_UNVERIFIED if status.get("remote") == "PARTIAL_REMOTE" else ROUTE_REVIEW_REQUIRED
-        )
+        code = REMOTE_UNVERIFIED if remote == "PARTIAL_REMOTE" else ROUTE_REVIEW_REQUIRED
         return TriageCategory("MANUAL_REVIEW", code, first)
     return TriageCategory("MANUAL_REVIEW", DATA_REVIEW_REQUIRED, first)
