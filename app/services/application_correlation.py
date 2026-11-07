@@ -64,6 +64,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import Literal
 
 from app.agents.application_response_classifier import normalize_body, normalize_subject
@@ -242,28 +243,58 @@ def in_response_window(application: Application, occurred_at: datetime | None) -
     return start <= occurred_at <= application.submitted_at + RESPONSE_WINDOW
 
 
+@dataclass(frozen=True)
+class PreparedMessage:
+    """Everything about a message that does NOT depend on the application it is compared with
+    (PERF-02): normalised once per message instead of once per (message, application) pair."""
+
+    text: str
+    display: str
+    normalized_text: str
+    normalized_display: str
+    role_text: str
+
+
+def prepare_message(message: InboundMessage) -> PreparedMessage:
+    subject = normalize_subject(message.subject).casefold()
+    body = normalize_body(message.body, has_html=message.has_html).casefold()
+    text = f"{subject}\n{body}"
+    display = (message.from_display_name or "").casefold()
+    return PreparedMessage(
+        text=text,
+        display=display,
+        normalized_text=normalize_company_name(text),
+        normalized_display=normalize_company_name(display),
+        role_text=re.sub(r"\s+", " ", _GENDER_SUFFIX.sub(" ", text)),
+    )
+
+
+# Pure string functions of an application's recorded name / title: cached across the
+# (message x application) loop, which asks for the same few hundred values over and over.
+_company_key = lru_cache(maxsize=4096)(normalize_company_name)
+_role_key = lru_cache(maxsize=4096)(role_phrase)
+
+
 def evaluate_candidate(
     message: InboundMessage,
     application: Application,
     *,
     thread_hashes: frozenset[str] = frozenset(),
+    prepared: PreparedMessage | None = None,
 ) -> CandidateEvaluation:
-    subject = normalize_subject(message.subject).casefold()
-    body = normalize_body(message.body, has_html=message.has_html).casefold()
-    text = f"{subject}\n{body}"
-    display = (message.from_display_name or "").casefold()
+    prepared = prepared or prepare_message(message)
+    text = prepared.text
     signals: set[Signal] = set()
     if _domain_matches(extract_sender_domain(message.from_address), application.employer_domains):
         signals.add("DOMAIN")
-    company = normalize_company_name(application.company_name)
-    normalized_text = normalize_company_name(text)
+    company = _company_key(application.company_name)
     if company and (
-        _contains_phrase(normalized_text, company)
-        or _contains_phrase(normalize_company_name(display), company)
+        _contains_phrase(prepared.normalized_text, company)
+        or _contains_phrase(prepared.normalized_display, company)
     ):
         signals.add("COMPANY")
-    role = role_phrase(application.role_title)
-    if role and _contains_phrase(re.sub(r"\s+", " ", _GENDER_SUFFIX.sub(" ", text)), role):
+    role = _role_key(application.role_title)
+    if role and _contains_phrase(prepared.role_text, role):
         signals.add("ROLE")
     reference = (application.source_reference or "").casefold()
     if reference and len(reference) >= 6 and reference in text:
@@ -297,7 +328,7 @@ def _employer_key(company_name: str) -> str:
     """Deliberately coarse: the first word of the normalized company name, so
     "ExampleCorp GmbH" and "ExampleCorp GmbH Standort Berlin" (and, harmlessly,
     "Volksbank A" and "Volksbank B") count as the same employer here."""
-    words = normalize_company_name(company_name).split()
+    words = _company_key(company_name).split()
     return words[0] if words else ""
 
 
@@ -349,12 +380,19 @@ def correlate_message(
     threads = thread_hashes_by_application or {}
     evaluations: list[CandidateEvaluation] = []
     employer_keys: dict[int, str] = {}
+    prepared: PreparedMessage | None = None
     for app in applications:
         if not in_response_window(app, message.occurred_at):
             continue
+        if (
+            prepared is None
+        ):  # normalise the message once, and only if some application is in the window
+            prepared = prepare_message(message)
         employer_keys[app.id] = _employer_key(app.company_name)
         evaluations.append(
-            evaluate_candidate(message, app, thread_hashes=threads.get(app.id, frozenset()))
+            evaluate_candidate(
+                message, app, thread_hashes=threads.get(app.id, frozenset()), prepared=prepared
+            )
         )
     evaluations = _with_sender_signal(message, evaluations, employer_keys, sender_seen)
     evaluations = [e for e in evaluations if e.confidence != "NONE"]
