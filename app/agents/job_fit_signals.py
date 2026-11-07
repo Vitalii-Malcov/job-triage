@@ -87,27 +87,34 @@ _REMOTE_REGION = re.compile(
 )
 
 
-# Negation: "kein Homeoffice", "Remote Germany ist nicht möglich", "no full-time". A match that is
-# negated close by never counts as affirmative evidence (shared by remote and working time).
-_NEGATED_BEFORE = re.compile(
-    r"(?:\b(?:kein|keine|keinen|keiner|keinem|nicht|ohne|no|not|without|never)\W+(?:\w+\W+){0,2}?)$",
-    re.IGNORECASE,
+# Negation is clause-scoped: "kein Homeoffice", "Remote Germany ist nicht möglich", "Vollzeit
+# bieten wir nicht an". A negator in another clause (".", ";", ",", newline) never counts, so
+# "100 % Remote. Büropräsenz ist nicht erforderlich." keeps the remote statement affirmative.
+_CLAUSE_BOUND = re.compile(r"[.;,\n!?]")
+_NEGATOR = re.compile(
+    r"\b(?:kein|keine|keinen|keiner|keinem|nicht|ohne|no|not|without|never|nie)\b", re.IGNORECASE
 )
-_NEGATED_AFTER = re.compile(
-    r"^\W{0,3}(?:(?:\w+\W+){0,3}?(?:ist|sind|is|are|wird|werden|bleibt)\W+)?"
-    r"(?:(?:leider|unfortunately)\W+)?(?:nicht|not|nie|never)\b",
-    re.IGNORECASE,
-)
+_NEGATOR_NEAR_BEFORE = 3  # words
+
+
+def _clause(text: str, start: int, end: int) -> tuple[str, str]:
+    """(the part of the clause before `start`, the part after `end`)."""
+    left = max((m.end() for m in _CLAUSE_BOUND.finditer(text, 0, start)), default=0)
+    right_match = _CLAUSE_BOUND.search(text, end)
+    return text[left:start], text[end : right_match.start() if right_match else len(text)]
+
+
+def _negated(text: str, match: re.Match[str]) -> bool:
+    before, after = _clause(text, match.start(), match.end())
+    near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+    return bool(_NEGATOR.search(near_before) or _NEGATOR.search(after))
 
 
 def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
-    """The first match of `pattern` that is not negated right before or after it."""
+    """The first match of `pattern` that is not negated inside its own clause."""
     for match in pattern.finditer(text):
-        before = text[max(0, match.start() - 30) : match.start()]
-        after = text[match.end() : match.end() + 30]
-        if _NEGATED_BEFORE.search(before) or _NEGATED_AFTER.match(after):
-            continue
-        return match
+        if not _negated(text, match):
+            return match
     return None
 
 
@@ -117,10 +124,26 @@ _PRESENCE = re.compile(
     r"|\bb(?:ü|ue)ro[\s-]*pr(?:ä|ae)senz|\bpr(?:ä|ae)senz\w*|\boffice\s+(?:days?|presence|attendance)\b"
     r"|\bb(?:ü|ue)rotage?\b|\bpresence\s+(?:in|at)\b"
     r"|\b(?:jeden|every|each)\s+(?:montag|dienstag|mittwoch|donnerstag|freitag"
-    r"|monday|tuesday|wednesday|thursday|friday)\b"
-    r"|\d\s*(?:tage?|days?|x)\s*(?:pro|per|a|/|in\s+der)?\s*(?:woche|week|monat|month)\b",
+    r"|monday|tuesday|wednesday|thursday|friday)\b",
     re.IGNORECASE,
 )
+# Office time the employee may choose is not a presence rule.
+_OPTIONAL = re.compile(
+    r"\boptional\w*|\bfreiwillig\w*|\bvoluntar\w*|\bauf\s+wunsch\b|\bnach\s+wunsch\b"
+    r"|\bif\s+you\s+(?:want|like|wish|prefer)\b|\bwenn\s+du\s+(?:willst|m(?:ö|oe)chtest)\b"
+    r"|\bkannst\b|\bk(?:ö|oe)nnen\b|\bcan\b",
+    re.IGNORECASE,
+)
+
+
+def _presence(text: str) -> re.Match[str] | None:
+    for match in _PRESENCE.finditer(text):
+        before, after = _clause(text, match.start(), match.end())
+        if _negated(text, match) or _OPTIONAL.search(before + " " + after):
+            continue
+        return match
+    return None
+
 
 # Countries outside Germany. US / USA / UK are case-sensitive ("us" is a pronoun).
 _COUNTRY = (
@@ -130,27 +153,36 @@ _COUNTRY = (
     r"|niederlande|ireland|irland|portugal|romania|rum(?:ä|ae)nien|usa|den\s+usa"
     r"|den\s+vereinigten\s+staaten|gro(?:ß|ss)britannien"
 )
-# A restriction names a country as the place the APPLICANT works from. "UK-based company" does not.
+_APPLICANT = r"(?:candidates?|applicants?|bewerber\w*|mitarbeiter\w*|talent)"
+# A restriction names a country as the place the APPLICANT works from. A company or customer
+# location ("UK-based company", "serves UK residents") does not.
 _COUNTRY_RESTRICTION = re.compile(
-    rf"\b(?:{_COUNTRY})[\s-]*(?:only|nur|residents?|(?:based\s+)?(?:candidates?|applicants?|employees?"
-    rf"|talent|bewerber\w*))\b"
+    rf"\b(?:{_COUNTRY})[\s-]*(?:only|nur)\b"
+    rf"|\b(?:{_COUNTRY})[\s-]*based\s+{_APPLICANT}\b"
     rf"|\bnur\s+(?:aus|in|f(?:ü|ue)r)\s+(?:dem\s+|der\s+|den\s+)?(?:{_COUNTRY})\b"
+    rf"|\bonly\s+{_APPLICANT}\s+(?:based|located|living|residing)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b{_APPLICANT}[^.;\n]{{0,30}}?\b(?:based|located|living|residing|wohnhaft|wohnsitz)\s+in\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\b(?:remote|home\s*-?\s*office|mobil\w*)[^.;\n]{{0,40}}?\b(?:only\s+)?(?:in|from|within|aus)\s+"
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
     re.IGNORECASE,
 )
 _BROAD = r"germany|deutschland|europe|europa|\beu\b|emea|dach|worldwide|global|weltweit"
-# Germany/Europe is an ALTERNATIVE place of work only when joined to the country directly
-# ("UK or Germany", "Poland / Deutschland", "US, incl. Germany"); customers in Germany are not.
-_ALTERNATIVE_AFTER = re.compile(
-    rf"^\s*(?:,|/|\+|or|oder|and|und|&|incl\.?|inkl\.?|including|einschlie(?:ß|ss)lich)?\s*"
-    rf"(?:incl\.?|inkl\.?|including)?\s*(?:{_BROAD})",
+# Germany/Europe is an ALTERNATIVE place of work only when joined to the country by or/und,
+# a slash or "incl." ("UK or Germany", "Poland / Deutschland"). ", Germany is our largest
+# market" or ", global customer base" are not alternatives.
+_JOIN = r"(?:/|\+|&|or|oder|and|und|incl\.?|inkl\.?|including|einschlie(?:ß|ss)lich)"
+_ARTICLE = r"(?:in\s+|im\s+|from\s+|aus\s+|within\s+)?(?:the\s+)?"
+_ALTERNATIVE_AFTER = re.compile(rf"^\s*{_JOIN}\s*{_ARTICLE}(?:{_BROAD})", re.IGNORECASE)
+_ALTERNATIVE_BEFORE = re.compile(rf"(?:{_BROAD})\s*{_JOIN}\s*{_ARTICLE}$", re.IGNORECASE)
+# A stated German region of work for remote jobs ("Remote in Deutschland", "bundesweit").
+_GERMAN_REMOTE = re.compile(
+    r"(?:remote|home\s*-?\s*office|mobil\w*)[^.;\n]{0,30}?\b(?:in|aus|from|within)\s+"
+    r"(?:germany|deutschland)\b|\b(?:deutschland|bundes)weit",
     re.IGNORECASE,
 )
-_ALTERNATIVE_BEFORE = re.compile(
-    rf"(?:{_BROAD})\s*(?:,|/|\+|or|oder|and|und|&)\s*(?:the\s+)?$", re.IGNORECASE
-)
+_FOREIGN_MENTION = re.compile(rf"\b(?:{_COUNTRY})\b", re.IGNORECASE)
 
 
 def _country_restriction(text: str) -> str | None:
@@ -174,9 +206,9 @@ class RemoteSignal:
 
 
 def classify_remote(text: str) -> RemoteSignal:
-    """Fully remote needs affirmative evidence AND no conflicting presence rule: any stated
-    office presence, hybrid wording or negation ("... ist nicht möglich") keeps the commute
-    gate on. Fails towards HYBRID/ONSITE, never towards skipping the gate."""
+    """Fully remote needs affirmative evidence AND no conflicting rule: stated office presence,
+    hybrid wording, a negation in the same clause, or an unresolved foreign country all keep the
+    commute gate on. Fails towards HYBRID/ONSITE/PARTIAL_REMOTE, never towards skipping the gate."""
     restriction = None
     region = _REMOTE_REGION.search(text)
     if region:
@@ -192,15 +224,19 @@ def classify_remote(text: str) -> RemoteSignal:
     up_to = _UP_TO_REMOTE.search(text)
     if up_to:
         return done("PARTIAL_REMOTE", up_to)
-    hybrid = _HYBRID.search(text) or _affirmed(_PRESENCE, text)
+    hybrid = _affirmed(_HYBRID, text) or _presence(text)
     full = _affirmed(_FULLY_REMOTE, text)
+    regional = _affirmed(_REMOTE_REGIONAL, text)
     if hybrid:
         return done("HYBRID", hybrid)
-    if full:
-        return done("FULLY_REMOTE", full)
-    regional = _affirmed(_REMOTE_REGIONAL, text)
-    if regional:
-        return done("FULLY_REMOTE", regional)
+    if full or regional:
+        confirmed = full or regional
+        german = regional or _GERMAN_REMOTE.search(text)
+        if _FOREIGN_MENTION.search(text) and not german:
+            # a country outside Germany is named and no German region of work is stated:
+            # not confirmed as workable from Germany -> manual review, commute gate stays on
+            return done("PARTIAL_REMOTE", confirmed)
+        return done("FULLY_REMOTE", confirmed)
     some = _SOME_REMOTE.search(text)
     if some:
         # a negated mention ("Homeoffice ist nicht möglich") is an on-site statement
