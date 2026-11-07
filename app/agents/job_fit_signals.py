@@ -99,7 +99,13 @@ _NEGATOR = re.compile(
     r"|unable|leider)\b",
     re.IGNORECASE,
 )
-_NEGATOR_NEAR_BEFORE = 3  # words
+_NEGATOR_NEAR_BEFORE = 6  # words
+# "No remote experience required", "Remote-Erfahrung": a requirement about skills or equipment,
+# not a statement about whether the job can be done remotely.
+_REMOTE_SKILL_NOUN = re.compile(
+    r"^\w*[\s-]*(?:experience|erfahrung|kenntnisse|skills?|tools?|setup|ausstattung|equipment)",
+    re.IGNORECASE,
+)
 
 
 def _clause(text: str, start: int, end: int) -> tuple[str, str]:
@@ -176,7 +182,10 @@ _COUNTRY_RESTRICTION = re.compile(
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\b(?:remote|home\s*-?\s*office|mobil\w*)[^.;\n]{{0,40}}?\b(?:only\s+)?(?:in|from|within|aus)\s+"
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
-    rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
+    rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:permitted|allowed|erlaubt|possible|m(?:ö|oe)glich)\s+(?:only\s+|nur\s+)(?:from|in|aus)\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\bonly\s+(?:from|in)\s+(?:the\s+)?(?:{_COUNTRY})\b",
     re.IGNORECASE,
 )
 _BROAD = r"germany|deutschland|europe|europa|\beu\b|emea|dach|worldwide|global|weltweit"
@@ -198,12 +207,21 @@ _FOREIGN_MENTION = re.compile(rf"\b(?:{_COUNTRY})\b", re.IGNORECASE)
 _ELIGIBILITY_WORDING = re.compile(
     r"\bonly\b|\bnur\b|\bausschlie(?:ß|ss)lich\b|\bexclusively\b|\beligible\b|\bresidents?\b"
     r"|\bcitizens?\b|\bwohnsitz\b|\bwohnhaft\b|\bwork\s+(?:permit|authori[sz]ation)\b"
-    r"|\barbeitserlaubnis\b|\bvisa\b|\bans(?:ä|ae)ssig\b",
+    r"|\barbeitserlaubnis\b|\bvisa\b|\bans(?:ä|ae)ssig\b|\bresid(?:e|es|ing)\b|\bliv(?:e|es|ing)\s+in\b"
+    r"|\bbased\s+in\b|\blocated\s+in\b|\bpermitted\b|\ballowed\b|\berlaubt\b",
     re.IGNORECASE,
 )
 _ELIGIBILITY_SUBJECT = re.compile(
-    r"remote|home\s*-?\s*office|candidates?|applicants?|bewerb\w*|resident|wohn|based|located"
-    r"|work\s+from|arbeit\w*\s+(?:aus|in|von)|eligible|permit|visa|citizen",
+    r"remote|home\s*-?\s*office|candidates?|applicants?|bewerb\w*|resident|resid|wohn|based|located"
+    r"|work\b|arbeit\w*|eligible|permit|visa|citizen|liv(?:e|ing)|you\b|du\b|sie\b|erlaubt|allowed",
+    re.IGNORECASE,
+)
+# A broad region named in the SAME clause resolves the wording ("only within the EU").
+_BROAD_REGION = re.compile(rf"\b(?:{_BROAD})", re.IGNORECASE)
+
+
+_ADDITIVE = re.compile(
+    r"\balso\b|\bauch\b|\bebenfalls\b|\badditionally\b|\bzus(?:ä|ae)tzlich\b|\bbesides\b|\bas\s+well\b",
     re.IGNORECASE,
 )
 
@@ -216,16 +234,24 @@ def _country_restriction(text: str) -> str | None:
             continue
         if _negated(text, match) or _NEGATOR.search(match.group(0)):  # "need not be based in"
             continue
+        clause_before, clause_after = _clause(text, match.start(), match.end())
+        if _ADDITIVE.search(clause_before + " " + clause_after):  # "also available from Poland"
+            continue
         return " ".join(match.group(0).split())[:40]
     return None
 
 
 def _unresolved_eligibility(text: str) -> bool:
-    """A clause limits who may take the job (only / nur / residents / eligible ...) and about
-    the work place or the applicant, without stating that work from Germany is allowed."""
+    """A clause limits who may take the job or where it may be done (only / nur / residents /
+    must reside / permitted ...) without naming Germany, the EU or another broad region IN THE
+    SAME CLAUSE. A region stated elsewhere does not resolve it ("Fully remote EU. Work is
+    permitted only from Poland.")."""
     for match in _ELIGIBILITY_WORDING.finditer(text):
         before, after = _clause(text, match.start(), match.end())
-        if _ELIGIBILITY_SUBJECT.search(before + " " + after) and not _negated(text, match):
+        clause = before + " " + after
+        if _negated(text, match) or _BROAD_REGION.search(clause):
+            continue
+        if _ELIGIBILITY_SUBJECT.search(clause):
             return True
     return False
 
@@ -243,6 +269,17 @@ class RemoteSignal:
     eligibility_unverified: bool = False
 
 
+def _remote_denied(text: str) -> bool:
+    """A remote/home-office mention that is negated in its own clause ("kein Homeoffice",
+    "unable to support working remotely"), ignoring requirements about remote SKILLS."""
+    for match in _SOME_REMOTE.finditer(text):
+        if _REMOTE_SKILL_NOUN.match(text[match.end() : match.end() + 30].lstrip(" -")):
+            continue
+        if _negated(text, match):
+            return True
+    return False
+
+
 def classify_remote(text: str) -> RemoteSignal:
     """FULLY_REMOTE (which skips the commute gate) needs clean affirmative evidence: a full-remote
     phrase, no office/presence vocabulary outside a negated or optional clause, no denial of remote
@@ -257,30 +294,32 @@ def classify_remote(text: str) -> RemoteSignal:
     def done(mode: RemoteMode, match: re.Match[str], unverified: bool = False) -> RemoteSignal:
         return RemoteSignal(mode, restriction, country, _snippet(text, match), unverified)
 
+    unresolved = _unresolved_eligibility(text) if _SOME_REMOTE.search(text) else False
     onsite = _NO_REMOTE.search(text)
     if onsite:
         return done("ONSITE", onsite)
     up_to = _UP_TO_REMOTE.search(text)
     if up_to:
-        return done("PARTIAL_REMOTE", up_to)
+        return done("PARTIAL_REMOTE", up_to, unresolved)
     some = _SOME_REMOTE.search(text)
-    if some and any(_negated(text, m) for m in _SOME_REMOTE.finditer(text)):
+    if some and _remote_denied(text):
         # remote work is denied somewhere in the text: whatever else it says, it is on-site
         return done("ONSITE", some)
     hybrid = _affirmed(_HYBRID, text) or _presence(text)
     if hybrid:
-        return done("HYBRID", hybrid)
+        return done("HYBRID", hybrid, unresolved)
     full = _affirmed(_FULLY_REMOTE, text)
     regional = _affirmed(_REMOTE_REGIONAL, text)
     if full or regional:
         confirmed = full or regional
         german = bool(regional or _GERMAN_REMOTE.search(text))
-        if not german and (_FOREIGN_MENTION.search(text) or _unresolved_eligibility(text)):
+        foreign = bool(_FOREIGN_MENTION.search(text)) and not german
+        if unresolved or foreign:
             # who may do this remote job is unclear: not confirmed as workable from Germany
             return done("PARTIAL_REMOTE", confirmed, unverified=True)
         return done("FULLY_REMOTE", confirmed)
     if some:
-        return done("PARTIAL_REMOTE", some)
+        return done("PARTIAL_REMOTE", some, unresolved)
     return RemoteSignal("UNKNOWN")
 
 

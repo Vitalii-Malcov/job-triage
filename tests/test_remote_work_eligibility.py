@@ -404,3 +404,43 @@ class TestAdversarialPostings:
 )
 def test_a_negation_belongs_only_to_the_word_it_follows(text, mode):
     assert classify_work_time(text).mode == mode
+
+
+class TestRound4Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote. We are unable to support working remotely.",
+            "Full-time. No remote experience required, but 100% on-site. We cannot offer remote.",
+        ],
+    )
+    def test_long_range_denial_keeps_the_commute_gate(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") in {"ONSITE", "HYBRID"}
+        assert _status(a, "location") != "REMOTE_OK"
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote EU. Work is permitted only from Poland.",
+            "Fully remote. Applicants must reside in Estonia.",
+            "Fully remote. Only residents of Poland may apply. Office visits are required.",
+        ],
+    )
+    def test_restriction_is_not_cancelled_by_a_region_or_a_hybrid_rule(self, description):
+        near = {"location": "Offenbach", "workplace_lat": 50.1, "workplace_lon": 8.77}
+        a = _assessment(description, place=near)
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. No remote experience required.",
+            "Fully remote in Germany. Remote work from Poland is also available.",
+        ],
+    )
+    def test_skill_requirements_and_additional_locations_do_not_exclude(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "COMPATIBLE"
+        assert automatic_block_reason(a) is None

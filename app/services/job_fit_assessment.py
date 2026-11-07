@@ -575,7 +575,7 @@ def remote_criterion(
         stated = _ba_home_office(job)
         if stated is not None:
             return stated
-    if signal.country_restriction and signal.mode in {"FULLY_REMOTE", "PARTIAL_REMOTE"}:
+    if signal.country_restriction and signal.mode in {"FULLY_REMOTE", "PARTIAL_REMOTE", "HYBRID"}:
         # remote work limited to a country other than Germany: no commute question, but the
         # candidate cannot take it up from Germany (unless the posting says otherwise)
         return Criterion(
