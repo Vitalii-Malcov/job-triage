@@ -171,6 +171,14 @@ def _near(text: str, match: re.Match[str], words: int = 4) -> str:
     return " ".join(before.split()[-words:] + after.split()[:words])
 
 
+# Unambiguous obligation. Deliberately not "required" / "Pflicht" ("keine Pflicht", "not required").
+_STRONG_OBLIGATION = re.compile(
+    r"\bmandatory\b|\bmust\b|\bzwingend\b|\bverpflichtend\b|\bnot\s+optional\b"
+    r"|\bnicht\s+(?:optional|freiwillig)\b",
+    re.IGNORECASE,
+)
+
+
 def _presence(text: str) -> re.Match[str] | None:
     """Office vocabulary that stands. Negation or optionality must sit right next to the phrase
     ("keine Büropräsenz", "no office attendance required", "kannst optional ins Büro"); an
@@ -179,6 +187,9 @@ def _presence(text: str) -> re.Match[str] | None:
         before, after = _clause(text, match.start(), match.end())
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
         after_head = " ".join(after.split()[:6])
+        clause = f"{before} {match.group(0)} {after}"
+        if _STRONG_OBLIGATION.search(clause):
+            return match  # "mandatory", "not optional": nothing else in the clause cancels it
         if (
             _NEGATOR.search(near_before)
             or _NOT_NEEDED.search(after_head)
@@ -205,7 +216,8 @@ _APPLICANT = r"(?:candidates?|applicants?|bewerber\w*|mitarbeiter\w*|talent|resi
 # location ("UK-based company", "serves UK residents") does not.
 _COUNTRY_RESTRICTION = re.compile(
     rf"\b(?:{_COUNTRY})[\s-]*(?:only|nur)\b"
-    rf"|\b(?:{_COUNTRY})[\s-]*based\s+{_APPLICANT}\b"
+    rf"|\b(?:{_COUNTRY})[\s-]*based\s+{_APPLICANT}\s+(?:only|nur|are\s+(?:eligible|required)"
+    rf"|may\s+apply|wanted|needed|required)\b"
     rf"|\bnur\s+(?:aus|in|f(?:ü|ue)r)\s+(?:dem\s+|der\s+|den\s+)?(?:{_COUNTRY})\b"
     rf"|\bonly\s+{_APPLICANT}\s+(?:of|from|in|based|located|living|residing)\s+(?:in\s+)?"
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
@@ -256,7 +268,9 @@ _BROAD_REGION = re.compile(rf"\b(?:{_BROAD})", re.IGNORECASE)
 
 
 _ADDITIVE = re.compile(
-    r"\balso\b|\bauch\b|\bebenfalls\b|\badditionally\b|\bzus(?:ä|ae)tzlich\b|\bbesides\b|\bas\s+well\b",
+    r"\balso\s+(?:available|possible|permitted|allowed|an\s+option)\b"
+    r"|\b(?:auch|ebenfalls|zus(?:ä|ae)tzlich)\s+(?:m(?:ö|oe)glich|erlaubt|angeboten)\b"
+    r"|\bas\s+well\b|\bin\s+addition\s+to\b",
     re.IGNORECASE,
 )
 
@@ -267,8 +281,9 @@ def _country_restriction(text: str) -> str | None:
         before = text[max(0, match.start() - 40) : match.start()]
         if _ALTERNATIVE_AFTER.match(after) or _ALTERNATIVE_BEFORE.search(before):
             continue
-        if _negated(text, match) or _NEGATOR.search(match.group(0)):  # "need not be based in"
-            continue
+        before_words = " ".join(text[max(0, match.start() - 60) : match.start()].split()[-3:])
+        if _NEGATOR.search(before_words) or _NEGATOR.search(match.group(0)):
+            continue  # "need not be based in the UK"; "no exceptions" later on does not count
         clause_before, clause_after = _clause(text, match.start(), match.end())
         if _ADDITIVE.search(clause_before + " " + clause_after):  # "also available from Poland"
             continue
@@ -309,7 +324,7 @@ class RemoteSignal:
 _DENIAL_AFTER = re.compile(
     r"\b(?:nicht|not|kein\w*|never|nie)\b\W+(?:\w+\W+){0,2}?(?:m(?:ö|oe)glich|possible|available"
     r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
-    r"|der\s+fall)\b",
+    r"|der\s+fall|permitted|gestattet)\b",
     re.IGNORECASE,
 )
 
@@ -326,6 +341,12 @@ def _affirmed_phrase(pattern: re.Pattern[str], text: str) -> re.Match[str] | Non
     return None
 
 
+_SKILL_BETWEEN = re.compile(
+    r"\b(?:experience|erfahrung|kenntnisse|skills?|equipment|ausstattung|knowledge)\b",
+    re.IGNORECASE,
+)
+
+
 def _remote_denied(text: str) -> bool:
     """A remote/home-office mention that is denied in its own clause ("kein Homeoffice",
     "unable to support working remotely", "Remote ist nicht möglich"), ignoring requirements
@@ -335,6 +356,8 @@ def _remote_denied(text: str) -> bool:
             continue
         before, after = _clause(text, match.start(), match.end())
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _SKILL_BETWEEN.search(near_before):
+            continue  # "No prior experience is necessary for remote work"
         if _NEGATOR.search(near_before) or _DENIAL_AFTER.search(after):
             return True
     return False

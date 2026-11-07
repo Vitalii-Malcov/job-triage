@@ -485,3 +485,43 @@ class TestRound5Postings:
         a = _assessment(description, place=BERLIN)
         assert _status(a, "remote") == "COMPATIBLE"
         assert _status(a, "location") == "REMOTE_OK"
+
+
+class TestRound6Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. No exceptions to mandatory office attendance.",
+            "Fully remote in Germany. Office attendance is not optional.",
+            "Fully remote in Germany. Remote working is not permitted.",
+        ],
+    )
+    def test_strong_obligation_and_denial_wording(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") in {"HYBRID", "ONSITE", "PARTIAL_REMOTE"}
+        assert _status(a, "location") != "REMOTE_OK"
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. Work is restricted to Poland with no exceptions.",
+            "Fully remote in Germany. We also require residency in Poland.",
+        ],
+    )
+    def test_restriction_survives_unrelated_negation_and_also(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. Our platform serves UK-based candidates.",
+            "Fully remote in Germany. No prior experience is necessary for remote work.",
+        ],
+    )
+    def test_customer_description_and_experience_wording_do_not_exclude(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "COMPATIBLE"
+        assert automatic_block_reason(a) is None
