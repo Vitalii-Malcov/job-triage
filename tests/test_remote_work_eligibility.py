@@ -525,3 +525,27 @@ class TestRound6Postings:
         a = _assessment(description, place=BERLIN)
         assert _status(a, "remote") == "COMPATIBLE"
         assert automatic_block_reason(a) is None
+
+
+class TestRound7Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. No exceptions to required office attendance.",
+            "Fully remote in Germany. Remote work is prohibited.",
+            "Fully remote in Germany. Remote work is forbidden.",
+            "Fully remote in Germany. Remote Arbeit ist ausgeschlossen.",
+            "Fully remote in Germany. No equipment will be provided for remote work because it "
+            "is not permitted.",
+        ],
+    )
+    def test_prohibition_and_required_attendance_keep_the_commute_gate(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") in {"HYBRID", "ONSITE", "PARTIAL_REMOTE"}
+        assert _status(a, "location") != "REMOTE_OK"
+        assert automatic_block_reason(a) is not None
+
+    def test_no_exceptions_does_not_cancel_a_country_restriction(self):
+        a = _assessment("Fully remote in Germany. No exceptions: only from Poland.")
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None

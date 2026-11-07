@@ -99,6 +99,17 @@ _NEGATOR = re.compile(
     r"|unable|leider)\b",
     re.IGNORECASE,
 )
+# "No exceptions" / "not only" are emphasis, not a negation of what they stress.
+_NEGATION_IDIOM = re.compile(
+    r"\bno\s+(?:exceptions?|doubt|worries)\b|\bnot\s+only\b|\bkeine\s+ausnahmen?\b|\bohne\s+ausnahme\b",
+    re.IGNORECASE,
+)
+
+
+def _has_negator(text: str) -> bool:
+    return bool(_NEGATOR.search(_NEGATION_IDIOM.sub(" ", text)))
+
+
 _NEGATOR_NEAR_BEFORE = 6  # words
 # "No remote experience required", "Remote-Erfahrung": a requirement about skills or equipment,
 # not a statement about whether the job can be done remotely.
@@ -118,7 +129,7 @@ def _clause(text: str, start: int, end: int) -> tuple[str, str]:
 def _negated(text: str, match: re.Match[str]) -> bool:
     before, after = _clause(text, match.start(), match.end())
     near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
-    return bool(_NEGATOR.search(near_before) or _NEGATOR.search(after))
+    return bool(_has_negator(near_before) or _has_negator(after))
 
 
 def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
@@ -174,6 +185,7 @@ def _near(text: str, match: re.Match[str], words: int = 4) -> str:
 # Unambiguous obligation. Deliberately not "required" / "Pflicht" ("keine Pflicht", "not required").
 _STRONG_OBLIGATION = re.compile(
     r"\bmandatory\b|\bmust\b|\bzwingend\b|\bverpflichtend\b|\bnot\s+optional\b"
+    r"|\brequired\s+(?:office|on-?site|attendance|presence|b(?:ü|ue)ro|pr(?:ä|ae)senz)"
     r"|\bnicht\s+(?:optional|freiwillig)\b",
     re.IGNORECASE,
 )
@@ -191,7 +203,7 @@ def _presence(text: str) -> re.Match[str] | None:
         if _STRONG_OBLIGATION.search(clause):
             return match  # "mandatory", "not optional": nothing else in the clause cancels it
         if (
-            _NEGATOR.search(near_before)
+            _has_negator(near_before)
             or _NOT_NEEDED.search(after_head)
             or _OFFICE_OPTIONAL.search(_near(text, match))
         ):
@@ -282,7 +294,7 @@ def _country_restriction(text: str) -> str | None:
         if _ALTERNATIVE_AFTER.match(after) or _ALTERNATIVE_BEFORE.search(before):
             continue
         before_words = " ".join(text[max(0, match.start() - 60) : match.start()].split()[-3:])
-        if _NEGATOR.search(before_words) or _NEGATOR.search(match.group(0)):
+        if _has_negator(before_words) or _has_negator(match.group(0)):
             continue  # "need not be based in the UK"; "no exceptions" later on does not count
         clause_before, clause_after = _clause(text, match.start(), match.end())
         if _ADDITIVE.search(clause_before + " " + clause_after):  # "also available from Poland"
@@ -324,7 +336,9 @@ class RemoteSignal:
 _DENIAL_AFTER = re.compile(
     r"\b(?:nicht|not|kein\w*|never|nie)\b\W+(?:\w+\W+){0,2}?(?:m(?:ö|oe)glich|possible|available"
     r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
-    r"|der\s+fall|permitted|gestattet)\b",
+    r"|der\s+fall|permitted|gestattet)\b"
+    # a prohibition carries its own negation: "Remote work is prohibited / ist ausgeschlossen"
+    r"|\b(?:prohibited|forbidden|banned|ausgeschlossen|untersagt|verboten)\b",
     re.IGNORECASE,
 )
 
@@ -335,7 +349,7 @@ def _affirmed_phrase(pattern: re.Pattern[str], text: str) -> re.Match[str] | Non
     for match in pattern.finditer(text):
         before, after = _clause(text, match.start(), match.end())
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
-        if _NEGATOR.search(near_before) or _DENIAL_AFTER.search(after):
+        if _has_negator(near_before) or _DENIAL_AFTER.search(after):
             continue
         return match
     return None
@@ -356,9 +370,11 @@ def _remote_denied(text: str) -> bool:
             continue
         before, after = _clause(text, match.start(), match.end())
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _DENIAL_AFTER.search(after):
+            return True  # "... for remote work because it is not permitted"
         if _SKILL_BETWEEN.search(near_before):
             continue  # "No prior experience is necessary for remote work"
-        if _NEGATOR.search(near_before) or _DENIAL_AFTER.search(after):
+        if _has_negator(near_before):
             return True
     return False
 
