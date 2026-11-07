@@ -39,6 +39,7 @@ from app.agents.job_domain import OFF_TARGET_DOMAINS, extract_domain_profile, ti
 from app.agents.job_fit_signals import (
     asks_immediate_start,
     classify_remote,
+    classify_work_time,
     entry_level_signals,
     extract_german_requirement,
     extract_salary,
@@ -131,6 +132,8 @@ _STRETCH = {
     ("education", "IT_DEGREE_REQUIRED"),
     ("entry_level", "STUDENT_JOB"),
     ("skills", "WEAK"),
+    # the candidate looks for full-time work; a part-time-only posting is the operator's call
+    ("work_time", "PART_TIME"),
 }
 _WEAKER = {
     ("skills", "PARTIAL"),
@@ -569,6 +572,16 @@ def remote_criterion(
         stated = _ba_home_office(job)
         if stated is not None:
             return stated
+    if signal.country_restriction and signal.mode in {"FULLY_REMOTE", "PARTIAL_REMOTE"}:
+        # remote work limited to a country other than Germany: no commute question, but the
+        # candidate cannot take it up from Germany (unless the posting says otherwise)
+        return Criterion(
+            "remote",
+            "INCOMPATIBLE",
+            f"remote work is restricted to {signal.country_restriction}; "
+            f"the candidate works from {settings.remote_work_from_region or 'Germany'}",
+            signal.evidence,
+        )
     if signal.mode != "FULLY_REMOTE":
         reasons = {
             "PARTIAL_REMOTE": "remote/home office mentioned but not confirmed as fully remote",
@@ -591,6 +604,22 @@ def remote_criterion(
     return Criterion(
         "remote", "COMPATIBLE", f"fully remote; work from {region} allowed", signal.evidence
     )
+
+
+def work_time_criterion(text: str) -> Criterion:
+    """Informational unless the posting is part-time only (then a stated gap). A missing
+    working time is never a reason to hold a vacancy."""
+    signal = classify_work_time(text)
+    if signal.mode == "FULL_TIME":
+        return Criterion("work_time", "FULL_TIME", "full-time stated", signal.evidence)
+    if signal.mode == "PART_TIME":
+        return Criterion(
+            "work_time",
+            "PART_TIME",
+            "part-time only; the candidate looks for full time",
+            signal.evidence,
+        )
+    return Criterion("work_time", "UNKNOWN", "working time not stated")
 
 
 def _same_origin(check: JobCommuteCheckRecord, settings: CandidateSearchSettings, label) -> bool:
@@ -1125,6 +1154,7 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         language_criterion(text, german_level),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
         remote,
+        work_time_criterion(text),
         salary_criterion(text, settings),
         entry_level_criterion(job.title, job.description or ""),
         education_criterion(job.description or "", job.quereinstieg_suitable),

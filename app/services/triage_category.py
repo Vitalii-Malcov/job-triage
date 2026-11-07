@@ -21,7 +21,7 @@ category never replaces the fit tier -- `shortlist_gate.AUTO_PREPARE_TIERS` stay
 the only rule that admits automatic preparation.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from app.agents.target_role import hybrid_support_admin_family, is_developer_title
@@ -57,7 +57,21 @@ _ROUTE_OPEN = frozenset(
 
 # Lower is better; the shortlist ranks PRIMARY before ADJACENT whatever the match score.
 _RANK = {"PRIMARY": 0, "ADJACENT": 1, "MANUAL_REVIEW": 2, "EXCLUDED": 3}
-UNKNOWN_RANK = 1
+# Within a role family: fully remote work (no commute) before hybrid before on-site / unknown.
+_FORMAT_RANK = {"FULL_REMOTE": 0, "HYBRID": 1}
+_FORMAT_OTHER_RANK = 2
+_FORMATS = 3
+# Neutral rank for a failed assessment (that job is blocked anyway): ADJACENT, fully remote.
+UNKNOWN_RANK = _RANK["ADJACENT"] * _FORMATS
+
+REMOTE_UNVERIFIED = "REMOTE_UNVERIFIED"
+_REMOTE_FORMAT = {
+    "COMPATIBLE": "FULL_REMOTE",
+    "HYBRID": "HYBRID",
+    "ONSITE": "ONSITE",
+    "PARTIAL_REMOTE": REMOTE_UNVERIFIED,
+    "INCOMPATIBLE": "REMOTE_RESTRICTED",
+}
 
 
 @dataclass(frozen=True)
@@ -65,13 +79,23 @@ class TriageCategory:
     category: Category
     code: str
     reason: str
+    # FULL_REMOTE | HYBRID | ONSITE | REMOTE_UNVERIFIED | REMOTE_RESTRICTED | UNKNOWN
+    work_format: str = "UNKNOWN"
 
     @property
     def rank(self) -> int:
-        return _RANK[self.category]
+        """Ordering key (lower first): role family, then work format. Ranking only."""
+        within = _FORMAT_RANK.get(self.work_format, _FORMAT_OTHER_RANK)
+        return _RANK[self.category] * _FORMATS + within
 
 
 def classify(assessment: FitAssessment) -> TriageCategory:
+    result = _classify_direction(assessment)
+    remote = next((c.status for c in assessment.criteria if c.name == "remote"), None)
+    return replace(result, work_format=_REMOTE_FORMAT.get(remote, "UNKNOWN"))
+
+
+def _classify_direction(assessment: FitAssessment) -> TriageCategory:
     tier = assessment.fit_tier
     status = {c.name: c.status for c in assessment.criteria}
     role = status.get("role")
@@ -118,5 +142,10 @@ def _manual(assessment: FitAssessment, status: dict[str, str]) -> TriageCategory
         # the tier shows the open fact first; the operator must also see the skill gap
         first += " [skills WEAK: low required-skill coverage]"
     if status.get("location") in _ROUTE_OPEN:
-        return TriageCategory("MANUAL_REVIEW", ROUTE_REVIEW_REQUIRED, first)
+        # remote work was stated but its terms are unclear: the operator may settle the route
+        # question by reading the remote conditions instead
+        code = (
+            REMOTE_UNVERIFIED if status.get("remote") == "PARTIAL_REMOTE" else ROUTE_REVIEW_REQUIRED
+        )
+        return TriageCategory("MANUAL_REVIEW", code, first)
     return TriageCategory("MANUAL_REVIEW", DATA_REVIEW_REQUIRED, first)

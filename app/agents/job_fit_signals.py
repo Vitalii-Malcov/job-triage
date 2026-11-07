@@ -56,6 +56,17 @@ _FULLY_REMOTE = re.compile(
     r"|arbeitsort\s*:\s*remote",
     re.IGNORECASE,
 )
+_FULLY_REMOTE = re.compile(
+    _FULLY_REMOTE.pattern + r"|home\s*-?\s*office\s*(?:zu\s*)?100\s*%|remote\s*\(\s*100\s*%",
+    re.IGNORECASE,
+)
+# "Remote Germany", "Remote EU", "Germany-wide remote": a stated region of work, weaker than
+# "100 % remote". Only used when the posting names no hybrid / on-site rule (see classify_remote).
+_REMOTE_REGIONAL = re.compile(
+    r"remote[\s(/-]*(?:in\s+|within\s+)?(?:germany|deutschland|eu|europe|europa|dach)\b"
+    r"|\b(?:germany|deutschland|eu|europe|europa|dach)[\s)/-]*remote\b",
+    re.IGNORECASE,
+)
 _NO_REMOTE = re.compile(
     r"kein(?:e|en)?\s+(?:home\s*-?\s*office|remote|mobiles\s+arbeiten)"
     r"|(?:ausschließlich|ausschliesslich|nur)\s+vor\s+ort",
@@ -76,11 +87,44 @@ _REMOTE_REGION = re.compile(
 )
 
 
+# A country outside Germany the remote work is restricted to ("Remote US only", "UK-based").
+# US / USA / UK are case-sensitive ("us" is a pronoun). Named only as a restriction.
+_COUNTRY = (
+    r"(?-i:US|USA|UK|U\.S\.)|united\s+states|united\s+kingdom|great\s+britain|canada|australia"
+    r"|india|brazil|mexico"
+)
+_COUNTRY_RESTRICTION = re.compile(
+    rf"\b(?:{_COUNTRY})[\s-]*(?:only|based|residents?)\b"
+    rf"|\b(?:remote|home\s*-?\s*office)[^.;\n]{{0,40}}?\b(?:only\s+)?(?:in|from|within)\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
+    re.IGNORECASE,
+)
+# A clause that also names Germany / Europe / the world is not a restriction to that country.
+_BROAD_REGION = re.compile(
+    r"germany|deutschland|europe|europa|\beu\b|emea|dach|worldwide|global|weltweit", re.IGNORECASE
+)
+_CLAUSE_END = re.compile(r"[.;\n]")
+
+
+def _country_restriction(text: str) -> str | None:
+    for match in _COUNTRY_RESTRICTION.finditer(text):
+        start = max((m.end() for m in _CLAUSE_END.finditer(text, 0, match.start())), default=0)
+        end_match = _CLAUSE_END.search(text, match.end())
+        clause = text[start : end_match.start() if end_match else len(text)]
+        if _BROAD_REGION.search(clause):
+            continue
+        return " ".join(match.group(0).split())[:40]
+    return None
+
+
 @dataclass(frozen=True)
 class RemoteSignal:
     mode: RemoteMode
-    # A German state the remote work is restricted to, if the posting says so.
+    # A German state or a foreign country the remote work is restricted to, if the posting says so.
     region_restriction: str | None = None
+    # Remote work limited to a country outside Germany ("Remote US only"); never a commute question.
+    country_restriction: str | None = None
     evidence: str | None = None
 
 
@@ -89,16 +133,18 @@ def classify_remote(text: str) -> RemoteSignal:
     region = _REMOTE_REGION.search(text)
     if region:
         restriction = _STATES[region.group(1).lower()]
+    country = _country_restriction(text) if _SOME_REMOTE.search(text) else None
     for pattern, mode in (
         (_NO_REMOTE, "ONSITE"),
         (_UP_TO_REMOTE, "PARTIAL_REMOTE"),
         (_FULLY_REMOTE, "FULLY_REMOTE"),
         (_HYBRID, "HYBRID"),
+        (_REMOTE_REGIONAL, "FULLY_REMOTE"),
         (_SOME_REMOTE, "PARTIAL_REMOTE"),
     ):
         match = pattern.search(text)
         if match:
-            return RemoteSignal(mode, restriction, _snippet(text, match))
+            return RemoteSignal(mode, restriction, country, _snippet(text, match))
     return RemoteSignal("UNKNOWN")
 
 
@@ -633,3 +679,28 @@ _IMMEDIATE = re.compile(r"ab\s+sofort|zum\s+nächstmöglichen|zum\s+naechstmoegl
 
 def asks_immediate_start(text: str) -> bool:
     return bool(_IMMEDIATE.search(text))
+
+
+# --- working time ---------------------------------------------------------
+
+WorkTimeMode = Literal["FULL_TIME", "PART_TIME", "UNKNOWN"]
+_FULL_TIME = re.compile(r"\bvollzeit\w*|\bfull[\s-]?time\b", re.IGNORECASE)
+_PART_TIME = re.compile(r"\bteilzeit\w*|\bpart[\s-]?time\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class WorkTimeSignal:
+    mode: WorkTimeMode
+    evidence: str | None = None
+
+
+def classify_work_time(text: str) -> WorkTimeSignal:
+    """What the posting states about working hours. "Vollzeit oder Teilzeit" counts as
+    full time (it is offered); only an unqualified part-time posting is PART_TIME."""
+    full = _FULL_TIME.search(text)
+    if full:
+        return WorkTimeSignal("FULL_TIME", _snippet(text, full))
+    part = _PART_TIME.search(text)
+    if part:
+        return WorkTimeSignal("PART_TIME", _snippet(text, part))
+    return WorkTimeSignal("UNKNOWN")
