@@ -155,6 +155,7 @@ class TestRoleFamily:
             "IT-Administrator / (Softwareentwickler)",
             "IT-Support für Softwareentwickler",
             "IT-Support - Anwendungsentwickler",
+            "IT-Support - Platform / Python Entwickler",
             "IT-Support - Software-Entwickler",
             "IT-Support (für unsere) Plattform / Python Entwickler",
             "Systemadministrator und Python Entwickler",
@@ -174,6 +175,12 @@ class TestRoleFamily:
             "Junior Python Developer (m/w/d)",
             "Backend Entwickler mit Docker und Linux",
             "FastAPI Developer",
+            "Backend Entwickler Linux/Docker (m/w/d)",
+            "Junior Python Entwickler Service Desk Tools (m/w/d)",
+            "Junior Software Developer IT-Support Tools",
+            "Software Development Engineer - IT-Support Tools",
+            "Junior Python Entwickler für IT-Support-Plattform",
+            "Junior Python Entwickler Applikation für Service Desk Lösung",
         ],
     )
     def test_developer_title_with_infrastructure_words_is_not_a_hybrid(self, title):
@@ -340,3 +347,13 @@ def test_developer_title_with_weak_skills_and_a_gap_stays_a_manual_review():
     a = _assessment(title="Softwareentwickler (m/w/d)", role="OTHER", skills="WEAK", language="GAP")
     assert a.fit_tier == "STRETCH"
     assert classify(a).category == "MANUAL_REVIEW"
+
+
+@pytest.mark.parametrize(
+    "title", ["Linux Admin Python", "Database Admin Python (m/w/d)", "Windows Admin / Powershell"]
+)
+def test_explicit_admin_titles_are_excluded_before_role_priorities(title):
+    a = _from_real_role_criterion(title, primary=[], secondary=["Python"])
+    assert a.criterion("role").status == "OFF_ROLE"
+    assert classify(a).category == "EXCLUDED"
+    assert automatic_block_reason(a) == "FIT_TIER_NOT_SUITABLE"

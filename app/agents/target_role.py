@@ -52,7 +52,7 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         (
             "administrator",
             r"\b\w*administrat(?:or|orin|oren|orinnen)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
-            r"[\s-]*administration\b|\b(?:it|system)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
+            r"[\s-]*administration\b|\b(?:it|system|linux|unix|windows|datenbank|database|db|cloud|server|netzwerk|network)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
         ),
         ("it-systemelektroniker", r"\b(?:it[\s-]*)?systemelektroniker(?:in|innen)?\b"),
         ("systemintegration", r"\bsystemintegrat(?:or|orin|ion)\b|\bit[\s-]?systemintegrat\w*"),
@@ -109,8 +109,8 @@ _GENDER_ONLY = re.compile(r"^(?:[mwdfx]|gn|divers|all|genders|[\*/|:_,\s])+$", r
 # The support/admin word names the PRODUCT being built ("... IT-Support Tools"), not the job.
 # Whole words only; a developer-role phrase ("Software-Entwickler") is never a product.
 _PRODUCT_NOUN = re.compile(
-    r"(?:tools?|software|plattformen?|platforms?|systems?|systeme|portale?|anwendungen|anwendung|"
-    r"applikationen?|l(?:ö|oe)sungen?|produkte?|apps?)\b",
+    r"(?:tools?|software|plattform(?:en)?|platforms?|systems?|systeme|portale?|anwendung(?:en)?|"
+    r"applikation(?:en)?|l(?:ö|oe)sung(?:en)?|produkte?|apps?)\b",
     re.IGNORECASE,
 )
 
@@ -141,7 +141,12 @@ def hybrid_support_admin_family(title: str) -> str | None:
     for name, pattern in _FAMILIES:
         for match in pattern.finditer(text):
             tail = text[match.end() :].lstrip(" -")
-            if _PRODUCT_NOUN.match(tail) and not _DEV_ROLE.match(tail):
+            # support names the product only when a developer role comes FIRST
+            if (
+                _DEV_ROLE.search(text[: match.start()])
+                and _PRODUCT_NOUN.match(tail)
+                and not _DEV_ROLE.match(tail)
+            ):
                 continue
             return name
     return None
