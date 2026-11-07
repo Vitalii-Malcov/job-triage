@@ -444,3 +444,44 @@ class TestRound4Postings:
         a = _assessment(description, place=BERLIN)
         assert _status(a, "remote") == "COMPATIBLE"
         assert automatic_block_reason(a) is None
+
+
+class TestRound5Postings:
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany. Office attendance in Berlin is mandatory with no exceptions.",
+            "Fully remote in Germany. You must attend our Berlin office every Tuesday so you can "
+            "meet the team.",
+        ],
+    )
+    def test_unrelated_negation_or_optional_wording_does_not_cancel_presence(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE"}
+        assert _status(a, "location") != "REMOTE_OK"
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote EU. Work is restricted to Poland.",
+            "Fully remote EU. This role requires residency in Poland.",
+        ],
+    )
+    def test_a_stated_regional_claim_does_not_mask_a_later_restriction(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") in {"INCOMPATIBLE", "UNVERIFIED_ELIGIBILITY"}
+        assert automatic_block_reason(a) is not None
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Fully remote in Germany with no office attendance required.",
+            "Fully remote in Germany. Keine Büropräsenz nötig.",
+            "100% Remote in Germany. Du kannst optional ins Büro kommen.",
+        ],
+    )
+    def test_negated_office_attendance_keeps_the_remote_claim(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") == "COMPATIBLE"
+        assert _status(a, "location") == "REMOTE_OK"

@@ -157,10 +157,33 @@ _OBLIGATION = re.compile(
 )
 
 
+# "(no) office attendance required / needed", "Büropräsenz nicht erforderlich"
+_NOT_NEEDED = re.compile(
+    r"\b(?:nicht|not|no|kein\w*)\W+(?:\w+\W+){0,2}?(?:required|needed|necessary|erforderlich"
+    r"|n(?:ö|oe)tig|notwendig|vorgeschrieben|expected|verpflichtend)\b",
+    re.IGNORECASE,
+)
+
+
+def _near(text: str, match: re.Match[str], words: int = 4) -> str:
+    """The few words right before and after a match, inside its clause."""
+    before, after = _clause(text, match.start(), match.end())
+    return " ".join(before.split()[-words:] + after.split()[:words])
+
+
 def _presence(text: str) -> re.Match[str] | None:
+    """Office vocabulary that stands. Negation or optionality must sit right next to the phrase
+    ("keine Büropräsenz", "no office attendance required", "kannst optional ins Büro"); an
+    unrelated "no exceptions" or "so you can meet the team" in the clause does not cancel it."""
     for match in _PRESENCE.finditer(text):
         before, after = _clause(text, match.start(), match.end())
-        if _negated(text, match) or _OFFICE_OPTIONAL.search(before + " " + after):
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        after_head = " ".join(after.split()[:6])
+        if (
+            _NEGATOR.search(near_before)
+            or _NOT_NEEDED.search(after_head)
+            or _OFFICE_OPTIONAL.search(_near(text, match))
+        ):
             continue
         return match
     return None
@@ -194,7 +217,9 @@ _COUNTRY_RESTRICTION = re.compile(
     rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b"
     rf"|\b(?:permitted|allowed|erlaubt|possible|m(?:ö|oe)glich)\s+(?:only\s+|nur\s+)(?:from|in|aus)\s+"
     rf"(?:the\s+)?(?:{_COUNTRY})\b"
-    rf"|\bonly\s+(?:from|in)\s+(?:the\s+)?(?:{_COUNTRY})\b",
+    rf"|\bonly\s+(?:from|in)\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:restricted|limited|beschr(?:ä|ae)nkt)\s+(?:to|auf)\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:requires?|erfordert)\s+(?:residen(?:cy|ce)|wohnsitz)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
     re.IGNORECASE,
 )
 _BROAD = r"germany|deutschland|europe|europa|\beu\b|emea|dach|worldwide|global|weltweit"
@@ -217,7 +242,8 @@ _ELIGIBILITY_WORDING = re.compile(
     r"\bonly\b|\bnur\b|\bausschlie(?:ß|ss)lich\b|\bexclusively\b|\beligible\b|\bresidents?\b"
     r"|\bcitizens?\b|\bwohnsitz\b|\bwohnhaft\b|\bwork\s+(?:permit|authori[sz]ation)\b"
     r"|\barbeitserlaubnis\b|\bvisa\b|\bans(?:ä|ae)ssig\b|\bresid(?:e|es|ing)\b|\bliv(?:e|es|ing)\s+in\b"
-    r"|\bbased\s+in\b|\blocated\s+in\b|\bpermitted\b|\ballowed\b|\berlaubt\b",
+    r"|\bbased\s+in\b|\blocated\s+in\b|\bpermitted\b|\ballowed\b|\berlaubt\b"
+    r"|\brestricted\b|\blimited\s+to\b|\bbeschr(?:ä|ae)nkt\b|\bresiden(?:cy|ce)\b",
     re.IGNORECASE,
 )
 _ELIGIBILITY_SUBJECT = re.compile(
@@ -278,13 +304,38 @@ class RemoteSignal:
     eligibility_unverified: bool = False
 
 
+# A denial AFTER the keyword is a predicate ("ist nicht möglich", "is not available"), not any
+# later "no" ("... with no office attendance required").
+_DENIAL_AFTER = re.compile(
+    r"\b(?:nicht|not|kein\w*|never|nie)\b\W+(?:\w+\W+){0,2}?(?:m(?:ö|oe)glich|possible|available"
+    r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
+    r"|der\s+fall)\b",
+    re.IGNORECASE,
+)
+
+
+def _affirmed_phrase(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """Like `_affirmed`, for remote-work phrases: negated only by a negator right before the
+    phrase or a denial predicate after it, not by any later "no" in the clause."""
+    for match in pattern.finditer(text):
+        before, after = _clause(text, match.start(), match.end())
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _NEGATOR.search(near_before) or _DENIAL_AFTER.search(after):
+            continue
+        return match
+    return None
+
+
 def _remote_denied(text: str) -> bool:
-    """A remote/home-office mention that is negated in its own clause ("kein Homeoffice",
-    "unable to support working remotely"), ignoring requirements about remote SKILLS."""
+    """A remote/home-office mention that is denied in its own clause ("kein Homeoffice",
+    "unable to support working remotely", "Remote ist nicht möglich"), ignoring requirements
+    about remote SKILLS and unrelated negations ("no office attendance required")."""
     for match in _SOME_REMOTE.finditer(text):
         if _REMOTE_SKILL_NOUN.match(text[match.end() : match.end() + 30].lstrip(" -")):
             continue
-        if _negated(text, match):
+        before, after = _clause(text, match.start(), match.end())
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _NEGATOR.search(near_before) or _DENIAL_AFTER.search(after):
             return True
     return False
 
@@ -314,11 +365,11 @@ def classify_remote(text: str) -> RemoteSignal:
     if some and _remote_denied(text):
         # remote work is denied somewhere in the text: whatever else it says, it is on-site
         return done("ONSITE", some)
-    hybrid = _affirmed(_HYBRID, text)
+    hybrid = _affirmed_phrase(_HYBRID, text)
     if hybrid:
         return done("HYBRID", hybrid, unresolved)
-    full = _affirmed(_FULLY_REMOTE, text)
-    regional = _affirmed(_REMOTE_REGIONAL, text)
+    full = _affirmed_phrase(_FULLY_REMOTE, text)
+    regional = _affirmed_phrase(_REMOTE_REGIONAL, text)
     if full or regional:
         confirmed = full or regional
         presence = _presence(text)
