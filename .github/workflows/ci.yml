@@ -20,7 +20,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -e ".[dev]"
+      - run: pip install -c constraints.txt -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
       # TEST-06: a per-test timeout kills a hung (thread/async) test instead of holding the job;
@@ -61,7 +61,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -e ".[dev,postgres]"
+      - run: pip install -c constraints.txt -e ".[dev,postgres]"
       # The expected head is read from the script tree (exactly one head), never hard-coded.
       - name: Alembic upgrade head against CI PostgreSQL
         shell: bash

@@ -61,3 +61,22 @@ def test_the_important_transitives_are_pinned_too():
         "mako",
     ):
         assert name in pins, name
+
+
+def test_dockerfile_installs_with_the_constraints_file():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r"^COPY pyproject\.toml constraints\.txt", dockerfile, re.MULTILINE)
+    assert "pip install -c constraints.txt" in dockerfile
+
+
+def test_every_ci_dependency_install_uses_the_constraints_file():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    installs = [line for line in workflow.splitlines() if "pip install" in line]
+    project_installs = [line for line in installs if ".[" in line]
+    assert project_installs
+    assert all("-c constraints.txt" in line for line in project_installs)
+
+
+def test_docker_build_context_keeps_the_constraints_file():
+    ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert "constraints.txt" not in [line.strip() for line in ignored]
