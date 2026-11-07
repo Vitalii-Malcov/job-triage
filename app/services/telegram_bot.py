@@ -103,6 +103,11 @@ from app.services.telegram_vacancy_feed import (
 
 logger = logging.getLogger(__name__)
 
+# A decision the review state does not allow is final for this card (FLOW-15): no retry hint.
+VACANCY_NOT_DECIDABLE_ANSWER = (
+    "Für diese Stelle nicht möglich: der Status lässt keine Entscheidung zu. Nichts geändert."
+)
+
 # Telegram messages are capped at 4096 characters. JOBS_LIST_LIMIT and the
 # per-field truncation in _format_job_line keep a *typical* /jobs reply well
 # under that, but neither is an airtight guarantee against arbitrarily long
@@ -853,7 +858,7 @@ async def on_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(already_reply)
         result = "unchanged"
     else:
-        await query.answer("Für diese Stelle gerade nicht möglich.")
+        await query.answer(VACANCY_NOT_DECIDABLE_ANSWER)
         result = "not_decidable"
     logger.info(
         "telegram_vacancy_callback action=%s review_id=%s result=%s",
