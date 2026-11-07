@@ -1092,6 +1092,12 @@ async def stop_bot(application: Application | None) -> None:
 _TERMINAL_START_FAILURES = frozenset({"InvalidToken"})  # retrying cannot help
 BOT_START_RETRY_INITIAL_SECONDS = 5.0
 BOT_START_RETRY_MAX_SECONDS = 300.0
+BOT_POLL_CHECK_SECONDS = 10.0
+
+
+def _polling_stopped(application) -> bool:
+    updater = getattr(application, "updater", None)
+    return updater is not None and getattr(updater, "running", True) is False
 
 
 async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
@@ -1116,11 +1122,19 @@ async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
         if application is not None:
             set_telegram_state(BotState.RUNNING)
             try:
-                await asyncio.Event().wait()  # runs until the task is cancelled by shutdown
-            finally:
+                # runs until shutdown cancels the task, or the update poller dies on its own
+                # (e.g. a revoked token): then readiness must go red and the start is retried.
+                while not _polling_stopped(application):
+                    await asyncio.sleep(BOT_POLL_CHECK_SECONDS)
+            except BaseException:
                 set_telegram_state(BotState.STOPPED)
                 await _run_to_completion(stop_bot(application))
-            return
+                raise
+            set_telegram_state(BotState.RETRYING)
+            logger.error("telegram_bot_polling_stopped restarting")
+            await _run_to_completion(stop_bot(application))
+            delay = BOT_START_RETRY_INITIAL_SECONDS
+            continue
         set_telegram_state(BotState.RETRYING)
         logger.warning("telegram_bot_start_retry in_seconds=%s", delay)
         await sleep(delay)

@@ -71,3 +71,13 @@ def test_report_refuses_missing_and_production_targets(tmp_path, copy_db, monkey
     assert report.main(["--db", str(tmp_path / "absent.db")]) == 2
     monkeypatch.setattr(report, "classify_path", lambda _p: DatabaseKind.PRODUCTION_RUNTIME)
     assert report.main(["--db", str(copy_db)]) == 2
+
+
+def test_json_output_never_targets_a_database_or_an_existing_file(tmp_path, copy_db):
+    assert report.main(["--db", str(copy_db), "--json", str(copy_db)]) == 2
+    other = tmp_path / "other.db"
+    assert report.main(["--db", str(copy_db), "--json", str(other)]) == 2
+    existing = tmp_path / "report.json"
+    existing.write_text("keep", encoding="utf-8")
+    assert report.main(["--db", str(copy_db), "--json", str(existing)]) == 2
+    assert existing.read_text(encoding="utf-8") == "keep"

@@ -124,3 +124,36 @@ def test_cli_exit_codes_and_no_partial_file_left(tmp_path, backup_file, capsys):
     assert restore_sqlite.main(args) == 2  # target now exists
     assert "REFUSED" in capsys.readouterr().err
     assert sorted(p.name for p in target.parent.iterdir()) == ["restored.db"]
+
+
+def test_a_target_created_during_the_restore_is_never_clobbered(tmp_path, backup_file, monkeypatch):
+    target = tmp_path / "scratch" / "race.db"
+    target.parent.mkdir()
+    real_copy = restore_sqlite.shutil.copyfile
+
+    def copy_then_rival(src, dst):
+        result = real_copy(src, dst)
+        _make_db(target, jobs=3)  # another process creates the target meanwhile
+        return result
+
+    monkeypatch.setattr(restore_sqlite.shutil, "copyfile", copy_then_rival)
+    with pytest.raises(RestoreRefused, match="appeared"):
+        restore(backup_file, target)
+    assert _count(target) == 3
+    assert sorted(p.name for p in target.parent.iterdir()) == ["race.db"]
+
+
+def test_restore_command_loads_without_the_scripts_package_on_the_path(tmp_path):
+    import subprocess
+    import sys
+
+    code = (
+        "import importlib.util,sys;"
+        "sys.path=[p for p in sys.path if p not in ('', '.')];"
+        f"s=importlib.util.spec_from_file_location('r', r'{restore_sqlite.__file__}');"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);print('ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert result.stdout.strip() == "ok", result.stderr

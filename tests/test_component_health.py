@@ -179,3 +179,42 @@ def test_components_endpoint_never_leaks_detail(monkeypatch):
     assert response.status_code == 200
     assert response.json()["telegram"] == "failed"
     assert response.json()["database"] == "down"
+
+
+def test_a_poller_that_dies_after_start_turns_readiness_red_and_restarts(monkeypatch):
+    from app.services import telegram_bot
+
+    applications = []
+    states_when_stopped = []
+
+    async def attempt(_settings):
+        app_ = SimpleNamespace(updater=SimpleNamespace(running=True))
+        applications.append(app_)
+        return app_, None
+
+    async def fake_stop(application):
+        states_when_stopped.append((application, ch.telegram_state()))
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        if len(applications) == 1:
+            applications[0].updater.running = False  # token revoked: poller exits
+        await real_sleep(0)
+
+    monkeypatch.setattr(telegram_bot, "_start_bot_attempt", attempt)
+    monkeypatch.setattr(telegram_bot, "stop_bot", fake_stop)
+    monkeypatch.setattr(telegram_bot.asyncio, "sleep", fast_sleep)
+
+    async def scenario():
+        task = asyncio.create_task(telegram_bot._run_bot_supervised(object()))
+        for _ in range(50):
+            await real_sleep(0)
+        assert len(applications) == 2  # restarted
+        assert ch.telegram_state() is BotState.RUNNING
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert states_when_stopped[0] == (applications[0], BotState.RETRYING)

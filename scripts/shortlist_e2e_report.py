@@ -64,17 +64,18 @@ def analyse(db: Session, settings: Settings) -> dict:
     blocked_reasons: Counter = Counter()
     rows = []
     for job in jobs:
-        assessment = assess_job(db, job.id)
-        tiers[assessment.fit_tier] += 1
-        verdict = evaluate(assessment, liveness="UNKNOWN")
-        gate[verdict.verdict] += 1
         eligible_pre = (
             job.status in ELIGIBLE_STATUSES and job.recommendation in ELIGIBLE_RECOMMENDATIONS
         )
         match_score = None
         if eligible_pre:
+            # the match must exist before the assessment reads it (as in the real pipeline)
             match = prepare_candidate_job_match(db, job.id, force_recompute=False)
             match_score = match.overall_score if match is not None else None
+        assessment = assess_job(db, job.id)
+        tiers[assessment.fit_tier] += 1
+        verdict = evaluate(assessment, liveness="UNKNOWN")
+        gate[verdict.verdict] += 1
         block = automatic_block_reason(assessment)
         auto = (
             eligible_pre
@@ -177,6 +178,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.json is not None:
+        out = args.json.resolve()
+        protected = {DatabaseKind.PRODUCTION_RUNTIME, DatabaseKind.PILOT, DatabaseKind.BACKUP}
+        if (
+            out == args.db.resolve()
+            or classify_path(out) in protected
+            or out.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+        ):
+            print("REFUSED: --json must be a new file, not a database path", file=sys.stderr)
+            return 2
+        if out.exists():
+            print("REFUSED: --json already exists; nothing is overwritten", file=sys.stderr)
+            return 2
     engine = create_engine(f"sqlite:///{args.db.resolve().as_posix()}")
     settings = Settings(_env_file=None)
     with Session(engine) as db:
@@ -185,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             report["drafts"] = prepare_drafts(db, report["rows"], settings)
     engine.dispose()
     if args.json:
-        args.json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        with args.json.open("x", encoding="utf-8") as out_file:
+            out_file.write(json.dumps(report, ensure_ascii=False, indent=1))
     print(
         json.dumps(
             report["summary"] | ({"drafts": report["drafts"]} if "drafts" in report else {}),

@@ -28,7 +28,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app.core.database_target import DatabaseKind, classify_path
-from scripts.backup_sqlite import _counts, _owned_backup, _readonly_uri
+
+
+def _load_backup_helpers():
+    """Load the sibling backup script by path: `jobtriage restore` runs from any directory
+    and `scripts` is not an installed package."""
+    import importlib.util
+
+    path = Path(__file__).with_name("backup_sqlite.py")
+    spec = importlib.util.spec_from_file_location("_jt_backup_sqlite", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_backup = _load_backup_helpers()
+_counts, _owned_backup, _readonly_uri = (
+    _backup._counts,
+    _backup._owned_backup,
+    _backup._readonly_uri,
+)
 
 
 class RestoreRefused(Exception):
@@ -88,7 +107,14 @@ def restore(
         integrity, counts = _inspect(partial)
         if integrity != "ok" or counts != expected:
             raise RuntimeError(f"restored copy failed verification (integrity={integrity})")
-        os.replace(partial, target)
+        if replace:
+            os.replace(partial, target)
+        else:
+            os.link(partial, target)  # fails if the target appeared meanwhile: never clobbers
+            partial.unlink()
+    except FileExistsError:
+        partial.unlink(missing_ok=True)
+        raise RestoreRefused("target appeared while restoring; nothing was overwritten") from None
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
