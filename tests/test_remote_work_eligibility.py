@@ -87,7 +87,8 @@ class TestSignals:
         assert classify_remote(text).mode == mode
 
     @pytest.mark.parametrize(
-        "text", ["Remote US only", "Fully remote, UK-based", "Remote in the United States"]
+        "text",
+        ["Remote US only", "Fully remote, UK-based candidates only", "Remote in the United States"],
     )
     def test_foreign_country_restriction_is_detected(self, text):
         assert classify_remote(text).country_restriction
@@ -230,3 +231,87 @@ class TestPriority:
         )
         assert adjacent_remote.category == "ADJACENT"
         assert primary_onsite.rank < adjacent_remote.rank
+
+
+class TestAdversarialPostings:
+    """Inputs from the independent review: the commute gate must stay on unless remote work is
+    affirmed without any conflicting presence rule or negation."""
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Vollzeit. Homeoffice 100%. Hybrid: 2 Tage pro Woche im Büro.",
+            "Vollzeit. Remote Germany. Onsite every Tuesday in Berlin.",
+            "Vollzeit. Remote Germany ist nicht möglich; Arbeitsort Berlin.",
+            "Vollzeit. Homeoffice 100% ist nicht möglich. Arbeitsort Berlin.",
+            "Vollzeit. 100% Remote, aber jeden Dienstag im Büro.",
+            "Full-time. Fully remote. Office presence in Berlin required 2 days per week.",
+        ],
+    )
+    def test_presence_or_negation_keeps_the_commute_gate(self, description):
+        a = _assessment(description, place=BERLIN)
+        assert _status(a, "remote") in {"HYBRID", "ONSITE"}
+        assert _status(a, "location") != "REMOTE_OK"
+        assert a.fit_tier == "NOT_SUITABLE"  # Berlin is far beyond the 100 km limit
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Vollzeit. 100% Remote in Poland.",
+            "Vollzeit. 100% Remote Austria only.",
+            "Vollzeit. 100% Remote Schweiz only.",
+            "Vollzeit. 100% Remote nur aus Österreich.",
+            "Vollzeit. 100% Remote, nur aus den USA.",
+            "Vollzeit. 100% Remote US only, serving customers in Germany.",
+        ],
+    )
+    def test_foreign_country_restriction_is_incompatible(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") == "INCOMPATIBLE"
+        assert automatic_block_reason(a) == "FIT_TIER_NOT_SUITABLE"
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "Vollzeit. 100% Remote in Germany. We are a UK-based company.",
+            "Vollzeit. 100% Remote UK or Germany.",
+            "Vollzeit. 100% Remote Poland / Deutschland.",
+            "Vollzeit. Fully remote within the EU, incl. Germany.",
+            "Vollzeit. 100% Remote. Keine Präsenzpflicht.",
+        ],
+    )
+    def test_company_location_or_a_german_alternative_is_not_a_restriction(self, description):
+        a = _assessment(description)
+        assert _status(a, "remote") == "COMPATIBLE"
+        assert automatic_block_reason(a) is None
+
+    @pytest.mark.parametrize(
+        "description,mode",
+        [
+            (
+                "Teilzeit (20 Stunden/Woche), 100% Remote. Unser Team: 50 Vollzeitmitarbeiter.",
+                "PART_TIME",
+            ),
+            ("100% Remote. Teilzeit, keine Vollzeit möglich.", "PART_TIME"),
+            ("100% Remote. Arbeitszeit: 40 Stunden/Woche. Teilzeit ist nicht möglich.", "UNKNOWN"),
+            ("Vollzeit, Teilzeit ist möglich.", "FULL_TIME"),
+        ],
+    )
+    def test_working_time_ignores_headcounts_and_negations(self, description, mode):
+        assert classify_work_time(description).mode == mode
+
+    def test_part_time_only_remote_is_held(self):
+        a = _assessment("Teilzeit, 100% Remote. Wir sind 50 Vollzeitmitarbeiter.")
+        assert _status(a, "work_time") == "PART_TIME"
+        assert automatic_block_reason(a) == "FIT_TIER_STRETCH"
+
+
+@pytest.mark.parametrize(
+    "text,mode",
+    [
+        ("Vollzeit, Homeoffice nicht möglich", "FULL_TIME"),
+        ("Teilzeit, keine Vollzeit möglich", "PART_TIME"),
+    ],
+)
+def test_a_negation_belongs_only_to_the_word_it_follows(text, mode):
+    assert classify_work_time(text).mode == mode
