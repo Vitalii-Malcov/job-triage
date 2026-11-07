@@ -591,7 +591,7 @@ class TestUnclearRemoteIsReviewedNotExcluded:
     employer is far away; a plain on-site job that merely allows home office stays excluded."""
 
     def test_far_job_with_a_vetoed_full_remote_claim_is_a_manual_review(self):
-        a = _assessment("Vollzeit. 100% Remote. Gelegentlich Team-Events im Büro.", place=BERLIN)
+        a = _assessment("Vollzeit. 100% Remote. Präsenz nach Absprache.", place=BERLIN)
         assert _status(a, "remote") == "UNVERIFIED_ELIGIBILITY"
         assert a.fit_tier == "NEEDS_OPERATOR"
         result = classify(a)
@@ -614,3 +614,32 @@ class TestUnclearRemoteIsReviewedNotExcluded:
         )
         assert _status(a, "remote") == "HYBRID"
         assert a.fit_tier == "NOT_SUITABLE"
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "100% Remote. Wir bieten Gesundheitskurse an, sowohl online als auch im Büro.",
+        "Vollzeit. 100% Remote. Fitnessangebote vor Ort, ganz flexibel.",
+        "Vollzeit. 100% Remote. Reisebereitschaft für Kundenprojekte innerhalb Deutschlands.",
+        "Vollzeit. 100% Remote, gelegentlich Teamevents. Strukturierte Einarbeitung.",
+    ],
+)
+def test_perks_and_customer_travel_are_not_a_presence_obligation(description):
+    a = _assessment(description, place=BERLIN)
+    assert _status(a, "remote") == "COMPATIBLE"
+    assert automatic_block_reason(a) is None
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Vollzeit. 100% Remote. Die Einarbeitung findet an unserem Standort in Berlin statt.",
+        "Vollzeit. 100% Remote. Monatliche Team-Meetings in Berlin.",
+        "Vollzeit. 100% Remote, quartalsweise Treffen im Büro in Berlin.",
+    ],
+)
+def test_obligations_tied_to_a_site_veto_the_remote_claim(description):
+    a = _assessment(description, place=BERLIN)
+    assert _status(a, "remote") in {"HYBRID", "PARTIAL_REMOTE", "UNVERIFIED_ELIGIBILITY"}
+    assert _status(a, "location") != "REMOTE_OK"

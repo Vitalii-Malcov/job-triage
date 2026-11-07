@@ -688,16 +688,29 @@ def location_criterion(
     remote: Criterion,
     check: JobCommuteCheckRecord | None,
 ) -> Criterion:
-    if remote.status == "COMPATIBLE":
-        return Criterion("location", "REMOTE_OK", "fully remote and compatible; no commute")
-    if remote.status == "UNVERIFIED_ELIGIBILITY":
-        # a full-remote claim whose terms are unclear: neither confirmed (no commute bypass) nor
-        # disproved, so the commute is not held against it -- the operator reads the posting
+    result = _commute_criterion(job, settings, remote, check)
+    if remote.status == "UNVERIFIED_ELIGIBILITY" and (
+        result.name == "location" and result.status in {"FAIL", "ESTIMATE_BEYOND"}
+    ):
+        # A full-remote claim with unclear terms is neither confirmed (no commute bypass) nor
+        # disproved: a commute barrier is not held against it until the operator has read it.
         return Criterion(
             "location",
             "DISTANCE_UNVERIFIED",
-            "remote work claimed but unconfirmed; commute not held against it until checked",
+            "remote work claimed but unconfirmed; commute not held against it until checked "
+            f"({result.reason})",
         )
+    return result
+
+
+def _commute_criterion(
+    job: JobRecord,
+    settings: CandidateSearchSettings,
+    remote: Criterion,
+    check: JobCommuteCheckRecord | None,
+) -> Criterion:
+    if remote.status == "COMPATIBLE":
+        return Criterion("location", "REMOTE_OK", "fully remote and compatible; no commute")
     if settings.max_commute_km is None or settings.commute_measure != "CAR_ROUTE":
         return Criterion("location", "NOT_CONFIGURED", "no car-route commute limit configured")
     limit = settings.max_commute_km

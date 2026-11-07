@@ -140,18 +140,22 @@ def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
     return None
 
 
-# Any office / presence vocabulary. Remote work is "100 %" only if every such clause is negated
-# ("keine Büropräsenz") or made optional ("kannst optional ins Büro") in ITS OWN clause.
-_PRESENCE = re.compile(
-    r"\bon-?\s?site\b|\bvor[\s-]+ort\b|\b\w*b(?:ü|ue)ro\w*|(?<!home )(?<!home-)\boffices?\b"
-    r"|\b\w*pr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*|\bheadquarters?\b"
-    r"|\bhauptsitz\b"
-    # onboarding / meetings / travel tied to a physical place
-    r"|\bonboarding\b|\beinarbeitung\b|\bteam[\s-]?(?:meetings?|events?|treffen|tage?)\b"
-    r"|\bkick-?off\b|\b(?:unser(?:em|er)?|our)\s+(?:standort|site|location)\b"
-    r"|\bdienstreisen?\b|\bbusiness\s+trips?\b|\breisebereitschaft\b"
+# Office presence. STRONG phrases veto a full-remote claim on their own; WEAK vocabulary (a Büro
+# mentioned in a perk, a site, onboarding, customer travel) vetoes only together with an
+# obligation or frequency cue in the same clause. Remote work is "100 %" only if every vetoing
+# clause is negated ("keine Büropräsenz") or made optional ("kannst optional ins Büro").
+_PRESENCE_STRONG = re.compile(
+    r"\bon-?\s?site\b|\b\w*pr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*"
+    r"|\bvor[\s-]+ort[\s-]+(?:arbeit\w*|pflicht|termine?)"
     r"|\b(?:jeden|every|each)\s+(?:montag|dienstag|mittwoch|donnerstag|freitag"
     r"|monday|tuesday|wednesday|thursday|friday)\b",
+    re.IGNORECASE,
+)
+_PRESENCE_WEAK = re.compile(
+    r"\bvor[\s-]+ort\b|\b\w*b(?:ü|ue)ro\w*|(?<!home )(?<!home-)\boffices?\b|\bheadquarters?\b"
+    r"|\bhauptsitz\b|\b(?:unser(?:em|er)?|our)\s+(?:standort|site|location)\b"
+    r"|\bonboarding\b|\beinarbeitung\b|\bkick-?off\b"
+    r"|\bteam[\s-]?(?:meetings?|treffen|events?)\s+(?:in|at|im)\s+(?-i:[A-ZÄÖÜ])",
     re.IGNORECASE,
 )
 # Office time the employee may choose is not a presence rule (own name: the language section
@@ -164,11 +168,13 @@ _OFFICE_OPTIONAL = re.compile(
 )
 
 
-# Wording that makes office presence an obligation ("must attend", "jeden Dienstag", "2x pro Woche")
+# Wording that makes office presence an obligation ("must attend", "jeden Dienstag", "2x/Woche")
 _OBLIGATION = re.compile(
     r"\bmust\b|\bmandatory\b|\brequired?\b|\bpflicht\w*|\bzwingend\b|\berforderlich\b"
     r"|\battend\w*|\b(?:jeden|every|each)\b|\b\d\s*(?:x|times|mal|tage?|days?)\b|\btwice\b"
-    r"|\bweekly\b|\bw(?:ö|oe)chentlich\b",
+    r"|\bweekly\b|\bw(?:ö|oe)chentlich\b|\bmonatlich\w*|\bmonthly\b|\bquartals\w*|\bquarterly\b"
+    r"|\bregelm(?:ä|ae)(?:ß|ss)ig\w*|\bregularly\b|\bfindet\b[^.;\n]{0,60}\bstatt\b"
+    r"|\btakes?\s+place\b|\bverpflichtend\b",
     re.IGNORECASE,
 )
 
@@ -200,11 +206,15 @@ def _presence(text: str) -> re.Match[str] | None:
     """Office vocabulary that stands. Negation or optionality must sit right next to the phrase
     ("keine Büropräsenz", "no office attendance required", "kannst optional ins Büro"); an
     unrelated "no exceptions" or "so you can meet the team" in the clause does not cancel it."""
-    for match in _PRESENCE.finditer(text):
+    candidates = [(m, True) for m in _PRESENCE_STRONG.finditer(text)]
+    candidates += [(m, False) for m in _PRESENCE_WEAK.finditer(text)]
+    for match, strong in sorted(candidates, key=lambda pair: pair[0].start()):
         before, after = _clause(text, match.start(), match.end())
         near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
         after_head = " ".join(after.split()[:6])
         clause = f"{before} {match.group(0)} {after}"
+        if not strong and not _OBLIGATION.search(clause):
+            continue  # a perk, a site or customer travel with no obligation cue
         if _STRONG_OBLIGATION.search(clause):
             return match  # "mandatory", "not optional": nothing else in the clause cancels it
         if (
