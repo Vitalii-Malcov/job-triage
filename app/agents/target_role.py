@@ -100,6 +100,19 @@ def support_admin_family(title: str) -> str | None:
     return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
 
 
+def hybrid_support_admin_family(title: str) -> str | None:
+    """The support/administration family of a HYBRID title, or None.
+
+    A title naming both an administration/support role and a developer role
+    ("IT-Administrator / Softwareentwickler") is not excluded (see
+    `support_admin_family`) but the main profession is unclear: the operator reads it
+    and it is never prepared automatically."""
+    text = title or ""
+    if not _DEV_ROLE.search(text):
+        return None
+    return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
+
+
 def is_support_admin_term(term: str) -> bool:
     """For configured search keywords: a search term that only finds support
     or administration vacancies ("Application Support", "Systemintegrator")."""

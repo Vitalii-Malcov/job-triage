@@ -64,6 +64,7 @@ from app.services.candidate_preparation import (
     prepare_candidate_job_match,
 )
 from app.services.collector_runner import TouchedJob, run_bundesagentur
+from app.services.shortlist_gate import PreparationCheck
 
 ACCOUNT = "me@example.com"
 
@@ -81,6 +82,10 @@ def _fit_gate_allows(monkeypatch):
     vacancies; the fit-tier gate itself is covered in tests/test_shortlist_fit_safety.py."""
     monkeypatch.setattr(
         "app.services.automation_shortlist.automatic_preparation_block", lambda db, job_id: None
+    )
+    monkeypatch.setattr(
+        "app.services.automation_shortlist.automatic_preparation_check",
+        lambda db, job_id: PreparationCheck(None, 0),
     )
 
 

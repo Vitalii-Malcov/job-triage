@@ -27,7 +27,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
+from app.agents.target_role import hybrid_support_admin_family
 from app.services.job_fit_assessment import FitAssessment, assess_job
+from app.services.triage_category import UNKNOWN_RANK, classify
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,7 @@ def evaluate(assessment: FitAssessment, *, liveness: Liveness = "UNKNOWN") -> Ga
 AUTO_PREPARE_TIERS = frozenset({"GOOD_MATCH", "PARTIAL_MATCH"})
 
 BLOCK_ASSESSMENT_UNAVAILABLE = "ASSESSMENT_UNAVAILABLE"
+BLOCK_HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
 
 
 def automatic_block_reason(assessment: FitAssessment) -> str | None:
@@ -138,6 +141,9 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
     reason code (no vacancy text, safe to log)."""
     tier = assessment.fit_tier
     if tier in AUTO_PREPARE_TIERS:
+        # A title that mixes administration/support with development is the operator's call.
+        if hybrid_support_admin_family(assessment.title) is not None:
+            return BLOCK_HYBRID_ADMIN_ROLE
         return None
     return (
         f"FIT_TIER_{tier}" if isinstance(tier, str) and tier.isidentifier() else "FIT_TIER_UNKNOWN"
@@ -162,16 +168,33 @@ def _assess_isolated(db: Session, job_id: int) -> FitAssessment:
         return assess_job(read_session, job_id)
 
 
-def automatic_preparation_block(db: Session, job_id: int) -> str | None:
-    """Fail-closed: None only when a fresh assessment says the vacancy may be
-    prepared automatically. Writes nothing, changes no status, sends nothing."""
+@dataclass(frozen=True)
+class PreparationCheck:
+    """One live assessment, two answers: may the vacancy be prepared automatically
+    (`block` is None) and where it ranks (PRIMARY 0 before ADJACENT 1)."""
+
+    block: str | None
+    rank: int
+
+
+def automatic_preparation_check(db: Session, job_id: int) -> PreparationCheck:
+    """Fail-closed: `block` is None only when a fresh assessment says the vacancy may be
+    prepared automatically. The rank is ordering only and never admits anything.
+    Writes nothing, changes no status, sends nothing."""
     try:
-        return automatic_block_reason(_assess_isolated(db, job_id))
+        assessment = _assess_isolated(db, job_id)
+        return PreparationCheck(automatic_block_reason(assessment), classify(assessment).rank)
     except Exception as exc:  # noqa: BLE001 -- unknown state must hold the job back
         logger.warning(
             "shortlist_gate_assessment_failed job_id=%s error_type=%s", job_id, type(exc).__name__
         )
-        return BLOCK_ASSESSMENT_UNAVAILABLE
+        return PreparationCheck(BLOCK_ASSESSMENT_UNAVAILABLE, UNKNOWN_RANK)
+
+
+def automatic_preparation_block(db: Session, job_id: int) -> str | None:
+    """Fail-closed: None only when a fresh assessment says the vacancy may be
+    prepared automatically."""
+    return automatic_preparation_check(db, job_id).block
 
 
 def confirmed_barrier(db: Session, job_id: int) -> str | None:
