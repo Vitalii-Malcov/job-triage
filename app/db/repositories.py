@@ -87,6 +87,10 @@ def _fingerprint(job: Job) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _same_text(stored: str, observed: str) -> bool:
+    return str(stored).strip().casefold() == str(observed).strip().casefold()
+
+
 def get_job_by_fingerprint(db: Session, job: Job) -> JobRecord | None:
     """Return the persisted record representing ``job``, if one exists.
 
@@ -94,6 +98,26 @@ def get_job_by_fingerprint(db: Session, job: Job) -> JobRecord | None:
     upsert uses), so a preliminary score reads the row that will actually be written."""
     if job.source in _FREEZE_ON_CONFLICT_SOURCES:
         return resolve_xing_identity(db, job, lock=False).record
+    if job.source == "bundesagentur":
+        # DB-01: a Bundesagentur posting is identified by its referenznummer. The URL part of
+        # the fingerprint changes when BA starts/stops returning `externeURL`, which used to
+        # insert a second row (status NEW) for a vacancy the operator had already acted on.
+        # When duplicates already exist, prefer the row the operator acted on, then the oldest.
+        # Only the URL may differ: a row whose title or company changed is NOT the same
+        # observation (the stored title/score would silently disagree), so it keeps the
+        # fingerprint behaviour (a separate row), exactly as before.
+        reference = storable_reference(job.source_reference)
+        if reference is not None:
+            candidates = db.scalars(
+                select(JobRecord)
+                .where(JobRecord.source == job.source, JobRecord.source_reference == reference)
+                .order_by((JobRecord.status != "NEW").desc(), JobRecord.id)
+            )
+            for candidate in candidates:
+                if _same_text(candidate.title, job.title) and _same_text(
+                    candidate.company, job.company
+                ):
+                    return candidate
     return db.scalar(select(JobRecord).where(JobRecord.fingerprint == _fingerprint(job)))
 
 
