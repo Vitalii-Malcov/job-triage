@@ -349,11 +349,10 @@ _LEVEL_WORD = (
 )
 _TECH_WORD = r"(?:python|back-?end)"
 _PYTHON_FOCUS = (
-    r"(?:\s*[-–—/,:]\s*"
+    r"(?:(?:\s*[-–—/,:]\s*"
     r"|\s+(?:mit\s+)?(?:schwerpunkt|fokus|focus)(?:\s+auf)?\s+"
-    r"|\s+with\s+focus\s+on\s+"
-    r"|\s*\(\s*)"
-    r"python\s*\)?"
+    r"|\s+with\s+focus\s+on\s+)python"
+    r"|\s*\(\s*python\s*\))"
 )
 # The WHOLE normalised title has to be one of these shapes: optional entry-level words, then
 # "Python Engineer" / "Backend Engineer", or "Engineer" with Python named as its focus.
