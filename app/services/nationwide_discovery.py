@@ -19,11 +19,12 @@ This module sends nothing; any vacancy card or alert comes from the existing, fl
 `_publish_persisted_job` tail, exactly as for the local run.
 """
 
+import hashlib
 import json
 import logging
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -57,7 +58,8 @@ def _covered_everything(step: dict) -> bool:
     the request ceiling or the page limit, a failed search) has NOT covered its period."""
     counters = step.get("counters") or {}
     return step.get("status") == "ok" and not any(
-        counters.get(key) for key in ("deferred", "truncated_searches", "failed_queries")
+        counters.get(key)
+        for key in ("deferred", "truncated_searches", "failed_queries", "detail_unavailable")
     )
 
 
@@ -113,8 +115,20 @@ def is_remote_candidate(job: Job) -> bool:
     return mode == "UNKNOWN" and job.home_office_possible is True
 
 
-def _entry_first(work: list[tuple[object, Job]]) -> list[tuple[object, Job]]:
-    return sorted(work, key=lambda pair: 0 if _ENTRY_TITLE.search(pair[1].title) else 1)
+def _entry_first(
+    work: list[tuple[object, Job]], today: date | None = None
+) -> list[tuple[object, Job]]:
+    """Entry-level titles first. Inside each group the order rotates with the date, so postings
+    the caps leave out on one day are not the same ones every day, and postings that are
+    rejected again and again cannot starve the others for good."""
+    day = (today or datetime.now(UTC).date()).isoformat()
+
+    def key(pair: tuple[object, Job]) -> tuple[int, str]:
+        job = pair[1]
+        rotation = hashlib.sha256(f"{day}:{job.source_reference or job.url}".encode()).hexdigest()
+        return (0 if _ENTRY_TITLE.search(job.title) else 1, rotation)
+
+    return sorted(work, key=key)
 
 
 async def run_nationwide_remote_discovery(
@@ -137,6 +151,7 @@ async def run_nationwide_remote_discovery(
     gate = RequestGate(
         settings.nationwide_remote_request_delay_seconds,
         settings.nationwide_remote_max_requests_per_run,
+        settings.nationwide_remote_max_detail_per_run,
     )
     stats: dict[str, int] = {}
     work, failed_queries, skipped_invalid = await _fetch_ba_work(
@@ -158,7 +173,7 @@ async def run_nationwide_remote_discovery(
         touched_jobs=touched_jobs,
         is_lease_lost=is_lease_lost,
         max_new=settings.nationwide_remote_max_new_per_run,
-        max_detail=settings.nationwide_remote_max_detail_per_run,
+        gate=gate,
         accept_new=is_remote_candidate,
         log_name="bundesagentur_nationwide_run",
     )

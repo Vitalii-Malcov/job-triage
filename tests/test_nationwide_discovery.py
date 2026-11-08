@@ -520,7 +520,8 @@ def test_missing_detail_is_not_evidence_against_remote(db, wired):
     assert row.source_reference == "nd" and row.description == ""
 
 
-def test_rejected_postings_do_not_use_up_the_cap_on_stored_vacancies(db, wired):
+def test_rejected_postings_do_not_use_up_the_cap_on_stored_vacancies(db, wired, monkeypatch):
+    monkeypatch.setattr("app.services.nationwide_discovery._entry_first", lambda work: work)
     ads = [posting("on", GOOD), posting("re", GOOD)]
     details = {"on": "Vor Ort im Buero in Nuernberg. Python.", "re": "100 % Remote. Python."}
     wired(FakeBA({"Python Entwickler": ads}, details=details))
@@ -568,3 +569,52 @@ def test_watermark_survives_many_unrelated_runs_and_ignores_incomplete_ones(db):
     )
     found = last_success_at(db, ACCOUNT)
     assert found is not None and (datetime.now(UTC) - found) > timedelta(days=1.5)
+
+
+def test_detail_retries_are_charged_to_the_detail_cap():
+    class Failing(FakeBA):
+        def handler(self, request):
+            if "jobdetails" in request.url.path:
+                self.requests.append({"detail": True})
+                return httpx.Response(500, json={})
+            return super().handler(request)
+
+    fake = Failing({})
+    gate = RequestGate(0.0, None, 2)
+    collector = BundesagenturCollector("k", max_retries=3, gate=gate, http_client=fake.client())
+    with pytest.raises(Exception):  # noqa: B017 -- retries end by the ceiling, nothing sent after
+        asyncio.run(collector.fetch_detail("1"))
+    assert len(fake.requests) == 2 and gate.detail_attempts == 2
+
+
+def test_a_run_that_stored_postings_without_text_is_incomplete(db, wired):
+    wired(FakeBA({"Python Entwickler": [posting("nd", GOOD)]}, details={}))
+    result = asyncio.run(run_nationwide_remote_discovery(db, settings()))
+    assert result["detail_unavailable"] == 1
+    _step_run(db, {STEP_NAME: {"status": "ok", "counters": result}}, days_ago=0.1)
+    assert last_success_at(db, ACCOUNT) is None  # the same period is searched again
+
+
+def test_candidate_order_rotates_with_the_date_but_keeps_entry_level_first():
+    from datetime import date
+
+    from app.services.nationwide_discovery import _entry_first
+
+    jobs = [
+        (
+            None,
+            Job(
+                source="bundesagentur",
+                title=t,
+                company="c",
+                location="",
+                url=f"https://e.org/{i}",
+                source_reference=str(i),
+            ),
+        )
+        for i, t in enumerate(["Python Developer"] * 12 + ["Junior Python Developer"] * 3)
+    ]
+    day_one = [j.source_reference for _, j in _entry_first(jobs, date(2026, 11, 8))]
+    day_two = [j.source_reference for _, j in _entry_first(jobs, date(2026, 11, 9))]
+    assert set(day_one[:3]) == {"12", "13", "14"} == set(day_two[:3])
+    assert day_one[3:] != day_two[3:]

@@ -47,20 +47,35 @@ class RequestBudgetExhausted(Exception):
 
 
 class RequestGate:
-    """Pacing and a ceiling on search requests for ONE run, shared by every collector the run
-    builds and applied at the HTTP boundary: each attempt (search or detail, retries included)
-    waits for the minimum interval since the previous one, and each search attempt is charged
-    against `max_requests`."""
+    """Pacing and ceilings for ONE run, shared by every collector the run builds and applied at
+    the HTTP boundary: each attempt (search or detail, retries included) waits for the minimum
+    interval since the previous one, search attempts are charged against `max_requests` and
+    detail attempts against `max_detail`."""
 
-    def __init__(self, interval_seconds: float = 0.0, max_requests: int | None = None) -> None:
+    def __init__(
+        self,
+        interval_seconds: float = 0.0,
+        max_requests: int | None = None,
+        max_detail: int | None = None,
+    ) -> None:
         self.interval_seconds = interval_seconds
         self.max_requests = max_requests
+        self.max_detail = max_detail
         self.search_attempts = 0
+        self.detail_attempts = 0
         self.exhausted = False
         self._last: float | None = None
 
-    async def before_attempt(self, *, counted: bool) -> None:
-        if counted and self.max_requests is not None and self.search_attempts >= self.max_requests:
+    def detail_exhausted(self) -> bool:
+        return self.max_detail is not None and self.detail_attempts >= self.max_detail
+
+    async def before_attempt(self, kind: str) -> None:
+        if kind == "search" and (
+            self.max_requests is not None and self.search_attempts >= self.max_requests
+        ):
+            self.exhausted = True
+            raise RequestBudgetExhausted
+        if kind == "detail" and self.detail_exhausted():
             self.exhausted = True
             raise RequestBudgetExhausted
         if self.interval_seconds > 0 and self._last is not None:
@@ -68,8 +83,10 @@ class RequestGate:
             if pause > 0:
                 await asyncio.sleep(pause)
         self._last = time.monotonic()
-        if counted:
+        if kind == "search":
             self.search_attempts += 1
+        elif kind == "detail":
+            self.detail_attempts += 1
 
 
 class BundesagenturAuthError(CollectorError):
@@ -516,8 +533,8 @@ class BundesagenturCollector(JobCollector):
 
         for attempt in range(1, self.max_retries + 1):
             if self.gate is not None:
-                # before EVERY HTTP attempt, a retry included: pace it, and charge a search
-                await self.gate.before_attempt(counted=request_name == "search")
+                # before EVERY HTTP attempt, a retry included: pace it and charge it
+                await self.gate.before_attempt(request_name)
             if request_name == "search":
                 self.requests_made += 1
             try:

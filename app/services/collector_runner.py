@@ -52,6 +52,7 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import (
     BundesagenturAPIError,
     BundesagenturCollector,
+    RequestBudgetExhausted,
     RequestGate,
     is_api_key_configured,
 )
@@ -650,6 +651,9 @@ async def enrich_and_persist_ba_job(
         else:
             try:
                 detail_description = await collector.fetch_detail(job.source_reference)
+            except RequestBudgetExhausted:
+                # the run's detail ceiling is reached: no description, nothing sent
+                detail_description = None
             except BundesagenturAPIError as exc:
                 logger.warning(
                     "bundesagentur_detail_failed referenznummer=%s error_type=%s",
@@ -1107,16 +1111,17 @@ async def _process_ba_work(
     touched_jobs: list[TouchedJob] | None = None,
     is_lease_lost: Callable[[], bool] | None = None,
     max_new: int | None = None,
-    max_detail: int | None = None,
+    gate: RequestGate | None = None,
     accept_new: Callable[[Job], bool] | None = None,
     log_name: str = "bundesagentur_collector_run",
 ) -> dict[str, int]:
     """Enrich, score and persist the de-duplicated postings of one Bundesagentur run (shared by
     the local run and the nationwide run). `max_new` caps the postings stored
-    that are NEW to the database and `max_detail` the detail requests spent on new postings
-    (a rejected one costs one too); the rest are `deferred` to the next run."""
+    that are NEW to the database; the gate's detail ceiling (HTTP attempts, retries included,
+    spent on stored and rejected postings alike) stops further new postings; the rest are
+    `deferred` to the next run."""
     new_stored = 0
-    detail_attempts = 0
+    detail_unavailable = 0
     deferred = 0
     not_candidate = 0
     # loaded ONCE for this whole collector run, never once per
@@ -1136,16 +1141,12 @@ async def _process_ba_work(
     detail_breaker = DetailBreaker()
     research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for collector, job in work:
-        if (max_new is not None or max_detail is not None) and get_job_by_fingerprint(
-            db, job
-        ) is None:
+        if (max_new is not None or gate is not None) and get_job_by_fingerprint(db, job) is None:
             if (max_new is not None and new_stored >= max_new) or (
-                max_detail is not None and detail_attempts >= max_detail
+                gate is not None and gate.detail_exhausted()
             ):
                 deferred += 1
                 continue
-            # a rejected posting costs a detail request too: it counts against `max_detail`
-            detail_attempts += 1
         if is_lease_lost is not None and is_lease_lost():
             # Ownership is gone: another run may own the slot now. Jobs already
             # committed stay (idempotent); no NEW vacancy write is started.
@@ -1186,6 +1187,8 @@ async def _process_ba_work(
         if created:
             new_stored += 1
             tally.created += 1
+            if accept_new is not None and not (job_record.description or "").strip():
+                detail_unavailable += 1  # stored without text; the next run must enrich it
         else:
             tally.updated += 1
 
@@ -1225,6 +1228,7 @@ async def _process_ba_work(
         "skipped_invalid": skipped_invalid,
         "failed": tally.failed,
         **({"deferred": deferred} if deferred else {}),
+        **({"detail_unavailable": detail_unavailable} if detail_unavailable else {}),
         **({"skipped_not_remote_candidate": not_candidate} if not_candidate else {}),
     }
 
