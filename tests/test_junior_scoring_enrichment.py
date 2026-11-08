@@ -18,7 +18,9 @@ from app.db.models import ApplicationRecord, JobRecord
 from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.models.job import Job
 from app.services.collector_runner import score_and_persist
-from app.services.job_fit_assessment import language_criterion
+from app.services.job_fit_assessment import Criterion, FitAssessment, language_criterion
+from app.services.shortlist_gate import automatic_block_reason
+from app.services.triage_category import THIN_SKILL_EVIDENCE, classify
 
 SKILLS = frozenset(["python", "fastapi", "sqlalchemy", "postgresql", "git", "pytest", "docker"])
 TARGET_ROLES = ["Junior Python Developer", "Junior Backend Developer"]
@@ -170,3 +172,43 @@ def test_rescoring_creates_no_application_and_keeps_the_job_status():
 )
 def test_language_policy_at_confirmed_b1(text, status):
     assert language_criterion(text, "B1").status == status
+
+
+# --- triage: thin evidence is a question for the operator, never a prepared application ----
+
+
+def _assessment(title, *, role="OTHER", skills="WEAK", language="NO_REQUIREMENT"):
+    a = FitAssessment(job_id=1, company="Example GmbH", title=title)
+    a.criteria = [
+        Criterion("role", role, "r"),
+        Criterion("skills", skills, "s"),
+        Criterion("location", "REMOTE_OK", "l"),
+        Criterion("remote", "COMPATIBLE", "r"),
+        Criterion("entry_level", "ENTRY_LEVEL", "e"),
+        Criterion("language", language, "g"),
+        Criterion("salary", "UNKNOWN", "p"),
+        Criterion("start_date", "UNKNOWN", "d"),
+        Criterion("experience", "UNKNOWN", "x"),
+    ]
+    return a
+
+
+def test_python_engineer_with_thin_skills_is_manual_review_not_excluded():
+    a = _assessment("Junior Engineer (m/w/d) Schwerpunkt Python", language="GAP")
+    result = classify(a)
+    assert (result.category, result.code) == ("MANUAL_REVIEW", THIN_SKILL_EVIDENCE)
+    assert automatic_block_reason(a) is not None  # never prepared on its own
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Datenanalyst (m/w/d)",
+        "DevOps Engineer (m/w/d)",
+        "IT Support Engineer Python (m/w/d)",
+        "Python Systemadministrator",
+        "Engineer Maschinenbau",
+    ],
+)
+def test_thin_skills_do_not_rescue_other_titles(title):
+    assert classify(_assessment(title)).category == "EXCLUDED"

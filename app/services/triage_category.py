@@ -24,7 +24,12 @@ the only rule that admits automatic preparation.
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from app.agents.target_role import hybrid_support_admin_family, is_developer_title
+from app.agents.role_relevance_classifier import is_review_rescue_title
+from app.agents.target_role import (
+    hybrid_support_admin_family,
+    is_developer_title,
+    support_admin_family,
+)
 from app.services.job_fit_assessment import FitAssessment
 
 Category = Literal["PRIMARY", "ADJACENT", "MANUAL_REVIEW", "EXCLUDED"]
@@ -37,6 +42,7 @@ NOT_TARGET_ROLE = "NOT_TARGET_ROLE"
 CONFIRMED_BARRIER = "CONFIRMED_BARRIER"
 HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
 STATED_GAP = "STATED_GAP"
+THIN_SKILL_EVIDENCE = "THIN_SKILL_EVIDENCE"
 
 # configured role statuses (or none configured): a title outside them still counts as adjacent
 # when the skills match
@@ -132,6 +138,20 @@ def _classify_direction(assessment: FitAssessment) -> TriageCategory:
     if role == "NO_IT_SIGNAL" and skills_ok:
         return TriageCategory(
             "MANUAL_REVIEW", ROLE_UNCLEAR, "title has no IT signal; the operator decides"
+        )
+    if (
+        status.get("skills") == "WEAK"
+        and role in _CONFIGURED_ROLES
+        and is_review_rescue_title(assessment.title)
+        and support_admin_family(assessment.title) is None
+    ):
+        # An engineer title that names Python ("Junior Engineer Schwerpunkt Python") with a
+        # short skill list: thin evidence is not contradicting evidence. Held for the operator
+        # with the reason; the fit tier alone decides about automatic preparation.
+        return TriageCategory(
+            "MANUAL_REVIEW",
+            THIN_SKILL_EVIDENCE,
+            "Python engineer title, few skill signals in the posting; the operator reads it",
         )
     return TriageCategory("EXCLUDED", NOT_TARGET_ROLE, f"role {role}, no usable skill evidence")
 
