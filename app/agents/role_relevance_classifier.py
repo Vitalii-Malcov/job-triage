@@ -340,64 +340,52 @@ _GENDER_MARKER = re.compile(
     r"\(?\s*\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b\s*\)?",
     re.IGNORECASE,
 )
-# The only words allowed IN FRONT of "Engineer" in a rescued title: seniority-entry words and
-# the two technologies. Anything else ("DevOps", "Mechanical Design", "Cloud Platform") names a
-# different kind of engineer, so this is an allowlist and not a growing list of exceptions.
-_ENGINEER_PREFIX_WORDS = frozenset(
-    {
-        "junior",
-        "jr",
-        "entry",
-        "level",
-        "associate",
-        "trainee",
-        "graduate",
-        "berufseinsteiger",
-        "einsteiger",
-        "python",
-        "backend",
-        "back",
-        "end",
-    }
+_LEVEL_IN_PARENTHESES = re.compile(
+    r"\(\s*(junior|jr\.?|entry[\s-]*level|trainee)\s*\)", re.IGNORECASE
 )
-_ENGINEER_WORD = re.compile(r"\b" + _ENGINEER + r"\b", re.IGNORECASE)
-# Accepted constructions after normalisation: "Python Engineer", "Backend Engineer", or an
-# engineer title that directly names Python as its focus ("Engineer Schwerpunkt Python",
-# "Engineer - Python", "Engineer (Python)"). Python elsewhere in the title does not count.
-_PYTHON_ENGINEER_REVIEW_PATTERN = re.compile(
-    (
-        r"\bpython[\s-]+{ENGINEER}\b"
-        r"|\bback-?end[\s-]+{ENGINEER}\b"
-        r"|\b{ENGINEER}\b\s*"
-        r"(?:[-–—/,:]\s*|(?:mit\s+)?(?:schwerpunkt|fokus|focus)(?:\s+auf)?\s+"
-        r"|with\s+focus\s+on\s+|\(\s*)"
-        r"python\b"
-    ).replace("{ENGINEER}", _ENGINEER),
+_LEVEL_WORD = (
+    r"(?:junior|jr\.?|entry[\s-]*level|associate|trainee|graduate"
+    r"|berufseinsteiger(?:in)?|einsteiger(?:in)?)"
+)
+_TECH_WORD = r"(?:python|back-?end)"
+_PYTHON_FOCUS = (
+    r"(?:\s*[-–—/,:]\s*"
+    r"|\s+(?:mit\s+)?(?:schwerpunkt|fokus|focus)(?:\s+auf)?\s+"
+    r"|\s+with\s+focus\s+on\s+"
+    r"|\s*\(\s*)"
+    r"python\s*\)?"
+)
+# The WHOLE normalised title has to be one of these shapes: optional entry-level words, then
+# "Python Engineer" / "Backend Engineer", or "Engineer" with Python named as its focus.
+# Nothing else may stand in the title (no other qualifier, no second role, no location), so the
+# grammar is closed instead of a list of exceptions. Titles it does not cover are simply not
+# rescued -- they stay in their ordinary review path, which is the safe direction.
+_REVIEW_RESCUE_TITLE = re.compile(
+    rf"(?:{_LEVEL_WORD}[\s-]+)*"
+    rf"(?:(?:{_TECH_WORD}[\s-]+){_ENGINEER}|{_ENGINEER}{_PYTHON_FOCUS})",
     re.IGNORECASE,
 )
 
 
-def _only_entry_words_before_engineer(text: str) -> bool:
-    match = _ENGINEER_WORD.search(text)
-    if match is None:
-        return False
-    words = re.findall(r"[a-zäöüß]+", text[: match.start()].casefold())
-    return all(word in _ENGINEER_PREFIX_WORDS for word in words)
+def _normalise_title(title: str) -> str:
+    text = _GENDER_MARKER.sub(" ", title or "")
+    text = _LEVEL_IN_PARENTHESES.sub(r" \1 ", text)
+    return " ".join(text.split())
 
 
 def is_review_rescue_title(title: str) -> bool:
     """May a thin-evidence posting with this title still be kept for a HUMAN look?
 
     Wider than RELEVANT, narrower than anything else: a RELEVANT title, or an UNKNOWN one
-    that is a plain engineer title (only entry-level words, Python or Backend in front of
-    "Engineer") naming Python as its focus ("Junior Engineer Schwerpunkt Python") or
-    "Backend Engineer". "Engineer" alone is not a software signal, which is why such a title
-    is UNKNOWN to `classify_title_relevance`. Any other qualifier ("DevOps Engineer", "Mechanical
-    Design Engineer - Python") is a different kind of engineer and is never rescued, and
-    neither is any text between the engineer word and Python except gender markers.
-    IRRELEVANT titles and titles with an irrelevant or ambiguity signal never qualify, and
-    the caller still has to rule out support/administration families. This only ever allows
-    SKIP -> MAYBE (review); it grants nothing towards an automatic APPLY.
+    whose whole text is a plain engineer title -- entry-level words, then "Python Engineer",
+    "Backend Engineer", or "Engineer" with Python named as its focus ("Junior Engineer
+    Schwerpunkt Python"). "Engineer" alone is not a software signal, which is why such a
+    title is UNKNOWN to `classify_title_relevance`. The match is on the whole title, so any
+    other qualifier ("DevOps Engineer - Python"), second role, discipline or location makes
+    it a different kind of title and it is not rescued. IRRELEVANT titles and titles with an
+    irrelevant or ambiguity signal never qualify, and the caller still has to rule out
+    support/administration families. This only ever allows SKIP -> MAYBE (review); it
+    grants nothing towards an automatic APPLY.
     """
     relevance = classify_title_relevance(title)
     if relevance.level == "RELEVANT":
@@ -409,10 +397,7 @@ def is_review_rescue_title(title: str) -> bool:
         return False
     if any(p.search(text) for _, p in _WEAK_AMBIGUITY_PATTERNS):
         return False
-    normalised = " ".join(_GENDER_MARKER.sub(" ", text).split())
-    return _only_entry_words_before_engineer(normalised) and bool(
-        _PYTHON_ENGINEER_REVIEW_PATTERN.search(normalised)
-    )
+    return _REVIEW_RESCUE_TITLE.fullmatch(_normalise_title(text)) is not None
 
 
 def derive_candidate_target_domain(target_roles: list[str]) -> CandidateTargetDomain:
