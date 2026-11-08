@@ -335,10 +335,25 @@ def is_apply_eligible_title(title: str) -> bool:
     return any(pattern.search(text) for _, pattern in _APPLY_ELIGIBLE_ADJACENT_PATTERNS)
 
 
+_ENGINEER = r"(?:engineer|ingenieur)(?:in)?"
+# Accepted constructions only: "Python Engineer", "Backend Engineer", or an engineer title
+# that directly names Python as its focus ("Junior Engineer (m/w/d) Schwerpunkt Python",
+# "Engineer - Python"). Python elsewhere in the title does not count.
 _PYTHON_ENGINEER_REVIEW_PATTERN = re.compile(
-    r"\b(?:engineer|ingenieur)(?:in)?\b.*\bpython\b"
-    r"|\bpython\b.*\b(?:engineer|ingenieur)(?:in)?\b"
-    r"|\bback-?end[\s-]+engineer\b",
+    r"\bpython[\s-]+{ENGINEER}\b"
+    r"|\bback-?end[\s-]+{ENGINEER}\b"
+    r"|\b{ENGINEER}\b\s*(?:\([^)]*\))?\s*"
+    r"(?:[-–—/,:]\s*|(?:mit\s+)?(?:schwerpunkt|fokus|focus)(?:\s+auf)?\s+|with\s+focus\s+on\s+|\(\s*)"
+    r"python\b".replace("{ENGINEER}", _ENGINEER),
+    re.IGNORECASE,
+)
+# A qualifier in front of "Engineer" that makes it a non-software engineering role. These stay
+# out of the review rescue even when Python is named ("DevOps Engineer - Python").
+_NON_SOFTWARE_ENGINEER = re.compile(
+    r"\b(?:devops|dev-ops|sre|system|systems|infrastructure|infrastruktur|cloud|platform|plattform|"
+    r"network|netzwerk|mechanical|mechatronik|electrical|elektro\w*|maschinenbau|service|support|"
+    r"security|it|embedded|hardware|process|prozess|test|qa|sales|presales|field|application|"
+    r"applikations?|site\s+reliability)\b[\s-]+{ENGINEER}\b".replace("{ENGINEER}", _ENGINEER),
     re.IGNORECASE,
 )
 
@@ -364,6 +379,8 @@ def is_review_rescue_title(title: str) -> bool:
     if any(p.search(text) for _, p in _IRRELEVANT_TITLE_PATTERNS):
         return False
     if any(p.search(text) for _, p in _WEAK_AMBIGUITY_PATTERNS):
+        return False
+    if _NON_SOFTWARE_ENGINEER.search(text):
         return False
     return _PYTHON_ENGINEER_REVIEW_PATTERN.search(text) is not None
 

@@ -30,7 +30,7 @@ from app.agents.target_role import (
     is_developer_title,
     support_admin_family,
 )
-from app.services.job_fit_assessment import FitAssessment
+from app.services.job_fit_assessment import MISSING_REQUIRED_MARKER, FitAssessment
 
 Category = Literal["PRIMARY", "ADJACENT", "MANUAL_REVIEW", "EXCLUDED"]
 
@@ -139,19 +139,26 @@ def _classify_direction(assessment: FitAssessment) -> TriageCategory:
         return TriageCategory(
             "MANUAL_REVIEW", ROLE_UNCLEAR, "title has no IT signal; the operator decides"
         )
+    skills_criterion = next((c for c in assessment.criteria if c.name == "skills"), None)
     if (
-        status.get("skills") == "WEAK"
+        skills_criterion is not None
+        and skills_criterion.status == "WEAK"
+        and MISSING_REQUIRED_MARKER not in skills_criterion.reason
         and role in _CONFIGURED_ROLES
         and is_review_rescue_title(assessment.title)
         and support_admin_family(assessment.title) is None
     ):
-        # An engineer title that names Python ("Junior Engineer Schwerpunkt Python") with a
-        # short skill list: thin evidence is not contradicting evidence. Held for the operator
-        # with the reason; the fit tier alone decides about automatic preparation.
+        # An engineer title that names Python ("Junior Engineer Schwerpunkt Python") whose
+        # skills could not be confirmed, with no required skill named that the candidate
+        # lacks: unconfirmed is not contradicted. Held for the operator, who sees the
+        # stated gaps (language, route ...) next to it; the fit tier alone decides about
+        # automatic preparation.
+        stated = "; ".join(assessment.tier_reasons[:2])
         return TriageCategory(
             "MANUAL_REVIEW",
             THIN_SKILL_EVIDENCE,
-            "Python engineer title, few skill signals in the posting; the operator reads it",
+            "Python engineer title, skills not confirmed (no missing requirement named)"
+            + (f"; {stated}" if stated else ""),
         )
     return TriageCategory("EXCLUDED", NOT_TARGET_ROLE, f"role {role}, no usable skill evidence")
 

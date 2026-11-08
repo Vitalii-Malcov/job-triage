@@ -86,6 +86,8 @@ _SENIOR_LEVEL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE))
     for name, pattern in (
         ("senior", r"\bsenior\b"),
+        # abbreviation: "Sr. Engineer", "Sr Python Developer" (never "Sr" inside a word)
+        ("senior-abbreviation", r"\bsr\.?(?=[\s,/-]|$)"),
         ("lead", r"\blead\b"),
         ("principal", r"\bprincipal\b"),
         ("staff", r"\bstaff\b"),

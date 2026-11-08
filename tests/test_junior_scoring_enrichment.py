@@ -12,13 +12,19 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.agents.role_relevance_classifier import is_review_rescue_title
+from app.agents.seniority_classifier import classify_title_seniority
 from app.db.base import Base
 from app.db.candidate_profile_repository import apply_candidate_profile_patch
 from app.db.models import ApplicationRecord, JobRecord
 from app.models.candidate_profile import CandidateProfilePatchRequest
 from app.models.job import Job
 from app.services.collector_runner import score_and_persist
-from app.services.job_fit_assessment import Criterion, FitAssessment, language_criterion
+from app.services.job_fit_assessment import (
+    MISSING_REQUIRED_MARKER,
+    Criterion,
+    FitAssessment,
+    language_criterion,
+)
 from app.services.shortlist_gate import automatic_block_reason
 from app.services.triage_category import THIN_SKILL_EVIDENCE, classify
 
@@ -109,6 +115,11 @@ def test_title_only_stub_is_needs_enrichment():
         "Senior Java Developer",
         "DevOps Engineer (m/w/d)",
         "Engineer Maschinenbau",
+        "DevOps Engineer - Python",
+        "IT System Engineer - Python",
+        "Mechanical Engineer - Python scripting",
+        "Sr. Engineer Python",
+        "Sr Engineer Python",
     ],
 )
 def test_unsuitable_titles_are_not_rescued(title):
@@ -123,6 +134,12 @@ def test_unsuitable_titles_are_not_rescued(title):
         ("Backend Engineer (m/w/d)", True),
         ("Junior Python Developer", True),
         ("IT System Engineer - Backend (m/w/d)", False),
+        ("Engineer - Python", True),
+        ("Python-Engineer", True),
+        ("DevOps Engineer - Python", False),
+        ("IT System Engineer - Python", False),
+        ("Mechanical Engineer - Python scripting", False),
+        ("Sr. Engineer Python", False),
         ("Engineer", False),
         ("DevOps Engineer", False),
         ("Python Systemadministrator", False),
@@ -177,15 +194,23 @@ def test_language_policy_at_confirmed_b1(text, status):
 # --- triage: thin evidence is a question for the operator, never a prepared application ----
 
 
-def _assessment(title, *, role="OTHER", skills="WEAK", language="NO_REQUIREMENT"):
+def _assessment(
+    title,
+    *,
+    role="OTHER",
+    skills="WEAK",
+    language="NO_REQUIREMENT",
+    skills_reason="s",
+    language_reason="g",
+):
     a = FitAssessment(job_id=1, company="Example GmbH", title=title)
     a.criteria = [
         Criterion("role", role, "r"),
-        Criterion("skills", skills, "s"),
+        Criterion("skills", skills, skills_reason),
         Criterion("location", "REMOTE_OK", "l"),
         Criterion("remote", "COMPATIBLE", "r"),
         Criterion("entry_level", "ENTRY_LEVEL", "e"),
-        Criterion("language", language, "g"),
+        Criterion("language", language, language_reason),
         Criterion("salary", "UNKNOWN", "p"),
         Criterion("start_date", "UNKNOWN", "d"),
         Criterion("experience", "UNKNOWN", "x"),
@@ -212,3 +237,31 @@ def test_python_engineer_with_thin_skills_is_manual_review_not_excluded():
 )
 def test_thin_skills_do_not_rescue_other_titles(title):
     assert classify(_assessment(title)).category == "EXCLUDED"
+
+
+def test_weak_skills_with_a_named_missing_requirement_are_not_thin_evidence():
+    a = _assessment(
+        "Junior Engineer Schwerpunkt Python",
+        skills_reason="required skill score 10/100 (v12)"
+        + MISSING_REQUIRED_MARKER
+        + "Java, Spring",
+    )
+    assert classify(a).category == "EXCLUDED"
+
+
+def test_thin_evidence_review_keeps_the_stated_gaps_visible():
+    a = _assessment(
+        "Junior Engineer Schwerpunkt Python", language="GAP", language_reason="German B2 required"
+    )
+    result = classify(a)
+    assert result.code == THIN_SKILL_EVIDENCE
+    assert "German B2 required" in result.reason
+
+
+@pytest.mark.parametrize("title", ["Sr. Engineer Python", "Sr Python Developer", "SR. Engineer"])
+def test_sr_abbreviation_is_a_senior_marker(title):
+    assert classify_title_seniority(title).level == "SENIOR"
+
+
+def test_sr_is_not_matched_inside_words():
+    assert classify_title_seniority("Srinivasan Python Developer").level != "SENIOR"

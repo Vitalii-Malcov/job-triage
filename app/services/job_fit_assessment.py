@@ -86,6 +86,10 @@ FitTier = Literal["NOT_SUITABLE", "NEEDS_OPERATOR", "STRETCH", "PARTIAL_MATCH", 
 # A STRONG skill fit needs at least this many extracted required skills.
 MIN_SKILL_REQUIREMENTS_FOR_STRONG = 2
 
+# Appears in the skills criterion reason only when the posting names required skills the
+# candidate lacks (a contradiction, as opposed to skills that could not be confirmed).
+MISSING_REQUIRED_MARKER = "; missing required: "
+
 _LEVEL = {"UNKNOWN": 0, "A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6, "NATIVE": 7}
 
 # Statuses that make the whole vacancy BLOCKED / NEEDS_VERIFICATION.
@@ -328,7 +332,7 @@ def skills_criterion(match: CandidateJobMatch | None) -> Criterion:
         status = "WEAK"
     reason = f"required skill score {score}/100 ({match.algorithm_version})"
     if missing:
-        reason += "; missing required: " + ", ".join(missing[:6])
+        reason += MISSING_REQUIRED_MARKER + ", ".join(missing[:6])
     return Criterion("skills", status, reason)
 
 
