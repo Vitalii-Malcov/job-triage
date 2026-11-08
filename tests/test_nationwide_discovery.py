@@ -7,8 +7,10 @@ not advance the watermark, and that the feature is off by default and sends noth
 """
 
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime, timedelta
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -62,7 +64,8 @@ def posting(ref, title, *, company="Remote GmbH", home_office=None, full_time=No
 class FakeBA:
     """A scripted Bundesagentur: one list of postings per search term, 100 per page."""
 
-    def __init__(self, by_term, *, fail_terms=()):
+    def __init__(self, by_term, *, fail_terms=(), details=None):
+        self.details = details or {}
         self.by_term = by_term
         self.fail_terms = set(fail_terms)
         self.requests: list[dict] = []
@@ -70,6 +73,11 @@ class FakeBA:
     def handler(self, request: httpx.Request) -> httpx.Response:
         params = dict(request.url.params)
         self.requests.append(params)
+        if "jobdetails" in request.url.path:
+            ref = base64.b64decode(unquote(request.url.path.rsplit("/", 1)[1])).decode()
+            return httpx.Response(
+                200, json={"stellenangebotsBeschreibung": self.details.get(ref, "")}
+            )
         if params.get("was") in self.fail_terms:
             return httpx.Response(500, json={})
         rows = self.by_term.get(params.get("was"), [])
@@ -299,7 +307,10 @@ def test_new_vacancy_outside_hessen_is_stored_with_its_flags(db, wired):
 
 
 def test_cap_on_new_vacancies_defers_the_rest_and_prefers_entry_level(db, wired):
-    rows = [posting("s1", "Senior Python Developer (m/w/d)"), posting("j1", GOOD)]
+    rows = [
+        posting("s1", "Senior Python Developer (m/w/d)", home_office=True),
+        posting("j1", GOOD, home_office=True),
+    ]
     wired(FakeBA({"Python Entwickler": rows}))
     cfg = settings(nationwide_remote_max_new_per_run=1)
     result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
@@ -391,3 +402,90 @@ def test_job_model_carries_the_flag():
     )
     assert job.full_time_offered is None
     assert job.model_copy(update={"full_time_offered": True}).full_time_offered is True
+
+
+# --- only postings that can still qualify are stored ---------------------------------------
+
+
+def test_new_onsite_and_hybrid_postings_are_not_stored_but_remote_ones_are(db, wired):
+    ads = [
+        posting("on", GOOD),
+        posting("hy", GOOD),
+        posting("re", GOOD),
+        posting("ho", GOOD, home_office=True),
+        posting("si", GOOD),
+    ]
+    details = {
+        "on": "Arbeitsort ist Nuernberg. Vor Ort im Buero. Python, SQL.",
+        "hy": "Hybrid: drei Tage pro Woche im Buero. Python, SQL.",
+        "re": "100 % Remote aus Deutschland. Vollzeit. Python, SQL.",
+        "ho": "Wir bieten spannende Aufgaben mit Python und SQL.",
+        "si": "Wir bieten spannende Aufgaben mit Python und SQL.",
+    }
+    wired(FakeBA({"Python Entwickler": ads}, details=details))
+    result = asyncio.run(run_nationwide_remote_discovery(db, settings()))
+    stored = {r.source_reference for r in db.scalars(select(JobRecord)).all()}
+    assert stored == {"re", "ho"}  # "si" says nothing about remote and has no BA flag
+    assert result["created"] == 2 and result["skipped_not_remote_candidate"] == 3
+
+
+def test_an_already_stored_posting_is_updated_even_if_it_no_longer_qualifies(db, wired):
+    ad = posting("on", GOOD, home_office=True)
+    cfg = settings(bundesagentur_search_keywords="Python")
+    wired(FakeBA({"Python": [ad]}, details={"on": "Vor Ort im Buero. Python."}))
+    asyncio.run(run_bundesagentur(db, cfg))
+    assert db.scalar(select(func.count()).select_from(JobRecord)) == 1
+
+    wired(FakeBA({"Python Entwickler": [ad]}, details={"on": "Vor Ort im Buero. Python."}))
+    result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
+    assert db.scalar(select(func.count()).select_from(JobRecord)) == 1
+    assert result["created"] == 0 and result["updated"] == 1
+
+
+# --- the automation cycle ------------------------------------------------------------------
+
+
+def _cycle(db, cfg, monkeypatch):
+    from app.services import automation
+
+    calls: list[str] = []
+
+    async def local(db, settings, *, touched_jobs=None, is_lease_lost=None):
+        calls.append("local")
+        return {"fetched": 0, "created": 0, "updated": 0, "failed": 0, "skipped_invalid": 0}
+
+    async def xing(db, settings, *, touched_jobs=None, is_lease_lost=None):
+        calls.append("xing")
+        return {"fetched": 0, "created": 0, "updated": 0, "failed": 0, "skipped_invalid": 0}
+
+    async def nationwide(db, settings, *, touched_jobs=None, is_lease_lost=None, window_days=None):
+        calls.append(f"nationwide:{window_days}")
+        return {"fetched": 0, "created": 0, "updated": 0, "failed": 0, "skipped_invalid": 0}
+
+    monkeypatch.setattr(automation, "run_bundesagentur", local)
+    monkeypatch.setattr(automation, "run_xing", xing)
+    monkeypatch.setattr(automation, "run_nationwide_remote_discovery", nationwide)
+    run = asyncio.run(automation.run_automation_cycle(db, account_key=ACCOUNT, settings=cfg))
+    return run, calls
+
+
+def test_cycle_default_runs_only_the_existing_steps(db, monkeypatch):
+    run, calls = _cycle(db, Settings(_env_file=None), monkeypatch)
+    assert calls == ["local", "xing"]
+    assert STEP_NAME not in json.loads(run.results_json)
+
+
+def test_cycle_runs_nationwide_when_enabled_and_records_the_step(db, monkeypatch):
+    run, calls = _cycle(db, settings(), monkeypatch)
+    assert calls == ["local", "xing", "nationwide:None"]
+    assert json.loads(run.results_json)[STEP_NAME]["status"] == "ok"
+    # the watermark now holds: a second cycle inside the interval does not search again
+    _run, calls_again = _cycle(db, settings(), monkeypatch)
+    assert calls_again == ["local", "xing"]
+
+
+def test_cycle_can_switch_the_local_track_off(db, monkeypatch):
+    cfg = settings(local_discovery_enabled=False)
+    run, calls = _cycle(db, cfg, monkeypatch)
+    assert calls == ["xing", "nationwide:None"]
+    assert "bundesagentur" not in json.loads(run.results_json)

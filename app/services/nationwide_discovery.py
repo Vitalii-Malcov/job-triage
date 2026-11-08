@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agents.job_fit_signals import classify_remote
 from app.collectors.bundesagentur import BundesagenturAPIError, is_api_key_configured
 from app.core.config import reveal
 from app.db.models import AutomationRunRecord
@@ -89,6 +90,17 @@ def nationwide_due(
     return True, nationwide_window_days(elapsed / 86_400)
 
 
+def is_remote_candidate(job: Job) -> bool:
+    """Can a posting that is new to the database still qualify as TRACK B? On-site and hybrid
+    work far from home cannot (the local track covers what is within reach); a posting that
+    mentions remote work, or says nothing but carries the BA home-office flag, may. The real
+    decision (fully remote, full time, workable from Germany) stays with the fit assessment."""
+    mode = classify_remote(job.title + chr(10) + job.description).mode
+    if mode in {"FULLY_REMOTE", "PARTIAL_REMOTE"}:
+        return True
+    return mode == "UNKNOWN" and job.home_office_possible is True
+
+
 def _entry_first(work: list[tuple[object, Job]]) -> list[tuple[object, Job]]:
     return sorted(work, key=lambda pair: 0 if _ENTRY_TITLE.search(pair[1].title) else 1)
 
@@ -130,6 +142,7 @@ async def run_nationwide_remote_discovery(
         touched_jobs=touched_jobs,
         is_lease_lost=is_lease_lost,
         max_new=settings.nationwide_remote_max_new_per_run,
+        accept_new=is_remote_candidate,
         log_name="bundesagentur_nationwide_run",
     )
     result = {**counters, **stats}

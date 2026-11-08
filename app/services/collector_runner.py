@@ -611,7 +611,8 @@ async def enrich_and_persist_ba_job(
     *,
     fetch_detail: bool = True,
     detail_breaker: DetailBreaker | None = None,
-) -> tuple[JobRecord, JobScore, bool]:
+    accept_new: Callable[[Job], bool] | None = None,
+) -> tuple[JobRecord, JobScore, bool] | None:
     """Detail enrichment (live BA description, or the stored one), skill
     extraction, scoring and persistence of ONE Bundesagentur posting -- the
     per-job core of `run_bundesagentur`, shared with the Stage 22 refresh CLI
@@ -666,6 +667,12 @@ async def enrich_and_persist_ba_job(
             job.url,
         )
 
+    if accept_new is not None and existing is None:
+        # Nationwide discovery: a posting the database has never seen is stored only if it can
+        # still qualify (see app.services.nationwide_discovery.is_remote_candidate). A known
+        # row is always updated; nothing already stored is ever dropped by this check.
+        if not accept_new(job.model_copy(update={"description": description})):
+            return None
     extraction = extract_skills(job.title, description)
     all_skills = sorted(
         set(job.skills) | set(extraction.must_have_skills) | set(extraction.nice_to_have_skills)
@@ -1108,6 +1115,7 @@ async def _process_ba_work(
     touched_jobs: list[TouchedJob] | None = None,
     is_lease_lost: Callable[[], bool] | None = None,
     max_new: int | None = None,
+    accept_new: Callable[[Job], bool] | None = None,
     log_name: str = "bundesagentur_collector_run",
 ) -> dict[str, int]:
     """Enrich, score and persist the de-duplicated postings of one Bundesagentur run (shared by
@@ -1115,6 +1123,7 @@ async def _process_ba_work(
     database (each costs a detail request); the rest are `deferred` to the next run."""
     new_seen = 0
     deferred = 0
+    not_candidate = 0
     # loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
     candidate_skills = get_candidate_skills_for_scoring(db)
@@ -1143,9 +1152,18 @@ async def _process_ba_work(
             logger.warning("bundesagentur_collector_stopped_lease_lost")
             break
         try:
-            job_record, result, created = await enrich_and_persist_ba_job(
-                db, collector, candidate_skills, job, detail_breaker=detail_breaker
+            outcome = await enrich_and_persist_ba_job(
+                db,
+                collector,
+                candidate_skills,
+                job,
+                detail_breaker=detail_breaker,
+                accept_new=accept_new,
             )
+            if outcome is None:
+                not_candidate += 1
+                continue
+            job_record, result, created = outcome
         except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and
@@ -1206,6 +1224,7 @@ async def _process_ba_work(
         "skipped_invalid": skipped_invalid,
         "failed": tally.failed,
         **({"deferred": deferred} if deferred else {}),
+        **({"skipped_not_remote_candidate": not_candidate} if not_candidate else {}),
     }
 
 
