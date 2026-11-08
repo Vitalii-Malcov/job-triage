@@ -317,10 +317,11 @@ def test_new_vacancy_outside_hessen_is_stored_with_its_flags(db, wired):
     assert result["created"] == 1 and result["searches"] == len(NATIONWIDE_TERMS)
 
 
-def test_cap_on_new_vacancies_defers_the_rest_and_prefers_entry_level(db, wired):
+def test_cap_on_new_vacancies_defers_the_rest(db, wired, monkeypatch):
+    monkeypatch.setattr("app.services.nationwide_discovery._entry_first", lambda work: work)
     rows = [
-        posting("s1", "Senior Python Developer (m/w/d)", home_office=True),
         posting("j1", GOOD, home_office=True),
+        posting("s1", "Senior Python Developer (m/w/d)", home_office=True),
     ]
     wired(FakeBA({"Python Entwickler": rows}))
     cfg = settings(nationwide_remote_max_new_per_run=1)
@@ -587,34 +588,67 @@ def test_detail_retries_are_charged_to_the_detail_cap():
     assert len(fake.requests) == 2 and gate.detail_attempts == 2
 
 
+class _DetailDown(FakeBA):
+    def handler(self, request):
+        if "jobdetails" in request.url.path:
+            return httpx.Response(500, json={})
+        return super().handler(request)
+
+
 def test_a_run_that_stored_postings_without_text_is_incomplete(db, wired):
-    wired(FakeBA({"Python Entwickler": [posting("nd", GOOD)]}, details={}))
+    wired(_DetailDown({"Python Entwickler": [posting("nd", GOOD)]}))
     result = asyncio.run(run_nationwide_remote_discovery(db, settings()))
     assert result["detail_unavailable"] == 1
     _step_run(db, {STEP_NAME: {"status": "ok", "counters": result}}, days_ago=0.1)
     assert last_success_at(db, ACCOUNT) is None  # the same period is searched again
 
 
-def test_candidate_order_rotates_with_the_date_but_keeps_entry_level_first():
-    from datetime import date
+def test_a_posting_the_source_has_no_text_for_does_not_hold_the_watermark_back(db, wired):
+    wired(FakeBA({"Python Entwickler": [posting("nt", GOOD, home_office=True)]}, details={}))
+    result = asyncio.run(run_nationwide_remote_discovery(db, settings()))
+    assert "detail_unavailable" not in result  # permanent gap, not a failure of this run
+
+
+def test_candidate_order_is_a_weighted_daily_shuffle_without_permanent_losers():
+    from datetime import date, timedelta
 
     from app.services.nationwide_discovery import _entry_first
 
+    titles = ["Python Developer"] * 12 + ["Junior Python Developer"] * 4
     jobs = [
         (
             None,
             Job(
                 source="bundesagentur",
-                title=t,
+                title=title,
                 company="c",
                 location="",
                 url=f"https://e.org/{i}",
                 source_reference=str(i),
             ),
         )
-        for i, t in enumerate(["Python Developer"] * 12 + ["Junior Python Developer"] * 3)
+        for i, title in enumerate(titles)
     ]
-    day_one = [j.source_reference for _, j in _entry_first(jobs, date(2026, 11, 8))]
-    day_two = [j.source_reference for _, j in _entry_first(jobs, date(2026, 11, 9))]
-    assert set(day_one[:3]) == {"12", "13", "14"} == set(day_two[:3])
-    assert day_one[3:] != day_two[3:]
+    first_places = {}
+    last_places = {}
+    junior_in_top4 = 0
+    for offset in range(60):
+        order = [
+            j.source_reference for _, j in _entry_first(jobs, date(2026, 1, 1) + timedelta(offset))
+        ]
+        first_places[order[0]] = first_places.get(order[0], 0) + 1
+        last_places[order[-1]] = last_places.get(order[-1], 0) + 1
+        junior_in_top4 += sum(1 for ref in order[:4] if int(ref) >= 12)
+    assert len(first_places) > 6 and len(last_places) > 6  # nobody is always first or last
+    assert junior_in_top4 > 60 * 4 * 0.4  # entry-level still comes early (fair share is 25 %)
+
+
+def test_an_empty_stored_row_after_a_failed_detail_keeps_the_period_open(db, wired):
+    ad = posting("up", GOOD, home_office=True)
+    cfg = settings()
+    wired(FakeBA({"Python Entwickler": [ad]}, details={"up": ""}))
+    asyncio.run(run_nationwide_remote_discovery(db, cfg))  # stored, BA has no text for it
+
+    wired(_DetailDown({"Python Entwickler": [ad]}))
+    result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
+    assert result["updated"] == 1 and result["detail_unavailable"] == 1

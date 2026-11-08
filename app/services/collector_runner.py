@@ -1187,10 +1187,16 @@ async def _process_ba_work(
         if created:
             new_stored += 1
             tally.created += 1
-            if accept_new is not None and not (job_record.description or "").strip():
-                detail_unavailable += 1  # stored without text; the next run must enrich it
         else:
             tally.updated += 1
+        if (
+            accept_new is not None
+            and not (job_record.description or "").strip()
+            and (detail_breaker.open or (gate is not None and gate.exhausted))
+        ):
+            # stored without text because the detail request failed or the ceiling was reached
+            # (a transient gap): the period is not covered until a later run enriches it
+            detail_unavailable += 1
 
         await _publish_persisted_job(
             db,

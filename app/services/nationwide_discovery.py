@@ -115,18 +115,24 @@ def is_remote_candidate(job: Job) -> bool:
     return mode == "UNKNOWN" and job.home_office_possible is True
 
 
+_ENTRY_WEIGHT = 3.0
+
+
 def _entry_first(
     work: list[tuple[object, Job]], today: date | None = None
 ) -> list[tuple[object, Job]]:
-    """Entry-level titles first. Inside each group the order rotates with the date, so postings
-    the caps leave out on one day are not the same ones every day, and postings that are
-    rejected again and again cannot starve the others for good."""
+    """A weighted daily shuffle: entry-level titles are three times as likely to come early, but
+    no posting is always first or always last. Which postings the per-run caps leave out
+    therefore changes from day to day, and postings that are rejected again and again cannot
+    starve the others for good (a persistent rejection ledger would need a table)."""
     day = (today or datetime.now(UTC).date()).isoformat()
 
-    def key(pair: tuple[object, Job]) -> tuple[int, str]:
+    def key(pair: tuple[object, Job]) -> float:
         job = pair[1]
-        rotation = hashlib.sha256(f"{day}:{job.source_reference or job.url}".encode()).hexdigest()
-        return (0 if _ENTRY_TITLE.search(job.title) else 1, rotation)
+        digest = hashlib.sha256(f"{day}:{job.source_reference or job.url}".encode()).digest()
+        fraction = (int.from_bytes(digest[:8], "big") + 1) / (2**64 + 1)  # in (0, 1)
+        weight = _ENTRY_WEIGHT if _ENTRY_TITLE.search(job.title) else 1.0
+        return -(fraction ** (1.0 / weight))
 
     return sorted(work, key=key)
 
