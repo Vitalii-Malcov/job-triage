@@ -403,7 +403,8 @@ def test_hybrid_admin_titles_are_not_in_the_junior_group_in_python_or_sql(writer
     assert 1 not in junior_ids and 2 not in other_ids
     assert junior_ids.isdisjoint(other_ids)
     # every queue member is reachable in exactly one phase
-    assert (junior_ids | other_ids) <= {1, 2}
+    assert junior_ids == {2}
+    assert other_ids == {1}
 
 
 def _collect(reader, *, page_size, scan_budget):
@@ -433,8 +434,13 @@ def test_following_the_links_visits_every_vacancy_once_across_both_phases(writer
             f"Junior Python Entwickler {n}" if n % 3 == 0 else f"Software Entwickler Java {n}"
         )
         _add_job(writer, n, titles[n])
+    titles[31] = "Python Entwickler / IT-Systemadministrator (m/w/d)"
+    _add_job(writer, 31, titles[31])
     everything = _collect(reader, page_size=50, scan_budget=10_000)
-    assert everything, "the queue must not be empty for this data"
+    # independent expectation: all 31 vacancies wait for review in this data (no route or
+    # profile is configured), and the hybrid admin title is among them but last
+    assert sorted(everything) == list(range(1, 32))
+    assert everything[-1] == 31
     for page_size, budget in ((3, 7), (5, 5), (4, 1000)):
         walked = _collect(reader, page_size=page_size, scan_budget=budget)
         assert sorted(walked) == sorted(everything)

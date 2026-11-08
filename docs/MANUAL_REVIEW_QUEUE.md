@@ -38,13 +38,19 @@ The ordering inside the "other" group is per page, not global (see limits).
 
 * Opening the page assesses live at most `SCAN_BUDGET` (200) vacancies, like the computed filters of
   the vacancy list (about 30 ms each on SQLite, so a page can take several seconds). It never
-  recomputes the database: the next page is a link.
+  recomputes the database: the next page is a link. In the rare case that the cache inputs changed
+  while a page was being built, the page is read once more without the cache, so one request can
+  assess up to twice the budget; the reported `scanned` counts the second read only.
 * If the assessment cache is in use, a vacancy whose **fresh** cached assessment is `NOT_SUITABLE`
   is skipped without a live assessment. A stale or missing cache row never hides a vacancy.
-* Measured on a copy of the database (3 368 vacancies): 663 entries, 8 of them Junior Python/Backend
+* Measured on a copy of the database (3 368 vacancies): 673 entries, 8 of them Junior Python/Backend
   titles; a full pass over the whole database takes about 100 s, which is why the page is paged.
 * Because the page is built from a scan, the queue size is not shown as a single number, and the
   "other" group is sorted within each page only.
+* Of the 673: 632 Bundesagentur and 41 XING (title-only stubs that stay visible for analysis);
+  by main reason `ROUTE_REVIEW_REQUIRED` 304, `REMOTE_UNVERIFIED` 194, `STATED_GAP` 96,
+  `ROLE_UNCLEAR` 41, `DATA_REVIEW_REQUIRED` 18, `NEEDS_ENRICHMENT` 16, `HYBRID_ADMIN_ROLE` 3,
+  `THIN_SKILL_EVIDENCE` 1; `LANGUAGE_REVIEW` is also tagged on 256 of them.
 * The Junior Python/Backend group is a title test (a level word and python/backend in the title); it
   is a heuristic, not a judgement about the posting.
 
