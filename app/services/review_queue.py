@@ -67,6 +67,9 @@ _CLARIFY = {
 }
 
 _GENERIC_CLARIFY = "Read the posting and decide; the reason says what is open."
+# A title with one of these is an administration/support (or mixed) role; it never belongs to the
+# Junior Python/Backend group, in SQL and in Python alike.
+_ADMIN_WORDS = ("admin", "support", "helpdesk", "service desk", "servicedesk", "betreuer")
 _JUNIOR_WORDS = ("junior", "trainee", "berufseinsteiger", "einsteiger", "entry")
 _TECH_WORDS = ("python", "backend", "back-end")
 
@@ -98,11 +101,15 @@ def is_junior_python_title(title: str) -> bool:
     """Plain substring test on purpose: the UI selects this group in SQL (`ilike`) and the
     two sides have to agree exactly."""
     text = (title or "").casefold()
-    return any(w in text for w in _JUNIOR_WORDS) and any(w in text for w in _TECH_WORDS)
+    return (
+        any(w in text for w in _JUNIOR_WORDS)
+        and any(w in text for w in _TECH_WORDS)
+        and not any(w in text for w in _ADMIN_WORDS)
+    )
 
 
-def junior_python_words() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    return _JUNIOR_WORDS, _TECH_WORDS
+def junior_python_words() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    return _JUNIOR_WORDS, _TECH_WORDS, _ADMIN_WORDS
 
 
 def _status(assessment: FitAssessment, name: str) -> str:
@@ -120,11 +127,16 @@ def review_item(job, assessment: FitAssessment, url: str | None) -> ReviewItem |
     elif (
         triage.category == "EXCLUDED"
         and triage.code == NOT_TARGET_ROLE
-        and job.recommendation == NEEDS_ENRICHMENT
+        and (
+            job.recommendation == NEEDS_ENRICHMENT
+            or _status(assessment, "skills") == "NOT_EVALUATED"
+        )
         and is_search_target_title(job.title)
     ):
+        # triage excluded it only because there is no skill evidence (missing or outdated
+        # analysis, or a description that is too short): unknown, not unsuitable
         code = NEEDS_ENRICHMENT
-        reason = "description missing or too short; nothing is known about skills, hours or place"
+        reason = "skill evidence is missing; nothing is known about skills, hours or place"
     else:
         return None
     also = []

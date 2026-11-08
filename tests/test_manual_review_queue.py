@@ -4,6 +4,7 @@ The queue only lists, explains and links. Being in it never clears a vacancy for
 application: nothing here prepares, approves, sends, creates an application or changes a status.
 """
 
+import dataclasses
 import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -277,12 +278,24 @@ def test_opening_the_page_never_assesses_more_than_the_scan_budget(writer, reade
     assert page.scanned <= 10
 
 
-def test_the_read_only_session_cannot_write(reader):
-    with pytest.raises(Exception):  # noqa: B017 - any driver error proves the engine is read-only
-        reader.add(
-            JobRecord(fingerprint="x", source="s", title="t", company="c", location="l", url="u")
-        )
-        reader.commit()
+def test_the_read_only_session_cannot_write_what_the_writer_can(writer, reader):
+    values = dict(
+        source="bundesagentur",
+        title="Probe",
+        company="c",
+        location="l",
+        url="https://example.invalid/p",
+        description="d",
+        score=1,
+        recommendation="MAYBE",
+        first_seen_at=NOW,
+        last_seen_at=NOW,
+    )
+    writer.add(JobRecord(fingerprint="writer-ok", **values))
+    writer.commit()  # the same valid row is accepted through the writer ...
+    with pytest.raises(Exception, match="(?i)readonly|read-only|read only"):
+        reader.add(JobRecord(fingerprint="reader-no", **values))
+        reader.commit()  # ... and refused by the read-only engine
 
 
 # --- the route -----------------------------------------------------------------------------
@@ -362,3 +375,141 @@ def test_a_garbage_filter_value_is_ignored_not_trusted(client, writer):
     assert client.get("/ui/review?phase=other&before_id=1").status_code == 200
     assert client.get("/ui/review?phase=evil").status_code == 422
     assert writer.scalar(select(func.count()).select_from(JobRecord)) == 1
+
+
+# --- review findings: visibility, phases, traversal, cache --------------------------------
+
+
+def test_a_target_title_with_missing_skill_analysis_stays_visible_whatever_the_recommendation():
+    a = _assessment("Junior Engineer Schwerpunkt Python", skills="NOT_EVALUATED")
+    item = rq.review_item(_job(recommendation="MAYBE"), a, None)
+    assert item is not None
+    assert item.reason_code == rq.NEEDS_ENRICHMENT
+
+
+def test_a_non_target_title_without_skill_analysis_is_still_excluded():
+    a = _assessment("Buchhalter (m/w/d)", skills="NOT_EVALUATED")
+    assert rq.review_item(_job(9, "Buchhalter (m/w/d)", recommendation="MAYBE"), a, None) is None
+
+
+def test_hybrid_admin_titles_are_not_in_the_junior_group_in_python_or_sql(writer, reader):
+    _add_job(writer, 1, "Junior Python Entwickler / IT-Systemadministrator")
+    _add_job(writer, 2, "Junior Python Entwickler (m/w/d)")
+    assert rq.is_junior_python_title("Junior Python Entwickler / IT-Systemadministrator") is False
+    junior = queries.review_page(reader, queries.ReviewFilters(phase="junior"))
+    other = queries.review_page(reader, queries.ReviewFilters(phase="other"))
+    junior_ids = {i.job_id for i in junior.items}
+    other_ids = {i.job_id for i in other.items}
+    assert 1 not in junior_ids and 2 not in other_ids
+    assert junior_ids.isdisjoint(other_ids)
+    # every queue member is reachable in exactly one phase
+    assert (junior_ids | other_ids) <= {1, 2}
+
+
+def _collect(reader, *, page_size, scan_budget):
+    """Follow the page links like the browser does; returns every item id in order."""
+    seen, phase, before = [], "junior", None
+    for _ in range(200):
+        page = queries.review_page(
+            reader,
+            queries.ReviewFilters(phase=phase, before_id=before),
+            page_size=page_size,
+            scan_budget=scan_budget,
+        )
+        seen += [i.job_id for i in page.items]
+        if page.next_before_id:
+            before = page.next_before_id
+        elif page.next_phase:
+            phase, before = page.next_phase, None
+        else:
+            return seen
+    raise AssertionError("pagination did not terminate")
+
+
+def test_following_the_links_visits_every_vacancy_once_across_both_phases(writer, reader):
+    titles = {}
+    for n in range(1, 31):
+        titles[n] = (
+            f"Junior Python Entwickler {n}" if n % 3 == 0 else f"Software Entwickler Java {n}"
+        )
+        _add_job(writer, n, titles[n])
+    everything = _collect(reader, page_size=50, scan_budget=10_000)
+    assert everything, "the queue must not be empty for this data"
+    for page_size, budget in ((3, 7), (5, 5), (4, 1000)):
+        walked = _collect(reader, page_size=page_size, scan_budget=budget)
+        assert sorted(walked) == sorted(everything)
+        assert len(walked) == len(set(walked))
+    junior_first = [i for i in everything if rq.is_junior_python_title(titles[i])]
+    assert junior_first, "the data must contain Junior Python titles"
+    assert set(everything[: len(junior_first)]) == set(junior_first)
+
+
+def _cache_row(db, job_id, key, tier):
+    from app.db.models import JobFitAssessmentRecord
+
+    db.add(
+        JobFitAssessmentRecord(
+            job_id=job_id,
+            input_key=key,
+            rules_hash="r" * 64,
+            profile_version=None,
+            fit_tier=tier,
+            decision="BLOCKED",
+            criteria_json="[]",
+            tier_reasons_json="[]",
+            work_mode="UNKNOWN",
+            applied=False,
+            computed_at=NOW,
+        )
+    )
+    db.commit()
+
+
+def test_a_stale_cached_barrier_never_hides_a_vacancy_but_a_fresh_one_is_skipped(writer, reader):
+    from app.services import fit_cache
+
+    _add_job(writer, 1, "Junior Python Entwickler stale")
+    _add_job(writer, 2, "Junior Python Entwickler fresh")
+    _cache_row(writer, 1, "0" * 64, "NOT_SUITABLE")  # stale: key differs from the current one
+    fresh_key = fit_cache.current_keys(writer, [2])[2]
+    _cache_row(writer, 2, fresh_key, "NOT_SUITABLE")
+    assert fit_cache.cache_in_use(reader)
+    assessed = []
+
+    def counting(db, job_id):
+        assessed.append(job_id)
+        return assess_job(db, job_id)
+
+    queries.review_page(reader, queries.ReviewFilters(), assess=counting)
+    assert 1 in assessed  # stale row: assessed live, never trusted
+    assert 2 not in assessed  # fresh confirmed barrier: no live assessment needed
+
+
+def test_the_page_is_read_again_without_the_cache_when_the_inputs_change_meanwhile(
+    writer, reader, monkeypatch
+):
+    from app.services import fit_cache
+
+    _add_job(writer, 1, "Junior Python Entwickler")
+    fresh_key = fit_cache.current_keys(writer, [1])[1]
+    _cache_row(writer, 1, fresh_key, "NOT_SUITABLE")
+    real = fit_cache.global_inputs
+    calls = {"n": 0}
+
+    def drifting(session):
+        calls["n"] += 1
+        value = real(session)
+        if calls["n"] >= 2:  # the end-of-page re-check sees a different state
+            return dataclasses.replace(value, profile_version=(value.profile_version or 0) + 1)
+        return value
+
+    monkeypatch.setattr(fit_cache, "global_inputs", drifting)
+    assessed = []
+
+    def counting(db, job_id):
+        assessed.append(job_id)
+        return assess_job(db, job_id)
+
+    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting)
+    assert 1 in assessed  # the cached barrier was not trusted after the inputs moved
+    assert page.from_cache is False

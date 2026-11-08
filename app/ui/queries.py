@@ -315,10 +315,11 @@ class ReviewPage:
 
 
 def _junior_python_clause():
-    junior, tech = review_queue.junior_python_words()
+    junior, tech, admin = review_queue.junior_python_words()
     return and_(
         or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in junior)),
         or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in tech)),
+        not_(or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in admin))),
     )
 
 
@@ -329,6 +330,7 @@ def review_page(
     assess: Callable[[Session, int], FitAssessment] = assess_job,
     page_size: int = PAGE_SIZE,
     scan_budget: int = SCAN_BUDGET,
+    use_cache: bool = True,
 ) -> ReviewPage:
     """One page of the manual review queue. Read-only: it assesses vacancies live (the same
     `assess_job` as the vacancy list), writes nothing and never recomputes the database --
@@ -337,7 +339,7 @@ def review_page(
     assessment; a stale or missing cache row never hides a vacancy."""
     phase = "other" if filters.phase == "other" else "junior"
     clause = _junior_python_clause()
-    cached = fit_cache.cache_in_use(db)
+    cached = use_cache and fit_cache.cache_in_use(db)
     if cached:
         query = select(
             JobRecord, JobFitAssessmentRecord.input_key, JobFitAssessmentRecord.fit_tier
@@ -382,6 +384,17 @@ def review_page(
             items.append(item)
         if not exhausted_source or len(candidates) < batch:
             break
+    if cached and fit_cache.global_inputs(db) != inputs:
+        # profile, rules or applications changed while the page was built: the cached tiers may
+        # have been compared with outdated inputs, so read the page again without the cache
+        return review_page(
+            db,
+            filters,
+            assess=assess,
+            page_size=page_size,
+            scan_budget=scan_budget,
+            use_cache=False,
+        )
     items.sort(key=review_queue.sort_key)
     budget_exhausted = not exhausted_source and len(items) < page_size
     return ReviewPage(
