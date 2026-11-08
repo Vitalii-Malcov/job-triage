@@ -58,11 +58,9 @@ class BundesagenturQuery:
     home_office_only: bool = False
     offer_type: int | None = None  # Stage 23: BA `angebotsart` (1 = employment)
     published_within_days: int | None = None  # Stage 23: BA `veroeffentlichtseit` (7 or 14)
-    # Nationwide discovery: keep postings whose home-office flag is unset (only an explicit
-    # "false" is dropped), keep only development-role titles, and pace the requests.
-    exclude_home_office_denied: bool = False
+    # Nationwide discovery: keep only development-role titles (the BA home-office flag is never
+    # a filter there: the posting text decides).
     target_titles_only: bool = False
-    request_delay_seconds: float = 0.0
 
 
 def ba_radius_for(limit_km: int) -> int:
@@ -261,13 +259,11 @@ def nationwide_window_days(days_since_last_success: float | None) -> int | None:
     return None
 
 
-def nationwide_remote_queries(
-    settings, *, window_days: int | None = None
-) -> list[BundesagenturQuery]:
+def nationwide_remote_queries(window_days: int | None = None) -> list[BundesagenturQuery]:
     """The TRACK B searches: the whole of Germany (no `wo`, no radius), employment only. The BA
-    home-office flag is not a filter here (it is unset on most postings and `arbeitszeit=ho`
-    returns nothing): only an explicit "no home office" drops a posting; whether it is FULLY
-    remote, full time and workable from Germany is decided afterwards from the posting."""
+    home-office flag is not a filter here (it is unset on most postings, employer-set, and
+    `arbeitszeit=ho` returns nothing): whether a posting is FULLY remote, full time and workable
+    from Germany is decided from its text."""
     return [
         BundesagenturQuery(
             label="nationwide",
@@ -277,9 +273,7 @@ def nationwide_remote_queries(
             max_pages=NATIONWIDE_MAX_PAGES,
             offer_type=EMPLOYMENT_ONLY,
             published_within_days=window_days,
-            exclude_home_office_denied=True,
             target_titles_only=True,
-            request_delay_seconds=settings.nationwide_remote_request_delay_seconds,
         )
         for term in NATIONWIDE_TERMS
     ]

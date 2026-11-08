@@ -29,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents.job_fit_signals import classify_remote
-from app.collectors.bundesagentur import BundesagenturAPIError, is_api_key_configured
+from app.collectors.bundesagentur import BundesagenturAPIError, RequestGate, is_api_key_configured
 from app.core.config import reveal
 from app.db.models import AutomationRunRecord
 from app.models.job import Job
@@ -52,13 +52,25 @@ _ENTRY_TITLE = re.compile(
 )
 
 
+def _covered_everything(step: dict) -> bool:
+    """A step that reports ok but left work behind (deferred postings, a search cut short by
+    the request ceiling or the page limit, a failed search) has NOT covered its period."""
+    counters = step.get("counters") or {}
+    return step.get("status") == "ok" and not any(
+        counters.get(key) for key in ("deferred", "truncated_searches", "failed_queries")
+    )
+
+
 def last_success_at(db: Session, account_key: str) -> datetime | None:
-    """When this account's last SUCCESSFUL nationwide step finished (None = never). A failed or
-    absent step never advances the watermark, so the next run covers the same period again."""
+    """When this account's last COMPLETE nationwide step finished (None = never). A failed or
+    incomplete step never advances the watermark, so the next run covers the same period
+    again; only runs that contain a nationwide step are looked at, however many unrelated
+    automation runs happened since."""
     rows = db.scalars(
         select(AutomationRunRecord)
         .where(AutomationRunRecord.account_key == account_key)
         .where(AutomationRunRecord.finished_at.is_not(None))
+        .where(AutomationRunRecord.results_json.contains(f'"{STEP_NAME}"'))
         .order_by(AutomationRunRecord.started_at.desc(), AutomationRunRecord.id.desc())
         .limit(_HISTORY)
     ).all()
@@ -67,7 +79,7 @@ def last_success_at(db: Session, account_key: str) -> datetime | None:
             step = json.loads(row.results_json).get(STEP_NAME)
         except ValueError:
             continue
-        if isinstance(step, dict) and step.get("status") == "ok":
+        if isinstance(step, dict) and _covered_everything(step):
             finished = row.finished_at
             return finished if finished.tzinfo else finished.replace(tzinfo=UTC)
     return None
@@ -97,7 +109,7 @@ def is_remote_candidate(job: Job) -> bool:
     decision (fully remote, full time, workable from Germany) stays with the fit assessment."""
     mode = classify_remote(job.title + chr(10) + job.description).mode
     if mode in {"FULLY_REMOTE", "PARTIAL_REMOTE"}:
-        return True
+        return True  # the BA flag, whatever it says, never overrides what the text states
     return mode == "UNKNOWN" and job.home_office_possible is True
 
 
@@ -121,13 +133,17 @@ async def run_nationwide_remote_discovery(
         raise CollectorNotConfiguredError(
             "Bundesagentur collector is not configured: set BUNDESAGENTUR_API_KEY."
         )
-    queries = nationwide_remote_queries(settings, window_days=window_days)
+    queries = nationwide_remote_queries(window_days)
+    gate = RequestGate(
+        settings.nationwide_remote_request_delay_seconds,
+        settings.nationwide_remote_max_requests_per_run,
+    )
     stats: dict[str, int] = {}
     work, failed_queries, skipped_invalid = await _fetch_ba_work(
         db,
         settings,
         queries,
-        request_budget=settings.nationwide_remote_max_requests_per_run,
+        gate=gate,
         isolate_first=True,
         stats=stats,
     )
@@ -142,6 +158,7 @@ async def run_nationwide_remote_discovery(
         touched_jobs=touched_jobs,
         is_lease_lost=is_lease_lost,
         max_new=settings.nationwide_remote_max_new_per_run,
+        max_detail=settings.nationwide_remote_max_detail_per_run,
         accept_new=is_remote_candidate,
         log_name="bundesagentur_nationwide_run",
     )

@@ -52,6 +52,7 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import (
     BundesagenturAPIError,
     BundesagenturCollector,
+    RequestGate,
     is_api_key_configured,
 )
 from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailCollector
@@ -576,7 +577,7 @@ async def _deliver_vacancy_feed(
         logger.warning("vacancy_feed_delivery_error error_type=%s", type(exc).__name__)
 
 
-def ba_query_collector(settings, query) -> BundesagenturCollector:
+def ba_query_collector(settings, query, gate: RequestGate | None = None) -> BundesagenturCollector:
     """The collector for one configured search; shared by `run_bundesagentur`
     and the Stage 22 refresh CLI so both run exactly the same searches."""
     return BundesagenturCollector(
@@ -589,9 +590,8 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
         max_pages=query.max_pages,
         offer_type=query.offer_type,
         published_within_days=query.published_within_days,
-        exclude_home_office_denied=query.exclude_home_office_denied,
         target_titles_only=query.target_titles_only,
-        request_delay_seconds=query.request_delay_seconds,
+        gate=gate,
     )
 
 
@@ -667,10 +667,12 @@ async def enrich_and_persist_ba_job(
             job.url,
         )
 
-    if accept_new is not None and existing is None:
+    if accept_new is not None and existing is None and description.strip():
         # Nationwide discovery: a posting the database has never seen is stored only if it can
         # still qualify (see app.services.nationwide_discovery.is_remote_candidate). A known
-        # row is always updated; nothing already stored is ever dropped by this check.
+        # row is always updated; nothing already stored is ever dropped by this check. No
+        # description (detail unavailable) is missing evidence, not evidence against: the
+        # posting is stored and the next run enriches it, as for every other source.
         if not accept_new(job.model_copy(update={"description": description})):
             return None
     extraction = extract_skills(job.title, description)
@@ -800,7 +802,7 @@ async def _fetch_ba_work(
     settings,
     queries: list[BundesagenturQuery] | None = None,
     *,
-    request_budget: int | None = None,
+    gate: RequestGate | None = None,
     isolate_first: bool = False,
     stats: dict[str, int] | None = None,
 ) -> tuple[list[tuple[BundesagenturCollector, Job]], int, int]:
@@ -816,14 +818,7 @@ async def _fetch_ba_work(
     if queries is None:
         queries = bundesagentur_queries(settings, _candidate_search_settings(db))
     for index, query in enumerate(queries):
-        query_collector = ba_query_collector(settings, query)
-        if request_budget is not None:
-            # one budget over all searches of the run: what is left after the earlier terms
-            if request_budget <= 0:
-                logger.warning("bundesagentur_request_budget_exhausted term=%s", query.keywords)
-                failed_queries += 1
-                continue
-            query_collector.max_requests = request_budget
+        query_collector = ba_query_collector(settings, query, gate)
         if index == 0 and not isolate_first:
             # The first search fails the run exactly as before.
             query_jobs = await query_collector.fetch()
@@ -843,14 +838,11 @@ async def _fetch_ba_work(
                 )
                 continue
         batches.append((query_collector, query_jobs))
-        if request_budget is not None:
-            request_budget -= query_collector.requests_made
         if stats is not None:
             for key, value in (
                 ("searches", 1),
                 ("requests", query_collector.requests_made),
                 ("hits", query_collector.total_results or 0),
-                ("skipped_home_office_denied", query_collector.skipped_home_office_denied),
                 ("skipped_not_target_title", query_collector.skipped_not_target_title),
                 ("truncated_searches", 1 if query_collector.truncated else 0),
             ):
@@ -1115,13 +1107,16 @@ async def _process_ba_work(
     touched_jobs: list[TouchedJob] | None = None,
     is_lease_lost: Callable[[], bool] | None = None,
     max_new: int | None = None,
+    max_detail: int | None = None,
     accept_new: Callable[[Job], bool] | None = None,
     log_name: str = "bundesagentur_collector_run",
 ) -> dict[str, int]:
     """Enrich, score and persist the de-duplicated postings of one Bundesagentur run (shared by
-    the local run and the nationwide run). `max_new` caps the postings that are NEW to the
-    database (each costs a detail request); the rest are `deferred` to the next run."""
-    new_seen = 0
+    the local run and the nationwide run). `max_new` caps the postings stored
+    that are NEW to the database and `max_detail` the detail requests spent on new postings
+    (a rejected one costs one too); the rest are `deferred` to the next run."""
+    new_stored = 0
+    detail_attempts = 0
     deferred = 0
     not_candidate = 0
     # loaded ONCE for this whole collector run, never once per
@@ -1141,11 +1136,16 @@ async def _process_ba_work(
     detail_breaker = DetailBreaker()
     research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for collector, job in work:
-        if max_new is not None and get_job_by_fingerprint(db, job) is None:
-            if new_seen >= max_new:
+        if (max_new is not None or max_detail is not None) and get_job_by_fingerprint(
+            db, job
+        ) is None:
+            if (max_new is not None and new_stored >= max_new) or (
+                max_detail is not None and detail_attempts >= max_detail
+            ):
                 deferred += 1
                 continue
-            new_seen += 1
+            # a rejected posting costs a detail request too: it counts against `max_detail`
+            detail_attempts += 1
         if is_lease_lost is not None and is_lease_lost():
             # Ownership is gone: another run may own the slot now. Jobs already
             # committed stay (idempotent); no NEW vacancy write is started.
@@ -1184,6 +1184,7 @@ async def _process_ba_work(
             continue
 
         if created:
+            new_stored += 1
             tally.created += 1
         else:
             tally.updated += 1

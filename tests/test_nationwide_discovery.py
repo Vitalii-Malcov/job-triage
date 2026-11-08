@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from app.collectors.bundesagentur import (
     BundesagenturAPIError,
     BundesagenturCollector,
+    RequestGate,
     structured_facts,
 )
 from app.core.config import Settings
@@ -144,8 +145,8 @@ def wired(monkeypatch):
     def install(fake: FakeBA):
         real = collector_runner.ba_query_collector
 
-        def build(cfg, query):
-            collector = real(cfg, query)
+        def build(cfg, query, gate=None):
+            collector = real(cfg, query, gate)
             collector._injected_client = fake.client()
             return collector
 
@@ -160,12 +161,12 @@ def wired(monkeypatch):
 
 
 def test_queries_are_nationwide_bounded_and_employment_only():
-    queries = nationwide_remote_queries(settings())
+    queries = nationwide_remote_queries()
     assert [q.keywords for q in queries] == list(NATIONWIDE_TERMS)
     for query in queries:
         assert query.location == "" and query.radius_km == 0
         assert query.offer_type == 1
-        assert query.exclude_home_office_denied and query.target_titles_only
+        assert query.target_titles_only
         assert not query.home_office_only  # the BA flag is a helper, never the filter
     assert len(set(NATIONWIDE_TERMS)) == len(NATIONWIDE_TERMS)
 
@@ -189,7 +190,7 @@ def test_window_is_used_only_for_the_effective_ba_values():
     assert nationwide_window_days(14.5) is None  # longer gap: no window, everything again
 
 
-def test_collector_keeps_unset_home_office_flag_and_drops_only_an_explicit_no():
+def test_collector_never_filters_on_the_home_office_flag_but_on_the_title():
     fake = FakeBA(
         {
             "x": [
@@ -202,15 +203,10 @@ def test_collector_keeps_unset_home_office_flag_and_drops_only_an_explicit_no():
         }
     )
     collector = BundesagenturCollector(
-        "k",
-        keywords="x",
-        exclude_home_office_denied=True,
-        target_titles_only=True,
-        http_client=fake.client(),
+        "k", keywords="x", target_titles_only=True, http_client=fake.client()
     )
     jobs = asyncio.run(collector.fetch())
-    assert [j.source_reference for j in jobs] == ["a", "b"]
-    assert collector.skipped_home_office_denied == 1
+    assert [j.source_reference for j in jobs] == ["a", "b", "c"]
     assert collector.skipped_not_target_title == 2
     assert collector.skipped_invalid_count == 0
 
@@ -218,34 +214,49 @@ def test_collector_keeps_unset_home_office_flag_and_drops_only_an_explicit_no():
 def test_request_budget_and_pagination_are_bounded():
     rows = [posting(str(i), "Python Developer (m/w/d)") for i in range(450)]
     fake = FakeBA({"x": rows})
+    gate = RequestGate(0.0, 2)
     collector = BundesagenturCollector(
-        "k", keywords="x", max_pages=5, max_requests=2, http_client=fake.client()
+        "k", keywords="x", max_pages=5, gate=gate, http_client=fake.client()
     )
     jobs = asyncio.run(collector.fetch())
     assert len(fake.requests) == 2 and len(jobs) == 200
-    assert collector.request_budget_exhausted and collector.truncated
+    assert gate.exhausted and collector.truncated
 
 
-def test_requests_are_paced(monkeypatch):
+def test_requests_are_paced_across_collectors_and_detail_calls(monkeypatch):
     pauses: list[float] = []
 
     async def record(seconds):
         pauses.append(seconds)
 
     monkeypatch.setattr("app.collectors.bundesagentur.asyncio.sleep", record)
-    fake = FakeBA({"x": [posting(str(i), "Python Developer (m/w/d)") for i in range(250)]})
+    fake = FakeBA({"x": [posting("1", GOOD)], "y": [posting("2", GOOD)]})
+    gate = RequestGate(1.5)
+    first = BundesagenturCollector("k", keywords="x", gate=gate, http_client=fake.client())
+    second = BundesagenturCollector("k", keywords="y", gate=gate, http_client=fake.client())
+    asyncio.run(first.fetch())
+    asyncio.run(first.fetch_detail("1"))
+    asyncio.run(second.fetch())
+    assert len(fake.requests) == 3
+    assert len(pauses) == 2 and all(0 < p <= 1.5 for p in pauses)  # none before the first
+
+
+def test_failed_attempts_and_retries_are_charged_to_the_budget():
+    fake = FakeBA({}, fail_terms={"x"})
+    gate = RequestGate(0.0, 2)
     collector = BundesagenturCollector(
-        "k", keywords="x", request_delay_seconds=1.5, http_client=fake.client()
+        "k", keywords="x", max_retries=3, gate=gate, http_client=fake.client()
     )
-    asyncio.run(collector.fetch())
-    assert pauses == [1.5, 1.5]  # three pages, a pause before each page after the first
+    asyncio.run(collector.fetch())  # budget ends the retries; the search yields nothing
+    assert len(fake.requests) == 2 and gate.search_attempts == 2 and collector.truncated
 
 
 def test_a_search_with_no_budget_left_cannot_make_requests():
     fake = FakeBA({"x": [posting("1", GOOD)]})
-    collector = BundesagenturCollector("k", keywords="x", max_requests=0, http_client=fake.client())
+    gate = RequestGate(0.0, 0)
+    collector = BundesagenturCollector("k", keywords="x", gate=gate, http_client=fake.client())
     assert asyncio.run(collector.fetch()) == []
-    assert fake.requests == [] and collector.request_budget_exhausted
+    assert fake.requests == [] and gate.exhausted
 
 
 # --- structured facts ----------------------------------------------------------------------
@@ -324,7 +335,7 @@ def test_request_budget_spans_all_terms(db, wired):
     cfg = settings(nationwide_remote_max_requests_per_run=3)
     result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
     assert len([p for p in fake.requests if "was" in p]) == 3
-    assert result["searches"] == 3 and result["failed_queries"] == len(NATIONWIDE_TERMS) - 3
+    assert result["requests"] == 3 and result["truncated_searches"] == len(NATIONWIDE_TERMS) - 3
 
 
 def test_one_failing_search_is_isolated_but_all_failing_raises(db, wired):
@@ -489,3 +500,71 @@ def test_cycle_can_switch_the_local_track_off(db, monkeypatch):
     run, calls = _cycle(db, cfg, monkeypatch)
     assert calls == ["xing", "nationwide:None"]
     assert "bundesagentur" not in json.loads(run.results_json)
+
+
+def test_the_home_office_flag_is_only_a_helper(db, wired):
+    ads = [
+        posting("fa", GOOD, home_office=False),  # flag says no, the text says 100 % remote
+        posting("fb", GOOD, home_office=False),  # flag says no, the text says nothing
+    ]
+    details = {"fa": "100 % Remote aus Deutschland. Python.", "fb": "Aufgaben mit Python."}
+    wired(FakeBA({"Python Entwickler": ads}, details=details))
+    asyncio.run(run_nationwide_remote_discovery(db, settings()))
+    assert {r.source_reference for r in db.scalars(select(JobRecord)).all()} == {"fa"}
+
+
+def test_missing_detail_is_not_evidence_against_remote(db, wired):
+    wired(FakeBA({"Python Entwickler": [posting("nd", GOOD)]}, details={}))
+    asyncio.run(run_nationwide_remote_discovery(db, settings()))
+    row = db.scalars(select(JobRecord)).one()  # stored; the next run enriches it
+    assert row.source_reference == "nd" and row.description == ""
+
+
+def test_rejected_postings_do_not_use_up_the_cap_on_stored_vacancies(db, wired):
+    ads = [posting("on", GOOD), posting("re", GOOD)]
+    details = {"on": "Vor Ort im Buero in Nuernberg. Python.", "re": "100 % Remote. Python."}
+    wired(FakeBA({"Python Entwickler": ads}, details=details))
+    cfg = settings(nationwide_remote_max_new_per_run=1)
+    result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
+    assert {r.source_reference for r in db.scalars(select(JobRecord)).all()} == {"re"}
+    assert result["skipped_not_remote_candidate"] == 1 and "deferred" not in result
+
+
+def test_detail_cap_bounds_the_requests_spent_on_new_postings(db, wired):
+    ads = [posting(str(i), GOOD) for i in range(5)]
+    fake = wired(FakeBA({"Python Entwickler": ads}, details={str(i): "On-site." for i in range(5)}))
+    cfg = settings(nationwide_remote_max_detail_per_run=2)
+    result = asyncio.run(run_nationwide_remote_discovery(db, cfg))
+    assert len([r for r in fake.requests if "was" not in r]) == 2
+    assert result["deferred"] == 3
+
+
+def _step_run(db, step, *, days_ago):
+    finished = datetime.now(UTC) - timedelta(days=days_ago)
+    db.add(
+        AutomationRunRecord(
+            account_key=ACCOUNT,
+            status="COMPLETED",
+            started_at=finished - timedelta(minutes=5),
+            finished_at=finished,
+            results_json=json.dumps(step),
+        )
+    )
+    db.commit()
+
+
+def test_watermark_survives_many_unrelated_runs_and_ignores_incomplete_ones(db):
+    _step_run(db, {STEP_NAME: {"status": "ok", "counters": {"deferred": 0}}}, days_ago=2)
+    for n in range(80):  # a 15-minute cadence of unrelated cycles since
+        _step_run(db, {"bundesagentur": {"status": "ok"}}, days_ago=1.9 - n * 0.01)
+    assert last_success_at(db, ACCOUNT) is not None
+
+    _step_run(db, {STEP_NAME: {"status": "ok", "counters": {"deferred": 4}}}, days_ago=0.5)
+    _step_run(
+        db, {STEP_NAME: {"status": "ok", "counters": {"truncated_searches": 1}}}, days_ago=0.4
+    )
+    _step_run(
+        db, {STEP_NAME: {"status": "partial", "counters": {"failed_queries": 1}}}, days_ago=0.3
+    )
+    found = last_success_at(db, ACCOUNT)
+    assert found is not None and (datetime.now(UTC) - found) > timedelta(days=1.5)
