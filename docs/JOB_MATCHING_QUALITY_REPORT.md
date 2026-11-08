@@ -233,7 +233,7 @@ rule set as the fallback, is the sensible next step; it is not part of this chan
 3. After deployment the cached `job_fit_assessments` are unaffected (categories and work formats are computed, not stored).
 4. Decide the open points in section 10, in particular whether to add a nationwide remote search.
 
-PR: PR_LINK_PLACEHOLDER
+PR: https://github.com/Vitalii-Malcov/job-triage/pull/48
 
 READY FOR OPERATOR REVIEW — NO PRODUCTION WRITE
 
