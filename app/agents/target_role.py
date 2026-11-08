@@ -159,6 +159,24 @@ def is_developer_title(title: str) -> bool:
     return _DEV_ROLE.search(title or "") is not None
 
 
+_SEARCH_TARGET_WORD = re.compile(
+    r"python|back-?end|django|fastapi|flask|data[\s-]*engineer|automation|\bapi\b|\bkI\b|\bAI\b",
+    re.IGNORECASE,
+)
+
+
+def is_search_target_title(title: str) -> bool:
+    """Title-only pre-filter for the nationwide search: a software-development title, or a
+    Python / backend / API / automation / data-engineering title that is not a support or
+    administration family. Used only to decide which search hits are worth a detail request
+    and a stored row; the fit assessment still judges every stored vacancy."""
+    if is_developer_title(title):
+        return True
+    if _SEARCH_TARGET_WORD.search(title or "") is None:
+        return False
+    return support_admin_family(title) is None
+
+
 def is_support_admin_term(term: str) -> bool:
     """For configured search keywords: a search term that only finds support
     or administration vacancies ("Application Support", "Systemintegrator")."""

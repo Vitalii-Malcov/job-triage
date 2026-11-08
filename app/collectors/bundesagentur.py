@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
+from app.agents.target_role import is_search_target_title
 from app.collectors.base import CollectorError, JobCollector
 from app.models.job import Job
 from app.utils.config_flags import is_configured
@@ -159,6 +160,8 @@ def structured_facts(posting: dict) -> dict:
     facts["home_office_type"] = _short_text(posting.get("homeofficetyp"), 40)
     percent = _number(posting.get("homeofficeprozent"), 0, 100)
     facts["home_office_percent"] = int(percent) if percent is not None else None
+    if isinstance(posting.get("arbeitszeitVollzeit"), bool):
+        facts["full_time_offered"] = posting["arbeitszeitVollzeit"]
     if isinstance(posting.get("quereinstiegGeeignet"), bool):
         facts["quereinstieg_suitable"] = posting["quereinstiegGeeignet"]
     return {key: value for key, value in facts.items() if value is not None}
@@ -268,6 +271,10 @@ class BundesagenturCollector(JobCollector):
         published_within_days: int | None = None,
         timeout_seconds: float = 10.0,
         max_retries: int = 3,
+        exclude_home_office_denied: bool = False,
+        target_titles_only: bool = False,
+        request_delay_seconds: float = 0.0,
+        max_requests: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
@@ -282,6 +289,20 @@ class BundesagenturCollector(JobCollector):
         # in `skipped_not_home_office`, never as invalid.
         self.home_office_only = home_office_only
         self.skipped_not_home_office = 0
+        # Nationwide discovery: drop only postings whose own `homeofficemoeglich` is explicitly
+        # false (the flag is optional; an unset flag says nothing and the text decides later),
+        # and optionally postings whose title names no development role (no detail request and
+        # no stored row for them). Each is counted, never an "invalid" posting.
+        self.exclude_home_office_denied = exclude_home_office_denied
+        self.target_titles_only = target_titles_only
+        self.skipped_home_office_denied = 0
+        self.skipped_not_target_title = 0
+        # Rate limiting: a pause before every search page after the first, and a ceiling on the
+        # number of search requests one fetch() may make (None = unlimited, the legacy behaviour).
+        self.request_delay_seconds = request_delay_seconds
+        self.max_requests = max_requests
+        self.requests_made = 0
+        self.request_budget_exhausted = False
         # Set when the result list was longer than `max_pages` allowed.
         self.truncated = False
         self.page_size = page_size
@@ -315,6 +336,10 @@ class BundesagenturCollector(JobCollector):
 
         self.skipped_invalid_count = 0
         self.skipped_not_home_office = 0
+        self.skipped_home_office_denied = 0
+        self.skipped_not_target_title = 0
+        self.requests_made = 0
+        self.request_budget_exhausted = False
         self.truncated = False
         self.total_results = None
         headers = {"X-API-Key": self.api_key}
@@ -402,6 +427,13 @@ class BundesagenturCollector(JobCollector):
 
         while page <= self.max_pages:
             page_params = {**base_params, "page": page}
+            if self.max_requests is not None and self.requests_made >= self.max_requests:
+                self.request_budget_exhausted = True
+                self.truncated = True
+                break
+            if self.requests_made and self.request_delay_seconds > 0:
+                await asyncio.sleep(self.request_delay_seconds)
+            self.requests_made += 1
             payload = await self._get_page(client, headers, page_params)
 
             if total_results is None:
@@ -418,6 +450,10 @@ class BundesagenturCollector(JobCollector):
                     self.skipped_invalid_count += 1
                 elif self.home_office_only and job.home_office_possible is not True:
                     self.skipped_not_home_office += 1
+                elif self.exclude_home_office_denied and job.home_office_possible is False:
+                    self.skipped_home_office_denied += 1
+                elif self.target_titles_only and not is_search_target_title(job.title):
+                    self.skipped_not_target_title += 1
                 else:
                     jobs.append(job)
 

@@ -80,7 +80,7 @@ from app.models.candidate_search import CandidateSearchSettings
 from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
-from app.services.search_strategy import bundesagentur_queries
+from app.services.search_strategy import BundesagenturQuery, bundesagentur_queries
 from app.services.telegram import TelegramNotifier
 from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
     confirmed_barrier,
@@ -589,6 +589,9 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
         max_pages=query.max_pages,
         offer_type=query.offer_type,
         published_within_days=query.published_within_days,
+        exclude_home_office_denied=query.exclude_home_office_denied,
+        target_titles_only=query.target_titles_only,
+        request_delay_seconds=query.request_delay_seconds,
     )
 
 
@@ -786,7 +789,13 @@ async def _publish_persisted_job(
 
 
 async def _fetch_ba_work(
-    db: Session, settings
+    db: Session,
+    settings,
+    queries: list[BundesagenturQuery] | None = None,
+    *,
+    request_budget: int | None = None,
+    isolate_first: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> tuple[list[tuple[BundesagenturCollector, Job]], int, int]:
     """Run the configured Bundesagentur searches and de-duplicate their postings.
 
@@ -797,9 +806,18 @@ async def _fetch_ba_work(
     # plus a nationwide home-office search), else from the legacy settings.
     batches: list[tuple[BundesagenturCollector, list[Job]]] = []
     failed_queries = 0
-    for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
+    if queries is None:
+        queries = bundesagentur_queries(settings, _candidate_search_settings(db))
+    for index, query in enumerate(queries):
         query_collector = ba_query_collector(settings, query)
-        if index == 0:
+        if request_budget is not None:
+            # one budget over all searches of the run: what is left after the earlier terms
+            if request_budget <= 0:
+                logger.warning("bundesagentur_request_budget_exhausted term=%s", query.keywords)
+                failed_queries += 1
+                continue
+            query_collector.max_requests = request_budget
+        if index == 0 and not isolate_first:
             # The first search fails the run exactly as before.
             query_jobs = await query_collector.fetch()
         else:
@@ -818,6 +836,18 @@ async def _fetch_ba_work(
                 )
                 continue
         batches.append((query_collector, query_jobs))
+        if request_budget is not None:
+            request_budget -= query_collector.requests_made
+        if stats is not None:
+            for key, value in (
+                ("searches", 1),
+                ("requests", query_collector.requests_made),
+                ("hits", query_collector.total_results or 0),
+                ("skipped_home_office_denied", query_collector.skipped_home_office_denied),
+                ("skipped_not_target_title", query_collector.skipped_not_target_title),
+                ("truncated_searches", 1 if query_collector.truncated else 0),
+            ):
+                stats[key] = stats.get(key, 0) + value
         logger.info(
             "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s "
             "home_office_only=%s jobs=%s skipped_not_home_office=%s truncated=%s",
@@ -1057,7 +1087,34 @@ async def run_bundesagentur(
         )
 
     work, failed_queries, skipped_invalid = await _fetch_ba_work(db, settings)
+    return await _process_ba_work(
+        db,
+        settings,
+        work,
+        failed_queries,
+        skipped_invalid,
+        touched_jobs=touched_jobs,
+        is_lease_lost=is_lease_lost,
+    )
 
+
+async def _process_ba_work(
+    db: Session,
+    settings,
+    work: list[tuple[BundesagenturCollector, Job]],
+    failed_queries: int,
+    skipped_invalid: int,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
+    max_new: int | None = None,
+    log_name: str = "bundesagentur_collector_run",
+) -> dict[str, int]:
+    """Enrich, score and persist the de-duplicated postings of one Bundesagentur run (shared by
+    the local run and the nationwide run). `max_new` caps the postings that are NEW to the
+    database (each costs a detail request); the rest are `deferred` to the next run."""
+    new_seen = 0
+    deferred = 0
     # loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
     candidate_skills = get_candidate_skills_for_scoring(db)
@@ -1075,6 +1132,11 @@ async def run_bundesagentur(
     detail_breaker = DetailBreaker()
     research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for collector, job in work:
+        if max_new is not None and get_job_by_fingerprint(db, job) is None:
+            if new_seen >= max_new:
+                deferred += 1
+                continue
+            new_seen += 1
         if is_lease_lost is not None and is_lease_lost():
             # Ownership is gone: another run may own the slot now. Jobs already
             # committed stay (idempotent); no NEW vacancy write is started.
@@ -1125,12 +1187,14 @@ async def run_bundesagentur(
     await _deliver_vacancy_feed(db, settings, is_lease_lost=is_lease_lost)
 
     logger.info(
-        "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        "%s fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s deferred=%s",
+        log_name,
         len(work),
         tally.created,
         tally.updated,
         skipped_invalid,
         tally.failed,
+        deferred,
     )
 
     return {
@@ -1141,6 +1205,7 @@ async def run_bundesagentur(
         "updated": tally.updated,
         "skipped_invalid": skipped_invalid,
         "failed": tally.failed,
+        **({"deferred": deferred} if deferred else {}),
     }
 
 

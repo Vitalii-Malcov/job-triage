@@ -73,6 +73,8 @@ class JobRecord(Base):
     home_office_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     home_office_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quereinstieg_suitable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # BA `arbeitszeitVollzeit`: full-time work is offered (None = the source did not say).
+    full_time_offered: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)

@@ -43,6 +43,7 @@ STRUCTURED_JOB_FACTS = (
     "home_office_type",
     "home_office_percent",
     "quereinstieg_suitable",
+    "full_time_offered",
 )
 
 DEFAULT_PROFILE_SKILLS = [

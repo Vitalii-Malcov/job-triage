@@ -58,6 +58,11 @@ class BundesagenturQuery:
     home_office_only: bool = False
     offer_type: int | None = None  # Stage 23: BA `angebotsart` (1 = employment)
     published_within_days: int | None = None  # Stage 23: BA `veroeffentlichtseit` (7 or 14)
+    # Nationwide discovery: keep postings whose home-office flag is unset (only an explicit
+    # "false" is dropped), keep only development-role titles, and pace the requests.
+    exclude_home_office_denied: bool = False
+    target_titles_only: bool = False
+    request_delay_seconds: float = 0.0
 
 
 def ba_radius_for(limit_km: int) -> int:
@@ -219,3 +224,62 @@ def bundesagentur_queries(
             for term in terms
         ]
     return queries
+
+
+# --- nationwide remote discovery (TRACK B) ----------------------------------------------
+# Terms measured live on 2026-11-08 (no `wo`, `angebotsart=1`): the BA `was` search is fuzzy,
+# so a narrow term already returns the narrower ones ("Python Entwickler" returned every hit of
+# "Junior Softwareentwickler Python", "Junior Fullstack Python", "Trainee Softwareentwicklung").
+# Only terms that added vacancies, plus the two framework roles the candidate names, are kept.
+NATIONWIDE_TERMS = (
+    "Python Entwickler",
+    "Backend Developer",
+    "Python Backend",
+    "Python Developer",
+    "Python Automation",
+    "Junior Python",
+    "Junior Backend Entwickler",
+    "Junior Data Engineer Python",
+    "Entry Level Python",
+    "Django Developer",
+    "FastAPI Developer",
+)
+NATIONWIDE_MAX_PAGES = 5  # 500 hits per term; every measured term is below that
+# BA `veroeffentlichtseit` narrows the result only for 7 and 14 (measured 2026-11-01).
+NATIONWIDE_WINDOWS = (7, 14)
+
+
+def nationwide_window_days(days_since_last_success: float | None) -> int | None:
+    """The BA freshness window for an incremental run: the smallest effective one that still
+    covers the time since the last successful run (one day of margin); None (no window =
+    everything) for a first run or a gap longer than 13 days."""
+    if days_since_last_success is None:
+        return None
+    for window in NATIONWIDE_WINDOWS:
+        if days_since_last_success <= window - 1:
+            return window
+    return None
+
+
+def nationwide_remote_queries(
+    settings, *, window_days: int | None = None
+) -> list[BundesagenturQuery]:
+    """The TRACK B searches: the whole of Germany (no `wo`, no radius), employment only. The BA
+    home-office flag is not a filter here (it is unset on most postings and `arbeitszeit=ho`
+    returns nothing): only an explicit "no home office" drops a posting; whether it is FULLY
+    remote, full time and workable from Germany is decided afterwards from the posting."""
+    return [
+        BundesagenturQuery(
+            label="nationwide",
+            keywords=term,
+            location="",
+            radius_km=0,
+            max_pages=NATIONWIDE_MAX_PAGES,
+            offer_type=EMPLOYMENT_ONLY,
+            published_within_days=window_days,
+            exclude_home_office_denied=True,
+            target_titles_only=True,
+            request_delay_seconds=settings.nationwide_remote_request_delay_seconds,
+        )
+        for term in NATIONWIDE_TERMS
+    ]
