@@ -61,6 +61,7 @@ def test_upgrade_head_creates_expected_tables(tmp_path: Path) -> None:
         "home_office_type",
         "home_office_percent",
         "quereinstieg_suitable",
+        "full_time_offered",
     }
 
     profile_columns = {col["name"] for col in inspector.get_columns("user_profiles")}
