@@ -120,6 +120,9 @@ def test_title_only_stub_is_needs_enrichment():
         "Mechanical Engineer - Python scripting",
         "Sr. Engineer Python",
         "Sr Engineer Python",
+        "Mechanical Design Engineer - Python",
+        "Engineer (Mechanical) - Python",
+        "DevOps (m/w/d) Engineer - Python",
     ],
 )
 def test_unsuitable_titles_are_not_rescued(title):
@@ -135,6 +138,11 @@ def test_unsuitable_titles_are_not_rescued(title):
         ("Junior Python Developer", True),
         ("IT System Engineer - Backend (m/w/d)", False),
         ("Engineer - Python", True),
+        ("Junior Backend Engineer", True),
+        ("Mechanical Design Engineer - Python", False),
+        ("Engineer (Mechanical) - Python", False),
+        ("DevOps (m/w/d) Engineer - Python", False),
+        ("Cloud Platform Engineer (OpenStack, Python)", False),
         ("Python-Engineer", True),
         ("DevOps Engineer - Python", False),
         ("IT System Engineer - Python", False),
