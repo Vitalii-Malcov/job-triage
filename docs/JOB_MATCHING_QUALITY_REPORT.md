@@ -171,7 +171,17 @@ need a schema change and is **proposed, not implemented**.
 
 ## 8. Tests
 
-TEST_RESULTS_PLACEHOLDER
+Final code (HEAD of this branch, one pytest process at a time):
+
+- Full pytest, SQLite: **8382 passed, 0 failed, 168 skipped** (39 min). The skips are the PostgreSQL modules without
+  `TEST_POSTGRES_URL` and the environmental Windows skips.
+- PostgreSQL 16 (dedicated throwaway container, `alembic upgrade head` first): phase 1 **125 passed**, phase 2
+  (`pg_migration_cycle`) **36 passed**, 0 failed. Alembic head unchanged: `d6e9a2b4c8f1` (no migration).
+- Ruff check and format: clean.
+- New tests: `tests/test_job_matching_quality.py` (62), `tests/test_remote_work_eligibility.py` (about 140 cases, including
+  every posting Codex reported). One existing assertion changed (`work_time` added to the criteria list).
+- Smoke: `scripts/shortlist_e2e_report.py` on an isolated copy of the 3 234 vacancies; the production database was only
+  read through the SQLite backup API.
 
 ## 9. Codex review
 
@@ -225,4 +235,6 @@ rule set as the fallback, is the sensible next step; it is not part of this chan
 
 PR: PR_LINK_PLACEHOLDER
 
-STATUS_LINE_PLACEHOLDER
+READY FOR OPERATOR REVIEW — NO PRODUCTION WRITE
+
+(Codex did not accept the remote filter; see section 9. The operator should weigh that before merging.)
