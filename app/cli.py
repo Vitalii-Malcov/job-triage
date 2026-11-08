@@ -66,6 +66,11 @@ COMMANDS: tuple[Command, ...] = (
         "end-to-end shortlist report on a database copy",
     ),
     Command(
+        "nationwide-dry-run",
+        "nationwide_dry_run.py",
+        "rehearse the nationwide remote discovery on a database copy",
+    ),
+    Command(
         "match-vacancies", "stage22_match_vacancies.py", "match vacancies against the candidate"
     ),
     Command("refresh-ba", "stage22_refresh_ba.py", "refresh stored Bundesagentur vacancies"),
