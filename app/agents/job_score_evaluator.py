@@ -41,8 +41,10 @@ from app.agents.posting_classifier import classify_posting
 from app.agents.role_relevance_classifier import (
     classify_title_relevance,
     is_apply_eligible_title,
+    is_review_rescue_title,
 )
 from app.agents.seniority_classifier import classify_title_seniority
+from app.agents.target_role import hybrid_support_admin_family, support_admin_family
 from app.models.job import Job, JobScore
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,17 @@ def excluded_job_score() -> JobScore:
         recommendation="SKIP",
         data_confidence=0.0,
     )
+
+
+def _title_may_be_rescued(title: str, relevance_level: str) -> bool:
+    """Stage 11C eligibility: a RELEVANT title, or an engineer title that names
+    Python/Backend ("Junior Engineer Schwerpunkt Python") and is no support or
+    administration role. Only ever feeds SKIP -> MAYBE (human review)."""
+    if relevance_level == "RELEVANT":
+        return True
+    if not is_review_rescue_title(title):
+        return False
+    return support_admin_family(title) is None and hybrid_support_admin_family(title) is None
 
 
 def evaluate_job_score(
@@ -356,7 +369,7 @@ def evaluate_job_score(
             get_candidate_target_seniority() == "JUNIOR"
         )
         if (
-            title_relevance.level == "RELEVANT"
+            _title_may_be_rescued(job.title, title_relevance.level)
             and not senior_mismatch
             and get_candidate_target_domain() == "SOFTWARE_DEVELOPMENT"
         ):

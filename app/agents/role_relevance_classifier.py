@@ -335,6 +335,39 @@ def is_apply_eligible_title(title: str) -> bool:
     return any(pattern.search(text) for _, pattern in _APPLY_ELIGIBLE_ADJACENT_PATTERNS)
 
 
+_PYTHON_ENGINEER_REVIEW_PATTERN = re.compile(
+    r"\b(?:engineer|ingenieur)(?:in)?\b.*\bpython\b"
+    r"|\bpython\b.*\b(?:engineer|ingenieur)(?:in)?\b"
+    r"|\bback-?end[\s-]+engineer\b",
+    re.IGNORECASE,
+)
+
+
+def is_review_rescue_title(title: str) -> bool:
+    """May a thin-evidence posting with this title still be kept for a HUMAN look?
+
+    Wider than RELEVANT, narrower than anything else: a RELEVANT title, or an UNKNOWN one
+    that names an engineer role together with Python ("Junior Engineer Schwerpunkt
+    Python") or "Backend Engineer". "Engineer" alone is not a software signal, which is
+    why such a title is UNKNOWN to `classify_title_relevance`; Python is. A "Backend"
+    elsewhere in the title ("IT System Engineer - Backend") is not enough. IRRELEVANT
+    titles and any title with an irrelevant or ambiguity signal never qualify, and the
+    caller still has to rule out support/administration families. This only ever allows
+    SKIP -> MAYBE (review); it grants nothing towards an automatic APPLY.
+    """
+    relevance = classify_title_relevance(title)
+    if relevance.level == "RELEVANT":
+        return True
+    if relevance.level == "IRRELEVANT":
+        return False
+    text = title or ""
+    if any(p.search(text) for _, p in _IRRELEVANT_TITLE_PATTERNS):
+        return False
+    if any(p.search(text) for _, p in _WEAK_AMBIGUITY_PATTERNS):
+        return False
+    return _PYTHON_ENGINEER_REVIEW_PATTERN.search(text) is not None
+
+
 def derive_candidate_target_domain(target_roles: list[str]) -> CandidateTargetDomain:
     """Conservative by design, mirroring
     app.agents.seniority_classifier.derive_candidate_target_seniority's
