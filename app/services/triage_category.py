@@ -24,8 +24,13 @@ the only rule that admits automatic preparation.
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from app.agents.target_role import hybrid_support_admin_family, is_developer_title
-from app.services.job_fit_assessment import FitAssessment
+from app.agents.role_relevance_classifier import is_review_rescue_title
+from app.agents.target_role import (
+    hybrid_support_admin_family,
+    is_developer_title,
+    support_admin_family,
+)
+from app.services.job_fit_assessment import MISSING_REQUIRED_MARKER, FitAssessment
 
 Category = Literal["PRIMARY", "ADJACENT", "MANUAL_REVIEW", "EXCLUDED"]
 
@@ -37,6 +42,7 @@ NOT_TARGET_ROLE = "NOT_TARGET_ROLE"
 CONFIRMED_BARRIER = "CONFIRMED_BARRIER"
 HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
 STATED_GAP = "STATED_GAP"
+THIN_SKILL_EVIDENCE = "THIN_SKILL_EVIDENCE"
 
 # configured role statuses (or none configured): a title outside them still counts as adjacent
 # when the skills match
@@ -132,6 +138,27 @@ def _classify_direction(assessment: FitAssessment) -> TriageCategory:
     if role == "NO_IT_SIGNAL" and skills_ok:
         return TriageCategory(
             "MANUAL_REVIEW", ROLE_UNCLEAR, "title has no IT signal; the operator decides"
+        )
+    skills_criterion = next((c for c in assessment.criteria if c.name == "skills"), None)
+    if (
+        skills_criterion is not None
+        and skills_criterion.status == "WEAK"
+        and MISSING_REQUIRED_MARKER not in skills_criterion.reason
+        and role in _CONFIGURED_ROLES
+        and is_review_rescue_title(assessment.title)
+        and support_admin_family(assessment.title) is None
+    ):
+        # An engineer title that names Python ("Junior Engineer Schwerpunkt Python") whose
+        # skills could not be confirmed, with no required skill named that the candidate
+        # lacks: unconfirmed is not contradicted. Held for the operator, who sees the
+        # stated gaps (language, route ...) next to it; the fit tier alone decides about
+        # automatic preparation.
+        stated = "; ".join(assessment.tier_reasons[:2])
+        return TriageCategory(
+            "MANUAL_REVIEW",
+            THIN_SKILL_EVIDENCE,
+            "Python engineer title, skills not confirmed (no missing requirement named)"
+            + (f"; {stated}" if stated else ""),
         )
     return TriageCategory("EXCLUDED", NOT_TARGET_ROLE, f"role {role}, no usable skill evidence")
 
