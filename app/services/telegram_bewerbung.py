@@ -172,7 +172,7 @@ NOTICES: dict[str, str] = {
     "PREPARATION_LOST": "Der Entwurf wurde inzwischen neu vorbereitet. " + _NOTHING_SENT,
     "ALREADY_SHOWN": (
         "Der Entwurf ist bereits vorbereitet und wurde angezeigt. 👁 Vorschau zeigt das "
-        "Anschreiben erneut. Status: ENTWURF — NICHT GESENDET."
+        "Anschreiben. Status: ENTWURF — NICHT GESENDET."
     ),
     "PREVIEW_UNCERTAIN": (
         "Die Vorschau wurde möglicherweise bereits zugestellt; sie wird nicht automatisch "

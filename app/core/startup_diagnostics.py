@@ -12,6 +12,9 @@ import logging
 
 from sqlalchemy.engine import make_url
 
+from app.core.config import reveal
+from app.core.key_strength import secret_strength
+
 logger = logging.getLogger(__name__)
 
 SAFETY_FLAGS = (
@@ -43,6 +46,8 @@ def startup_safety_fields(settings) -> dict[str, str]:
     fields["database_dialect"] = _database_dialect(settings.database_url)
     fields["trusted_proxy_count"] = str(len(settings.trusted_proxy_ip_set))
     fields["shared_state_backend"] = str(settings.shared_state_backend)
+    # Strength class only ('unset' | 'placeholder' | 'weak' | 'strong'), never the value.
+    fields["api_key_strength"] = secret_strength(reveal(settings.api_key))
     return fields
 
 

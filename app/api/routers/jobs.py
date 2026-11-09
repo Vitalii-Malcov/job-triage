@@ -23,7 +23,7 @@ from app.db.repositories import (
 from app.db.session import get_db
 from app.domain.status_transitions import InvalidStatusTransitionError
 from app.models.application_status import ApplicationStatus
-from app.models.job import Job, JobDetail, JobListItem, JobScore, StatusUpdateRequest
+from app.models.job import Job, JobDetail, JobIngest, JobListItem, JobScore, StatusUpdateRequest
 from app.security.auth import require_api_key
 from app.security.rate_limit import (
     enforce_rate_limit,
@@ -32,6 +32,7 @@ from app.services.collector_runner import (
     score_and_persist,
 )
 from app.services.offload import run_off_loop
+from app.services.shortlist_gate import confirmed_barrier
 from app.services.telegram import TelegramNotifier
 
 logger = logging.getLogger("app.api.routes")
@@ -43,7 +44,7 @@ router = APIRouter()
     response_model=JobScore,
     dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)],
 )
-async def score_job(job: Job, db: Session = Depends(get_db)) -> JobScore:
+async def score_job(job: JobIngest, db: Session = Depends(get_db)) -> JobScore:
     # Review 2.4: synchronous scoring/persistence runs off the web loop.
     return await run_off_loop(lambda: _score_job_service(job, db))
 
@@ -103,7 +104,13 @@ async def _score_job_service(job: Job, db: Session) -> JobScore:
             max_retries=settings.telegram_max_retries,
         )
         try:
-            sent = await notifier.send_job(job, result)
+            # Fit gate: a CONFIRMED barrier (NOT_SUITABLE) is never proposed, whatever the score;
+            # the guard also revalidates before every retry attempt.
+            def _guard() -> str | None:
+                return confirmed_barrier(db, record.id)
+
+            notifier.guard = _guard
+            sent = False if _guard() is not None else await notifier.send_job(job, result)
         except Exception as exc:
             logger.warning(
                 "job_score_notification_error job_id=%s error_type=%s",

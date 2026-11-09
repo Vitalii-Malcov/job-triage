@@ -35,8 +35,8 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ),
         (
             "it-support",
-            r"\b(?:it|edv|user|anwender|applikations?|application|software|technical|technischer?|"
-            r"desktop|field)[\s-]*support(?:er|erin)?\b|\bsupport[\s-]*(?:techniker|mitarbeiter|specialist|"
+            r"\b(?:it|edv|user|anwender|anwendungs|applikations?|application|software|technical|technischer?|"
+            r"desktop|field|client)[\s-]*support(?:er|erin|ern|erinnen)?\b|\bsupport[\s-]*(?:techniker|mitarbeiter|specialist|"
             r"spezialist|analyst|engineer|agent)\w*",
         ),
         (
@@ -51,9 +51,10 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("it-techniker", r"\bit[\s-]?techniker\w*|\bit[\s-]?servicetechniker\w*"),
         (
             "administrator",
-            r"\b\w*administrat(?:or|orin)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
-            r"[\s-]*administration\b|\bit[\s-]?admin\b|\bsysadmin\b|\bsystemverwalt\w*",
+            r"\b\w*administrat(?:or|orin|oren|orinnen)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
+            r"[\s-]*administration\b|\b(?:it|system)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
         ),
+        ("it-systemelektroniker", r"\b(?:it[\s-]*)?systemelektroniker(?:in|innen)?\b"),
         ("systemintegration", r"\bsystemintegrat(?:or|orin|ion)\b|\bit[\s-]?systemintegrat\w*"),
         # A technology name alone is no role: it needs an admin/support/consulting
         # role word next to it ("Microsoft 365 Administrator", "AD Spezialist").

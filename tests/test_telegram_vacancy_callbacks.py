@@ -242,7 +242,5 @@ class TestActions:
 
         await bot.on_vacancy_callback(update, _make_context())
 
-        update.callback_query.answer.assert_awaited_once_with(
-            "Für diese Stelle gerade nicht möglich."
-        )
+        update.callback_query.answer.assert_awaited_once_with(bot.VACANCY_NOT_DECIDABLE_ANSWER)
         assert _state(session_factory, review_id) == "QUEUED_FOR_REVIEW"

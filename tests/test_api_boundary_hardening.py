@@ -88,7 +88,10 @@ class TestBodySizeBehavior:
     this measures what actually happens rather than restating that fact.
     """
 
-    @pytest.mark.parametrize("size_kb", [100, 1024, 5 * 1024])
+    # API-03 (audit 2026-11-06): the old BOUND-003 stance "leave unbounded" is retired.
+    # A description up to MAX_INGEST_DESCRIPTION (100 000 chars) is still accepted and
+    # persisted verbatim; anything larger is refused with 422 (tests below).
+    @pytest.mark.parametrize("size_kb", [10, 50, 97])
     def test_large_job_description_is_accepted_and_persisted_verbatim(self, client, size_kb):
         test_client, session_factory = client
         description = "A" * (size_kb * 1024)
@@ -123,33 +126,30 @@ class TestBodySizeBehavior:
         finally:
             db.close()
 
-    def test_10mb_job_description_is_still_accepted(self, client):
-        """Upper bound of what this test suite constructs -- 10MB, per
-        explicit instruction not to generate hundreds of MB. Confirms
-        the behavior scales the same way at the largest size tested,
-        not just at smaller ones.
-        """
+    @pytest.mark.parametrize("size", [100_001, 10 * 1024 * 1024])
+    def test_oversized_job_description_is_refused_with_422(self, client, size):
+        """Above the ingest bound (incl. the former 10MB case) the request is a controlled 422
+        and nothing is stored -- no CPU/DB cost proportional to the payload."""
         test_client, session_factory = client
-        description = "B" * (10 * 1024 * 1024)
-
         start = time.monotonic()
         response = test_client.post(
             "/api/v1/jobs/score",
-            json=_job_payload(description=description, url="https://example.com/jobs/size-10mb"),
+            json=_job_payload(description="B" * size, url=f"https://example.com/jobs/over-{size}"),
             headers=_auth_headers(),
         )
-        elapsed = time.monotonic() - start
-
-        assert response.status_code == 200, response.text[:500]
-        assert elapsed < 20.0, f"10MB description took {elapsed:.2f}s"
+        assert time.monotonic() - start < 20.0
+        assert response.status_code == 422, response.text[:200]
 
         db = session_factory()
         try:
-            stored = db.scalar(
-                select(JobRecord).where(JobRecord.url == "https://example.com/jobs/size-10mb")
+            assert (
+                db.scalar(
+                    select(JobRecord).where(
+                        JobRecord.url == f"https://example.com/jobs/over-{size}"
+                    )
+                )
+                is None
             )
-            assert stored is not None
-            assert len(stored.description) == 10 * 1024 * 1024
         finally:
             db.close()
 
@@ -179,7 +179,7 @@ class TestBodySizeBehavior:
 
 
 class TestListCardinality:
-    @pytest.mark.parametrize("count", [100, 1000, 5000])
+    @pytest.mark.parametrize("count", [10, 100, 200])
     def test_large_skills_list_is_accepted_no_quadratic_blowup(self, client, count):
         test_client, session_factory = client
         skills = [f"skill-{i}" for i in range(count)]
@@ -209,6 +209,19 @@ class TestListCardinality:
             assert stored is not None
         finally:
             db.close()
+
+    @pytest.mark.parametrize("count", [201, 5000])
+    def test_job_skills_list_over_the_bound_is_refused_with_422(self, client, count):
+        test_client, _ = client
+        response = test_client.post(
+            "/api/v1/jobs/score",
+            json=_job_payload(
+                skills=[f"skill-{i}" for i in range(count)],
+                url=f"https://example.com/jobs/skills-over-{count}",
+            ),
+            headers=_auth_headers(),
+        )
+        assert response.status_code == 422, response.text[:200]
 
     def test_1000_candidate_skills_accepted_and_roundtrip_correctly(self, client):
         test_client, session_factory = client

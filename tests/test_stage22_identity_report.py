@@ -40,8 +40,24 @@ def db_path(tmp_path):
         )
         return record
 
-    job("10001-1-S", "https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-1-S")
-    job("10001-1-S", "https://acme.example/jobs/1")  # same posting, employer URL
+    # same posting, employer URL: a LEGACY duplicate (the upsert no longer creates these -- DB-01),
+    # so the row is inserted directly, exactly as old data looks
+    first = job("10001-1-S", "https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-1-S")
+    session.add(
+        JobRecord(
+            fingerprint="legacy-duplicate-10001-1",
+            source="bundesagentur",
+            source_reference="10001-1-S",
+            title=first.title,
+            company=first.company,
+            location=first.location,
+            url="https://acme.example/jobs/1",
+            description="",
+            score=50,
+            recommendation="MAYBE",
+        )
+    )
+    session.commit()
     applied = job("10001-2-S", "https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-2-S")
     job("10001-2-S", "https://acme.example/jobs/2", title="Senior Python Developer")
     job("10001-3-S", "https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-3-S")  # alone
