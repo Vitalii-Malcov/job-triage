@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import get_settings, reveal
 from app.core.key_strength import is_strong_secret
 from app.db.datetime_utils import ensure_utc
+from app.services import review_queue
 from app.ui import queries
 from app.ui.auth import (
     COOKIE_NAME,
@@ -231,6 +232,44 @@ def vacancies(
         recommendations=queries.RECOMMENDATIONS,
         next_query=next_query,
         first_query=_query_without(request, "before_id"),
+        budget=queries.SCAN_BUDGET,
+    )
+
+
+@pages.get("/review", include_in_schema=False)
+def review(
+    request: Request,
+    db: Session = Depends(get_ui_db),
+    reason: str = Query("", max_length=40),
+    source: str = Query("", max_length=100),
+    phase: str = Query("junior", pattern="^(junior|other)$"),
+    before_id: int | None = Query(None, ge=1),
+) -> Response:
+    """Vacancies that wait for a decision. Read-only: it lists, explains and links; it has no
+    form that acts and no way to prepare, approve or send anything."""
+    filters = queries.ReviewFilters(
+        reason=reason
+        if reason in review_queue.REASON_CODES + (review_queue.LANGUAGE_REVIEW,)
+        else "",
+        source=source,
+        phase=phase,
+        before_id=before_id,
+    )
+    page = queries.review_page(db, filters)
+    if page.next_before_id:
+        next_query = _query_without(request, "before_id", before_id=str(page.next_before_id))
+    elif page.next_phase:
+        next_query = _query_without(request, "before_id", phase=page.next_phase)
+    else:
+        next_query = None
+    return _render(
+        request,
+        "review.html",
+        page=page,
+        filters=filters,
+        sources=queries.vacancy_sources(db),
+        reasons=review_queue.REASON_CODES + (review_queue.LANGUAGE_REVIEW,),
+        next_query=next_query,
         budget=queries.SCAN_BUDGET,
     )
 

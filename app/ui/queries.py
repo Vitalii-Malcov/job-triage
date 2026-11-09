@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, not_, null, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import application_repository as app_repo
@@ -39,7 +39,7 @@ from app.db.models import (
 from app.domain.application_lifecycle import is_terminal
 from app.models.application_lifecycle import Application, ApplicationDetail
 from app.models.application_lifecycle import ApplicationLifecycleStatus as S
-from app.services import fit_cache
+from app.services import fit_cache, review_queue
 from app.services.application_duplicates import DuplicateFinding
 from app.services.application_guard import vacancy_findings
 from app.services.application_response_processor import (
@@ -288,6 +288,124 @@ def _detail_cache_state(db: Session, job_id: int) -> str | None:
         return None
     stored = fit_cache.cached_keys(db, [job_id]).get(job_id)
     return fit_cache.cache_state(stored, fit_cache.current_keys(db, [job_id]).get(job_id))
+
+
+# --- manual review queue -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReviewFilters:
+    reason: str = ""
+    source: str = ""
+    # "junior": Junior Python/Backend titles first (selected in SQL), then "other".
+    phase: str = "junior"
+    before_id: int | None = None
+
+
+@dataclass(frozen=True)
+class ReviewPage:
+    items: list[review_queue.ReviewItem]
+    phase: str
+    next_before_id: int | None
+    # set when this phase is exhausted and the other group is still to be read
+    next_phase: str | None
+    scanned: int
+    budget_exhausted: bool
+    from_cache: bool = False
+
+
+def _junior_python_clause():
+    junior, tech, admin = review_queue.junior_python_words()
+    return and_(
+        or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in junior)),
+        or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in tech)),
+        not_(or_(*(JobRecord.title.ilike(_like(w), escape="\\") for w in admin))),
+    )
+
+
+def review_page(
+    db: Session,
+    filters: ReviewFilters,
+    *,
+    assess: Callable[[Session, int], FitAssessment] = assess_job,
+    page_size: int = PAGE_SIZE,
+    scan_budget: int = SCAN_BUDGET,
+    use_cache: bool = True,
+) -> ReviewPage:
+    """One page of the manual review queue. Read-only: it assesses vacancies live (the same
+    `assess_job` as the vacancy list), writes nothing and never recomputes the database --
+    one request looks at most at `scan_budget` vacancies, exactly like the computed filters.
+    A vacancy whose FRESH cached assessment is NOT_SUITABLE is skipped without a live
+    assessment; a stale or missing cache row never hides a vacancy."""
+    phase = "other" if filters.phase == "other" else "junior"
+    clause = _junior_python_clause()
+    cached = use_cache and fit_cache.cache_in_use(db)
+    if cached:
+        query = select(
+            JobRecord, JobFitAssessmentRecord.input_key, JobFitAssessmentRecord.fit_tier
+        ).outerjoin(JobFitAssessmentRecord, JobFitAssessmentRecord.job_id == JobRecord.id)
+    else:
+        query = select(JobRecord, null(), null())
+    query = query.where(clause if phase == "junior" else not_(clause))
+    if filters.source:
+        query = query.where(JobRecord.source == filters.source)
+    if filters.before_id is not None:
+        query = query.where(JobRecord.id < filters.before_id)
+    query = query.order_by(JobRecord.id.desc())
+    inputs = fit_cache.global_inputs(db) if cached else None
+    batch = page_size * 2
+    items: list[review_queue.ReviewItem] = []
+    scanned = 0
+    last_scanned: int | None = None
+    last_batch_id: int | None = None
+    exhausted_source = True
+    while True:
+        page_query = query if last_batch_id is None else query.where(JobRecord.id < last_batch_id)
+        candidates = db.execute(page_query.limit(batch)).all()
+        current = (
+            fit_cache.current_keys(db, [job.id for job, _, _ in candidates], inputs)
+            if cached
+            else {}
+        )
+        for job, stored_key, stored_tier in candidates:
+            last_batch_id = job.id
+            if len(items) == page_size or scanned == scan_budget:
+                exhausted_source = False
+                break
+            scanned += 1
+            last_scanned = job.id
+            if cached and stored_tier == "NOT_SUITABLE" and stored_key == current.get(job.id):
+                continue  # confirmed barrier, assessed on the current inputs
+            item = review_queue.review_item(job, assess(db, job.id), safe_external_url(job.url))
+            if item is None:
+                continue
+            if filters.reason and filters.reason not in (item.reason_code, *item.also):
+                continue
+            items.append(item)
+        if not exhausted_source or len(candidates) < batch:
+            break
+    if cached and fit_cache.global_inputs(db) != inputs:
+        # profile, rules or applications changed while the page was built: the cached tiers may
+        # have been compared with outdated inputs, so read the page again without the cache
+        return review_page(
+            db,
+            filters,
+            assess=assess,
+            page_size=page_size,
+            scan_budget=scan_budget,
+            use_cache=False,
+        )
+    items.sort(key=review_queue.sort_key)
+    budget_exhausted = not exhausted_source and len(items) < page_size
+    return ReviewPage(
+        items=items,
+        phase=phase,
+        next_before_id=None if exhausted_source else last_scanned,
+        next_phase="other" if exhausted_source and phase == "junior" else None,
+        scanned=scanned,
+        budget_exhausted=budget_exhausted,
+        from_cache=cached,
+    )
 
 
 # --- applications ------------------------------------------------------------
