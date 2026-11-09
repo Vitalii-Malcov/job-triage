@@ -21,7 +21,7 @@ from app.db.models import (
     JobRecord,
 )
 from app.services import shortlist_gate
-from app.services.job_fit_assessment import FitAssessment, assess_job
+from app.services.job_fit_assessment import Criterion, FitAssessment, assess_job
 from app.services.shortlist_gate import (
     AUTO_PREPARE_TIERS,
     automatic_block_reason,
@@ -46,6 +46,8 @@ class _Fixed(FitAssessment):
 def _fixed(tier: str, job_id: int = 1) -> FitAssessment:
     a = _Fixed(job_id=job_id, company="X", title="T")
     a.forced = tier
+    # automatic preparation needs CONFIRMED full time (Stage 54): the fixture states it
+    a.criteria = [Criterion("work_time", "FULL_TIME", "full-time stated")]
     return a
 
 
