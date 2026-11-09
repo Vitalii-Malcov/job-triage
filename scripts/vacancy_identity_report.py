@@ -114,7 +114,7 @@ def linked_applications(session: Session, source: str, reference: str) -> int:
             select(func.count())
             .select_from(ApplicationRecord)
             .where(
-                ApplicationRecord.source == source,
+                func.lower(ApplicationRecord.source) == source.strip().casefold(),
                 func.lower(ApplicationRecord.source_reference) == reference.lower(),
             )
         ).scalar_one()

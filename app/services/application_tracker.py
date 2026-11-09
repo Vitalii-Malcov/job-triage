@@ -246,7 +246,7 @@ class ApplicationTracker:
         company_name: str,
         role_title: str,
         source: str,
-        source_reference: str | None,
+        source_reference: str,
         application_channel: ApplicationChannel,
         initial_status: S = S.DISCOVERED,
         origin: ApplicationEventOrigin,
@@ -274,16 +274,13 @@ class ApplicationTracker:
         role = _require_text("role_title", role_title, 300)
         source_value = repo.canonical_source(_require_text("source", source, 64))
         actor_value = _require_text("actor", actor, MAX_ACTOR_LENGTH)
-        if source_reference is not None:
-            existing = repo.get_application_by_source_reference(db, source_value, source_reference)
-            if existing is not None:
-                return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
-        elif job_id is not None:
-            # No reference, so UNIQUE(source, source_reference) cannot protect: the local job row is
-            # the identity (a second application for the same job row is the same vacancy).
-            existing = repo.get_application_by_source_job(db, source_value, job_id)
-            if existing is not None:
-                return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
+        # The external reference IS the application's identity (UNIQUE(source, source_reference)).
+        # SQL lets any number of NULLs through, so an application without one would be unprotected
+        # against a second copy: refuse it instead of guessing an identity from the job row.
+        reference = _require_text("source_reference", source_reference, 64)
+        existing = repo.get_application_by_source_reference(db, source_value, reference)
+        if existing is not None:
+            return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
         if correlation_key and repo.get_event_by_correlation_key(db, correlation_key):
             event = repo.get_event_by_correlation_key(db, correlation_key)
             record = repo.get_application(db, event.application_id)
@@ -297,7 +294,7 @@ class ApplicationTracker:
             role_title=role,
             location=location,
             source=source_value,
-            source_reference=source_reference,
+            source_reference=reference,
             external_job_id=external_job_id,
             vacancy_fingerprint=vacancy_fingerprint,
             application_channel=ApplicationChannel(application_channel).value,
@@ -325,7 +322,7 @@ class ApplicationTracker:
                 origin=ApplicationEventOrigin(origin).value,
                 actor=actor_value,
                 reason=_bounded(reason, MAX_REASON_LENGTH),
-                source_reference=source_reference,
+                source_reference=reference,
                 occurred_at=when,
                 evidence_hash=evidence_hash,
                 evidence_summary=_bounded(evidence_summary, MAX_SUMMARY_LENGTH),
@@ -335,11 +332,7 @@ class ApplicationTracker:
             db.commit()
         except IntegrityError:
             db.rollback()
-            existing = (
-                repo.get_application_by_source_reference(db, source_value, source_reference)
-                if source_reference is not None
-                else None
-            )
+            existing = repo.get_application_by_source_reference(db, source_value, reference)
             if existing is not None:
                 return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
             raise

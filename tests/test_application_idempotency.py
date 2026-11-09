@@ -412,30 +412,50 @@ def test_source_spelling_is_one_identity(session_factory):
         db.close()
 
 
-def test_without_a_reference_the_job_row_is_the_identity(session_factory):
+def test_an_application_without_a_reference_is_refused(session_factory):
+    """UNIQUE(source, source_reference) cannot protect a NULL reference, so there is none."""
     db = session_factory()
     try:
-        job_a = _seed_job(db, tier=TIER_60)
-        job_b = _seed_job(db, tier=TIER_60)
+        job = _seed_job(db, tier=TIER_60)
+        for reference in (None, "", "   "):
+            with pytest.raises(Exception, match="source_reference"):
+                ApplicationTracker().create_application(
+                    db,
+                    company_name="Example GmbH",
+                    role_title="Backend",
+                    source="bundesagentur",
+                    source_reference=reference,
+                    application_channel=ApplicationChannel.EMAIL,
+                    initial_status=S.DISCOVERED,
+                    origin=ApplicationEventOrigin.OPERATOR,
+                    actor="test",
+                    job_id=job.id,
+                )
+        assert db.query(ApplicationRecord).count() == 0
+    finally:
+        db.close()
 
-        def create(job_id):
-            return ApplicationTracker().create_application(
-                db,
-                company_name="Example GmbH",
-                role_title="Backend",
-                source="bundesagentur",
-                source_reference=None,
-                application_channel=ApplicationChannel.EMAIL,
-                initial_status=S.DISCOVERED,
-                origin=ApplicationEventOrigin.OPERATOR,
-                actor="test",
-                job_id=job_id,
-            )
 
-        first, again, other = create(job_a.id), create(job_a.id), create(job_b.id)
+def test_a_row_stored_before_canonical_source_is_still_found(session_factory):
+    db = session_factory()
+    try:
+        first = ApplicationTracker().create_application(
+            db,
+            company_name="Example GmbH",
+            role_title="Backend",
+            source="bundesagentur",
+            source_reference="legacy-1",
+            application_channel=ApplicationChannel.EMAIL,
+            initial_status=S.DISCOVERED,
+            origin=ApplicationEventOrigin.OPERATOR,
+            actor="test",
+        )
+        record = db.get(ApplicationRecord, first.application.id)
+        record.source = "Bundesagentur"  # what an older version stored
+        db.commit()
+        again = _create(db, "legacy-1")
         assert again.duplicate is True and again.application.id == first.application.id
-        assert other.duplicate is False and other.application.id != first.application.id
-        assert db.query(ApplicationRecord).count() == 2
+        assert db.query(ApplicationRecord).count() == 1
     finally:
         db.close()
 

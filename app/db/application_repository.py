@@ -98,24 +98,13 @@ def canonical_source(source: str) -> str:
 def get_application_by_source_reference(
     db: Session, source: str, source_reference: str
 ) -> ApplicationRecord | None:
-    return db.scalars(
-        select(ApplicationRecord).where(
-            ApplicationRecord.source == canonical_source(source),
-            ApplicationRecord.source_reference == source_reference,
-        )
-    ).one_or_none()
-
-
-def get_application_by_source_job(
-    db: Session, source: str, job_id: int
-) -> ApplicationRecord | None:
-    """The application for this local job row from this source. The fallback identity when the
-    caller has no `source_reference` (SQL UNIQUE lets any number of NULL references through)."""
+    """Matched case-insensitively on `source` so a row stored before `canonical_source` existed
+    (`Bundesagentur`) is still found; new rows are always stored canonical."""
     return db.scalars(
         select(ApplicationRecord)
         .where(
-            ApplicationRecord.source == canonical_source(source),
-            ApplicationRecord.job_id == job_id,
+            func.lower(ApplicationRecord.source) == canonical_source(source),
+            ApplicationRecord.source_reference == source_reference,
         )
         .order_by(ApplicationRecord.id)
         .limit(1)
