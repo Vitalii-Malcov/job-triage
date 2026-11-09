@@ -192,6 +192,11 @@ def run_candidate_cv_draft(
     """
     with http_errors(
         (
+            (
+                AlreadyAppliedError,
+                http_status.HTTP_409_CONFLICT,
+                lambda exc: _already_applied_detail(exc),
+            ),
             (CVDraftMatchNotFoundError, http_status.HTTP_404_NOT_FOUND, str),
             (CVDraftMatchJobMismatchError, http_status.HTTP_422_UNPROCESSABLE_CONTENT, str),
             (

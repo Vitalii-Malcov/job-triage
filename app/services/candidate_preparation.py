@@ -52,6 +52,7 @@ from app.db.repositories import get_job_by_id
 from app.models.bewerbung import BewerbungDraft
 from app.models.candidate_job_match import CandidateJobMatch
 from app.models.cv_draft import TailoredCVDraft
+from app.services.application_guard import ensure_not_already_applied
 from app.services.bewerbung import BewerbungService
 from app.services.company_research import AmbiguousCompanyIdentityError, CompanyResearchService
 
@@ -157,6 +158,12 @@ def prepare_candidate_cv_draft(
     the manual `POST /jobs/{id}/cv-draft` endpoint's behavior and return
     type are completely unchanged.
     """
+    job = get_job_by_id(db, job_id)
+    if job is None:
+        return None
+    # Stage 55: like the letter (Stage 17C), no new CV for a vacancy already applied to. The
+    # automatic path is held earlier by the shortlist gate; this closes the manual endpoint.
+    ensure_not_already_applied(db, job)
     result = prepare_candidate_cv_draft_with_outcome(
         db, job_id, match_id, force_recompute=force_recompute
     )

@@ -382,3 +382,120 @@ def test_an_application_never_starts_in_a_terminal_status(session_factory):
             )
     finally:
         db.close()
+
+
+# --- Codex round 1 (Stage 55): identity spelling, NULL reference, unverified vacancy, manual CV ---
+
+
+def test_source_spelling_is_one_identity(session_factory):
+    db = session_factory()
+    try:
+        first = ApplicationTracker().create_application(
+            db,
+            company_name="Example GmbH",
+            role_title="Backend",
+            source="Bundesagentur",
+            source_reference="12345-42-S",
+            application_channel=ApplicationChannel.EMAIL,
+            initial_status=S.DISCOVERED,
+            origin=ApplicationEventOrigin.OPERATOR,
+            actor="test",
+        )
+        second = _create(db, "12345-42-S")  # "bundesagentur"
+        assert second.duplicate is True
+        assert second.application.id == first.application.id
+        assert db.query(ApplicationRecord).count() == 1
+        assert db.query(ApplicationRecord).one().source == "bundesagentur"
+        found = ApplicationTracker().find_by_source_reference(db, " BUNDESAGENTUR ", "12345-42-S")
+        assert found is not None and found.id == first.application.id
+    finally:
+        db.close()
+
+
+def test_without_a_reference_the_job_row_is_the_identity(session_factory):
+    db = session_factory()
+    try:
+        job_a = _seed_job(db, tier=TIER_60)
+        job_b = _seed_job(db, tier=TIER_60)
+
+        def create(job_id):
+            return ApplicationTracker().create_application(
+                db,
+                company_name="Example GmbH",
+                role_title="Backend",
+                source="bundesagentur",
+                source_reference=None,
+                application_channel=ApplicationChannel.EMAIL,
+                initial_status=S.DISCOVERED,
+                origin=ApplicationEventOrigin.OPERATOR,
+                actor="test",
+                job_id=job_id,
+            )
+
+        first, again, other = create(job_a.id), create(job_a.id), create(job_b.id)
+        assert again.duplicate is True and again.application.id == first.application.id
+        assert other.duplicate is False and other.application.id != first.application.id
+        assert db.query(ApplicationRecord).count() == 2
+    finally:
+        db.close()
+
+
+def test_a_sent_application_blocks_the_manual_cv_endpoint_too(session_factory):
+    from app.services.application_guard import AlreadyAppliedError
+    from app.services.candidate_preparation import prepare_candidate_cv_draft
+
+    db = session_factory()
+    try:
+        job = _seed_job(db, tier=TIER_60)
+        _apply(db, job, S.SUBMITTED)
+        with pytest.raises(AlreadyAppliedError):
+            prepare_candidate_cv_draft(db, job.id, 1, force_recompute=False)
+        assert db.query(CandidateCVDraftRecord).count() == 0
+    finally:
+        db.close()
+
+
+def test_a_job_without_an_application_is_not_stopped_by_the_manual_cv_guard(session_factory):
+    from app.agents.cv_adapter import CVDraftMatchNotFoundError
+    from app.services.candidate_preparation import prepare_candidate_cv_draft
+
+    db = session_factory()
+    try:
+        job = _seed_job(db, tier=TIER_60)
+        with pytest.raises(CVDraftMatchNotFoundError):  # got past the guard, no such match
+            prepare_candidate_cv_draft(db, job.id, 999, force_recompute=False)
+    finally:
+        db.close()
+
+
+def test_telegram_approval_needs_a_verified_vacancy(tmp_path):
+    """An application with no job row would approve whatever package it points to."""
+    from sqlalchemy.pool import NullPool
+
+    from app.db.session_engine import enable_sqlite_foreign_keys
+    from app.services.application_tracker import ApplicationTracker as Tracker
+    from app.services.telegram_operator_control import assess_package
+    from tests.stage16_fixtures import build_target
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'tg.db'}",
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False},
+    )
+    enable_sqlite_foreign_keys(engine)
+    Base.metadata.create_all(engine)
+    db = sessionmaker(engine)()
+    try:
+        target = build_target(db)
+        summary, _ = assess_package(db, Tracker().get_application(db, target.application_id))
+        assert summary.ready, summary.reasons
+
+        record = db.get(ApplicationRecord, target.application_id)
+        record.job_id = None
+        db.commit()
+        summary, _ = assess_package(db, Tracker().get_application(db, target.application_id))
+        assert not summary.ready
+        assert "NO_VERIFIED_VACANCY" in summary.reasons
+    finally:
+        db.close()
+        engine.dispose()

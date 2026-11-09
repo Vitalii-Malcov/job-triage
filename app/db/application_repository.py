@@ -88,15 +88,38 @@ def get_application(db: Session, application_id: int) -> ApplicationRecord | Non
     return db.get(ApplicationRecord, application_id)
 
 
+def canonical_source(source: str) -> str:
+    """The identity form of a source name: `Bundesagentur` and `bundesagentur ` are one source.
+    Every write and every lookup of `(source, source_reference)` goes through this, otherwise the
+    UNIQUE constraint compares different spellings of the same vacancy and lets both through."""
+    return source.strip().casefold()
+
+
 def get_application_by_source_reference(
     db: Session, source: str, source_reference: str
 ) -> ApplicationRecord | None:
     return db.scalars(
         select(ApplicationRecord).where(
-            ApplicationRecord.source == source,
+            ApplicationRecord.source == canonical_source(source),
             ApplicationRecord.source_reference == source_reference,
         )
     ).one_or_none()
+
+
+def get_application_by_source_job(
+    db: Session, source: str, job_id: int
+) -> ApplicationRecord | None:
+    """The application for this local job row from this source. The fallback identity when the
+    caller has no `source_reference` (SQL UNIQUE lets any number of NULL references through)."""
+    return db.scalars(
+        select(ApplicationRecord)
+        .where(
+            ApplicationRecord.source == canonical_source(source),
+            ApplicationRecord.job_id == job_id,
+        )
+        .order_by(ApplicationRecord.id)
+        .limit(1)
+    ).first()
 
 
 def has_application_for_job(db: Session, job_id: int) -> bool:

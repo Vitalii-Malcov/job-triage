@@ -272,10 +272,16 @@ class ApplicationTracker:
             raise TerminalStatusNotPermittedError("an application cannot start terminal")
         company = _require_text("company_name", company_name, 300)
         role = _require_text("role_title", role_title, 300)
-        source_value = _require_text("source", source, 64)
+        source_value = repo.canonical_source(_require_text("source", source, 64))
         actor_value = _require_text("actor", actor, MAX_ACTOR_LENGTH)
         if source_reference is not None:
             existing = repo.get_application_by_source_reference(db, source_value, source_reference)
+            if existing is not None:
+                return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
+        elif job_id is not None:
+            # No reference, so UNIQUE(source, source_reference) cannot protect: the local job row is
+            # the identity (a second application for the same job row is the same vacancy).
+            existing = repo.get_application_by_source_job(db, source_value, job_id)
             if existing is not None:
                 return self._duplicate(existing, correlation_key, db, "APPLICATION_EXISTS")
         if correlation_key and repo.get_event_by_correlation_key(db, correlation_key):
