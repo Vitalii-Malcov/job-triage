@@ -66,6 +66,19 @@ _CLARIFY = {
     STATED_GAP: "The posting states a gap (see the reason): decide whether you accept it.",
 }
 
+# Short plain-language label of each reason code, shown above the detailed reason.
+REASON_LABELS = {
+    THIN_SKILL_EVIDENCE: "Skills not confirmed from the text",
+    NEEDS_ENRICHMENT: "Description missing or too short",
+    ROUTE_REVIEW_REQUIRED: "Workplace not confirmed reachable",
+    REMOTE_UNVERIFIED: "Remote work not confirmed",
+    HYBRID_ADMIN_ROLE: "Admin/support mixed with developer role",
+    DATA_REVIEW_REQUIRED: "Key facts missing",
+    ROLE_UNCLEAR: "Title has no clear IT signal",
+    STATED_GAP: "Posting states a gap",
+    LANGUAGE_REVIEW: "German level to check",
+}
+
 _GENERIC_CLARIFY = "Read the posting and decide; the reason says what is open."
 # A title with one of these is an administration/support (or mixed) role; it never belongs to the
 # Junior Python/Backend group, in SQL and in Python alike.
@@ -95,6 +108,10 @@ class ReviewItem:
     reason: str
     clarify: list[str] = field(default_factory=list)
     also: list[str] = field(default_factory=list)  # further codes that apply
+    location: str = ""
+    # CLEAR | IN_PREPARATION | POSSIBLE_DUPLICATE: an existing Bewerbung that touches this
+    # vacancy (ALREADY_APPLIED never reaches the queue)
+    duplicate_status: str = "CLEAR"
 
 
 def is_junior_python_title(title: str) -> bool:
@@ -178,11 +195,20 @@ def review_item(job, assessment: FitAssessment, url: str | None) -> ReviewItem |
         reason=reason,
         clarify=clarify,
         also=also,
+        location=getattr(job, "location", "") or "",
+        duplicate_status=_status(assessment, "duplicate"),
     )
 
 
 _FAMILY_RANK = {"DEVELOPER": 0, "ADJACENT": 1, "OTHER": 2, "HYBRID_ADMIN": 3}
 _FORMAT_RANK = {"FULL_REMOTE": 0, "HYBRID": 1}
+PROFESSIONS = ("junior", "developer", "adjacent", "other", "hybrid_admin")
+
+
+def in_profession(item: ReviewItem, profession: str) -> bool:
+    if profession == "junior":
+        return item.junior_python
+    return not profession or item.family == profession.upper()
 
 
 def sort_key(item: ReviewItem) -> tuple:

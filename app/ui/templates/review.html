@@ -3,45 +3,44 @@
 {% block title %}Needs review{% endblock %}
 {% block content %}
 <h1>Needs review</h1>
-<p class="notice">These vacancies wait for <strong>your</strong> decision. Being listed here does not allow an automatic application: nothing is prepared, approved or sent from this page, and the fit gate, the late re-check, approval and duplicate protection are unchanged. Junior Python / Backend titles come first, then the rest.</p>
+<p class="notice">These vacancies wait for <strong>your</strong> decision. Being listed here does not allow an automatic application: nothing is prepared, approved or sent from this page, and the fit gate, the late re-check, approval and duplicate protection are unchanged. The whole queue is sorted before it is paged: Junior Python / Backend first, then developer roles, adjacent roles, other roles, and administration/developer hybrids last.</p>
 <form method="get" action="/ui/review" class="filters">
+  <select name="profession"><option value="">Any profession</option>
+    {% for p in professions %}<option value="{{ p }}" {% if p == filters.profession %}selected{% endif %}>{% if p == "junior" %}Junior Python / Backend{% elif p == "hybrid_admin" %}Admin / developer hybrid{% else %}{{ p|capitalize }}{% endif %}</option>{% endfor %}
+  </select>
   <select name="reason"><option value="">Any reason</option>
-    {% for r in reasons %}<option value="{{ r }}" {% if r == filters.reason %}selected{% endif %}>{{ r }}</option>{% endfor %}
+    {% for r in reasons %}<option value="{{ r }}" {% if r == filters.reason %}selected{% endif %}>{{ reason_labels.get(r, r) }}</option>{% endfor %}
   </select>
   <select name="source"><option value="">Any source</option>
     {% for s in sources %}<option value="{{ s }}" {% if s == filters.source %}selected{% endif %}>{{ s }}</option>{% endfor %}
   </select>
-  <select name="phase">
-    <option value="junior" {% if filters.phase == "junior" %}selected{% endif %}>Junior Python / Backend</option>
-    <option value="other" {% if filters.phase == "other" %}selected{% endif %}>All other vacancies</option>
-  </select>
   <button type="submit">Filter</button>
   <a href="/ui/review">Reset</a>
 </form>
-<p class="muted">Showing: {% if page.phase == "junior" %}Junior Python / Backend titles{% else %}all other vacancies{% endif %}. This page checked {{ page.scanned }} vacancies (at most {{ budget }} per page); within a page the order is Junior Python / Backend, developer roles before adjacent roles, fully remote before hybrid, then score.
-{% if page.budget_exhausted %}<strong>The scan budget ran out before the page was full — older vacancies were not checked yet.</strong>{% endif %}</p>
+<p class="muted">{{ page.total }} vacancies wait for review with these filters ({{ page.fresh }} read from the assessment cache, {{ page.live_assessed }} assessed live). Showing {{ page.items|length }} on this page.</p>
+{% if page.stale_unassessed %}<p class="notice"><strong>{{ page.stale_unassessed }} vacancies have a stale or missing stored assessment and were not recomputed here</strong> (at most {{ stale_budget }} are assessed live per request, Junior Python / Backend first), so they may be missing from this list. Refresh the cache offline with <code>scripts/stage21_assess_vacancies.py</code>; this page never does it.</p>{% endif %}
 
 <table class="vacancies stack">
-  <thead><tr><th>#</th><th>Vacancy</th><th>Kind</th><th>Fit tier</th><th>Mode</th><th>Hours</th><th>Why it waits</th><th>What to clarify</th><th>First seen</th></tr></thead>
+  <thead><tr><th>#</th><th>Vacancy</th><th>Kind</th><th>Fit tier</th><th>Work format</th><th>Hours (Vollzeit)</th><th>Why it waits</th><th>What to clarify</th><th>First seen</th></tr></thead>
   <tbody>
   {% for item in page.items %}
     <tr>
       <td data-label="#">{{ item.job_id }}</td>
-      <td data-label="Vacancy"><a href="/ui/vacancies/{{ item.job_id }}">{{ item.title }}</a><br><small>{{ item.company }} · {{ item.source }} · score {{ item.score }} · {{ item.recommendation }}</small>{% if item.url %}<br><small><a href="{{ item.url }}" rel="noopener noreferrer nofollow" target="_blank">Source posting</a></small>{% endif %}</td>
+      <td data-label="Vacancy"><a href="/ui/vacancies/{{ item.job_id }}">{{ item.title }}</a><br><small>{{ item.company }}{% if item.location %} · {{ item.location }}{% endif %} · {{ item.source }} · score {{ item.score }} · {{ item.recommendation }}</small>{% if item.duplicate_status != "CLEAR" %}<br><small><strong>Existing Bewerbung: {{ item.duplicate_status }}</strong> — check before doing anything</small>{% endif %}{% if item.url %}<br><small><a href="{{ item.url }}" rel="noopener noreferrer nofollow" target="_blank">Source posting</a></small>{% endif %}</td>
       <td data-label="Kind">{% if item.junior_python %}<strong>Junior Python / Backend</strong><br>{% endif %}{{ item.family }}</td>
       <td data-label="Fit tier">{{ tier(item.fit_tier) }}</td>
       <td data-label="Mode">{{ item.work_format }}</td>
       <td data-label="Hours">{{ item.work_time }}</td>
-      <td data-label="Why it waits" class="why"><strong>{{ item.reason_code }}</strong><br><small>{{ item.reason }}</small>{% if item.also %}<br><small>Also: {{ item.also|join(", ") }}</small>{% endif %}</td>
+      <td data-label="Why it waits" class="why"><strong>{{ reason_labels.get(item.reason_code, item.reason_code) }}</strong> <small>({{ item.reason_code }})</small><br><small>{{ item.reason }}</small>{% if item.also %}<br><small>Also: {{ item.also|join(", ") }}</small>{% endif %}</td>
       <td data-label="What to clarify" class="why"><ul>{% for line in item.clarify %}<li>{{ line }}</li>{% endfor %}</ul></td>
       <td data-label="First seen">{% if item.first_seen_at %}{{ item.first_seen_at|local }}{% else %}—{% endif %}</td>
     </tr>
   {% else %}
-    <tr><td colspan="9" class="muted">No vacancy on this page waits for review{% if next_query %} — continue{% endif %}.</td></tr>
+    <tr><td colspan="9" class="muted">No vacancy waits for review with these filters.</td></tr>
   {% endfor %}
   </tbody>
 </table>
 <nav class="pager">
-  {% if next_query %}<a href="/ui/review?{{ next_query }}">{% if page.next_phase %}All other vacancies »{% elif page.budget_exhausted %}Continue scanning »{% else %}Older »{% endif %}</a>{% else %}<span class="muted">End of the queue.</span>{% endif %}
+  {% if next_query %}<a href="/ui/review?{{ next_query }}">Next »</a>{% else %}<span class="muted">End of the queue.</span>{% endif %}
 </nav>
 {% endblock %}
