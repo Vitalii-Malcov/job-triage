@@ -21,7 +21,7 @@ from app.core.config import get_settings, reveal
 from app.core.key_strength import is_strong_secret
 from app.db.datetime_utils import ensure_utc
 from app.services import review_queue
-from app.ui import queries
+from app.ui import queries, review_queue_query
 from app.ui.auth import (
     COOKIE_NAME,
     NotLoggedInError,
@@ -242,26 +242,25 @@ def review(
     db: Session = Depends(get_ui_db),
     reason: str = Query("", max_length=40),
     source: str = Query("", max_length=100),
-    phase: str = Query("junior", pattern="^(junior|other)$"),
-    before_id: int | None = Query(None, ge=1),
+    profession: str = Query("", pattern="^(junior|developer|adjacent|other|hybrid_admin)?$"),
+    cursor: str = Query("", max_length=60),
 ) -> Response:
-    """Vacancies that wait for a decision. Read-only: it lists, explains and links; it has no
-    form that acts and no way to prepare, approve or send anything."""
+    """Vacancies that wait for a decision, globally sorted and cursor-paged. Read-only: it lists,
+    explains and links; it has no form that acts and no way to prepare, approve or send anything.
+    A plain `def` on purpose: FastAPI runs it in the thread pool, so the synchronous database
+    reads never block the event loop."""
     filters = queries.ReviewFilters(
         reason=reason
         if reason in review_queue.REASON_CODES + (review_queue.LANGUAGE_REVIEW,)
         else "",
         source=source,
-        phase=phase,
-        before_id=before_id,
+        profession=profession,
+        cursor=cursor,
     )
     page = queries.review_page(db, filters)
-    if page.next_before_id:
-        next_query = _query_without(request, "before_id", before_id=str(page.next_before_id))
-    elif page.next_phase:
-        next_query = _query_without(request, "before_id", phase=page.next_phase)
-    else:
-        next_query = None
+    next_query = (
+        _query_without(request, "cursor", cursor=page.next_cursor) if page.next_cursor else None
+    )
     return _render(
         request,
         "review.html",
@@ -269,8 +268,10 @@ def review(
         filters=filters,
         sources=queries.vacancy_sources(db),
         reasons=review_queue.REASON_CODES + (review_queue.LANGUAGE_REVIEW,),
+        reason_labels=review_queue.REASON_LABELS,
+        professions=review_queue.PROFESSIONS,
         next_query=next_query,
-        budget=queries.SCAN_BUDGET,
+        stale_budget=review_queue_query.STALE_LIVE_BUDGET,
     )
 
 

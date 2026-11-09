@@ -256,15 +256,15 @@ def test_opening_the_page_twice_is_stable_and_writes_nothing(writer, reader):
         _add_job(writer, n, f"Junior Python Entwickler {n}" if n % 2 else f"Backend Engineer {n}")
     before = _rows(writer)
     filters = queries.ReviewFilters()
-    first = queries.review_page(reader, filters, page_size=5, scan_budget=20)
-    second = queries.review_page(reader, filters, page_size=5, scan_budget=20)
+    first = queries.review_page(reader, filters, page_size=5)
+    second = queries.review_page(reader, filters, page_size=5)
     assert [i.job_id for i in first.items] == [i.job_id for i in second.items]
-    assert first.scanned == second.scanned
+    assert first.next_cursor == second.next_cursor
     assert _rows(writer) == before
     assert before["applications"] == 0
 
 
-def test_opening_the_page_never_assesses_more_than_the_scan_budget(writer, reader):
+def test_a_cold_cache_costs_at_most_the_stale_budget(writer, reader):
     for n in range(1, 40):
         _add_job(writer, n, f"Junior Python Entwickler {n}")
     calls = []
@@ -273,9 +273,24 @@ def test_opening_the_page_never_assesses_more_than_the_scan_budget(writer, reade
         calls.append(job_id)
         return assess_job(db, job_id)
 
-    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, scan_budget=10)
-    assert len(calls) <= 10
-    assert page.scanned <= 10
+    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, stale_budget=10)
+    assert len(calls) == 10
+    assert page.stale_unassessed == 29
+    assert page.live_assessed <= 10
+
+
+def test_the_stale_budget_goes_to_junior_titles_first(writer, reader):
+    for n in range(1, 21):
+        _add_job(writer, n, f"Software Entwickler Java {n}")
+    _add_job(writer, 21, "Junior Python Entwickler (m/w/d)")
+    calls = []
+
+    def counting(db, job_id):
+        calls.append(job_id)
+        return assess_job(db, job_id)
+
+    queries.review_page(reader, queries.ReviewFilters(), assess=counting, stale_budget=3)
+    assert calls[0] == 21 and len(calls) == 3
 
 
 def test_the_read_only_session_cannot_write_what_the_writer_can(writer, reader):
@@ -372,8 +387,9 @@ def test_the_page_has_no_way_to_change_anything(client):
 def test_a_garbage_filter_value_is_ignored_not_trusted(client, writer):
     _add_job(writer, 1, "Junior Python Entwickler (m/w/d)")
     assert client.get("/ui/review?reason=%27%3B+DROP+TABLE+jobs%3B--").status_code == 200
-    assert client.get("/ui/review?phase=other&before_id=1").status_code == 200
-    assert client.get("/ui/review?phase=evil").status_code == 422
+    assert client.get("/ui/review?cursor=1%27%3B--").status_code == 200
+    assert client.get("/ui/review?profession=evil").status_code == 422
+    assert client.get("/ui/review?profession=junior&reason=NEEDS_ENRICHMENT").status_code == 200
     assert writer.scalar(select(func.count()).select_from(JobRecord)) == 1
 
 
@@ -392,65 +408,89 @@ def test_a_non_target_title_without_skill_analysis_is_still_excluded():
     assert rq.review_item(_job(9, "Buchhalter (m/w/d)", recommendation="MAYBE"), a, None) is None
 
 
-def test_hybrid_admin_titles_are_not_in_the_junior_group_in_python_or_sql(writer, reader):
+def test_hybrid_admin_titles_are_not_in_the_junior_group(writer, reader):
     _add_job(writer, 1, "Junior Python Entwickler / IT-Systemadministrator")
     _add_job(writer, 2, "Junior Python Entwickler (m/w/d)")
     assert rq.is_junior_python_title("Junior Python Entwickler / IT-Systemadministrator") is False
-    junior = queries.review_page(reader, queries.ReviewFilters(phase="junior"))
-    other = queries.review_page(reader, queries.ReviewFilters(phase="other"))
-    junior_ids = {i.job_id for i in junior.items}
-    other_ids = {i.job_id for i in other.items}
-    assert 1 not in junior_ids and 2 not in other_ids
-    assert junior_ids.isdisjoint(other_ids)
-    # every queue member is reachable in exactly one phase
-    assert junior_ids == {2}
-    assert other_ids == {1}
+    junior = queries.review_page(reader, queries.ReviewFilters(profession="junior"))
+    hybrid = queries.review_page(reader, queries.ReviewFilters(profession="hybrid_admin"))
+    assert [i.job_id for i in junior.items] == [2]
+    assert [i.job_id for i in hybrid.items] == [1]
 
 
-def _collect(reader, *, page_size, scan_budget):
-    """Follow the page links like the browser does; returns every item id in order."""
-    seen, phase, before = [], "junior", None
+def _walk(reader, *, page_size, **filters):
+    """Follow the cursor links like the browser does; returns every item id in order."""
+    seen, cursor = [], ""
     for _ in range(200):
         page = queries.review_page(
-            reader,
-            queries.ReviewFilters(phase=phase, before_id=before),
-            page_size=page_size,
-            scan_budget=scan_budget,
+            reader, queries.ReviewFilters(cursor=cursor, **filters), page_size=page_size
         )
         seen += [i.job_id for i in page.items]
-        if page.next_before_id:
-            before = page.next_before_id
-        elif page.next_phase:
-            phase, before = page.next_phase, None
-        else:
+        if not page.next_cursor:
             return seen
+        cursor = page.next_cursor
     raise AssertionError("pagination did not terminate")
 
 
-def test_following_the_links_visits_every_vacancy_once_across_both_phases(writer, reader):
+def _seed_mixed(writer):
     titles = {}
     for n in range(1, 31):
         titles[n] = (
-            f"Junior Python Entwickler {n}" if n % 3 == 0 else f"Software Entwickler Java {n}"
+            f"Junior Python Entwickler {n}" if n % 7 == 0 else f"Software Entwickler Java {n}"
         )
         _add_job(writer, n, titles[n])
     titles[31] = "Python Entwickler / IT-Systemadministrator (m/w/d)"
     _add_job(writer, 31, titles[31])
-    everything = _collect(reader, page_size=50, scan_budget=10_000)
-    # independent expectation: all 31 vacancies wait for review in this data (no route or
-    # profile is configured), and the hybrid admin title is among them but last
-    assert sorted(everything) == list(range(1, 32))
-    assert everything[-1] == 31
-    for page_size, budget in ((3, 7), (5, 5), (4, 1000)):
-        walked = _collect(reader, page_size=page_size, scan_budget=budget)
-        assert sorted(walked) == sorted(everything)
-        assert len(walked) == len(set(walked))
-    junior_first = [i for i in everything if rq.is_junior_python_title(titles[i])]
-    assert junior_first, "the data must contain Junior Python titles"
-    assert set(everything[: len(junior_first)]) == set(junior_first)
+    return titles
 
 
-def _cache_row(db, job_id, key, tier):
+def test_the_queue_is_sorted_globally_before_it_is_paged(writer, reader):
+    titles = _seed_mixed(writer)
+    everything = _walk(reader, page_size=1000)
+    for size in (1, 3, 4, 7):
+        assert _walk(reader, page_size=size) == everything  # same global order on any page size
+    junior = [i for i in everything if rq.is_junior_python_title(titles[i])]
+    assert junior and everything[: len(junior)] == junior  # junior first, across page borders
+    assert everything[-1] == 31  # the admin/developer hybrid is last
+    assert len(everything) == len(set(everything)) == 31
+
+
+def test_pagination_has_no_duplicates_and_survives_a_vacancy_arriving_meanwhile(writer, reader):
+    _seed_mixed(writer)
+    first = queries.review_page(reader, queries.ReviewFilters(), page_size=5)
+    _add_job(writer, 99, "Junior Python Entwickler brandneu")  # arrives between two requests
+    rest, cursor = [], first.next_cursor
+    while cursor:
+        page = queries.review_page(reader, queries.ReviewFilters(cursor=cursor), page_size=5)
+        rest += [i.job_id for i in page.items]
+        cursor = page.next_cursor
+    seen = [i.job_id for i in first.items] + rest
+    assert len(seen) == len(set(seen))  # never twice
+    # every original vacancy is still reachable exactly once; the newcomer sorts before the
+    # cursor, so it is not forced into the middle of the walk
+    assert set(range(1, 32)) <= set(seen)
+
+
+def test_a_malformed_cursor_is_ignored_not_trusted(writer, reader):
+    _seed_mixed(writer)
+    base = queries.review_page(reader, queries.ReviewFilters(), page_size=5)
+    for bad in ("x", "1.2.3", "1;DROP", "9" * 80, "1.2.3.4.5.6"):
+        page = queries.review_page(reader, queries.ReviewFilters(cursor=bad), page_size=5)
+        assert [i.job_id for i in page.items] == [i.job_id for i in base.items]
+
+
+def test_profession_and_reason_filters_select_inside_the_global_order(writer, reader):
+    titles = _seed_mixed(writer)
+    everything = _walk(reader, page_size=1000)
+    junior = _walk(reader, page_size=2, profession="junior")
+    assert junior == [i for i in everything if rq.is_junior_python_title(titles[i])]
+    developer = _walk(reader, page_size=1000, profession="developer")
+    assert set(junior) <= set(developer) and 31 not in developer  # junior is a subset
+    nothing = queries.review_page(reader, queries.ReviewFilters(reason="STATED_GAP"))
+    assert nothing.items == [] and nothing.total == 0
+
+
+def _cache_row(db, job_id, key, tier, applied=False):
     from app.db.models import JobFitAssessmentRecord
 
     db.add(
@@ -464,41 +504,92 @@ def _cache_row(db, job_id, key, tier):
             criteria_json="[]",
             tier_reasons_json="[]",
             work_mode="UNKNOWN",
-            applied=False,
+            applied=applied,
             computed_at=NOW,
         )
     )
     db.commit()
 
 
-def test_a_stale_cached_barrier_never_hides_a_vacancy_but_a_fresh_one_is_skipped(writer, reader):
+def _refresh_cache(db):
+    """Store a fresh cache row per vacancy, exactly like scripts/stage21_assess_vacancies.py."""
     from app.services import fit_cache
 
-    _add_job(writer, 1, "Junior Python Entwickler stale")
-    _add_job(writer, 2, "Junior Python Entwickler fresh")
-    _cache_row(writer, 1, "0" * 64, "NOT_SUITABLE")  # stale: key differs from the current one
-    fresh_key = fit_cache.current_keys(writer, [2])[2]
-    _cache_row(writer, 2, fresh_key, "NOT_SUITABLE")
-    assert fit_cache.cache_in_use(reader)
+    inputs = fit_cache.global_inputs(db)
+    ids = [j for (j,) in db.execute(select(JobRecord.id))]
+    keys = fit_cache.current_keys(db, ids, inputs)
+    for job_id in ids:
+        fit_cache.upsert_assessment(
+            db, job_id=job_id, key=keys[job_id], inputs=inputs, assessment=assess_job(db, job_id)
+        )
+    db.commit()
+
+
+def _raising_assess(db, job_id):
+    raise AssertionError(f"job {job_id} was assessed live although its cache row is fresh")
+
+
+def test_fresh_cache_rows_are_read_without_any_live_assessment(writer, reader):
+    _seed_mixed(writer)
+    live = queries.review_page(reader, queries.ReviewFilters(), page_size=1000)
+    _refresh_cache(writer)
+    cached = queries.review_page(
+        reader, queries.ReviewFilters(), page_size=1000, assess=_raising_assess
+    )
+    assert cached.from_cache and cached.live_assessed == 0 and cached.stale_unassessed == 0
+    assert [i.job_id for i in cached.items] == [i.job_id for i in live.items]
+    assert [(i.family, i.reason_code, i.work_format) for i in cached.items] == [
+        (i.family, i.reason_code, i.work_format) for i in live.items
+    ]
+
+
+def test_a_changed_vacancy_turns_its_cache_row_stale_and_is_assessed_live(writer, reader):
+    _seed_mixed(writer)
+    _refresh_cache(writer)
+    job = writer.get(JobRecord, 5)
+    job.description = "Python, Django. Deutsch C2 verhandlungssicher."
+    writer.commit()
     assessed = []
 
     def counting(db, job_id):
         assessed.append(job_id)
         return assess_job(db, job_id)
 
-    queries.review_page(reader, queries.ReviewFilters(), assess=counting)
-    assert 1 in assessed  # stale row: assessed live, never trusted
-    assert 2 not in assessed  # fresh confirmed barrier: no live assessment needed
+    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, page_size=1000)
+    assert assessed == [5]  # only the changed vacancy; every other row is still fresh
+    assert page.fresh >= 29 and page.stale_unassessed == 0
 
 
-def test_the_page_is_read_again_without_the_cache_when_the_inputs_change_meanwhile(
+def test_a_fresh_applied_or_barrier_row_is_dropped_and_a_stale_one_never_hides(writer, reader):
+    from app.db.models import JobFitAssessmentRecord
+    from app.services import fit_cache
+
+    _add_job(writer, 1, "Junior Python Entwickler stale")
+    _add_job(writer, 2, "Junior Python Entwickler fresh barrier")
+    _add_job(writer, 3, "Junior Python Entwickler fresh applied")
+    _cache_row(writer, 1, "0" * 64, "NOT_SUITABLE")  # stale: key differs from the current one
+    keys = fit_cache.current_keys(writer, [2, 3])
+    _cache_row(writer, 2, keys[2], "NOT_SUITABLE")
+    _cache_row(writer, 3, keys[3], "NEEDS_OPERATOR", applied=True)
+    assert writer.get(JobFitAssessmentRecord, 3).applied is True
+    assessed = []
+
+    def counting(db, job_id):
+        assessed.append(job_id)
+        return assess_job(db, job_id)
+
+    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting)
+    assert assessed == [1]  # the stale row is assessed live, never trusted
+    assert [i.job_id for i in page.items] == [1]
+
+
+def test_the_page_is_built_again_without_the_cache_when_the_inputs_change_meanwhile(
     writer, reader, monkeypatch
 ):
     from app.services import fit_cache
 
     _add_job(writer, 1, "Junior Python Entwickler")
-    fresh_key = fit_cache.current_keys(writer, [1])[1]
-    _cache_row(writer, 1, fresh_key, "NOT_SUITABLE")
+    _refresh_cache(writer)
     real = fit_cache.global_inputs
     calls = {"n": 0}
 
@@ -517,5 +608,107 @@ def test_the_page_is_read_again_without_the_cache_when_the_inputs_change_meanwhi
         return assess_job(db, job_id)
 
     page = queries.review_page(reader, queries.ReviewFilters(), assess=counting)
-    assert 1 in assessed  # the cached barrier was not trusted after the inputs moved
+    assert assessed == [1]  # the cached row was not trusted after the inputs moved
     assert page.from_cache is False
+
+
+def test_xing_stubs_are_listed_for_manual_opening_and_never_fetched(writer, reader, monkeypatch):
+    import socket
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("the queue must never open a connection")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    writer.add(
+        JobRecord(
+            fingerprint="xing-stub",
+            source="xing",
+            title="(Junior) Backend Engineer (m/w/d)",
+            company="Stub GmbH",
+            location="Frankfurt am Main",
+            url="https://www.xing.com/m/CrV68YHN5uRnwD67EiFNgM",
+            description="Titel - Ort",
+            score=45,
+            recommendation="NEEDS_ENRICHMENT",
+            first_seen_at=NOW,
+            last_seen_at=NOW,
+        )
+    )
+    writer.commit()
+    page = queries.review_page(reader, queries.ReviewFilters(profession="junior"))
+    assert len(page.items) == 1 and rq.NEEDS_ENRICHMENT in page.items[0].also
+    assert page.items[0].url == "https://www.xing.com/m/CrV68YHN5uRnwD67EiFNgM"
+
+
+def test_the_queue_modules_cannot_reach_gmail_telegram_or_an_employer():
+    import ast
+    from pathlib import Path
+
+    for name in ("app/ui/review_queue_query.py", "app/services/review_queue.py"):
+        tree = ast.parse(Path(name).read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+            elif isinstance(node, ast.Import):
+                imported.update(a.name for a in node.names)
+        for module in imported:
+            assert not any(
+                w in module for w in ("telegram", "gmail", "smtp", "imap", "httpx", "requests")
+            ), f"{name} imports {module}"
+
+
+def test_the_number_of_statements_does_not_grow_with_the_number_of_vacancies(writer, reader):
+    from sqlalchemy import event
+
+    def count(n_jobs):
+        for n in range(1, n_jobs + 1):
+            if writer.get(JobRecord, n) is None:
+                _add_job(writer, n, f"Software Entwickler Java {n}")
+        _refresh_cache(writer)
+        seen = []
+        engine = reader.get_bind()
+
+        def record(*args):
+            seen.append(1)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            queries.review_page(reader, queries.ReviewFilters(), assess=_raising_assess)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        return len(seen)
+
+    small = count(20)
+    large = count(120)
+    assert large <= small + 2, (small, large)  # chunked, not one statement per vacancy
+
+
+def test_the_route_is_a_thread_pool_handler_that_never_blocks_the_event_loop():
+    import inspect
+
+    from app.ui import routes
+
+    assert not inspect.iscoroutinefunction(routes.review)
+
+
+def test_an_existing_bewerbung_is_shown_on_the_entry():
+    a = _assessment("Junior Python Entwickler", duplicate="POSSIBLE_DUPLICATE")
+    item = rq.review_item(_job(), a, None)
+    assert item is not None and item.duplicate_status == "POSSIBLE_DUPLICATE"
+    applied = _assessment("Junior Python Entwickler", duplicate="ALREADY_APPLIED")
+    assert rq.review_item(_job(), applied, None) is None  # already applied: not in the queue
+
+
+def test_the_page_shows_filters_format_and_the_stale_notice(client, writer, monkeypatch):
+    from app.ui import review_queue_query
+
+    defaults = {**review_queue_query.review_page.__kwdefaults__, "stale_budget": 1}
+    monkeypatch.setattr(review_queue_query.review_page, "__kwdefaults__", defaults)
+    for n in range(1, 4):
+        _add_job(writer, n, f"Junior Python Entwickler {n}")
+    html = client.get("/ui/review?profession=junior").text
+    assert 'name="profession"' in html and 'name="reason"' in html
+    assert "Work format" in html and "Vollzeit" in html
+    assert "not recomputed here" in html  # the cache is empty: the notice says so
+    assert "scripts/stage21_assess_vacancies.py" in html
