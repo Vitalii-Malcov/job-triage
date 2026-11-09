@@ -46,8 +46,12 @@ class _Fixed(FitAssessment):
 def _fixed(tier: str, job_id: int = 1) -> FitAssessment:
     a = _Fixed(job_id=job_id, company="X", title="T")
     a.forced = tier
-    # automatic preparation needs CONFIRMED full time (Stage 54): the fixture states it
-    a.criteria = [Criterion("work_time", "FULL_TIME", "full-time stated")]
+    # automatic preparation needs CONFIRMED full time (Stage 54) and no application already in
+    # progress for the vacancy (Stage 55): the fixture states both
+    a.criteria = [
+        Criterion("work_time", "FULL_TIME", "full-time stated"),
+        Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
+    ]
     return a
 
 

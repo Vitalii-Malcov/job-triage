@@ -68,6 +68,7 @@ def _assessment(
         location_criterion(job, SETTINGS, remote, None),
         remote,
         work_time_criterion(text),
+        Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
     ]
     return a
 
