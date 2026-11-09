@@ -58,6 +58,11 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command("job-fit", "stage17_job_fit.py", "commute and fit assessment of vacancies"),
     Command("assess-vacancies", "stage21_assess_vacancies.py", "fill the vacancy fit cache"),
+    Command(
+        "audit-remote-fulltime",
+        "audit_remote_fulltime_reconciliation.py",
+        "read-only FULL_REMOTE + Vollzeit reconciliation across database copies",
+    ),
     Command("backup", "backup_sqlite.py", "verified consistent backup of the SQLite database"),
     Command("restore", "restore_sqlite.py", "verified restore of a SQLite backup"),
     Command(
