@@ -36,6 +36,7 @@ def _assessment(
     salary="UNKNOWN",
     start="UNKNOWN",
     experience="UNKNOWN",
+    work_time="FULL_TIME",
 ) -> FitAssessment:
     a = FitAssessment(job_id=1, company="Example GmbH", title=title)
     a.criteria = [
@@ -47,6 +48,7 @@ def _assessment(
         Criterion("salary", salary, "p"),
         Criterion("start_date", start, "d"),
         Criterion("experience", experience, "x"),
+        Criterion("work_time", work_time, "w"),
     ]
     return a
 

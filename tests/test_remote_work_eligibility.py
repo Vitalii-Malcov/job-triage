@@ -6,6 +6,8 @@ language checks, the part-time check and the country restriction all still apply
 remote terms (REMOTE_UNVERIFIED) go to a manual review. Nothing here sends or writes anything.
 """
 
+import re
+
 import pytest
 
 from app.agents.job_fit_signals import classify_remote, classify_work_time
@@ -44,7 +46,16 @@ def _assessment(
     entry="ENTRY_LEVEL",
     language="NO_REQUIREMENT",
     role="PRIMARY",
+    hours: str | None = None,
 ) -> FitAssessment:
+    if (
+        hours is None
+    ):  # a posting that states no working time is UNKNOWN; most tests are not about it
+        stated = re.search(
+            r"vollzeit|teilzeit|full[\s-]?time|part[\s-]?time|voll-", description, re.I
+        )
+        hours = "" if stated else "Vollzeit. "
+    description = hours + description
     job = JobRecord(title=title, company="Example GmbH", description=description, **place)
     text = f"{title}\n{place['location']}\n{description}"
     remote = remote_criterion(text, SETTINGS, job)
@@ -177,9 +188,17 @@ class TestRemoteDoesNotSwitchOffOtherChecks:
         assert a.fit_tier == "STRETCH"
         assert automatic_block_reason(a) == "FIT_TIER_STRETCH"
 
-    def test_unknown_working_time_never_holds_a_remote_job(self):
-        a = _assessment("100% Remote.")
+    def test_unknown_working_time_does_not_downgrade_the_fit_but_holds_automatic_preparation(self):
+        # Stage 54: UNKNOWN is not "full time". The tier is untouched (the vacancy stays visible and
+        # PRIMARY for the operator) but the automatic gate needs CONFIRMED full time.
+        a = _assessment("100% Remote.", hours="")
         assert _status(a, "work_time") == "UNKNOWN"
+        assert a.fit_tier == "GOOD_MATCH"
+        assert automatic_block_reason(a) == "WORK_TIME_NOT_CONFIRMED"
+
+    def test_confirmed_full_time_remote_is_the_one_that_may_be_prepared(self):
+        a = _assessment("Vollzeit, 100% Remote.")
+        assert _status(a, "work_time") == "FULL_TIME"
         assert automatic_block_reason(a) is None
 
 

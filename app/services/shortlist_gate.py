@@ -134,6 +134,11 @@ AUTO_PREPARE_TIERS = frozenset({"GOOD_MATCH", "PARTIAL_MATCH"})
 
 BLOCK_ASSESSMENT_UNAVAILABLE = "ASSESSMENT_UNAVAILABLE"
 BLOCK_HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
+# Stage 54: automatic preparation needs CONFIRMED full time (the posting states it, or the source's
+# own full-time flag does). The working-time classifier is a text heuristic: "not stated" and
+# "could not be recognised" (Halbtagsstelle, 50 %-Stelle, hours without the word Teilzeit) are both
+# UNKNOWN, so UNKNOWN must never open an automatic gate. A held vacancy stays in the review queue.
+BLOCK_WORK_TIME_NOT_CONFIRMED = "WORK_TIME_NOT_CONFIRMED"
 
 
 def automatic_block_reason(assessment: FitAssessment) -> str | None:
@@ -144,6 +149,11 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
         # A title that mixes administration/support with development is the operator's call.
         if hybrid_support_admin_family(assessment.title) is not None:
             return BLOCK_HYBRID_ADMIN_ROLE
+        work_time = next(
+            (c.status for c in assessment.criteria if c.name == "work_time"), "UNKNOWN"
+        )
+        if work_time != "FULL_TIME":
+            return BLOCK_WORK_TIME_NOT_CONFIRMED
         return None
     return (
         f"FIT_TIER_{tier}" if isinstance(tier, str) and tier.isidentifier() else "FIT_TIER_UNKNOWN"

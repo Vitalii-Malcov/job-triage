@@ -1108,16 +1108,18 @@ _OWN_HOURS = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_BREAK = re.compile(r"[.;\n]")
+_HOURS_CLAUSE_BREAK = re.compile(r"[.;,\n]")
 
 
 def _own_hours_nearby(text: str, match: re.Match[str]) -> bool:
-    """Explicit hours in the same sentence, close to the word: "(20 hours per week)", "(75 %)"."""
+    """Explicit hours in the same CLAUSE as the word: "(20 hours per week)", "(75 %)". A comma ends
+    the clause, so the hours of a preceding "Vollzeit (40 h)," are not those of this mention."""
     lo, hi = max(0, match.start() - 60), match.end() + 60
     window = text[lo:hi]
     rel = match.start() - lo
     rel_end = match.end() - lo
-    starts = [m.end() for m in _SENTENCE_BREAK.finditer(window, 0, rel)]
-    ends = _SENTENCE_BREAK.search(window, rel_end)
+    starts = [m.end() for m in _HOURS_CLAUSE_BREAK.finditer(window, 0, rel)]
+    ends = _HOURS_CLAUSE_BREAK.search(window, rel_end)
     sentence = window[(starts[-1] if starts else 0) : ends.start() if ends else len(window)]
     return bool(_OWN_HOURS.search(sentence))
 
@@ -1162,6 +1164,65 @@ def _is_staff_statement(text: str, match: re.Match[str]) -> bool:
     return bool(_STAFF_SUBJECT.search(sentence))
 
 
+_COMBINED_TAIL = re.compile(
+    r"^[\s-]*(?:/|oder|und|&|bzw\.?|or|and)\s*(?:teilzeit|part[\s-]?time)", re.IGNORECASE
+)
+
+
+_COMBINED_LEAD = re.compile(
+    r"(?:vollzeit\w*|voll-|full[\s-]?time|full[\s-]*)[\s-]*(?:\([^)]{0,20}\)\s*)?"
+    r"(?:/|oder|und|&|bzw\.?|or|and|sowie|als\s+auch)\s*(?:in\s+|vollzeitnaher\s+)?$",
+    re.IGNORECASE,
+)
+
+
+def _combined_span(text: str, full: re.Match[str]) -> tuple[int, int]:
+    """The full-time phrase with its "oder Teilzeit" / "-/Teilzeit" tail, if it has one."""
+    if _COMBINED_FULL_PART.match(full.group(0)):
+        return full.start(), full.end()
+    tail = _COMBINED_TAIL.match(text[full.end() : full.end() + 30])
+    return (full.start(), full.end() + tail.end()) if tail else (full.start(), full.end())
+
+
+_THIS_POSITION = re.compile(
+    r"\b(?:diese|die|this|the|unsere|our)\s+(?:stelle|position|role|vakanz)\b[^.;\n]{0,40}$",
+    re.IGNORECASE,
+)
+
+
+def _vacancy_defining(text: str, match: re.Match[str]) -> bool:
+    """A part-time mention that says what THIS vacancy is: a labelled field, "Teilzeitstelle",
+    stated hours, or "This position is part-time". A list item ("Vollzeit, Teilzeit und mobiles
+    Arbeiten") is not."""
+    before = text[max(0, match.start() - 60) : match.start()]
+    return bool(
+        _PART_TIME_LABELLED.search(text[max(0, match.start() - 30) : match.end()])
+        or _PART_TIME_JOB_WORD.fullmatch(match.group(0))
+        or _own_hours_nearby(text, match)
+        or _THIS_POSITION.search(before)
+    )
+
+
+def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool) -> bool:
+    """Another, non-offer, non-negated part-time mention that is not part of a "Vollzeit oder
+    Teilzeit" phrase: the vacancy's own statement, which a general full-time statement never
+    overrides."""
+    checked = 0
+    for match in _PART_TIME.finditer(text):
+        if match.start() < span[1] and match.end() > span[0]:
+            continue  # part of the phrase itself
+        if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
+            continue  # the "Teilzeit" of another "Vollzeit oder Teilzeit"
+        if _part_time_is_an_offer(text, match):
+            continue
+        if not combined and not _vacancy_defining(text, match):
+            continue  # a plain "Vollzeit" yields only to the vacancy's own statement
+        checked += 1
+        if checked > _MAX_NEGATION_CHECKS or not _negated(text, match):
+            return True
+    return False
+
+
 def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
     """(first non-negated match, budget exhausted). Hostile pages that repeat a negated phrase
     thousands of times must not cost quadratic time: after `_MAX_NEGATION_CHECKS` the caller is
@@ -1183,6 +1244,14 @@ def classify_work_time(text: str) -> WorkTimeSignal:
     full, over_full = _affirmed_bounded(_FULL_TIME, text)
     if full and _is_staff_statement(text, full):
         full = None  # "Our employees work full- and part-time": about the staff, not the job
+    span = _combined_span(text, full) if full else None
+    combined = bool(full) and (
+        span[1] > full.end() or bool(_COMBINED_FULL_PART.match(full.group(0)))
+    )
+    if full and _own_part_time_elsewhere(text, span, combined=combined):
+        # "We offer full- and part-time work. This position is part-time.": the general
+        # statement never overrides the vacancy's own part-time statement
+        return WorkTimeSignal("PART_TIME", _snippet(text, full))
     if full:
         return WorkTimeSignal("FULL_TIME", _snippet(text, full))
     if over_full:
