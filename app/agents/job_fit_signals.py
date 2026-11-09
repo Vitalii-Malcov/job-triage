@@ -7,7 +7,9 @@ a decision on its own.
 """
 
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Literal
 
 RemoteMode = Literal["FULLY_REMOTE", "PARTIAL_REMOTE", "HYBRID", "ONSITE", "UNKNOWN"]
@@ -121,9 +123,19 @@ _REMOTE_SKILL_NOUN = re.compile(
 
 def _clause(text: str, start: int, end: int) -> tuple[str, str]:
     """(the part of the clause before `start`, the part after `end`)."""
-    left = max((m.end() for m in _CLAUSE_BOUND.finditer(text, 0, start)), default=0)
-    right_match = _CLAUSE_BOUND.search(text, end)
-    return text[left:start], text[end : right_match.start() if right_match else len(text)]
+    # The clause boundaries of a text are computed once and then bisected: rescanning the text
+    # for every mention is quadratic on a page that repeats a word thousands of times.
+    starts, ends = _clause_bounds_of(text)
+    i = bisect_right(ends, start)
+    left = ends[i - 1] if i else 0
+    j = bisect_left(starts, end)
+    return text[left:start], text[end : starts[j] if j < len(starts) else len(text)]
+
+
+@lru_cache(maxsize=4)
+def _clause_bounds_of(text: str) -> tuple[list[int], list[int]]:
+    bounds = list(_CLAUSE_BOUND.finditer(text))
+    return [m.start() for m in bounds], [m.end() for m in bounds]
 
 
 def _negated(text: str, match: re.Match[str]) -> bool:
@@ -1010,13 +1022,125 @@ def asks_immediate_start(text: str) -> bool:
 # --- working time ---------------------------------------------------------
 
 WorkTimeMode = Literal["FULL_TIME", "PART_TIME", "UNKNOWN"]
+_COMBINED_DE_AFTER = (
+    r"(?=\s*(?:$|[.,;:!?)(/\n])"
+    r"|\s+(?:zu|zum|zur|ab|in|bei|f(?:ü|ue)r|mit|im|am|als|oder|und|m(?:ö|oe)glich|stellen?"
+    r"|besch(?:ä|ae)ftigung|arbeit|arbeiten|angebote?|jobs?|positionen?|verf(?:ü|ue)gbar)\b)"
+)
+_COMBINED_EN_AFTER = (
+    r"(?=\s*(?:$|[.,;:!?)(/\n])"
+    r"|\s+(?:work|working|positions?|roles?|jobs?|employment|basis|schedule|hours|possible"
+    r"|available|opportunit\w*|contract|options?|arrangements?|to|for|with|from|in|at|is|are|as"
+    r"|on)\b)"
+)
 # "50 Vollzeitmitarbeitern" in a company blurb is a headcount, not this vacancy's hours.
 _FULL_TIME = re.compile(
     r"\bvollzeit(?!mitarbeit|kr(?:ä|ae)ft|kraft|besch(?:ä|ae)ftigte|angestellte)\w*"
-    r"|\bfull[\s-]?time(?!\s+(?:employees?|staff|team|colleagues))\b",
+    r"|\bfull[\s-]?time(?!\s+(?:employees?|staff|team|colleagues))\b"
+    # "Voll- oder Teilzeit", "Voll-/Teilzeit", "full- or part-time": full time is offered
+    # -- only when what follows is about the JOB or ends the phrase (allow-list: a person noun such
+    #    as "engineers" or "Mitarbeiter" describes staff, not this vacancy, so it must not count)
+    r"|\bvoll-\s*(?:/|oder|und|&|bzw\.?)\s*teilzeit\b" + _COMBINED_DE_AFTER + r""
+    r"|\bfull[\s-]*(?:/|or|and|&)\s*part[\s-]?time\b" + _COMBINED_EN_AFTER + r"",
     re.IGNORECASE,
 )
-_PART_TIME = re.compile(r"\bteilzeit\w*|\bpart[\s-]?time\b", re.IGNORECASE)
+# A labelled field is the vacancy's own hours even next to benefit vocabulary:
+# "Arbeitszeit: Teilzeit", "Umfang: Teilzeit 50 %", "Vertragsart: Teilzeit".
+_PART_TIME_LABELLED = re.compile(
+    r"\b(?:arbeitszeit|vertragsart|umfang|stellenumfang|pensum|besch(?:ä|ae)ftigung(?:sart|sumfang)?"
+    r"|working\s+hours|employment\s+type)\W{0,4}teilzeit\b",
+    re.IGNORECASE,
+)
+_MAX_NEGATION_CHECKS = 25
+_PART_TIME = re.compile(r"\bteilzeit\w{0,30}|\bpart[\s-]?time\b", re.IGNORECASE)
+# A staff statement in the same sentence ("Our employees work full- and part-time") is not an
+# offer of full time for THIS vacancy.
+_STAFF_SUBJECT = re.compile(
+    r"\b(?:employees?|staff|workforce|colleagues|engineers?|developers?|people|team"
+    r"|mitarbeiter\w*|belegschaft|kolleg\w+|besch(?:ä|ae)ftigte\w*)\b"
+    # "Wir arbeiten in Voll- und Teilzeit", "We work full- and part-time": how the company works
+    r"|\b(?:wir|sie|we|they)\s+(?:\w+\s+)?(?:arbeiten|work|working)\b",
+    re.IGNORECASE,
+)
+_COMBINED_FULL_PART = re.compile(r"\bvoll-|\bfull[\s-]*(?:/|or|and|&)", re.IGNORECASE)
+# "Teilzeitmöglichkeiten", "Teilzeitmodell", "Teilzeitoption": a benefit the employer lists, not the
+# hours of this job.
+_PART_TIME_OFFER_WORD = re.compile(
+    r"teilzeit(?:m(?:ö|oe)glichkeit|modell|option|variante|angebot|regelung|geeignet)\w*",
+    re.IGNORECASE,
+)
+# Right after the word, inside the same clause: an explicit POSSIBILITY word. Schedule wording
+# ("nach Vereinbarung", "bei Bedarf", "auf Wunsch") describes the hours, so it is not an offer;
+# "Teilzeit nach Absprache möglich" is still an offer because of "möglich".
+_PART_TIME_OFFER_AFTER = re.compile(
+    r"^[\s-]*(?:(?!with\b|mit\b|and\b|und\b|sowie\b|but\b|aber\b)\w+\s+){0,2}?"
+    r"(?:m(?:ö|oe)glich|denkbar|available|possible|options?|arrangements?|can\s+be\s+discussed"
+    r"|geeignet|nichts\s+im\s+wege|steht\s+(?:\w+\s+){0,2}?nichts|eligible)\b",
+    re.IGNORECASE,
+)
+_PART_TIME_JOB_NOUN = re.compile(
+    r"^[\s-]*(?:\w+\s+){0,2}?(?:position|job|role|stelle|contract|vertrag|arbeitsplatz)\b",
+    re.IGNORECASE,
+)
+_PART_TIME_OFFER_BEFORE = re.compile(
+    r"(?:\bauch|\bggf\.?|\bgegebenenfalls|\boptional|\balternativ|\bon\s+request"
+    r")\s+(?:in\s+)?$",
+    re.IGNORECASE,
+)
+# "Möglichkeit zur Teilzeitbeschäftigung", "die Option auf Teilzeit"
+_PART_TIME_OFFER_LEAD = re.compile(
+    r"\b(?:m(?:ö|oe)glichkeit(?:en)?|options?|chance|possibilit(?:y|ies))\s+(?:zur?|auf|der|einer|von|f(?:ü|ue)r|of|for)\s+(?:\w+\s+){0,4}$"
+    r"|\b(?:also\s+)?available\s+$|\bk(?:ö|oe)nnen\s+(?:sie|du|ihr)\s+(?:\w+\s+){0,3}in\s+$"
+    r"|\bkann\s+(?:\w+\s+){0,3}(?:mit|in)\s+$",
+    re.IGNORECASE,
+)
+_ONLY_PART_TIME = re.compile(
+    r"\b(?:nur|ausschlie(?:ß|ss)lich|lediglich)\s+(?:in\s+)?teilzeit"
+    r"|\bpart[\s-]?time\s+only\b|\bonly\s+part[\s-]?time\b",
+    re.IGNORECASE,
+)
+
+
+_PART_TIME_JOB_WORD = re.compile(r"teilzeit(?:stelle|arbeitsplatz|job|position)\w*", re.IGNORECASE)
+_OWN_HOURS = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:stunden|std|hours?|hrs|h\b|wochenstunden)"
+    r"|\bteilzeit\s*\(?\s*\d+\s*%",
+    re.IGNORECASE,
+)
+_SENTENCE_BREAK = re.compile(r"[.;\n]")
+
+
+def _own_hours_nearby(text: str, match: re.Match[str]) -> bool:
+    """Explicit hours in the same sentence, close to the word: "(20 hours per week)", "(75 %)"."""
+    lo, hi = max(0, match.start() - 60), match.end() + 60
+    window = text[lo:hi]
+    rel = match.start() - lo
+    rel_end = match.end() - lo
+    starts = [m.end() for m in _SENTENCE_BREAK.finditer(window, 0, rel)]
+    ends = _SENTENCE_BREAK.search(window, rel_end)
+    sentence = window[(starts[-1] if starts else 0) : ends.start() if ends else len(window)]
+    return bool(_OWN_HOURS.search(sentence))
+
+
+def _part_time_is_an_offer(text: str, match: re.Match[str]) -> bool:
+    """True when the part-time word describes something the employer MAY allow ("Teilzeit nach
+    Absprache möglich", "part-time options") rather than the hours of this vacancy."""
+    if _PART_TIME_LABELLED.search(text[max(0, match.start() - 30) : match.end()]):
+        return False
+    if _PART_TIME_JOB_WORD.fullmatch(match.group(0)):
+        return False  # "Teilzeitstelle", "Teilzeitarbeitsplatz": the job itself is part time
+    if _own_hours_nearby(text, match):
+        return False  # stated hours of THIS vacancy beat any option wording around them
+    if _PART_TIME_OFFER_WORD.fullmatch(match.group(0)):
+        return True
+    if _PART_TIME_OFFER_LEAD.search(text[max(0, match.start() - 40) : match.start()]):
+        return True
+    after = re.split(r"[,;.\n]", text[match.end() : match.end() + 60], maxsplit=1)[0]
+    if _PART_TIME_JOB_NOUN.match(after):
+        return False  # "part-time position with pension options": the position IS part time
+    if _PART_TIME_OFFER_AFTER.match(after):
+        return True
+    return bool(_PART_TIME_OFFER_BEFORE.search(text[max(0, match.start() - 25) : match.start()]))
 
 
 @dataclass(frozen=True)
@@ -1025,13 +1149,56 @@ class WorkTimeSignal:
     evidence: str | None = None
 
 
+def _is_staff_statement(text: str, match: re.Match[str]) -> bool:
+    """A combined "Voll-/Teilzeit" match whose own sentence has a staff subject."""
+    if not _COMBINED_FULL_PART.match(match.group(0)):
+        return False
+    lo, hi = max(0, match.start() - 100), match.end() + 60
+    window = text[lo:hi]
+    rel, rel_end = match.start() - lo, match.end() - lo
+    starts = [m.end() for m in _SENTENCE_BREAK.finditer(window, 0, rel)]
+    stop = _SENTENCE_BREAK.search(window, rel_end)
+    sentence = window[(starts[-1] if starts else 0) : stop.start() if stop else len(window)]
+    return bool(_STAFF_SUBJECT.search(sentence))
+
+
+def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
+    """(first non-negated match, budget exhausted). Hostile pages that repeat a negated phrase
+    thousands of times must not cost quadratic time: after `_MAX_NEGATION_CHECKS` the caller is
+    told the budget ran out."""
+    for checked, match in enumerate(pattern.finditer(text)):
+        if checked >= _MAX_NEGATION_CHECKS:
+            return None, True
+        if not _negated(text, match):
+            return match, False
+    return None, False
+
+
 def classify_work_time(text: str) -> WorkTimeSignal:
     """What the posting states about working hours. "Vollzeit oder Teilzeit" counts as
-    full time (it is offered); only an unqualified part-time posting is PART_TIME."""
-    full = _affirmed(_FULL_TIME, text)
+    full time (it is offered); only a part-time posting is PART_TIME. A listed option
+    ("Teilzeitmöglichkeiten") and a missing statement are UNKNOWN. Unsafe direction first: when the
+    work is too large to decide (hostile repetition) the answer is the one that keeps a human in
+    the loop (PART_TIME), never FULL_TIME or UNKNOWN."""
+    full, over_full = _affirmed_bounded(_FULL_TIME, text)
+    if full and _is_staff_statement(text, full):
+        full = None  # "Our employees work full- and part-time": about the staff, not the job
     if full:
         return WorkTimeSignal("FULL_TIME", _snippet(text, full))
-    part = _affirmed(_PART_TIME, text)  # "Teilzeit ist nicht möglich" is not a part-time posting
-    if part:
-        return WorkTimeSignal("PART_TIME", _snippet(text, part))
+    if over_full:
+        return WorkTimeSignal("PART_TIME", None)
+    only, over = _affirmed_bounded(_ONLY_PART_TIME, text)
+    if only:
+        return WorkTimeSignal("PART_TIME", _snippet(text, only))
+    if over:
+        return WorkTimeSignal("PART_TIME", None)
+    checked = 0
+    for match in _PART_TIME.finditer(text):
+        if _part_time_is_an_offer(text, match):
+            continue
+        checked += 1
+        if checked > _MAX_NEGATION_CHECKS:
+            return WorkTimeSignal("PART_TIME", _snippet(text, match))
+        if not _negated(text, match):
+            return WorkTimeSignal("PART_TIME", _snippet(text, match))
     return WorkTimeSignal("UNKNOWN")
