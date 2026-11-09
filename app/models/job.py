@@ -48,6 +48,8 @@ class Job(BaseModel):
     home_office_type: str | None = Field(default=None, max_length=40)
     home_office_percent: int | None = Field(default=None, ge=0, le=100)
     quereinstieg_suitable: bool | None = None
+    # BA `arbeitszeitVollzeit`: the posting offers full-time work (it may offer part time too).
+    full_time_offered: bool | None = None
     # XING only, never persisted: message-local multiplicity of an identical posting block
     # (the n-th block with the same company/title/location/details but a different link
     # inside ONE e-mail). 1 for everything else. See

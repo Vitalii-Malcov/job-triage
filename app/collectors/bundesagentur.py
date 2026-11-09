@@ -2,12 +2,14 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from datetime import datetime
 from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
 
+from app.agents.target_role import is_search_target_title
 from app.collectors.base import CollectorError, JobCollector
 from app.models.job import Job
 from app.utils.config_flags import is_configured
@@ -38,6 +40,53 @@ SOURCE_NAME = "bundesagentur"
 
 # API-documented limit for the `veroeffentlichtseit` (published-since) filter.
 MAX_VEROEFFENTLICHTSEIT_DAYS = 100
+
+
+class RequestBudgetExhausted(Exception):
+    """The run's ceiling on search requests is reached; nothing was sent."""
+
+
+class RequestGate:
+    """Pacing and ceilings for ONE run, shared by every collector the run builds and applied at
+    the HTTP boundary: each attempt (search or detail, retries included) waits for the minimum
+    interval since the previous one, search attempts are charged against `max_requests` and
+    detail attempts against `max_detail`."""
+
+    def __init__(
+        self,
+        interval_seconds: float = 0.0,
+        max_requests: int | None = None,
+        max_detail: int | None = None,
+    ) -> None:
+        self.interval_seconds = interval_seconds
+        self.max_requests = max_requests
+        self.max_detail = max_detail
+        self.search_attempts = 0
+        self.detail_attempts = 0
+        self.exhausted = False
+        self._last: float | None = None
+
+    def detail_exhausted(self) -> bool:
+        return self.max_detail is not None and self.detail_attempts >= self.max_detail
+
+    async def before_attempt(self, kind: str) -> None:
+        if kind == "search" and (
+            self.max_requests is not None and self.search_attempts >= self.max_requests
+        ):
+            self.exhausted = True
+            raise RequestBudgetExhausted
+        if kind == "detail" and self.detail_exhausted():
+            self.exhausted = True
+            raise RequestBudgetExhausted
+        if self.interval_seconds > 0 and self._last is not None:
+            pause = self.interval_seconds - (time.monotonic() - self._last)
+            if pause > 0:
+                await asyncio.sleep(pause)
+        self._last = time.monotonic()
+        if kind == "search":
+            self.search_attempts += 1
+        elif kind == "detail":
+            self.detail_attempts += 1
 
 
 class BundesagenturAuthError(CollectorError):
@@ -159,6 +208,8 @@ def structured_facts(posting: dict) -> dict:
     facts["home_office_type"] = _short_text(posting.get("homeofficetyp"), 40)
     percent = _number(posting.get("homeofficeprozent"), 0, 100)
     facts["home_office_percent"] = int(percent) if percent is not None else None
+    if isinstance(posting.get("arbeitszeitVollzeit"), bool):
+        facts["full_time_offered"] = posting["arbeitszeitVollzeit"]
     if isinstance(posting.get("quereinstiegGeeignet"), bool):
         facts["quereinstieg_suitable"] = posting["quereinstiegGeeignet"]
     return {key: value for key, value in facts.items() if value is not None}
@@ -268,6 +319,8 @@ class BundesagenturCollector(JobCollector):
         published_within_days: int | None = None,
         timeout_seconds: float = 10.0,
         max_retries: int = 3,
+        target_titles_only: bool = False,
+        gate: RequestGate | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
@@ -282,6 +335,16 @@ class BundesagenturCollector(JobCollector):
         # in `skipped_not_home_office`, never as invalid.
         self.home_office_only = home_office_only
         self.skipped_not_home_office = 0
+        # Nationwide discovery: optionally drop postings whose title names no development role
+        # (no detail request and no stored row for them), counted and never "invalid". The BA
+        # home-office flag is NOT used as an exclusion here: it is optional and employer-set,
+        # so the posting text decides.
+        self.target_titles_only = target_titles_only
+        self.skipped_not_target_title = 0
+        # Rate limiting and request ceiling over HTTP attempts (retries included), shared by
+        # every collector of a run. None = unpaced and unlimited, the legacy behaviour.
+        self.gate = gate
+        self.requests_made = 0
         # Set when the result list was longer than `max_pages` allowed.
         self.truncated = False
         self.page_size = page_size
@@ -315,6 +378,8 @@ class BundesagenturCollector(JobCollector):
 
         self.skipped_invalid_count = 0
         self.skipped_not_home_office = 0
+        self.skipped_not_target_title = 0
+        self.requests_made = 0
         self.truncated = False
         self.total_results = None
         headers = {"X-API-Key": self.api_key}
@@ -402,7 +467,11 @@ class BundesagenturCollector(JobCollector):
 
         while page <= self.max_pages:
             page_params = {**base_params, "page": page}
-            payload = await self._get_page(client, headers, page_params)
+            try:
+                payload = await self._get_page(client, headers, page_params)
+            except RequestBudgetExhausted:
+                self.truncated = True
+                break
 
             if total_results is None:
                 total_results = _parse_int(payload.get("maxErgebnisse"))
@@ -418,6 +487,8 @@ class BundesagenturCollector(JobCollector):
                     self.skipped_invalid_count += 1
                 elif self.home_office_only and job.home_office_possible is not True:
                     self.skipped_not_home_office += 1
+                elif self.target_titles_only and not is_search_target_title(job.title):
+                    self.skipped_not_target_title += 1
                 else:
                     jobs.append(job)
 
@@ -461,6 +532,11 @@ class BundesagenturCollector(JobCollector):
         last_exc: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
+            if self.gate is not None:
+                # before EVERY HTTP attempt, a retry included: pace it and charge it
+                await self.gate.before_attempt(request_name)
+            if request_name == "search":
+                self.requests_made += 1
             try:
                 response = await client.get(url, headers=headers, params=params)
                 if response.status_code == 401:

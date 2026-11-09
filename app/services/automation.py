@@ -86,6 +86,7 @@ results; see that module's own docstring for the full policy.
 
 import logging
 import threading
+from functools import partial
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -108,6 +109,10 @@ from app.services.collector_runner import (
     run_bundesagentur,
     run_xing,
 )
+from app.services.nationwide_discovery import (
+    STEP_NAME as NATIONWIDE_STEP,
+)
+from app.services.nationwide_discovery import nationwide_due, run_nationwide_remote_discovery
 from app.services.run_leases import CANCELLED_LEASE_EXTENSION_SECONDS, lock_account_keys
 
 logger = logging.getLogger(__name__)
@@ -626,7 +631,14 @@ async def run_automation_cycle(
     touched_jobs: list[TouchedJob] = []
     try:
         step_results: dict[str, dict] = {}
-        for step_name in AUTOMATION_STEPS:
+        # TRACK A (local commute search) can be switched off on its own; it is on by default,
+        # so an existing installation behaves exactly as before.
+        core_steps = tuple(
+            name
+            for name in AUTOMATION_STEPS
+            if name != "bundesagentur" or settings.local_discovery_enabled
+        )
+        for step_name in core_steps:
             # checked before EVERY step, not only once at the
             # very end — see _raise_if_lease_lost's own docstring.
             _raise_if_lease_lost(heartbeat, run.id, account_key)
@@ -638,6 +650,22 @@ async def run_automation_cycle(
                 touched_jobs,
                 is_lease_lost=heartbeat.lease_lost.is_set,
             )
+
+        # TRACK B: nationwide fully-remote discovery. Opt-in (off by default) with its own
+        # interval; it runs before Stage 8C so the vacancies it stored can be shortlisted by
+        # the same gate as every other vacancy. A failed run does not advance its watermark.
+        if settings.nationwide_remote_discovery_enabled:
+            due, window_days = nationwide_due(db, account_key, settings)
+            if due:
+                _raise_if_lease_lost(heartbeat, run.id, account_key)
+                step_results[NATIONWIDE_STEP] = await _run_step(
+                    db,
+                    NATIONWIDE_STEP,
+                    partial(run_nationwide_remote_discovery, window_days=window_days),
+                    settings,
+                    touched_jobs,
+                    is_lease_lost=heartbeat.lease_lost.is_set,
+                )
 
         # Stage 8C: opt-in only (Settings.automation_auto_prepare_enabled
         # defaults to False, independent of the scheduler being enabled —
@@ -672,7 +700,8 @@ async def run_automation_cycle(
                 db, account_key, settings
             )
 
-        overall_status = _compute_overall_status(step_results, AUTOMATION_STEPS)
+        counted_steps = core_steps + ((NATIONWIDE_STEP,) if NATIONWIDE_STEP in step_results else ())
+        overall_status = _compute_overall_status(step_results, counted_steps)
         error_summary = _build_error_summary(step_results)
 
         # one last check immediately before the final write —

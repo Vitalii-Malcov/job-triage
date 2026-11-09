@@ -161,6 +161,7 @@ _NULL_REPLACEMENT = {
     "home_office_possible": True,
     "home_office_percent": 50,
     "quereinstieg_suitable": True,
+    "full_time_offered": True,
 }
 
 

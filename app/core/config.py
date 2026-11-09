@@ -326,6 +326,25 @@ class Settings(BaseSettings):
     # account_key parameter already accepts (mirrors GMAIL_USERNAME's role
     # elsewhere in this project).
     automation_scheduler_enabled: bool = False
+    # Two independent discovery tracks inside the automation cycle. LOCAL keeps today's
+    # behaviour (on); NATIONWIDE remote discovery is new and off until the operator enables it.
+    local_discovery_enabled: bool = True
+    nationwide_remote_discovery_enabled: bool = False
+    # Minimum time between two nationwide runs (the cycle itself may run more often).
+    nationwide_remote_discovery_interval_seconds: int = Field(
+        default=86_400, ge=3_600, le=1_209_600
+    )
+    # Pause between two BA search pages of the nationwide searches.
+    nationwide_remote_request_delay_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
+    # Ceiling on BA search requests per nationwide run, over all terms (a full backfill needs
+    # about 30; the incremental run about 12).
+    nationwide_remote_max_requests_per_run: int = Field(default=60, ge=1, le=500)
+    # Ceiling on NEW vacancies (each costs one BA detail request) stored per nationwide run;
+    # the rest is picked up by the next run.
+    nationwide_remote_max_new_per_run: int = Field(default=150, ge=1, le=1000)
+    # Ceiling on detail requests spent on postings new to the database per nationwide run,
+    # stored or rejected (a rejected posting is looked at again by the next window).
+    nationwide_remote_max_detail_per_run: int = Field(default=400, ge=1, le=2000)
     automation_scheduler_account_key: str = ""
     # Bounded 60s..7 days: below 60s risks hammering the DB/collectors far
     # faster than any real job source refreshes; above 7 days defeats the

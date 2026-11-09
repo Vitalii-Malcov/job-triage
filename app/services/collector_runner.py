@@ -52,6 +52,8 @@ from app.collectors.base import CollectorError, CollectorNotConfiguredError
 from app.collectors.bundesagentur import (
     BundesagenturAPIError,
     BundesagenturCollector,
+    RequestBudgetExhausted,
+    RequestGate,
     is_api_key_configured,
 )
 from app.collectors.xing_email import XING_DIGEST_RULES_VERSION, XingEmailCollector
@@ -80,7 +82,7 @@ from app.models.candidate_search import CandidateSearchSettings
 from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
-from app.services.search_strategy import bundesagentur_queries
+from app.services.search_strategy import BundesagenturQuery, bundesagentur_queries
 from app.services.telegram import TelegramNotifier
 from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
     confirmed_barrier,
@@ -576,7 +578,7 @@ async def _deliver_vacancy_feed(
         logger.warning("vacancy_feed_delivery_error error_type=%s", type(exc).__name__)
 
 
-def ba_query_collector(settings, query) -> BundesagenturCollector:
+def ba_query_collector(settings, query, gate: RequestGate | None = None) -> BundesagenturCollector:
     """The collector for one configured search; shared by `run_bundesagentur`
     and the Stage 22 refresh CLI so both run exactly the same searches."""
     return BundesagenturCollector(
@@ -589,6 +591,8 @@ def ba_query_collector(settings, query) -> BundesagenturCollector:
         max_pages=query.max_pages,
         offer_type=query.offer_type,
         published_within_days=query.published_within_days,
+        target_titles_only=query.target_titles_only,
+        gate=gate,
     )
 
 
@@ -608,7 +612,8 @@ async def enrich_and_persist_ba_job(
     *,
     fetch_detail: bool = True,
     detail_breaker: DetailBreaker | None = None,
-) -> tuple[JobRecord, JobScore, bool]:
+    accept_new: Callable[[Job], bool] | None = None,
+) -> tuple[JobRecord, JobScore, bool] | None:
     """Detail enrichment (live BA description, or the stored one), skill
     extraction, scoring and persistence of ONE Bundesagentur posting -- the
     per-job core of `run_bundesagentur`, shared with the Stage 22 refresh CLI
@@ -646,6 +651,9 @@ async def enrich_and_persist_ba_job(
         else:
             try:
                 detail_description = await collector.fetch_detail(job.source_reference)
+            except RequestBudgetExhausted:
+                # the run's detail ceiling is reached: no description, nothing sent
+                detail_description = None
             except BundesagenturAPIError as exc:
                 logger.warning(
                     "bundesagentur_detail_failed referenznummer=%s error_type=%s",
@@ -663,6 +671,14 @@ async def enrich_and_persist_ba_job(
             job.url,
         )
 
+    if accept_new is not None and existing is None and description.strip():
+        # Nationwide discovery: a posting the database has never seen is stored only if it can
+        # still qualify (see app.services.nationwide_discovery.is_remote_candidate). A known
+        # row is always updated; nothing already stored is ever dropped by this check. No
+        # description (detail unavailable) is missing evidence, not evidence against: the
+        # posting is stored and the next run enriches it, as for every other source.
+        if not accept_new(job.model_copy(update={"description": description})):
+            return None
     extraction = extract_skills(job.title, description)
     all_skills = sorted(
         set(job.skills) | set(extraction.must_have_skills) | set(extraction.nice_to_have_skills)
@@ -786,7 +802,13 @@ async def _publish_persisted_job(
 
 
 async def _fetch_ba_work(
-    db: Session, settings
+    db: Session,
+    settings,
+    queries: list[BundesagenturQuery] | None = None,
+    *,
+    gate: RequestGate | None = None,
+    isolate_first: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> tuple[list[tuple[BundesagenturCollector, Job]], int, int]:
     """Run the configured Bundesagentur searches and de-duplicate their postings.
 
@@ -797,9 +819,11 @@ async def _fetch_ba_work(
     # plus a nationwide home-office search), else from the legacy settings.
     batches: list[tuple[BundesagenturCollector, list[Job]]] = []
     failed_queries = 0
-    for index, query in enumerate(bundesagentur_queries(settings, _candidate_search_settings(db))):
-        query_collector = ba_query_collector(settings, query)
-        if index == 0:
+    if queries is None:
+        queries = bundesagentur_queries(settings, _candidate_search_settings(db))
+    for index, query in enumerate(queries):
+        query_collector = ba_query_collector(settings, query, gate)
+        if index == 0 and not isolate_first:
             # The first search fails the run exactly as before.
             query_jobs = await query_collector.fetch()
         else:
@@ -818,6 +842,15 @@ async def _fetch_ba_work(
                 )
                 continue
         batches.append((query_collector, query_jobs))
+        if stats is not None:
+            for key, value in (
+                ("searches", 1),
+                ("requests", query_collector.requests_made),
+                ("hits", query_collector.total_results or 0),
+                ("skipped_not_target_title", query_collector.skipped_not_target_title),
+                ("truncated_searches", 1 if query_collector.truncated else 0),
+            ):
+                stats[key] = stats.get(key, 0) + value
         logger.info(
             "bundesagentur_query label=%s term=%s radius_km=%s working_time=%s "
             "home_office_only=%s jobs=%s skipped_not_home_office=%s truncated=%s",
@@ -1057,7 +1090,40 @@ async def run_bundesagentur(
         )
 
     work, failed_queries, skipped_invalid = await _fetch_ba_work(db, settings)
+    return await _process_ba_work(
+        db,
+        settings,
+        work,
+        failed_queries,
+        skipped_invalid,
+        touched_jobs=touched_jobs,
+        is_lease_lost=is_lease_lost,
+    )
 
+
+async def _process_ba_work(
+    db: Session,
+    settings,
+    work: list[tuple[BundesagenturCollector, Job]],
+    failed_queries: int,
+    skipped_invalid: int,
+    *,
+    touched_jobs: list[TouchedJob] | None = None,
+    is_lease_lost: Callable[[], bool] | None = None,
+    max_new: int | None = None,
+    gate: RequestGate | None = None,
+    accept_new: Callable[[Job], bool] | None = None,
+    log_name: str = "bundesagentur_collector_run",
+) -> dict[str, int]:
+    """Enrich, score and persist the de-duplicated postings of one Bundesagentur run (shared by
+    the local run and the nationwide run). `max_new` caps the postings stored
+    that are NEW to the database; the gate's detail ceiling (HTTP attempts, retries included,
+    spent on stored and rejected postings alike) stops further new postings; the rest are
+    `deferred` to the next run."""
+    new_stored = 0
+    detail_unavailable = 0
+    deferred = 0
+    not_candidate = 0
     # loaded ONCE for this whole collector run, never once per
     # vacancy -- see get_candidate_skills_for_scoring's own docstring.
     candidate_skills = get_candidate_skills_for_scoring(db)
@@ -1075,15 +1141,30 @@ async def run_bundesagentur(
     detail_breaker = DetailBreaker()
     research_budget = {"remaining": settings.company_research_auto_max_per_run}
     for collector, job in work:
+        if (max_new is not None or gate is not None) and get_job_by_fingerprint(db, job) is None:
+            if (max_new is not None and new_stored >= max_new) or (
+                gate is not None and gate.detail_exhausted()
+            ):
+                deferred += 1
+                continue
         if is_lease_lost is not None and is_lease_lost():
             # Ownership is gone: another run may own the slot now. Jobs already
             # committed stay (idempotent); no NEW vacancy write is started.
             logger.warning("bundesagentur_collector_stopped_lease_lost")
             break
         try:
-            job_record, result, created = await enrich_and_persist_ba_job(
-                db, collector, candidate_skills, job, detail_breaker=detail_breaker
+            outcome = await enrich_and_persist_ba_job(
+                db,
+                collector,
+                candidate_skills,
+                job,
+                detail_breaker=detail_breaker,
+                accept_new=accept_new,
             )
+            if outcome is None:
+                not_candidate += 1
+                continue
+            job_record, result, created = outcome
         except Exception as exc:
             # A failure scoring/persisting one job (JobScorer bug, DB
             # constraint violation, etc.) must not abort the whole run and
@@ -1104,9 +1185,18 @@ async def run_bundesagentur(
             continue
 
         if created:
+            new_stored += 1
             tally.created += 1
         else:
             tally.updated += 1
+        if (
+            accept_new is not None
+            and not (job_record.description or "").strip()
+            and (detail_breaker.open or (gate is not None and gate.exhausted))
+        ):
+            # stored without text because the detail request failed or the ceiling was reached
+            # (a transient gap): the period is not covered until a later run enriches it
+            detail_unavailable += 1
 
         await _publish_persisted_job(
             db,
@@ -1125,12 +1215,14 @@ async def run_bundesagentur(
     await _deliver_vacancy_feed(db, settings, is_lease_lost=is_lease_lost)
 
     logger.info(
-        "bundesagentur_collector_run fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s",
+        "%s fetched=%s created=%s updated=%s skipped_invalid=%s failed=%s deferred=%s",
+        log_name,
         len(work),
         tally.created,
         tally.updated,
         skipped_invalid,
         tally.failed,
+        deferred,
     )
 
     return {
@@ -1141,6 +1233,9 @@ async def run_bundesagentur(
         "updated": tally.updated,
         "skipped_invalid": skipped_invalid,
         "failed": tally.failed,
+        **({"deferred": deferred} if deferred else {}),
+        **({"detail_unavailable": detail_unavailable} if detail_unavailable else {}),
+        **({"skipped_not_remote_candidate": not_candidate} if not_candidate else {}),
     }
 
 

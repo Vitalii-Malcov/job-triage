@@ -618,9 +618,10 @@ def remote_criterion(
     )
 
 
-def work_time_criterion(text: str) -> Criterion:
+def work_time_criterion(text: str, job: JobRecord | None = None) -> Criterion:
     """Informational unless the posting is part-time only (then a stated gap). A missing
-    working time is never a reason to hold a vacancy."""
+    working time is never a reason to hold a vacancy. The posting's text decides; the
+    source's own `arbeitszeitVollzeit` flag speaks only where the text is silent."""
     signal = classify_work_time(text)
     if signal.mode == "FULL_TIME":
         return Criterion("work_time", "FULL_TIME", "full-time stated", signal.evidence)
@@ -630,6 +631,18 @@ def work_time_criterion(text: str) -> Criterion:
             "PART_TIME",
             "part-time only; the candidate looks for full time",
             signal.evidence,
+        )
+    offered = getattr(job, "full_time_offered", None) if job is not None else None
+    if offered is True:
+        return Criterion(
+            "work_time", "FULL_TIME", "full time offered (source flag)", "arbeitszeitVollzeit=true"
+        )
+    if offered is False:
+        return Criterion(
+            "work_time",
+            "PART_TIME",
+            "the source does not offer full time; the candidate looks for full time",
+            "arbeitszeitVollzeit=false",
         )
     return Criterion("work_time", "UNKNOWN", "working time not stated")
 
@@ -1187,7 +1200,7 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         language_criterion(text, german_level),
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
         remote,
-        work_time_criterion(text),
+        work_time_criterion(text, job),
         salary_criterion(text, settings),
         entry_level_criterion(job.title, job.description or ""),
         education_criterion(job.description or "", job.quereinstieg_suitable),
