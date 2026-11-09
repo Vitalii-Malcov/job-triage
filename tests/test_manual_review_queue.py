@@ -712,3 +712,24 @@ def test_the_page_shows_filters_format_and_the_stale_notice(client, writer, monk
     assert "Work format" in html and "Vollzeit" in html
     assert "not recomputed here" in html  # the cache is empty: the notice says so
     assert "scripts/stage21_assess_vacancies.py" in html
+
+
+def test_a_changed_rules_hash_makes_every_cached_decision_stale(writer, reader, monkeypatch):
+    from app.services import fit_cache
+
+    _seed_mixed(writer)
+    _refresh_cache(writer)
+    fresh = queries.review_page(
+        reader, queries.ReviewFilters(), page_size=1000, assess=_raising_assess
+    )
+    assert fresh.from_cache and fresh.stale_unassessed == 0
+    monkeypatch.setattr(fit_cache, "rules_hash", lambda: "f" * 64)  # the rules changed
+    calls = []
+
+    def counting(db, job_id):
+        calls.append(job_id)
+        return assess_job(db, job_id)
+
+    page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, stale_budget=5)
+    assert len(calls) == 5  # no old row is trusted; the live work is bounded
+    assert page.stale_unassessed == 26  # and the page says that it is incomplete

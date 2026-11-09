@@ -279,9 +279,15 @@ def _row(flag):
 def test_source_flag_speaks_only_where_the_text_is_silent():
     silent = "Wir suchen einen Entwickler."
     assert work_time_criterion(silent, _row(True)).status == "FULL_TIME"
-    assert work_time_criterion("Teilzeit, 20 Stunden pro Woche.", _row(True)).status == "PART_TIME"
     assert work_time_criterion(silent, _row(False)).status == "PART_TIME"
-    assert work_time_criterion("Vollzeit.", _row(False)).status == "FULL_TIME"
+    # text and flag agree
+    assert work_time_criterion("Teilzeit, 20 Stunden pro Woche.", _row(False)).status == "PART_TIME"
+    assert work_time_criterion("Vollzeit.", _row(True)).status == "FULL_TIME"
+    # text and flag contradict each other: neither wins silently, the operator verifies
+    for text, flag in (("Teilzeit, 20 Stunden pro Woche.", True), ("Vollzeit.", False)):
+        criterion = work_time_criterion(text, _row(flag))
+        assert criterion.status == "CONFLICT"
+        assert "arbeitszeitVollzeit" in criterion.reason
     assert work_time_criterion(silent, _row(None)).status == "UNKNOWN"
     assert work_time_criterion(silent, None).status == "UNKNOWN"
 

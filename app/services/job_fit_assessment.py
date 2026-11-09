@@ -166,6 +166,7 @@ _VERIFY = {
     ("location", "ESTIMATE_BEYOND_RELOCATION"),
     ("location", "LOCATION_UNVERIFIED"),
     ("duplicate", "POSSIBLE_DUPLICATE"),
+    ("work_time", "CONFLICT"),
     ("skills", "NOT_EVALUATED"),
     # remote work stated but who may do it is unclear: the operator reads the posting, however
     # short the commute is
@@ -622,11 +623,28 @@ def remote_criterion(
     )
 
 
+def _work_time_conflict(text_says: str, evidence: str | None, flag: str) -> Criterion:
+    """Text and the source's structured flag disagree: neither wins silently."""
+    return Criterion(
+        "work_time",
+        "CONFLICT",
+        f"{text_says}, but the source flag arbeitszeitVollzeit={flag}; read the posting",
+        evidence,
+    )
+
+
 def work_time_criterion(text: str, job: JobRecord | None = None) -> Criterion:
     """Informational unless the posting is part-time only (then a stated gap). A missing
     working time is never a reason to hold a vacancy. The posting's text decides; the
-    source's own `arbeitszeitVollzeit` flag speaks only where the text is silent."""
+    source's own `arbeitszeitVollzeit` flag speaks only where the text is silent. A text that
+    contradicts the flag is a CONFLICT (needs verification), never a silent pick. A listed
+    option ("Teilzeitmöglichkeiten") is not part-time-only; no statement stays UNKNOWN."""
     signal = classify_work_time(text)
+    offered = getattr(job, "full_time_offered", None) if job is not None else None
+    if signal.mode == "FULL_TIME" and offered is False:
+        return _work_time_conflict("the text states full time", signal.evidence, "false")
+    if signal.mode == "PART_TIME" and offered is True:
+        return _work_time_conflict("the text states part time only", signal.evidence, "true")
     if signal.mode == "FULL_TIME":
         return Criterion("work_time", "FULL_TIME", "full-time stated", signal.evidence)
     if signal.mode == "PART_TIME":
@@ -636,7 +654,6 @@ def work_time_criterion(text: str, job: JobRecord | None = None) -> Criterion:
             "part-time only; the candidate looks for full time",
             signal.evidence,
         )
-    offered = getattr(job, "full_time_offered", None) if job is not None else None
     if offered is True:
         return Criterion(
             "work_time", "FULL_TIME", "full time offered (source flag)", "arbeitszeitVollzeit=true"
