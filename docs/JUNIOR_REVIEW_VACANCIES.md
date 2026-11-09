@@ -40,11 +40,11 @@ work. Open them yourself from the e-mail or the XING app; do not let a script fo
 | 310 | 2026-10-20 | Vollzeit (stub); salary 45.000–60.000 € | UNKNOWN | 45 / NEEDS_ENRICHMENT | NEEDS_OPERATOR | `ROUTE_REVIEW_REQUIRED`; also `NEEDS_ENRICHMENT` |
 | 292 | 2026-10-20 | Vollzeit (stub); salary 48.500–67.000 € | UNKNOWN | 45 / NEEDS_ENRICHMENT | NEEDS_OPERATOR | `ROUTE_REVIEW_REQUIRED`; also `NEEDS_ENRICHMENT` |
 
-**Note A (a finding, not fixed here).** The work-time rule labels 705, 752 and 1337 `PART_TIME`
-("part-time only"). The only evidence is benefit wording — "Teilzeitmöglichkeiten" (705, 752) and
-"part-time options" (1337) — which says part time is *possible*, not that the job is part time only.
-These three are therefore shown as UNKNOWN above. The rule (`classify_work_time`) should be fixed in
-a separate change, because it alters the rules hash and invalidates every cached assessment.
+**Note A (fixed in the work-time change).** An earlier version of the rule labelled 705, 752 and
+1337 `PART_TIME` because of benefit wording ("Teilzeitmöglichkeiten", "part-time options"). That
+wording only says part time is *possible*. After the fix all three are `UNKNOWN`: the posting does
+not state the hours, and Vollzeit is **not** confirmed either. See
+`docs/WORK_TIME_CLASSIFICATION_REPORT.md`.
 
 ## What to clarify and recommendation
 
