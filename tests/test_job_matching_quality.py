@@ -49,6 +49,7 @@ def _assessment(
         Criterion("start_date", start, "d"),
         Criterion("experience", experience, "x"),
         Criterion("work_time", work_time, "w"),
+        Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
     ]
     return a
 

@@ -139,6 +139,13 @@ BLOCK_HYBRID_ADMIN_ROLE = "HYBRID_ADMIN_ROLE"
 # "could not be recognised" (Halbtagsstelle, 50 %-Stelle, hours without the word Teilzeit) are both
 # UNKNOWN, so UNKNOWN must never open an automatic gate. A held vacancy stays in the review queue.
 BLOCK_WORK_TIME_NOT_CONFIRMED = "WORK_TIME_NOT_CONFIRMED"
+# Stage 55: an application for THIS vacancy already exists and has not been sent (`duplicate`
+# IN_PREPARATION: same job row, source reference, URL or fingerprint). It is the operator's
+# controlled work -- the automatic path must not prepare it a second time. Only a recorded CLEAR
+# admits: an unknown or missing duplicate state is held like every other unconfirmed fact.
+# (`POSSIBLE_DUPLICATE` -- same employer and role, no exact signal -- is held by the fit tier, and
+# other vacancies of the same employer are not touched by this rule.)
+BLOCK_APPLICATION_IN_PROGRESS = "APPLICATION_IN_PROGRESS"
 
 
 def automatic_block_reason(assessment: FitAssessment) -> str | None:
@@ -154,6 +161,9 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
         )
         if work_time != "FULL_TIME":
             return BLOCK_WORK_TIME_NOT_CONFIRMED
+        duplicate = next((c.status for c in assessment.criteria if c.name == "duplicate"), None)
+        if duplicate != "CLEAR":
+            return BLOCK_APPLICATION_IN_PROGRESS
         return None
     return (
         f"FIT_TIER_{tier}" if isinstance(tier, str) and tier.isidentifier() else "FIT_TIER_UNKNOWN"

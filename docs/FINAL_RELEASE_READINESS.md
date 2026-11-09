@@ -1,4 +1,4 @@
-# Готовность релиза: цепочка PR #47 → #54
+# Готовность релиза: цепочка PR #47 → #55
 
 Статус документа: **read-only аудит и план, 2026-11-09. Ничего из него не выполнялось на production.**
 Рабочая SQLite, `.env`, планировщик, Gmail/Telegram и Bewerbungen не затрагивались. Каждый шаг с
@@ -16,6 +16,7 @@
 | #52 | `perf/manual-review-queue` (0d0e6d9) | #51 | 3 | 6/6 pass (8 534 passed, 169 skipped; PostgreSQL 36 passed) | CLEAN |
 | #53 | `fix/work-time-classification` (98ad8a8) | #52 | 4 | 6/6 pass (8 622 passed, 169 skipped; PostgreSQL 36 passed) | CLEAN |
 | #54 | `fix/work-time-gate-confirmation` | #53 | 4 | см. PR #54 (первый прогон поймал незарегистрированный скрипт; исправлено) | — |
+| #55 | `fix/application-idempotency` | #54 | 4 | см. PR #55 | — |
 
 * Цепочка линейна: каждая ветка — потомок предыдущей. `git merge-tree main <tip>` для вершины цепочки
   (#53): **без конфликтов**.
@@ -81,7 +82,7 @@ STALE после merge любого PR цепочки. Последствия: `
 1. **Проверка `.env`** на шаблонные `API_KEY` / `UI_SESSION_SECRET` / `POSTGRES_PASSWORD` (после #37 с шаблоном
    приложение не стартует): булева проверка из `AUDIT_2026_11_06_DEPLOYMENT_PLAN.md` §2, без вывода секрета.
    Фактические значения production `.env` в этой работе **не читались**.
-2. **Merge в `main`** по порядку: #47 → перенацелить #48 на `main` → #48 → #49 → #50 → #51 → #52 → #53 → #54; после
+2. **Merge в `main`** по порядку: #47 → перенацелить #48 на `main` → #48 → #49 → #50 → #51 → #52 → #53 → #54 → #55; после
    каждого — зелёный CI. Старые PR ветвей аудита закрыть без слияния.
 3. **Резервная копия** (чек-лист):
    * приложение и планировщик остановлены, процессов `uvicorn` / `app.scheduler` нет;
@@ -125,6 +126,7 @@ STALE после merge любого PR цепочки. Последствия: `
 **GO** только если выполнено всё:
 
 * CI #47–#53 зелёный непосредственно перед соответствующим слиянием (включая `scheduler-postgres`);
+* оператор принял политику PR #55 (автоподготовка не трогает вакансию с неотправленной заявкой; `source_reference` обязателен; Telegram APPROVE требует проверенной вакансии; остаточный риск — до 2 локальных черновиков письма при гонке воркеров), см. `docs/APPLICATION_IDEMPOTENCY_AUDIT.md`;
 * оператор принял политику PR #54 («автоматическая подготовка только при подтверждённом FULL_TIME»; без неё gate допускает UNKNOWN, см. `docs/FINAL_AUDIT_STAGE54.md`);
 * оператор прочитал `docs/WORK_TIME_CLASSIFICATION_REPORT.md` и принял, что формального Codex ACCEPT для
   #52/#53 **нет** (ревью оставлены с открытыми замечаниями: компромиссы очереди и эвристика рабочего времени);
@@ -143,3 +145,14 @@ STALE после merge любого PR цепочки. Последствия: `
 * На холодном кэше список очереди неполон — это отражено на странице.
 * Полный локальный pytest на Windows не запускался (медленно; модуль `test_imap_deadline.py` по известной проблеме блокируется
   Windows Application Control, WinError 4551 — защита не отключалась); полный Linux CI — на GitHub.
+
+
+## Stage 55: идемпотентность подготовки Bewerbung
+
+Отчёт: `docs/APPLICATION_IDEMPOTENCY_AUDIT.md`. Production не менялась (SHA-256 `aef7383e…`, 3 234 / 25 / 54,
+`d6e9a2b4c8f1`). Булевы проверки production `.env`: `OUTBOUND_SENDING_ENABLED`, `AUTOMATION_AUTO_PREPARE_ENABLED`,
+`AUTOMATION_SCHEDULER_ENABLED`, `ALEMBIC_AUTO_UPGRADE`, `AUTOMATION_FOLLOW_UP_CYCLE_ENABLED`,
+`AUTOMATION_GMAIL_CYCLE_ENABLED`, `COMPANY_RESEARCH_AUTO_ENABLED`, `TELEGRAM_DAILY_DIGEST_ENABLED` — все `false`;
+флаги Telegram operator control / Gmail draft / nationwide не заданы в файле (действует умолчание кода, false).
+**Перед внедрением** `ALEMBIC_AUTO_UPGRADE` должен оставаться `false`: миграция `a7c3e5f1b9d2` выполняется только
+явной командой после бэкапа.

@@ -88,15 +88,27 @@ def get_application(db: Session, application_id: int) -> ApplicationRecord | Non
     return db.get(ApplicationRecord, application_id)
 
 
+def canonical_source(source: str) -> str:
+    """The identity form of a source name: `Bundesagentur` and `bundesagentur ` are one source.
+    Every write and every lookup of `(source, source_reference)` goes through this, otherwise the
+    UNIQUE constraint compares different spellings of the same vacancy and lets both through."""
+    return source.strip().casefold()
+
+
 def get_application_by_source_reference(
     db: Session, source: str, source_reference: str
 ) -> ApplicationRecord | None:
+    """Matched case-insensitively on `source` so a row stored before `canonical_source` existed
+    (`Bundesagentur`) is still found; new rows are always stored canonical."""
     return db.scalars(
-        select(ApplicationRecord).where(
-            ApplicationRecord.source == source,
+        select(ApplicationRecord)
+        .where(
+            func.lower(ApplicationRecord.source) == canonical_source(source),
             ApplicationRecord.source_reference == source_reference,
         )
-    ).one_or_none()
+        .order_by(ApplicationRecord.id)
+        .limit(1)
+    ).first()
 
 
 def has_application_for_job(db: Session, job_id: int) -> bool:

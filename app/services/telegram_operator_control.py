@@ -326,7 +326,11 @@ def assess_package(db: Session, application: Application) -> tuple[PackageSummar
         reasons.append("REVIEW_PACKAGE_REJECTED")
     if revision is None:
         reasons.append("NO_REVISION")
-    if application.job_id is not None and review.job_id != application.job_id:
+    if application.job_id is None:
+        # Nothing ties this application to the package's vacancy (company, role, reference or URL
+        # are not compared here): approving would approve whatever package it points to.
+        reasons.append("NO_VERIFIED_VACANCY")
+    elif review.job_id != application.job_id:
         reasons.append("PACKAGE_JOB_MISMATCH")
     profile = get_candidate_profile(db)
     if profile is None:
