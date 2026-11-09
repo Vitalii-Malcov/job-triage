@@ -96,7 +96,7 @@ from app.services.candidate_preparation import (
     prepare_candidate_job_match,
 )
 from app.services.collector_runner import TouchedJob
-from app.services.shortlist_gate import automatic_preparation_block
+from app.services.shortlist_gate import automatic_preparation_block, automatic_preparation_check
 
 logger = logging.getLogger(__name__)
 
@@ -358,20 +358,27 @@ async def prepare_shortlist_drafts(
     # APPLY recommendation never bypasses it.
     blocked_by_fit = 0
     gated: list[tuple] = []
+    ranks: dict[int, int] = {}
     for job, match in matched:
         if match.overall_score < settings.automation_shortlist_min_match_score:
             continue
-        reason = automatic_preparation_block(db, job.id)
-        if reason is not None:
+        check = automatic_preparation_check(db, job.id)
+        if check.block is not None:
             blocked_by_fit += 1
-            logger.info("automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, reason)
+            logger.info(
+                "automation_shortlist_blocked_by_fit job_id=%s reason=%s", job.id, check.block
+            )
             continue
         gated.append((job, match))
+        ranks[job.id] = check.rank
     shortlist_candidates = gated
-    # Deterministic ranking (spec section 6): match score DESC, then
-    # JobRecord.score DESC, then job id ASC as the final, always-unique
-    # tie-break. Never randomness.
-    shortlist_candidates.sort(key=lambda pair: (-pair[1].overall_score, -pair[0].score, pair[0].id))
+    # Deterministic ranking (spec section 6): role family (a Python/backend role is never
+    # displaced by an adjacent data/DevOps role that merely matches more keywords), then match
+    # score DESC, then JobRecord.score DESC, then job id ASC as the final, always-unique
+    # tie-break. Never randomness. Ranking only; admission was decided above.
+    shortlist_candidates.sort(
+        key=lambda pair: (ranks[pair[0].id], -pair[1].overall_score, -pair[0].score, pair[0].id)
+    )
     shortlisted = shortlist_candidates[: settings.automation_shortlist_max_per_run]
 
     (

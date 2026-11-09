@@ -52,7 +52,7 @@ _FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         (
             "administrator",
             r"\b\w*administrat(?:or|orin|oren|orinnen)\b|\b(?:it|system|netzwerk|network|server|windows|linux)"
-            r"[\s-]*administration\b|\b(?:it|system)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
+            r"[\s-]*administration\b|\b(?:it|system|linux|unix|windows|datenbank|database|db|cloud|server|netzwerk|network)[\s-]?admins?\b|\bsysadmins?\b|\bsystemverwalt\w*",
         ),
         ("it-systemelektroniker", r"\b(?:it[\s-]*)?systemelektroniker(?:in|innen)?\b"),
         ("systemintegration", r"\bsystemintegrat(?:or|orin|ion)\b|\bit[\s-]?systemintegrat\w*"),
@@ -98,6 +98,65 @@ def support_admin_family(title: str) -> str | None:
         # is a hybrid the operator reads; "... mit Entwicklungsaufgaben" is not.
         return None
     return next((name for name, pattern in _FAMILIES if pattern.search(text)), None)
+
+
+# Gender markers ("(m/w/d)", "m/w/x") are noise; parenthesised ROLE words are kept.
+_GENDER_MARKER = re.compile(
+    r"\b[mwdfx](?:\s*[/|*:_]\s*[mwdfx]){1,3}\b|\b[mwdfx]\s*\*\s*[mwdfx]\b", re.IGNORECASE
+)
+_PARENTHESIS = re.compile(r"\(([^)]*)\)")
+_GENDER_ONLY = re.compile(r"^(?:[mwdfx]|gn|divers|all|genders|[\*/|:_,\s])+$", re.IGNORECASE)
+# The support/admin word names the PRODUCT being built ("... IT-Support Tools"), not the job.
+# Whole words only; a developer-role phrase ("Software-Entwickler") is never a product.
+_PRODUCT_NOUN = re.compile(
+    r"(?:tools?|software|plattform(?:en)?|platforms?|systems?|systeme|portale?|anwendung(?:en)?|"
+    r"applikation(?:en)?|l(?:ö|oe)sung(?:en)?|produkte?|apps?|dashboards?|tooling)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_noise(title: str) -> str:
+    """Drop gender markers; keep any other parenthesised text, set off by ';' so it can
+    never make two words look adjacent."""
+    text = _PARENTHESIS.sub(
+        lambda m: " " if _GENDER_ONLY.match(m.group(1).strip()) else f" ; {m.group(1)} ; ",
+        title or "",
+    )
+    return _GENDER_MARKER.sub(" ", text)
+
+
+def hybrid_support_admin_family(title: str) -> str | None:
+    """The support/administration family of a HYBRID title, or None.
+
+    Hybrid = the title names a developer role AND an administration/support role term
+    ("IT-Administrator / Softwareentwickler", "IT-Support für Softwareentwickler"). It is not
+    excluded (see `support_admin_family`) but the main profession is unclear: the operator
+    reads it and it is never prepared automatically. Fails safe: a false positive only
+    costs a manual look, a false negative would let an admin job through. The one
+    exemption is support that names the software being built ("Python Entwickler Service
+    Desk Tools"): the term is directly followed by a product noun."""
+    text = _strip_noise(title)
+    if not _DEV_ROLE.search(text):
+        return None
+    for name, pattern in _FAMILIES:
+        for match in pattern.finditer(text):
+            tail = text[match.end() :].lstrip(" -")
+            # support names the product only when a developer role comes FIRST
+            if (
+                _DEV_ROLE.search(text[: match.start()])
+                and _PRODUCT_NOUN.match(tail)
+                and not _DEV_ROLE.match(tail)
+            ):
+                continue
+            return name
+    return None
+
+
+def is_developer_title(title: str) -> bool:
+    """Title-only: does the title name a software-development role? Independent of the
+    candidate's configured role priorities and never true for a support/administration
+    title without a separate developer alternative."""
+    return _DEV_ROLE.search(title or "") is not None
 
 
 def is_support_admin_term(term: str) -> bool:

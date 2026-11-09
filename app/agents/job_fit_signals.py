@@ -56,6 +56,17 @@ _FULLY_REMOTE = re.compile(
     r"|arbeitsort\s*:\s*remote",
     re.IGNORECASE,
 )
+_FULLY_REMOTE = re.compile(
+    _FULLY_REMOTE.pattern + r"|home\s*-?\s*office\s*(?:zu\s*)?100\s*%|remote\s*\(\s*100\s*%",
+    re.IGNORECASE,
+)
+# "Remote Germany", "Remote EU", "Germany-wide remote": a stated region of work, weaker than
+# "100 % remote". Only used when the posting names no hybrid / on-site rule (see classify_remote).
+_REMOTE_REGIONAL = re.compile(
+    r"remote[\s(/-]*(?:in\s+|within\s+)?(?:germany|deutschland|eu|europe|europa|dach)\b"
+    r"|\b(?:germany|deutschland|eu|europe|europa|dach)[\s)/-]*remote\b",
+    re.IGNORECASE,
+)
 _NO_REMOTE = re.compile(
     r"kein(?:e|en)?\s+(?:home\s*-?\s*office|remote|mobiles\s+arbeiten)"
     r"|(?:ausschließlich|ausschliesslich|nur)\s+vor\s+ort",
@@ -76,29 +87,390 @@ _REMOTE_REGION = re.compile(
 )
 
 
+# Negation is clause-scoped: "kein Homeoffice", "Remote Germany ist nicht möglich", "Vollzeit
+# bieten wir nicht an". A negator in another clause never counts, so "100 % Remote. Büropräsenz
+# ist nicht erforderlich." keeps the remote statement affirmative. A clause ends at . ; , newline
+# or a conjunction ("... mandatory and Python is preferred" are two clauses).
+_CLAUSE_BOUND = re.compile(
+    r"[.;,\n!?]|\b(?:and|und|but|aber|while|whereas|sowie|jedoch)\b", re.IGNORECASE
+)
+_NEGATOR = re.compile(
+    r"\b(?:kein|keine|keinen|keiner|keinem|nicht|ohne|no|not|without|never|nie|cannot|can't"
+    r"|unable|leider)\b",
+    re.IGNORECASE,
+)
+# "No exceptions" / "not only" are emphasis, not a negation of what they stress.
+_NEGATION_IDIOM = re.compile(
+    r"\bno\s+(?:exceptions?|doubt|worries)\b|\bnot\s+only\b|\bkeine\s+ausnahmen?\b|\bohne\s+ausnahme\b",
+    re.IGNORECASE,
+)
+
+
+def _has_negator(text: str) -> bool:
+    return bool(_NEGATOR.search(_NEGATION_IDIOM.sub(" ", text)))
+
+
+_NEGATOR_NEAR_BEFORE = 6  # words
+# "No remote experience required", "Remote-Erfahrung": a requirement about skills or equipment,
+# not a statement about whether the job can be done remotely.
+_REMOTE_SKILL_NOUN = re.compile(
+    r"^\w*[\s-]*(?:experience|erfahrung|kenntnisse|skills?|tools?|setup|ausstattung|equipment)",
+    re.IGNORECASE,
+)
+
+
+def _clause(text: str, start: int, end: int) -> tuple[str, str]:
+    """(the part of the clause before `start`, the part after `end`)."""
+    left = max((m.end() for m in _CLAUSE_BOUND.finditer(text, 0, start)), default=0)
+    right_match = _CLAUSE_BOUND.search(text, end)
+    return text[left:start], text[end : right_match.start() if right_match else len(text)]
+
+
+def _negated(text: str, match: re.Match[str]) -> bool:
+    before, after = _clause(text, match.start(), match.end())
+    near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+    return bool(_has_negator(near_before) or _has_negator(after))
+
+
+def _affirmed(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """The first match of `pattern` that is not negated inside its own clause."""
+    for match in pattern.finditer(text):
+        if not _negated(text, match):
+            return match
+    return None
+
+
+# Office presence. STRONG phrases veto a full-remote claim on their own; WEAK vocabulary (a Büro
+# mentioned in a perk, a site, onboarding, customer travel) vetoes only together with an
+# obligation or frequency cue in the same clause. Remote work is "100 %" only if every vetoing
+# clause is negated ("keine Büropräsenz") or made optional ("kannst optional ins Büro").
+_PRESENCE_STRONG = re.compile(
+    r"\bon-?\s?site\b|\b\w*pr(?:ä|ae)senz\w*|\bpresence\b|\battend\w*|\banwesen\w*"
+    r"|\bvor[\s-]+ort[\s-]+(?:arbeit\w*|pflicht|termine?)"
+    r"|\b(?:jeden|every|each)\s+(?:montag|dienstag|mittwoch|donnerstag|freitag"
+    r"|monday|tuesday|wednesday|thursday|friday)\b",
+    re.IGNORECASE,
+)
+_PRESENCE_WEAK = re.compile(
+    r"\bvor[\s-]+ort\b|\b\w*b(?:ü|ue)ro\w*|(?<!home )(?<!home-)\boffices?\b|\bheadquarters?\b"
+    r"|\bhauptsitz\b|\b(?:unser(?:em|er)?|our)\s+(?:standort|site|location)\b"
+    r"|\bonboarding\b|\beinarbeitung\b|\bkick-?off\b"
+    r"|\bteam[\s-]?(?:meetings?|treffen|events?)\s+(?:in|at|im)\s+(?-i:[A-ZÄÖÜ])",
+    re.IGNORECASE,
+)
+# Office time the employee may choose is not a presence rule (own name: the language section
+# defines a different _OPTIONAL further down).
+_OFFICE_OPTIONAL = re.compile(
+    r"\boptional\w*|\bfreiwillig\w*|\bvoluntar\w*|\bauf\s+wunsch\b|\bnach\s+wunsch\b"
+    r"|\bif\s+you\s+(?:want|like|wish|prefer)\b|\bwenn\s+du\s+(?:willst|m(?:ö|oe)chtest)\b"
+    r"|\bkannst\b|\bsie\s+k(?:ö|oe)nnen\b|\byou\s+(?:can|may)\b|\bdu\s+kannst\b",
+    re.IGNORECASE,
+)
+
+
+# Wording that makes office presence an obligation ("must attend", "jeden Dienstag", "2x/Woche")
+_OBLIGATION = re.compile(
+    r"\bmust\b|\bmandatory\b|\brequired?\b|\bpflicht\w*|\bzwingend\b|\berforderlich\b"
+    r"|\battend\w*|\b(?:jeden|every|each)\b|\b\d\s*(?:x|times|mal|tage?|days?)\b|\btwice\b"
+    r"|\bweekly\b|\bw(?:ö|oe)chentlich\b|\bmonatlich\w*|\bmonthly\b|\bquartals\w*|\bquarterly\b"
+    r"|\bregelm(?:ä|ae)(?:ß|ss)ig\w*|\bregularly\b|\bfindet\b[^.;\n]{0,60}\bstatt\b"
+    r"|\btakes?\s+place\b|\bverpflichtend\b|\berfolgt\b|\bexpected\b|\bwird\s+erwartet\b"
+    r"|\berwarten\b|\bmuss\w*|\bm(?:ü|ue)ssen\b|\bsollst\b|\bsollten?\b|\bshould\b"
+    r"|\b(?:have|has|need|needs)\s+to\b|\bshort\s+notice\b|\bkurzfristig\w*",
+    re.IGNORECASE,
+)
+
+
+# "(no) office attendance required / needed", "Büropräsenz nicht erforderlich"
+_NOT_NEEDED = re.compile(
+    r"\b(?:nicht|not|no|kein\w*)\W+(?:\w+\W+){0,2}?(?:required|needed|necessary|erforderlich"
+    r"|n(?:ö|oe)tig|notwendig|vorgeschrieben|expected|verpflichtend)\b",
+    re.IGNORECASE,
+)
+
+
+def _near(text: str, match: re.Match[str], words: int = 4) -> str:
+    """The few words right before and after a match, inside its clause."""
+    before, after = _clause(text, match.start(), match.end())
+    return " ".join(before.split()[-words:] + after.split()[:words])
+
+
+# Unambiguous obligation. Deliberately not "required" / "Pflicht" ("keine Pflicht", "not required").
+_STRONG_OBLIGATION = re.compile(
+    r"\bmandatory\b|\bmust\b|\bzwingend\b|\bverpflichtend\b|\bnot\s+optional\b"
+    r"|\brequired\s+(?:office|on-?site|attendance|presence|b(?:ü|ue)ro|pr(?:ä|ae)senz)"
+    r"|\bnicht\s+(?:optional|freiwillig)\b",
+    re.IGNORECASE,
+)
+
+
+# A negator directly before a strong obligation word cancels that word ("kein zwingender Büro...").
+_NEGATED_STRONG = re.compile(
+    r"\b(?:no|not|kein\w*|nicht|ohne|without)\s+(?:\w+\s+)?(?:mandatory|zwingend\w*"
+    r"|verpflichtend\w*|must)\b",
+    re.IGNORECASE,
+)
+# Perks and facilities, not working arrangements.
+_BENEFIT = re.compile(
+    r"\byoga\b|\bkurs\w*|\bclasses\b|\bparking\b|\bparkplatz\w*|\bfitness\w*|\bmassage\w*"
+    r"|\bkantine\b|\bcanteen\b|\bsnacks?\b|\bobst\b|\bfruit\b|\bgetr(?:ä|ae)nke\b|\bbenefits?\b"
+    r"|\bgratis\b|\bkostenlos\w*|\bfree\b|\bperks?\b|\bbieten\b|\banbieten\b|\bangebot\w*|\bwe\s+offer\b|\bwe\s+provide\b",
+    re.IGNORECASE,
+)
+
+
+def _presence(text: str) -> re.Match[str] | None:
+    """Office vocabulary that stands. Negation or optionality must sit right next to the phrase
+    ("keine Büropräsenz", "no office attendance required", "kannst optional ins Büro"); an
+    unrelated "no exceptions" or "so you can meet the team" in the clause does not cancel it."""
+    candidates = [(m, True) for m in _PRESENCE_STRONG.finditer(text)]
+    candidates += [(m, False) for m in _PRESENCE_WEAK.finditer(text)]
+    for match, strong in sorted(candidates, key=lambda pair: pair[0].start()):
+        before, after = _clause(text, match.start(), match.end())
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        after_head = " ".join(after.split()[:6])
+        clause = f"{before} {match.group(0)} {after}"
+        if _BENEFIT.search(clause):
+            continue  # "Weekly yoga classes in our office": a perk, not a working arrangement
+        if not strong and not _OBLIGATION.search(clause):
+            continue  # a site or customer travel with no obligation cue
+        # "No mandatory attendance" is not mandatory; "No exceptions to mandatory ..." still is
+        if _STRONG_OBLIGATION.search(_NEGATED_STRONG.sub(" ", clause)):
+            return match  # "mandatory", "not optional": nothing else in the clause cancels it
+        if (
+            _has_negator(near_before)
+            or _NOT_NEEDED.search(after_head)
+            or _OFFICE_OPTIONAL.search(_near(text, match))
+        ):
+            continue
+        return match
+    return None
+
+
+# Countries outside Germany. US / USA / UK are case-sensitive ("us" is a pronoun).
+_COUNTRY = (
+    r"(?-i:US|USA|UK|U\.S\.)|(?:the\s+)?united\s+states|(?:the\s+)?united\s+kingdom"
+    r"|great\s+britain|canada|australia|india|brazil|mexico|poland|polen|austria|(?:ö|oe)sterreich"
+    r"|switzerland|schweiz|france|frankreich|spain|spanien|italy|italien|netherlands"
+    r"|niederlande|ireland|irland|portugal|romania|rum(?:ä|ae)nien|usa|den\s+usa"
+    r"|den\s+vereinigten\s+staaten|gro(?:ß|ss)britannien|belgium|belgien|czech\w*|tschechien"
+    r"|denmark|d(?:ä|ae)nemark|sweden|schweden|norway|norwegen|finland|finnland|greece"
+    r"|griechenland|hungary|ungarn|turkey|t(?:ü|ue)rkei|china|japan|singapore|south\s+africa"
+    r"|luxembourg|luxemburg|bulgaria|bulgarien|croatia|kroatien|serbia|serbien|ukraine"
+)
+_APPLICANT = r"(?:candidates?|applicants?|bewerber\w*|mitarbeiter\w*|talent|residents?|citizens?)"
+# A restriction names a country as the place the APPLICANT works from. A company or customer
+# location ("UK-based company", "serves UK residents") does not.
+_COUNTRY_RESTRICTION = re.compile(
+    rf"\b(?:{_COUNTRY})[\s-]*(?:only|nur)\b"
+    rf"|\b(?:{_COUNTRY})[\s-]*based\s+{_APPLICANT}\s+(?:only|nur|are\s+(?:eligible|required)"
+    rf"|may\s+apply|wanted|needed|required)\b"
+    rf"|\bnur\s+(?:aus|in|f(?:ü|ue)r)\s+(?:dem\s+|der\s+|den\s+)?(?:{_COUNTRY})\b"
+    rf"|\bonly\s+{_APPLICANT}\s+(?:of|from|in|based|located|living|residing)\s+(?:in\s+)?"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b{_APPLICANT}\s+of\s+(?:the\s+)?(?:{_COUNTRY})\s+only\b"
+    rf"|\b{_APPLICANT}[^.;\n]{{0,30}}?\b(?:based|located|living|residing|wohnhaft|wohnsitz)\s+in\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:remote|home\s*-?\s*office|mobil\w*)[^.;\n]{{0,40}}?\b(?:only\s+)?(?:in|from|within|aus)\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\bmust\s+(?:be\s+)?(?:located|based|reside|living)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:permitted|allowed|erlaubt|possible|m(?:ö|oe)glich)\s+(?:only\s+|nur\s+)(?:from|in|aus)\s+"
+    rf"(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\bonly\s+(?:from|in)\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    rf"|\b(?:restricted|limited|beschr(?:ä|ae)nkt)\s+(?:to|auf)\s+(?:the\s+)?(?:{_COUNTRY})\b"
+    # nationality adjective + residency/citizenship ("Polish residency is required")
+    r"|\b(?:polish|british|american|french|spanish|italian|dutch|swiss|austrian|belgian|czech"
+    r"|irish|portuguese|romanian|canadian|indian|polnische\w*|britische\w*|franz(?:ö|oe)sische\w*"
+    r"|(?:ö|oe)sterreichische\w*|schweizer\w*)\s+(?:residen\w*|citizen\w*|staatsb(?:ü|ue)rger\w*"
+    r"|nationality|work\s+permit|wohnsitz)"
+    rf"|\b(?:requires?|erfordert)\s+(?:residen(?:cy|ce)|wohnsitz)\s+in\s+(?:the\s+)?(?:{_COUNTRY})\b",
+    re.IGNORECASE,
+)
+_BROAD = r"germany|deutschland|europe|europa|\beu\b|emea|dach|worldwide|global|weltweit"
+# Germany/Europe is an ALTERNATIVE place of work only when joined to the country by or/und,
+# a slash or "incl." ("UK or Germany", "Poland / Deutschland"). ", Germany is our largest
+# market" or ", global customer base" are not alternatives.
+_JOIN = r"(?:/|\+|&|or|oder|and|und|incl\.?|inkl\.?|including|einschlie(?:ß|ss)lich)"
+_ARTICLE = r"(?:in\s+|im\s+|from\s+|aus\s+|within\s+)?(?:the\s+)?"
+_ALTERNATIVE_AFTER = re.compile(rf"^\s*{_JOIN}\s*{_ARTICLE}(?:{_BROAD})", re.IGNORECASE)
+_ALTERNATIVE_BEFORE = re.compile(rf"(?:{_BROAD})\s*{_JOIN}\s*{_ARTICLE}$", re.IGNORECASE)
+# A stated German region of work for remote jobs ("Remote in Deutschland", "Poland or Germany").
+_GERMAN_REMOTE = re.compile(
+    r"(?:remote|home\s*-?\s*office|mobil\w*)[^.;\n]{0,40}?(?:\b(?:in|aus|from|within|or|oder|and|und)|/)\s*"
+    r"(?:the\s+)?(?:germany|deutschland)\b|\b(?:deutschland|bundes)weit",
+    re.IGNORECASE,
+)
+_FOREIGN_MENTION = re.compile(rf"\b(?:{_COUNTRY})\b", re.IGNORECASE)
+# Wording that limits WHO may take the job. Unresolved (no stated German region) -> review.
+_ELIGIBILITY_WORDING = re.compile(
+    r"\bonly\b|\bnur\b|\bausschlie(?:ß|ss)lich\b|\bexclusively\b|\beligible\b|\bresidents?\b"
+    r"|\bcitizens?\b|\bwohnsitz\b|\bwohnhaft\b|\bwork\s+(?:permit|authori[sz]ation)\b"
+    r"|\barbeitserlaubnis\b|\bvisa\b|\bans(?:ä|ae)ssig\b|\bresid(?:e|es|ing)\b|\bliv(?:e|es|ing)\s+in\b"
+    r"|\bbased\s+in\b|\blocated\s+in\b|\bpermitted\b|\ballowed\b|\berlaubt\b"
+    r"|\brestricted\b|\blimited\s+to\b|\bbeschr(?:ä|ae)nkt\b|\bresiden(?:cy|ce)\b",
+    re.IGNORECASE,
+)
+_ELIGIBILITY_SUBJECT = re.compile(
+    r"remote|home\s*-?\s*office|candidates?|applicants?|bewerb\w*|resident|resid|wohn|based|located"
+    r"|work\b|arbeit\w*|eligible|permit|visa|citizen|liv(?:e|ing)|you\b|du\b|sie\b|erlaubt|allowed"
+    r"|position|stelle|\brole\b|\bjob\b|vacancy|rolle",
+    re.IGNORECASE,
+)
+# A broad region named in the SAME clause resolves the wording ("only within the EU").
+_BROAD_REGION = re.compile(rf"\b(?:{_BROAD})", re.IGNORECASE)
+
+
+_ADDITIVE = re.compile(
+    r"\balso\s+(?:available|possible|permitted|allowed|an\s+option)\b"
+    r"|\b(?:auch|ebenfalls|zus(?:ä|ae)tzlich)\s+(?:m(?:ö|oe)glich|erlaubt|angeboten)\b"
+    r"|\bas\s+well\b|\bin\s+addition\s+to\b",
+    re.IGNORECASE,
+)
+
+
+def _country_restriction(text: str) -> str | None:
+    for match in _COUNTRY_RESTRICTION.finditer(text):
+        after = text[match.end() : match.end() + 40]
+        before = text[max(0, match.start() - 40) : match.start()]
+        if _ALTERNATIVE_AFTER.match(after) or _ALTERNATIVE_BEFORE.search(before):
+            continue
+        before_words = " ".join(text[max(0, match.start() - 60) : match.start()].split()[-3:])
+        if _has_negator(before_words) or _has_negator(match.group(0)):
+            continue  # "need not be based in the UK"; "no exceptions" later on does not count
+        clause_before, clause_after = _clause(text, match.start(), match.end())
+        if _ADDITIVE.search(clause_before + " " + clause_after):  # "also available from Poland"
+            continue
+        return " ".join(match.group(0).split())[:40]
+    return None
+
+
+def _unresolved_eligibility(text: str) -> bool:
+    """A clause limits who may take the job or where it may be done (only / nur / residents /
+    must reside / permitted ...) without naming Germany, the EU or another broad region IN THE
+    SAME CLAUSE. A region stated elsewhere does not resolve it ("Fully remote EU. Work is
+    permitted only from Poland.")."""
+    for match in _ELIGIBILITY_WORDING.finditer(text):
+        before, after = _clause(text, match.start(), match.end())
+        clause = before + " " + match.group(0) + " " + after
+        if _negated(text, match) or _BROAD_REGION.search(clause):
+            continue
+        if _ELIGIBILITY_SUBJECT.search(clause):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class RemoteSignal:
     mode: RemoteMode
-    # A German state the remote work is restricted to, if the posting says so.
+    # A German state or a foreign country the remote work is restricted to, if the posting says so.
     region_restriction: str | None = None
+    # Remote work limited to a country outside Germany ("Remote US only"); never a commute question.
+    country_restriction: str | None = None
     evidence: str | None = None
+    # Remote work is stated but who may do it is unclear (foreign country named, "only ...").
+    # Never a confirmed FULLY_REMOTE; the operator decides.
+    eligibility_unverified: bool = False
+
+
+# A denial AFTER the keyword is a predicate ("ist nicht möglich", "is not available"), not any
+# later "no" ("... with no office attendance required").
+_DENIAL_AFTER = re.compile(
+    r"\b(?:nicht|not|kein\w*|never|nie)\b\W+(?:\w+\W+){0,2}?(?:m(?:ö|oe)glich|possible|available"
+    r"|offered|verf(?:ü|ue)gbar|vorgesehen|an|angeboten|supported|gew(?:ä|ae)hrt|erlaubt|allowed"
+    r"|der\s+fall|permitted|gestattet|infrage|in\s+frage)\b"
+    r"|\bunavailable\b|\bnicht\s+(?:\w+\s+){0,3}?(?:infrage|in\s+frage)\b"
+    r"|\bno\s+longer\b|\bnot\s+an\s+option\b|\bkeine\s+option\b|\bnicht\s+mehr\b"
+    # a prohibition carries its own negation: "Remote work is prohibited / ist ausgeschlossen"
+    r"|\b(?:prohibited|forbidden|banned|ausgeschlossen|untersagt|verboten)\b",
+    re.IGNORECASE,
+)
+
+
+def _affirmed_phrase(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """Like `_affirmed`, for remote-work phrases: negated only by a negator right before the
+    phrase or a denial predicate after it, not by any later "no" in the clause."""
+    for match in pattern.finditer(text):
+        before, after = _clause(text, match.start(), match.end())
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _has_negator(near_before) or _DENIAL_AFTER.search(after):
+            continue
+        return match
+    return None
+
+
+_SKILL_BETWEEN = re.compile(
+    r"\b(?:experience|erfahrung|kenntnisse|skills?|equipment|ausstattung|knowledge)\b",
+    re.IGNORECASE,
+)
+
+
+def _remote_denied(text: str) -> bool:
+    """A remote/home-office mention that is denied in its own clause ("kein Homeoffice",
+    "unable to support working remotely", "Remote ist nicht möglich"), ignoring requirements
+    about remote SKILLS and unrelated negations ("no office attendance required")."""
+    for match in _SOME_REMOTE.finditer(text):
+        if _REMOTE_SKILL_NOUN.match(text[match.end() : match.end() + 30].lstrip(" -")):
+            continue
+        before, after = _clause(text, match.start(), match.end())
+        near_before = " ".join(before.split()[-_NEGATOR_NEAR_BEFORE:])
+        if _DENIAL_AFTER.search(after):
+            return True  # "... for remote work because it is not permitted"
+        if _SKILL_BETWEEN.search(near_before):
+            continue  # "No prior experience is necessary for remote work"
+        if _has_negator(near_before):
+            return True
+    return False
 
 
 def classify_remote(text: str) -> RemoteSignal:
+    """FULLY_REMOTE (which skips the commute gate) needs clean affirmative evidence: a full-remote
+    phrase, no office/presence vocabulary outside a negated or optional clause, no denial of remote
+    work anywhere, and no unresolved eligibility wording. Everything else fails towards HYBRID,
+    ONSITE or PARTIAL_REMOTE, never towards skipping the gate."""
     restriction = None
     region = _REMOTE_REGION.search(text)
     if region:
         restriction = _STATES[region.group(1).lower()]
-    for pattern, mode in (
-        (_NO_REMOTE, "ONSITE"),
-        (_UP_TO_REMOTE, "PARTIAL_REMOTE"),
-        (_FULLY_REMOTE, "FULLY_REMOTE"),
-        (_HYBRID, "HYBRID"),
-        (_SOME_REMOTE, "PARTIAL_REMOTE"),
-    ):
-        match = pattern.search(text)
-        if match:
-            return RemoteSignal(mode, restriction, _snippet(text, match))
+    country = _country_restriction(text) if _SOME_REMOTE.search(text) else None
+
+    def done(mode: RemoteMode, match: re.Match[str], unverified: bool = False) -> RemoteSignal:
+        return RemoteSignal(mode, restriction, country, _snippet(text, match), unverified)
+
+    unresolved = _unresolved_eligibility(text) if _SOME_REMOTE.search(text) else False
+    onsite = _NO_REMOTE.search(text)
+    if onsite:
+        return done("ONSITE", onsite)
+    up_to = _UP_TO_REMOTE.search(text)
+    if up_to:
+        return done("PARTIAL_REMOTE", up_to, unresolved)
+    some = _SOME_REMOTE.search(text)
+    if some and _remote_denied(text):
+        # remote work is denied somewhere in the text: whatever else it says, it is on-site
+        return done("ONSITE", some)
+    hybrid = _affirmed_phrase(_HYBRID, text)
+    if hybrid:
+        return done("HYBRID", hybrid, unresolved)
+    full = _affirmed_phrase(_FULLY_REMOTE, text)
+    regional = _affirmed_phrase(_REMOTE_REGIONAL, text)
+    if full or regional:
+        confirmed = full or regional
+        presence = _presence(text)
+        if presence:
+            # office vocabulary next to a full-remote claim vetoes it (never labels an ad on
+            # its own): a stated obligation is HYBRID, a bare mention stays unverified remote
+            near_before, near_after = _clause(text, presence.start(), presence.end())
+            clause = f"{near_before} {presence.group(0)} {near_after}"
+            mode: RemoteMode = "HYBRID" if _OBLIGATION.search(clause) else "PARTIAL_REMOTE"
+            # a bare mention leaves a full-remote CLAIM unconfirmed: the operator reads it
+            return done(mode, presence, unresolved or mode == "PARTIAL_REMOTE")
+        german = bool(regional or _GERMAN_REMOTE.search(text))
+        foreign = bool(_FOREIGN_MENTION.search(text)) and not german
+        if unresolved or foreign:
+            # who may do this remote job is unclear: not confirmed as workable from Germany
+            return done("PARTIAL_REMOTE", confirmed, unverified=True)
+        return done("FULLY_REMOTE", confirmed)
+    if some:
+        return done("PARTIAL_REMOTE", some, unresolved)
     return RemoteSignal("UNKNOWN")
 
 
@@ -633,3 +1005,33 @@ _IMMEDIATE = re.compile(r"ab\s+sofort|zum\s+nächstmöglichen|zum\s+naechstmoegl
 
 def asks_immediate_start(text: str) -> bool:
     return bool(_IMMEDIATE.search(text))
+
+
+# --- working time ---------------------------------------------------------
+
+WorkTimeMode = Literal["FULL_TIME", "PART_TIME", "UNKNOWN"]
+# "50 Vollzeitmitarbeitern" in a company blurb is a headcount, not this vacancy's hours.
+_FULL_TIME = re.compile(
+    r"\bvollzeit(?!mitarbeit|kr(?:ä|ae)ft|kraft|besch(?:ä|ae)ftigte|angestellte)\w*"
+    r"|\bfull[\s-]?time(?!\s+(?:employees?|staff|team|colleagues))\b",
+    re.IGNORECASE,
+)
+_PART_TIME = re.compile(r"\bteilzeit\w*|\bpart[\s-]?time\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class WorkTimeSignal:
+    mode: WorkTimeMode
+    evidence: str | None = None
+
+
+def classify_work_time(text: str) -> WorkTimeSignal:
+    """What the posting states about working hours. "Vollzeit oder Teilzeit" counts as
+    full time (it is offered); only an unqualified part-time posting is PART_TIME."""
+    full = _affirmed(_FULL_TIME, text)
+    if full:
+        return WorkTimeSignal("FULL_TIME", _snippet(text, full))
+    part = _affirmed(_PART_TIME, text)  # "Teilzeit ist nicht möglich" is not a part-time posting
+    if part:
+        return WorkTimeSignal("PART_TIME", _snippet(text, part))
+    return WorkTimeSignal("UNKNOWN")
