@@ -143,3 +143,10 @@ def test_missing_description_never_confirms_a_field():
 def test_full_time_hours_do_not_block_the_flag():
     text = "40 Stunden pro Woche, Python Entwickler."
     assert work_time_evidence(text, BA, True, text).current_full_time_confirmed
+
+
+@pytest.mark.parametrize("pct", ["60,5 %", "60.5%", "99,9 %"])
+def test_decimal_employment_percentages_block_both_confirmation_paths(pct):
+    text = f"Arbeitszeit: Vollzeit\n\nBeschäftigungsgrad: {pct}"
+    assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
+    assert not work_time_evidence(text, None, None, text).current_full_time_confirmed

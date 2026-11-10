@@ -58,8 +58,8 @@ _KEY_VALUE = re.compile(
 _REDUCED_HOURS = re.compile(
     r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d+)?\s*(?:-\s*(?:\d{1,2}\s*)?)?"
     r"(?:wochen\s*stunden|stunden|std\b\.?|h\b|hours?)"
-    r"|\b(?:[1-9]\d?)\s*%[\s-]*(?:stelle|besch|teilzeit|arbeit)"
-    r"|besch(?:ä|ae)ftigungsgrad\W{0,6}[1-9]\d?\s*%"
+    r"|(?<![\d.,])(?:[1-9]\d?)(?:[.,]\d+)?\s*%[\s-]*(?:stelle|besch|teilzeit|arbeit)"
+    r"|besch(?:ä|ae)ftigungsgrad\W{0,6}[1-9]\d?(?:[.,]\d+)?\s*%"
     r"|\b(?:halbtag|minijob|midijob|werkstudent|geringf(?:ü|ue)gig)",
     re.IGNORECASE,
 )
