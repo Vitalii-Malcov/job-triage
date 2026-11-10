@@ -66,6 +66,9 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Vollzeit ab 1. Januar 2027",
         "Full-time, but only after onboarding.",
         "Vollzeit, jedoch erst nach der Probezeit",
+        "Full-time, however, only after onboarding.",
+        "Teilzeit zum Einstieg. Vollzeit nach sechs Monaten möglich.",
+        "Teilzeit. Full-time after 6 months possible.",
     ],
 )
 def test_a_deferred_full_time_is_never_confirmed(text):
@@ -76,6 +79,8 @@ def test_a_deferred_full_time_is_never_confirmed(text):
 def test_stated_reduced_weekly_hours_beat_an_option_on_full_time():
     text = "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit."
     assert mode(text) == "PART_TIME"
+    assert mode("Arbeitszeit: 20 h/Woche mit Option auf Vollzeit.") == "PART_TIME"
+    assert mode("Arbeitszeit: 20 Wochenstunden mit Option auf Vollzeit.") == "PART_TIME"
     assert mode("Vollzeit, 38,5 Stunden pro Woche. Später Homeoffice.") == "FULL_TIME"
     assert mode("Vollzeit ab 01.03.2026") == "FULL_TIME"
 

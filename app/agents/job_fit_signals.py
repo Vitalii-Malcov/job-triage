@@ -1246,8 +1246,8 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
 _FUTURE_MARKER = re.compile(
     r"\bsp(?:ä|ae)ter\w*|\bdanach\b|\bperspektivisch\w*|\beventuell\b|\beventually\b|\blater\b"
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
-    r"|\bnach\s+(?:\w+\s+){0,3}?(?:einarbeitung\w*|probe\w*)"
-    r"|\bafter\s+(?:\w+\s+){0,3}?(?:onboarding|probation\w*|training)"
+    r"|\bnach\s+(?:\w+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
+    r"|\bafter\s+(?:\w+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
     r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b",
     re.IGNORECASE,
 )
@@ -1286,9 +1286,12 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     for _ in range(3):  # the clause plus at most two contrastive continuations
         parts = re.split(_CLAUSE_END, tail, maxsplit=1)
         after += parts[0]
-        if len(parts) < 2 or not _CONTRAST_START.match(parts[1].lstrip() or " "):
+        contrast = _CONTRAST_START.match(parts[1].lstrip()) if len(parts) > 1 else None
+        if contrast is None:
             break
-        tail = parts[1]
+        rest = parts[1].lstrip()
+        after += " " + contrast.group(0)
+        tail = rest[contrast.end() :].lstrip(" ,;")  # "however, only after ..." keeps its tail
     clause = before + match.group(0) + after
     if _FUTURE_MARKER.search(clause):
         return True
@@ -1337,7 +1340,7 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
 # "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit": stated hours below full time are
 # the vacancy's current part time even without the word "Teilzeit".
 _REDUCED_HOURS = re.compile(
-    r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d)?\s*(?:stunden|std\.?|hours?|hrs)\b",
+    r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d)?\s*(?:wochenstunden|stunden|std\.?|hours?|hrs|h\b)",
     re.IGNORECASE,
 )
 
