@@ -43,6 +43,7 @@ from app.agents.job_fit_signals import (
     entry_level_signals,
     extract_german_requirement,
     extract_salary,
+    full_time_denied,
 )
 from app.agents.role_relevance_classifier import classify_title_relevance
 from app.agents.seniority_classifier import classify_title_seniority
@@ -654,6 +655,8 @@ def work_time_criterion(text: str, job: JobRecord | None = None) -> Criterion:
             "part-time only; the candidate looks for full time",
             signal.evidence,
         )
+    if offered is True and full_time_denied(text):
+        return _work_time_conflict("the text denies full time", None, "true")
     if offered is True:
         return Criterion(
             "work_time", "FULL_TIME", "full time offered (source flag)", "arbeitszeitVollzeit=true"

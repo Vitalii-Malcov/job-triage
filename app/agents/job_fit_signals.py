@@ -1035,7 +1035,7 @@ _COMBINED_EN_AFTER = (
 )
 # "50 Vollzeitmitarbeitern" in a company blurb is a headcount, not this vacancy's hours.
 _FULL_TIME = re.compile(
-    r"\bvollzeit(?!mitarbeit|kr(?:ä|ae)ft|kraft|besch(?:ä|ae)ftigte|angestellte)\w*"
+    r"\bvollzeit(?!mitarbeit|kr(?:ä|ae)ft|kraft|besch(?:ä|ae)ftigte|angestellte|nah)\w*"
     r"|\bfull[\s-]?time(?!\s+(?:employees?|staff|team|colleagues))\b"
     # "Voll- oder Teilzeit", "Voll-/Teilzeit", "full- or part-time": full time is offered
     # -- only when what follows is about the JOB or ends the phrase (allow-list: a person noun such
@@ -1052,6 +1052,7 @@ _PART_TIME_LABELLED = re.compile(
     re.IGNORECASE,
 )
 _MAX_NEGATION_CHECKS = 25
+_REDUCED_FULL_TIME = re.compile(r"\bvollzeitnah", re.IGNORECASE)
 _PART_TIME = re.compile(r"\bteilzeit\w{0,30}|\bpart[\s-]?time\b", re.IGNORECASE)
 # A staff statement in the same sentence ("Our employees work full- and part-time") is not an
 # offer of full time for THIS vacancy.
@@ -1252,6 +1253,12 @@ def classify_work_time(text: str) -> WorkTimeSignal:
         # "We offer full- and part-time work. This position is part-time.": the general
         # statement never overrides the vacancy's own part-time statement
         return WorkTimeSignal("PART_TIME", _snippet(text, full))
+    if full and not combined:
+        # "Nur Teilzeit. Vollzeit eventuell spaeter moeglich.": an explicit part-time-only
+        # statement of the vacancy is never overridden by a general or future full-time remark
+        only_pt, _ = _affirmed_bounded(_ONLY_PART_TIME, text)
+        if only_pt:
+            return WorkTimeSignal("PART_TIME", _snippet(text, only_pt))
     if full:
         return WorkTimeSignal("FULL_TIME", _snippet(text, full))
     if over_full:
@@ -1271,3 +1278,16 @@ def classify_work_time(text: str) -> WorkTimeSignal:
         if not _negated(text, match):
             return WorkTimeSignal("PART_TIME", _snippet(text, match))
     return WorkTimeSignal("UNKNOWN")
+
+
+def full_time_denied(text: str) -> bool:
+    """True when the posting explicitly denies full time ("Keine Vollzeit moeglich"). The
+    classifier answers UNKNOWN for it; the source's own full-time flag must not override it."""
+    if _REDUCED_FULL_TIME.search(text):
+        return True  # "Vollzeitnah": close to, not, full time
+    for checked, match in enumerate(_FULL_TIME.finditer(text)):
+        if checked >= _MAX_NEGATION_CHECKS:
+            return False
+        if _negated(text, match):
+            return True
+    return False
