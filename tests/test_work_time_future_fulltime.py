@@ -100,6 +100,7 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Arbeitszeit: Teilzeit ohne Schichtdienst, mit Option auf Vollzeit.",
         "Teilzeit mit Vollzeitperspektive.",
         "Teilzeit mit Vollzeit-Perspektive.",
+        "Wir suchen Quereinsteiger ohne Berufserfahrung in Teilzeit mit Option auf Vollzeit.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )

@@ -1385,7 +1385,8 @@ _STAFF_ACTS = re.compile(
 
 
 _DIRECT_NEGATOR = re.compile(
-    r"\b(?:kein\w*|nicht|ohne|no|not|never|without)\s+(?:\w+\s+){0,2}$", re.IGNORECASE
+    r"\b(?:kein\w*|nicht|ohne|no|not|never|without)\s+(?:(?:in|als|auf|as|a|an)\s+)?$",
+    re.IGNORECASE,
 )
 
 
