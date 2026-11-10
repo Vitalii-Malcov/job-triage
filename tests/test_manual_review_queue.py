@@ -733,3 +733,57 @@ def test_a_changed_rules_hash_makes_every_cached_decision_stale(writer, reader, 
     page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, stale_budget=5)
     assert len(calls) == 5  # no old row is trusted; the live work is bounded
     assert page.stale_unassessed == 26  # and the page says that it is incomplete
+
+
+# Stage 58: a vacancy the gate holds for unconfirmed hours must not vanish from every list ------
+
+
+def _primary_with_work_time(status):
+    a = _assessment("Python Entwickler (m/w/d)", role="PRIMARY", skills="STRONG")
+    a.criteria = [c for c in a.criteria if c.name != "work_time"]
+    a.criteria.append(Criterion("work_time", status, "w"))
+    a.criteria.append(
+        Criterion(
+            "work_time_evidence", "CONFIRMED" if status == "FULL_TIME" else "NOT_CONFIRMED", "w"
+        )
+    )
+    return a
+
+
+def test_a_suitable_developer_role_with_unconfirmed_hours_is_in_the_queue():
+    # PART_TIME / CONFLICT already lower the fit tier (STRETCH); UNKNOWN is the case the gate holds
+    status = "UNKNOWN"
+    a = _primary_with_work_time(status)
+    assert automatic_block_reason(a) == "WORK_TIME_NOT_CONFIRMED"  # the gate holds it ...
+    item = rq.review_item(_job(title=a.title), a, "https://example.invalid/x")
+    assert item is not None  # ... so a human must be able to see it
+    assert item.reason_code == rq.WORK_TIME_NOT_CONFIRMED
+    assert "unknown" in item.reason.lower()
+
+
+def test_a_confirmed_full_time_developer_role_does_not_enter_the_queue():
+    a = _primary_with_work_time("FULL_TIME")
+    assert rq.review_item(_job(title=a.title), a, None) is None
+
+
+def test_heuristic_full_time_without_evidence_stays_in_the_queue():
+    """Stage 60: the classifier's FULL_TIME is not enough; the vacancy waits for a human."""
+    a = _primary_with_work_time("FULL_TIME")
+    a.criteria = [c for c in a.criteria if c.name != "work_time_evidence"]
+    item = rq.review_item(_job(title=a.title), a, None)
+    assert item is not None
+    assert item.reason_code == "WORK_TIME_NOT_CONFIRMED"
+
+
+def test_adjacent_heuristic_full_time_without_evidence_stays_in_the_queue():
+    """Stage 60 (Codex P2): a newly held ADJACENT vacancy must not vanish from the queue."""
+    a = _primary_with_work_time("FULL_TIME")
+    a.criteria = [
+        Criterion("skills", "STRONG", "s") if c.name == "skills" else c
+        for c in a.criteria
+        if c.name != "work_time_evidence"
+    ]
+    a.title = "Junior Data Analyst (m/w/d)"
+    item = rq.review_item(_job(title=a.title), a, None)
+    assert item is not None
+    assert item.reason_code == "WORK_TIME_NOT_CONFIRMED"

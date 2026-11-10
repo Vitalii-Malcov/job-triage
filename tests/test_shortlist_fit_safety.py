@@ -50,6 +50,7 @@ def _fixed(tier: str, job_id: int = 1) -> FitAssessment:
     # progress for the vacancy (Stage 55): the fixture states both
     a.criteria = [
         Criterion("work_time", "FULL_TIME", "full-time stated"),
+        Criterion("work_time_evidence", "CONFIRMED", "source flag"),  # Stage 60
         Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
     ]
     return a

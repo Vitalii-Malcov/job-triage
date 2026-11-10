@@ -23,6 +23,11 @@ from datetime import datetime
 from app.agents.target_role import is_developer_title, is_search_target_title
 from app.services.fit_cache import applied
 from app.services.job_fit_assessment import FitAssessment
+from app.services.shortlist_gate import (
+    AUTO_PREPARE_TIERS,
+    BLOCK_WORK_TIME_NOT_CONFIRMED,
+    work_time_evidence_confirmed,
+)
 from app.services.triage_category import (
     DATA_REVIEW_REQUIRED,
     HYBRID_ADMIN_ROLE,
@@ -37,11 +42,15 @@ from app.services.triage_category import (
 
 NEEDS_ENRICHMENT = "NEEDS_ENRICHMENT"
 LANGUAGE_REVIEW = "LANGUAGE_REVIEW"
+# A developer vacancy the pipeline would take on its own except that its working time is not
+# confirmed as full time (unknown or conflicting): held by the gate, so a human has to read it.
+WORK_TIME_NOT_CONFIRMED = BLOCK_WORK_TIME_NOT_CONFIRMED
 
 # Reason codes that can be the main reason of a queue entry, in the order they are offered.
 REASON_CODES = (
     THIN_SKILL_EVIDENCE,
     NEEDS_ENRICHMENT,
+    WORK_TIME_NOT_CONFIRMED,
     ROUTE_REVIEW_REQUIRED,
     REMOTE_UNVERIFIED,
     HYBRID_ADMIN_ROLE,
@@ -55,6 +64,8 @@ _CLARIFY = {
     "decide whether the role fits your skills.",
     NEEDS_ENRICHMENT: "The description is missing or too short: open the source and read the full "
     "posting before deciding. Nothing about skills, hours or place is assumed.",
+    WORK_TIME_NOT_CONFIRMED: "Full time is not confirmed (unknown or conflicting hours): read the "
+    "posting for the weekly hours before deciding.",
     ROUTE_REVIEW_REQUIRED: "No route to the workplace is confirmed: check whether the place is "
     "reachable, or whether the role is remote.",
     REMOTE_UNVERIFIED: "Remote work is not confirmed as full and allowed from Germany: read what "
@@ -70,6 +81,7 @@ _CLARIFY = {
 REASON_LABELS = {
     THIN_SKILL_EVIDENCE: "Skills not confirmed from the text",
     NEEDS_ENRICHMENT: "Description missing or too short",
+    WORK_TIME_NOT_CONFIRMED: "Full time not confirmed",
     ROUTE_REVIEW_REQUIRED: "Workplace not confirmed reachable",
     REMOTE_UNVERIFIED: "Remote work not confirmed",
     HYBRID_ADMIN_ROLE: "Admin/support mixed with developer role",
@@ -141,6 +153,28 @@ def review_item(job, assessment: FitAssessment, url: str | None) -> ReviewItem |
     code, reason = triage.code, triage.reason
     if triage.category == "MANUAL_REVIEW":
         pass
+    elif assessment.fit_tier in AUTO_PREPARE_TIERS and (
+        (
+            triage.category == "PRIMARY"
+            and (
+                _status(assessment, "work_time") != "FULL_TIME"
+                or not work_time_evidence_confirmed(assessment)
+            )
+        )
+        # Stage 60: an ADJACENT role that read as full time was gate-open before and is now
+        # held only for missing evidence; it must not vanish from every list either
+        or (
+            triage.category == "ADJACENT"
+            and _status(assessment, "work_time") == "FULL_TIME"
+            and not work_time_evidence_confirmed(assessment)
+        )
+    ):
+        # the gate holds it (`WORK_TIME_NOT_CONFIRMED`): a suitable developer role must not
+        # vanish from every list because its hours are not stated
+        code = WORK_TIME_NOT_CONFIRMED
+        reason = f"working time is {_status(assessment, 'work_time')}, not confirmed full time"
+        if _status(assessment, "work_time") == "FULL_TIME":
+            reason = "full time is only a text reading; no structured evidence (Stage 60)"
     elif (
         triage.category == "EXCLUDED"
         and triage.code == NOT_TARGET_ROLE

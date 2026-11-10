@@ -20,15 +20,23 @@ from app.services.shortlist_gate import (
 from tests.test_remote_work_eligibility import _assessment, _status
 
 
-def _with_work_time(status: str):
+def _with_work_time(status: str, confirmed: bool = True):
     a = _assessment("Vollzeit, 100% Remote.")
     a.criteria = [c for c in a.criteria if c.name != "work_time"]
     a.criteria.append(Criterion("work_time", status, "audit"))
+    a.criteria = [c for c in a.criteria if c.name != "work_time_evidence"]
+    if confirmed:
+        a.criteria.append(Criterion("work_time_evidence", "CONFIRMED", "audit"))
     return a
 
 
 def test_only_confirmed_full_time_opens_the_gate():
     assert automatic_block_reason(_with_work_time("FULL_TIME")) is None
+    # Stage 60: a heuristic FULL_TIME without positive evidence is held
+    assert (
+        automatic_block_reason(_with_work_time("FULL_TIME", confirmed=False))
+        == "FULL_TIME_NOT_CONFIRMED"
+    )
     assert automatic_block_reason(_with_work_time("UNKNOWN")) == BLOCK_WORK_TIME_NOT_CONFIRMED
     # these are already held by the fit tier, before the work-time check is reached
     assert automatic_block_reason(_with_work_time("PART_TIME")) == "FIT_TIER_STRETCH"

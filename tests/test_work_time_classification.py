@@ -455,3 +455,50 @@ def test_whole_word_possibility_is_still_an_offer():
         "Teilzeit denkbar",
     ):
         assert mode(text) == "UNKNOWN", text
+
+
+# Stage 58: the three P2 findings of the release-candidate review -------------------------------
+
+
+@pytest.mark.parametrize("text", ["Vollzeitnah (30 Stunden pro Woche)", "Vollzeitnah"])
+def test_vollzeitnah_is_reduced_hours_not_confirmed_full_time(text):
+    assert classify_work_time(text).mode == "UNKNOWN"
+    # the source flag must not turn reduced hours into a confirmed full time
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    assert work_time_criterion(text, _row(None)).status == "UNKNOWN"
+
+
+def test_a_part_time_only_statement_beats_a_later_full_time_remark():
+    text = "Nur Teilzeit. Vollzeit eventuell spaeter moeglich."
+    assert classify_work_time(text).mode == "PART_TIME"
+    assert work_time_criterion(text, _row(None)).status == "PART_TIME"
+    # a plain full-time statement is unchanged
+    assert classify_work_time("Vollzeit (40 Stunden).").mode == "FULL_TIME"
+    assert classify_work_time("Wir bieten Vollzeit oder Teilzeit.").mode == "FULL_TIME"
+
+
+@pytest.mark.parametrize(
+    "text", ["Keine Vollzeit moeglich. 20 Stunden pro Woche.", "Teilzeit (Vollzeit nicht moeglich)"]
+)
+def test_a_denied_full_time_is_not_confirmed_by_the_source_flag(text):
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    assert work_time_criterion(text, _row(None)).status == "UNKNOWN"
+    assert work_time_criterion("Wir suchen einen Entwickler.", _row(True)).status == "FULL_TIME"
+
+
+def test_part_time_only_also_beats_a_combined_full_or_part_time_remark():
+    text = "Nur Teilzeit moeglich. Vollzeit oder Teilzeit eventuell spaeter moeglich."
+    assert classify_work_time(text).mode == "PART_TIME"
+    for flag in (None, True):
+        assert work_time_criterion(text, _row(flag)).status in {"PART_TIME", "CONFLICT"}
+
+
+def test_nur_teilzeitmodelle_stays_part_time_and_a_flag_cannot_override_it():
+    # a blanket "option/model compound" exclusion would turn this restriction into UNKNOWN
+    # (and then FULL_TIME through the source flag): the unsafe direction. A benefit sentence that
+    # is held as PART_TIME instead ("Nur Teilzeitoptionen ...") is the safe, accepted direction.
+    text = "Fuer diese Stelle sind nur Teilzeitmodelle moeglich."
+    assert classify_work_time(text).mode == "PART_TIME"
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    text2 = text + " Vollzeit eventuell spaeter moeglich."
+    assert classify_work_time(text2).mode == "PART_TIME"

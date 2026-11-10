@@ -348,6 +348,7 @@ def test_assess_job_end_to_end(db):
         "location": "DISTANCE_UNVERIFIED",
         "remote": "HYBRID",
         "work_time": "UNKNOWN",  # remote work eligibility
+        "work_time_evidence": "NOT_CONFIRMED",  # Stage 60
         "salary": "MATCH",
         "entry_level": "OPEN",
         "education": "NO_REQUIREMENT",  # Stage 22 P1
