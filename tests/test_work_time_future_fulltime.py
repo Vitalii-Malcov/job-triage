@@ -109,6 +109,8 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Du startest in Teilzeit. Eine Vollzeitstelle ist eine Option.",
         "Teilzeit zum Einstieg, Vollzeit nach 1,5 Monaten Einarbeitung möglich.",
         "Part-time first. Full-time after 1.5 months of probation.",
+        "Start at 20 hours per week, full-time from the second month.",
+        "Part-time now, full-time starting month 3.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
