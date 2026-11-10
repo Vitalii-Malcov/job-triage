@@ -1247,8 +1247,8 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
 _FUTURE_MARKER = re.compile(
     r"\bsp(?:ä|ae)ter\w*|\bdanach\b|\bperspektivisch\w*|\beventuell\b|\beventually\b|\blater\b"
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
-    r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
-    r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
+    r"|\bnach\s+(?:[\w\-–—]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
+    r"|\bafter\s+(?:[\w\-–—]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
     r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
     r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
     r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
@@ -1267,14 +1267,15 @@ _ORDINAL_DAY = re.compile(
     re.IGNORECASE,
 )
 _ABBREVIATION = re.compile(
-    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc|[^\W\d_])\.", re.IGNORECASE
+    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc|jan|feb|mrz|apr|jun|jul|aug|sept?|okt|oct|nov|dez|dec|[^\W\d_])\.",
+    re.IGNORECASE,
 )
 
 
 def _unabbreviate(text: str) -> str:
     """Drop the dots of ordinal days ("1. Januar 2027", "2. Monat") and common abbreviations
     ("Std.", "ca.") so that they do not end a sentence."""
-    return _ABBREVIATION.sub(r"\1", _ORDINAL_DAY.sub(r"\1", text))
+    return _ORDINAL_DAY.sub(r"\1", _ABBREVIATION.sub(r"\1", text))
 
 
 # The SENTENCE (bounded by ; newline and a period that is not a date dot) is the unit: a deferral

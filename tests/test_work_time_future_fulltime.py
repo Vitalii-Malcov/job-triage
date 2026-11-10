@@ -95,6 +95,8 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Assistenz (m/w/d) in Teilzeit mit Option auf Vollzeit in unserem Team.",
         "Teilzeit zum Einstieg. Vollzeit ist i. d. R. erst nach der Probezeit möglich.",
         "Arbeitszeit: 19,50 Wochenstunden mit Option auf Vollzeit.",
+        "Vollzeit ab dem 1. Feb. 2027.",
+        "20 h/Woche zum Einstieg, Vollzeit nach 3–6 Monaten.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
