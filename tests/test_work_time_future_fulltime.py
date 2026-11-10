@@ -101,6 +101,7 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Teilzeit mit Vollzeitperspektive.",
         "Teilzeit mit Vollzeit-Perspektive.",
         "Wir suchen Quereinsteiger ohne Berufserfahrung in Teilzeit mit Option auf Vollzeit.",
+        "Einstieg mit 20 Wochenstunden; Vollzeit ab dem 2. oder 3. Monat möglich.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
@@ -137,6 +138,8 @@ def test_a_future_full_time_alone_is_unknown_not_full_time(text):
         "We offer full- or part-time work.",
         "Einstellung in Vollzeit. Nach der Einarbeitung ist Homeoffice möglich.",
         "Vollzeit im Spätdienst",
+        # real vacancies #547 / #1297
+        "Unsere Stellen sind in Vollzeit als auch in Teilzeit ab 32 Stunden pro Woche verfügbar.",
         "Wir bieten eine langfristige Perspektive in Vollzeit (40 Stunden pro Woche). "
         "Unsere Kollegen arbeiten in Teilzeit.",
         "Flexible Arbeitszeiten mit der Option auf 4 Tage Vollzeit (32 Stunden pro Woche).",

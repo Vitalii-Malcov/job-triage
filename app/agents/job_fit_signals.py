@@ -1249,7 +1249,8 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:[\w\-–—]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w\-–—]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
-    r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
+    r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+dem\s+(?:\w+\s+){0,3}?(?:monat|woche|jahr)\w*"
+    r"|\bab\s+(?:erst|zweit|dritt|viert|f(?:ü|ue)nft|sechst)\w*\s+(?:\w+\s+)?(?:monat|woche|jahr)\w*"
     r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
     r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
     r"|january|february|march|may|june|july|october|december)\b",
@@ -1263,7 +1264,7 @@ _FUTURE_LEAD = re.compile(
 )
 # "1. Januar 2027": the dot of an ordinal day does not end a clause either.
 _ORDINAL_DAY = re.compile(
-    r"\b(\d{1,2})\.(?=\s+(?:[^\W\d]+\s+){0,2}(?:20\d\d|monat|woche|jahr|quartal|month|week|year))",
+    r"\b(\d{1,2})\.(?=\s+(?:[a-zäöüß0-9]|(?:[^\W\d]+\s+){0,2}(?:20\d\d|monat|woche|jahr|quartal|month|week|year)))",
     re.IGNORECASE,
 )
 _ABBREVIATION = re.compile(
@@ -1280,7 +1281,9 @@ def _unabbreviate(text: str) -> str:
 
 # The SENTENCE (bounded by ; newline and a period that is not a date dot) is the unit: a deferral
 # word anywhere in it may qualify the full-time mention, so the answer is the safe one.
-_CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
+# A period ends a sentence only before whitespace + a capital letter (or the end of the text):
+# "2. oder 3. Monat", "z. B. nach" and "1.1.2027" stay inside the sentence.
+_CLAUSE_END = re.compile(r"[;\n]|\.(?=\s+[A-ZÄÖÜ]|\s*$)")
 # A marker that qualifies PART time ("Vollzeit, später Teilzeit möglich") does not defer full time.
 _ADVERB_MARKER = re.compile(r"sp(?:ä|ae)ter\w*|danach|later|eventuell|eventually", re.IGNORECASE)
 _QUALIFIES_PART_TIME = re.compile(
