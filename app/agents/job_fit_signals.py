@@ -1097,6 +1097,7 @@ _PART_TIME_OFFER_LEAD = re.compile(
 )
 _ONLY_PART_TIME = re.compile(
     r"\b(?:nur|ausschlie(?:ß|ss)lich|lediglich)\s+(?:in\s+)?teilzeit"
+    r"(?!m(?:ö|oe)glichkeit|modell|option|variante|angebot|regelung|geeignet)"
     r"|\bpart[\s-]?time\s+only\b|\bonly\s+part[\s-]?time\b",
     re.IGNORECASE,
 )
@@ -1253,7 +1254,7 @@ def classify_work_time(text: str) -> WorkTimeSignal:
         # "We offer full- and part-time work. This position is part-time.": the general
         # statement never overrides the vacancy's own part-time statement
         return WorkTimeSignal("PART_TIME", _snippet(text, full))
-    if full and not combined:
+    if full:
         # "Nur Teilzeit. Vollzeit eventuell spaeter moeglich.": an explicit part-time-only
         # statement of the vacancy is never overridden by a general or future full-time remark
         only_pt, _ = _affirmed_bounded(_ONLY_PART_TIME, text)

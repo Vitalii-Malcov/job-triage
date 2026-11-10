@@ -484,3 +484,16 @@ def test_a_denied_full_time_is_not_confirmed_by_the_source_flag(text):
     assert work_time_criterion(text, _row(True)).status == "CONFLICT"
     assert work_time_criterion(text, _row(None)).status == "UNKNOWN"
     assert work_time_criterion("Wir suchen einen Entwickler.", _row(True)).status == "FULL_TIME"
+
+
+def test_part_time_only_also_beats_a_combined_full_or_part_time_remark():
+    text = "Nur Teilzeit moeglich. Vollzeit oder Teilzeit eventuell spaeter moeglich."
+    assert classify_work_time(text).mode == "PART_TIME"
+    for flag in (None, True):
+        assert work_time_criterion(text, _row(flag)).status in {"PART_TIME", "CONFLICT"}
+
+
+def test_nur_teilzeitoptionen_is_a_benefit_not_a_part_time_only_restriction():
+    text = "Vollzeit. Nur Teilzeitoptionen beduerfen einer Absprache."
+    assert classify_work_time(text).mode == "FULL_TIME"
+    assert work_time_criterion(text, _row(True)).status == "FULL_TIME"
