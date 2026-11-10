@@ -43,6 +43,13 @@ def _row(flag):
         "Teilzeit, Vollzeit nach Probezeit möglich",
         "Teilzeit mit Option auf Vollzeit",
         "Teilzeit mit Übergang in Vollzeit",
+        "Teilzeit, Vollzeit ab 2027",
+        "Teilzeit, Vollzeit nach erfolgreicher Einarbeitung",
+        "Teilzeit, Vollzeit ist aber erst nach der Probezeit möglich",
+        "Teilzeit mit Option auf eine unbefristete Vollzeitstelle",
+        "Teilzeit, später: Vollzeit",
+        ("Teilzeitoptionen. " * 25)
+        + "Teilzeit, später Vollzeit möglich. Unsere Mitarbeiter arbeiten Vollzeit.",
         # a general or staff full-time remark never beats own part time + future full time
         "Teilzeit, später Voll- oder Teilzeit möglich. Unsere Mitarbeiter arbeiten Vollzeit.",
         "Wir suchen Mitarbeiter in Voll- und Teilzeit, Vollzeit aber erst später.",
@@ -71,6 +78,9 @@ def test_a_future_full_time_alone_is_unknown_not_full_time(text):
         "We offer full- or part-time work.",
         "Einstellung in Vollzeit. Nach der Einarbeitung ist Homeoffice möglich.",
         "Vollzeit im Spätdienst",
+        # real vacancies #49 and #2463: an option between full-time models / a permanent offer
+        "Flexible Arbeitszeiten mit der Option auf 4 oder 5 Tage Vollzeit (32 – 40 Stunden)",
+        "Langfristige berufliche Perspektive in Vollzeitbeschäftigung",
     ],
 )
 def test_a_current_full_time_is_not_lost(text):

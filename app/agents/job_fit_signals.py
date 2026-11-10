@@ -1239,45 +1239,84 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
     return False
 
 
-# A full-time mention that is a FUTURE possibility, not the current terms of the vacancy:
-# "Teilzeit, später Vollzeit möglich", "Vollzeit nach Einarbeitung", "part-time, full-time later".
+# A full-time mention that is a FUTURE possibility, not the current terms of the vacancy.
+# Structural, not a phrase list: the CLAUSE (bounded by , . ; newline) around the mention is
+# deferred when it holds a forward-looking marker, a future year, or option/transition wording.
 # Only forward-looking markers: "aktuell/zunächst/currently" describe the present and do not defer.
-_FUTURE_MARKER = (
-    r"sp(?:ä|ae)ter\w*|danach|perspektivisch\w*|eventuell|eventually|later|in\s+(?:the\s+)?future"
-    r"|nach\s+(?:der\s+|dem\s+)?(?:einarbeitung\w*|probezeit|probe\w*)"
-    r"|after\s+(?:the\s+)?(?:onboarding|probation\w*)"
-)
-# "Teilzeit mit Option auf Vollzeit", "Übergang in Vollzeit", "Aufstockung auf Vollzeit"
-_FUTURE_LEAD = (
-    r"(?:option|m(?:ö|oe)glichkeit|chance|perspektive|opportunit(?:y|ies)|"
-    r"(?:ü|ue)bergang|wechsel|aufstockung|transition|move|conversion)\w*\s+"
-    r"(?:in|auf|zur?|f(?:ü|ue)r|to|into|of|for)\s+(?:eine?\s+|a\s+)?"
-)
-_CLAUSE_END = re.compile(r"[,.;:\n]")
-_FUTURE_BEFORE = re.compile(
-    r"\b(?:(?:" + _FUTURE_MARKER + r")\W{0,3}(?:\w+\s+){0,2}?|" + _FUTURE_LEAD + r")$",
+_FUTURE_MARKER = re.compile(
+    r"\bsp(?:ä|ae)ter\w*|\bdanach\b|\bperspektivisch\w*|\beventuell\b|\beventually\b|\blater\b"
+    r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
+    r"|\bnach\s+(?:\w+\s+){0,3}?(?:einarbeitung\w*|probe\w*)"
+    r"|\bafter\s+(?:\w+\s+){0,3}?(?:onboarding|probation\w*|training)"
+    r"|\bab\s+(?:[\w.]+\s+){0,2}?20(?:2[7-9]|[3-9]\d)\b|\bfrom\s+(?:\w+\s+){0,2}?20(?:2[7-9]|[3-9]\d)\b",
     re.IGNORECASE,
 )
-_FUTURE_AFTER = re.compile(r"^\W{0,3}(?:\w+\s+){0,2}?(?:" + _FUTURE_MARKER + r")\b", re.IGNORECASE)
+# "Option auf Vollzeit", "Übergang in eine unbefristete Vollzeitstelle", "Aufstockung auf Vollzeit"
+_FUTURE_LEAD = re.compile(
+    r"\b(?:option|m(?:ö|oe)glichkeit|chance|opportunit(?:y|ies)|(?:ü|ue)bergang"
+    r"|wechsel|aufstockung|transition|move|conversion)\w*\b",
+    re.IGNORECASE,
+)
+_CLAUSE_END = re.compile(r"[,.;\n]")
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
 )
+_CLAUSE_WINDOW = 120
 
 
-def _full_time_deferred(text: str, match: re.Match[str]) -> bool:
-    """True when the full-time mention is tied, inside its own clause, to a time marker or to
-    "option/opportunity" wording. Only a CURRENT full-time statement may open the automatic gate:
-    a future possibility is not evidence of today's terms (the candidate cannot be hired full time
-    on a promise). Bounded: only the clause (no comma/period) around the match is looked at."""
-    lo = max(0, match.start() - 40)
-    before = re.split(_CLAUSE_END, text[lo : match.start()])[-1]
-    after = re.split(_CLAUSE_END, text[match.end() : match.end() + 60], maxsplit=1)[0]
-    return bool(
-        _FUTURE_BEFORE.search(before)
-        or _FUTURE_AFTER.match(after)
+def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) -> bool:
+    """True when the clause of this full-time mention defers it (see above). HARD markers
+    (later, after the probation, from 2027) discard the mention. SOFT wording (option, transition,
+    "Teilzeit, Vollzeit ...") is ambiguous -- "Option auf 4 oder 5 Tage Vollzeit" offers full time
+    today -- so it counts only with `soft=True`, i.e. next to a current part-time statement.
+    Only a CURRENT full-time statement may open the automatic gate: a future possibility is not
+    evidence of today's terms. Bounded: only the clause (at most `_CLAUSE_WINDOW` characters a side)."""
+    before = re.split(_CLAUSE_END, text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])[-1]
+    after = re.split(_CLAUSE_END, text[match.end() : match.end() + _CLAUSE_WINDOW], maxsplit=1)[0]
+    clause = before + match.group(0) + after
+    if _FUTURE_MARKER.search(clause):
+        return True
+    return soft and bool(
+        _FUTURE_LEAD.search(before)
         or _FULL_TIME_OPTION_WORD.match(text[match.start() : match.start() + 40])
+        or _staged_part_time_first(text, match)
     )
+
+
+def _staged_part_time_first(text: str, match: re.Match[str]) -> bool:
+    """ "Teilzeit, Vollzeit ab ...": a plain part-time word, then the full-time word as a separate
+    comma clause. Not "Teilzeit oder Vollzeit" (an offer of both) and not a list the other way
+    round. The vacancy is held for a human instead of being confirmed as full time."""
+    before = text[max(0, match.start() - 40) : match.start()]
+    m = re.search(r"(?:teilzeit\w*|part[\s-]?time)\s*[,;:]\s*(?:(?:\w+\s+){0,2})?$", before, re.I)
+    return bool(m)
+
+
+_MAX_PART_TIME_SCAN = 60
+
+
+def _deferred_full_time_with_current_part_time(text: str) -> bool:
+    """A future full-time remark next to a current part-time statement of the vacancy: the
+    part-time statement wins, whichever other full-time words (staff, general) the text has.
+    An exhausted scan budget answers True (held for a human), never False."""
+    deferred = False
+    for checked, match in enumerate(_FULL_TIME.finditer(text)):
+        if checked >= _MAX_NEGATION_CHECKS:
+            return True
+        if _full_time_deferred(text, match, soft=True):
+            deferred = True
+            break
+    if not deferred:
+        return False
+    for checked, match in enumerate(_PART_TIME.finditer(text)):
+        if checked >= _MAX_PART_TIME_SCAN:
+            return True
+        if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
+            continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
+        if not _part_time_is_an_offer(text, match) and not _negated(text, match):
+            return True
+    return False
 
 
 def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
@@ -1290,23 +1329,6 @@ def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str
         if not _negated(text, match):
             return match, False
     return None, False
-
-
-def _deferred_full_time_with_current_part_time(text: str) -> bool:
-    """A future full-time remark next to a current part-time statement of the vacancy: the
-    part-time statement wins, whichever other full-time words (staff, general) the text has."""
-    deferred = any(
-        _full_time_deferred(text, m)
-        for _, m in zip(range(_MAX_NEGATION_CHECKS), _FULL_TIME.finditer(text), strict=False)
-    )
-    if not deferred:
-        return False
-    for _, match in zip(range(_MAX_NEGATION_CHECKS), _PART_TIME.finditer(text), strict=False):
-        if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
-            continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
-        if not _part_time_is_an_offer(text, match) and not _negated(text, match):
-            return True
-    return False
 
 
 def _current_full_time(text: str) -> tuple[re.Match[str] | None, bool]:
