@@ -118,3 +118,28 @@ def test_a_field_line_inside_employer_prose_is_not_evidence():
 def test_a_leading_metadata_block_is_evidence():
     text = "Firma: Example GmbH\nOrt: Berlin\nArbeitszeit: Vollzeit\n\nDu entwickelst Python."
     assert work_time_evidence(text, None, None, text).current_full_time_confirmed
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Diese Stelle ist auf 20 Wochenstunden begrenzt.",
+        "Wir bieten 30 Stunden pro Woche.",
+        "Umfang: 50 %-Stelle",
+        "Beschäftigungsgrad: 60 %",
+        "Werkstudent (m/w/d)",
+    ],
+)
+def test_reduced_hours_anywhere_block_confirmation_even_with_ba_flag(tail):
+    text = f"Arbeitszeit: Vollzeit\n\n100% Remote. {tail}"
+    assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
+
+
+def test_missing_description_never_confirms_a_field():
+    result = work_time_evidence("Arbeitszeit: Vollzeit", "xing_email", None, None)
+    assert not result.current_full_time_confirmed
+
+
+def test_full_time_hours_do_not_block_the_flag():
+    text = "40 Stunden pro Woche, Python Entwickler."
+    assert work_time_evidence(text, BA, True, text).current_full_time_confirmed

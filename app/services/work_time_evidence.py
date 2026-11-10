@@ -52,6 +52,17 @@ _ANY_FIELD = re.compile(
 _KEY_VALUE = re.compile(
     r"^[ 	>*\-]*[^\W\d_][\w .\-/äöüÄÖÜß]{0,40}[ 	]*[:：][ 	]*\S.{0,80}$"
 )
+# Fail-closed numeric guard: ANY stated weekly hours below full time, a part-time percentage or a
+# reduced job form anywhere in the text means "not confirmed" (over-blocking is the safe
+# direction; the vacancy stays in the review queue).
+_REDUCED_HOURS = re.compile(
+    r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d+)?\s*(?:-\s*(?:\d{1,2}\s*)?)?"
+    r"(?:wochen\s*stunden|stunden|std\b\.?|h\b|hours?)"
+    r"|\b(?:[1-9]\d?)\s*%[\s-]*(?:stelle|besch|teilzeit|arbeit)"
+    r"|besch(?:ä|ae)ftigungsgrad\W{0,6}[1-9]\d?\s*%"
+    r"|\b(?:halbtag|minijob|midijob|werkstudent|geringf(?:ü|ue)gig)",
+    re.IGNORECASE,
+)
 _VOLLZEIT_WORD = re.compile(r"\bvoll[\s-]?zeit|\bfull[\s-]?time|\bvoll-\s*(?:/|oder|und|&)", re.I)
 
 
@@ -100,9 +111,11 @@ def work_time_evidence(
 
     # any working-time field line anywhere must be a plain Vollzeit/Teilzeit value, but only the
     # description's leading metadata block can CONFIRM
+    if _REDUCED_HOURS.search(text):
+        return _not("the text states reduced weekly hours or a reduced job form")
     fields = [m.group(0) for m in _ANY_FIELD.finditer(text)]
     all_good = [m for m in _FIELD.finditer(text)]
-    block = _leading_field_block(description if description is not None else text)
+    block = _leading_field_block(description or "")
     good = [m for m in _FIELD.finditer(block)]
     if len(all_good) != len(fields):
         return _not("a working-time field is not a plain Vollzeit/Teilzeit value")
