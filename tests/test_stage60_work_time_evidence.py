@@ -185,3 +185,12 @@ def test_a_scope_label_must_state_exactly_100_percent(tail):
 def test_scope_label_with_100_percent_is_fine():
     text = "Beschäftigungsgrad: 100 %\nPython."
     assert work_time_evidence(text, BA, True, text).current_full_time_confirmed
+
+
+@pytest.mark.parametrize(
+    "tail", ["Stellenumfang: <100 %", "Stellenumfang: 100 % (aktuell auf 80 % reduziert)"]
+)
+def test_the_whole_labelled_value_must_be_100_percent(tail):
+    text = f"Arbeitszeit: Vollzeit\n\n{tail}"
+    assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
+    assert not work_time_evidence(text, None, None, text).current_full_time_confirmed

@@ -77,12 +77,14 @@ _SCOPE_LABEL = re.compile(
     r"|arbeitszeitumfang",
     re.IGNORECASE,
 )
-_FULL_SCOPE = re.compile(r"\W{0,6}100(?:[.,]0+)?\s*%(?![\d\-–]|\s*[-–]\s*\d)")
+_FULL_SCOPE = re.compile(r"[ \t:=]*100(?:[.,]0+)?[ \t]*%[ \t.]*")
 
 
 def _reduced_share(text: str) -> bool:
     for m in _SCOPE_LABEL.finditer(text):
-        if not _FULL_SCOPE.match(text, m.end()):
+        line_end = text.find("\n", m.end())
+        rest = text[m.end() : line_end if line_end != -1 else len(text)]
+        if not _FULL_SCOPE.fullmatch(rest):
             return True
     for m in _SHARE.finditer(text):
         raw = m.group(1) or m.group("grad")
