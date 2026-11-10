@@ -1248,7 +1248,7 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:\w+\s+){0,3}?(?:einarbeitung\w*|probe\w*)"
     r"|\bafter\s+(?:\w+\s+){0,3}?(?:onboarding|probation\w*|training)"
-    r"|\bab\s+(?:[\w.]+\s+){0,2}?20(?:2[7-9]|[3-9]\d)\b|\bfrom\s+(?:\w+\s+){0,2}?20(?:2[7-9]|[3-9]\d)\b",
+    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b",
     re.IGNORECASE,
 )
 # "Option auf Vollzeit", "Übergang in eine unbefristete Vollzeitstelle", "Aufstockung auf Vollzeit"
@@ -1257,12 +1257,19 @@ _FUTURE_LEAD = re.compile(
     r"|wechsel|aufstockung|transition|move|conversion)\w*\b",
     re.IGNORECASE,
 )
-_CLAUSE_END = re.compile(r"[,.;\n]")
+# "1. Januar 2027": the dot of an ordinal day does not end a clause either.
+_ORDINAL_DAY = re.compile(r"\b(\d{1,2})\.(?=\s+[^\W\d]+\s+20\d\d)")
+# A period between digits ("01.01.2027") does not end a clause.
+_CLAUSE_END = re.compile(r"[,;\n]|(?<!\d)\.|\.(?!\d)")
+# "Full-time, but only after onboarding": a contrastive continuation belongs to the same clause.
+_CONTRAST_START = re.compile(
+    r"^[,;]?\s*(?:aber|jedoch|allerdings|doch|wobei|but|however|though|yet|while)\b", re.IGNORECASE
+)
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
 )
-_CLAUSE_WINDOW = 120
+_CLAUSE_WINDOW = 250
 
 
 def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) -> bool:
@@ -1272,8 +1279,16 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     today -- so it counts only with `soft=True`, i.e. next to a current part-time statement.
     Only a CURRENT full-time statement may open the automatic gate: a future possibility is not
     evidence of today's terms. Bounded: only the clause, `_CLAUSE_WINDOW` characters a side."""
-    before = re.split(_CLAUSE_END, text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])[-1]
-    after = re.split(_CLAUSE_END, text[match.end() : match.end() + _CLAUSE_WINDOW], maxsplit=1)[0]
+    head = _ORDINAL_DAY.sub(r"\1", text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
+    before = re.split(_CLAUSE_END, head)[-1]
+    tail = _ORDINAL_DAY.sub(r"\1", text[match.end() : match.end() + _CLAUSE_WINDOW])
+    after = ""
+    for _ in range(3):  # the clause plus at most two contrastive continuations
+        parts = re.split(_CLAUSE_END, tail, maxsplit=1)
+        after += parts[0]
+        if len(parts) < 2 or not _CONTRAST_START.match(parts[1].lstrip() or " "):
+            break
+        tail = parts[1]
     clause = before + match.group(0) + after
     if _FUTURE_MARKER.search(clause):
         return True
@@ -1316,7 +1331,15 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
         if not _part_time_is_an_offer(text, match) and not _negated(text, match):
             return True
-    return False
+    return bool(_REDUCED_HOURS.search(text))
+
+
+# "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit": stated hours below full time are
+# the vacancy's current part time even without the word "Teilzeit".
+_REDUCED_HOURS = re.compile(
+    r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d)?\s*(?:stunden|std\.?|hours?|hrs)\b",
+    re.IGNORECASE,
+)
 
 
 def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
