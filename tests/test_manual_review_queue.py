@@ -742,6 +742,11 @@ def _primary_with_work_time(status):
     a = _assessment("Python Entwickler (m/w/d)", role="PRIMARY", skills="STRONG")
     a.criteria = [c for c in a.criteria if c.name != "work_time"]
     a.criteria.append(Criterion("work_time", status, "w"))
+    a.criteria.append(
+        Criterion(
+            "work_time_evidence", "CONFIRMED" if status == "FULL_TIME" else "NOT_CONFIRMED", "w"
+        )
+    )
     return a
 
 
@@ -759,3 +764,12 @@ def test_a_suitable_developer_role_with_unconfirmed_hours_is_in_the_queue():
 def test_a_confirmed_full_time_developer_role_does_not_enter_the_queue():
     a = _primary_with_work_time("FULL_TIME")
     assert rq.review_item(_job(title=a.title), a, None) is None
+
+
+def test_heuristic_full_time_without_evidence_stays_in_the_queue():
+    """Stage 60: the classifier's FULL_TIME is not enough; the vacancy waits for a human."""
+    a = _primary_with_work_time("FULL_TIME")
+    a.criteria = [c for c in a.criteria if c.name != "work_time_evidence"]
+    item = rq.review_item(_job(title=a.title), a, None)
+    assert item is not None
+    assert item.reason_code == "WORK_TIME_NOT_CONFIRMED"

@@ -30,6 +30,8 @@ from sqlalchemy.pool import SingletonThreadPool, StaticPool
 from app.agents.target_role import hybrid_support_admin_family
 from app.services.job_fit_assessment import FitAssessment, assess_job
 from app.services.triage_category import UNKNOWN_RANK, classify
+from app.services.work_time_evidence import CONFIRMED as WT_CONFIRMED
+from app.services.work_time_evidence import CRITERION_NAME as WT_EVIDENCE_CRITERION
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,15 @@ BLOCK_WORK_TIME_NOT_CONFIRMED = "WORK_TIME_NOT_CONFIRMED"
 # (`POSSIBLE_DUPLICATE` -- same employer and role, no exact signal -- is held by the fit tier, and
 # other vacancies of the same employer are not touched by this rule.)
 BLOCK_APPLICATION_IN_PROGRESS = "APPLICATION_IN_PROGRESS"
+# Stage 60: FULL_TIME came from the text heuristic only; there is no positive, uncontradicted
+# structured evidence (BA flag / Arbeitszeit field) that full time is offered NOW.
+BLOCK_FULL_TIME_NOT_CONFIRMED = "FULL_TIME_NOT_CONFIRMED"
+
+
+def work_time_evidence_confirmed(assessment: FitAssessment) -> bool:
+    return any(
+        c.name == WT_EVIDENCE_CRITERION and c.status == WT_CONFIRMED for c in assessment.criteria
+    )
 
 
 def automatic_block_reason(assessment: FitAssessment) -> str | None:
@@ -161,6 +172,10 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
         )
         if work_time != "FULL_TIME":
             return BLOCK_WORK_TIME_NOT_CONFIRMED
+        # Stage 60: the classifier's FULL_TIME is a heuristic; automatic preparation needs the
+        # separate positive evidence (missing criterion, e.g. an old cache row = not confirmed)
+        if not work_time_evidence_confirmed(assessment):
+            return BLOCK_FULL_TIME_NOT_CONFIRMED
         duplicate = next((c.status for c in assessment.criteria if c.name == "duplicate"), None)
         if duplicate != "CLEAR":
             return BLOCK_APPLICATION_IN_PROGRESS

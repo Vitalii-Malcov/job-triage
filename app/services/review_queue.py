@@ -23,7 +23,11 @@ from datetime import datetime
 from app.agents.target_role import is_developer_title, is_search_target_title
 from app.services.fit_cache import applied
 from app.services.job_fit_assessment import FitAssessment
-from app.services.shortlist_gate import AUTO_PREPARE_TIERS, BLOCK_WORK_TIME_NOT_CONFIRMED
+from app.services.shortlist_gate import (
+    AUTO_PREPARE_TIERS,
+    BLOCK_WORK_TIME_NOT_CONFIRMED,
+    work_time_evidence_confirmed,
+)
 from app.services.triage_category import (
     DATA_REVIEW_REQUIRED,
     HYBRID_ADMIN_ROLE,
@@ -152,12 +156,17 @@ def review_item(job, assessment: FitAssessment, url: str | None) -> ReviewItem |
     elif (
         triage.category == "PRIMARY"
         and assessment.fit_tier in AUTO_PREPARE_TIERS
-        and _status(assessment, "work_time") != "FULL_TIME"
+        and (
+            _status(assessment, "work_time") != "FULL_TIME"
+            or not work_time_evidence_confirmed(assessment)
+        )
     ):
         # the gate holds it (`WORK_TIME_NOT_CONFIRMED`): a suitable developer role must not
         # vanish from every list because its hours are not stated
         code = WORK_TIME_NOT_CONFIRMED
         reason = f"working time is {_status(assessment, 'work_time')}, not confirmed full time"
+        if _status(assessment, "work_time") == "FULL_TIME":
+            reason = "full time is only a text reading; no structured evidence (Stage 60)"
     elif (
         triage.category == "EXCLUDED"
         and triage.code == NOT_TARGET_ROLE

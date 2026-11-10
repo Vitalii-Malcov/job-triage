@@ -68,6 +68,13 @@ def _assessment(
         location_criterion(job, SETTINGS, remote, None),
         remote,
         work_time_criterion(text),
+        # Stage 60: these tests are about remote/location, not work-time evidence; a posting
+        # that reads as full time is modelled as one whose full time is confirmed by the source.
+        Criterion(
+            "work_time_evidence",
+            "CONFIRMED" if work_time_criterion(text).status == "FULL_TIME" else "NOT_CONFIRMED",
+            "test fixture",
+        ),
         Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
     ]
     return a

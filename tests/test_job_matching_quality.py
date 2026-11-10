@@ -49,6 +49,10 @@ def _assessment(
         Criterion("start_date", start, "d"),
         Criterion("experience", experience, "x"),
         Criterion("work_time", work_time, "w"),
+        # Stage 60: a FULL_TIME fixture models full time confirmed by the source
+        Criterion(
+            "work_time_evidence", "CONFIRMED" if work_time == "FULL_TIME" else "NOT_CONFIRMED", "w"
+        ),
         Criterion("duplicate", "CLEAR", "no application to this vacancy recorded"),
     ]
     return a

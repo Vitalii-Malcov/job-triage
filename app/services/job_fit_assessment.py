@@ -70,6 +70,7 @@ from app.db.models import JobCommuteCheckRecord, JobRecord
 from app.models.candidate_job_match import CandidateJobMatch
 from app.models.candidate_profile import is_usable_for_generation, normalize_text_identity
 from app.models.candidate_search import CandidateSearchSettings
+from app.services import work_time_evidence as wte
 from app.services.application_duplicates import is_intermediary, verdict
 from app.services.application_guard import sent_duplicate, vacancy_findings
 
@@ -671,6 +672,22 @@ def work_time_criterion(text: str, job: JobRecord | None = None) -> Criterion:
     return Criterion("work_time", "UNKNOWN", "working time not stated")
 
 
+def work_time_evidence_criterion(text: str, job: JobRecord | None = None) -> Criterion:
+    """Stage 60: separate from the classification above -- CONFIRMED only on positive,
+    uncontradicted structured evidence; the automatic-preparation gate requires it."""
+    evidence = wte.work_time_evidence(
+        text,
+        getattr(job, "source", None),
+        getattr(job, "full_time_offered", None),
+    )
+    return Criterion(
+        wte.CRITERION_NAME,
+        wte.CONFIRMED if evidence.current_full_time_confirmed else wte.NOT_CONFIRMED,
+        evidence.reason,
+        evidence.source if evidence.current_full_time_confirmed else None,
+    )
+
+
 def _same_origin(check: JobCommuteCheckRecord, settings: CandidateSearchSettings, label) -> bool:
     if check.origin_label != label:
         return False
@@ -1225,6 +1242,7 @@ def assess_job(session: Session, job_id: int) -> FitAssessment:
         location_criterion(job, settings, remote, latest_commute_check(session, job_id)),
         remote,
         work_time_criterion(text, job),
+        work_time_evidence_criterion(text, job),
         salary_criterion(text, settings),
         entry_level_criterion(job.title, job.description or ""),
         education_criterion(job.description or "", job.quereinstieg_suitable),
