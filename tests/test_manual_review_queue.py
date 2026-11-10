@@ -733,3 +733,29 @@ def test_a_changed_rules_hash_makes_every_cached_decision_stale(writer, reader, 
     page = queries.review_page(reader, queries.ReviewFilters(), assess=counting, stale_budget=5)
     assert len(calls) == 5  # no old row is trusted; the live work is bounded
     assert page.stale_unassessed == 26  # and the page says that it is incomplete
+
+
+# Stage 58: a vacancy the gate holds for unconfirmed hours must not vanish from every list ------
+
+
+def _primary_with_work_time(status):
+    a = _assessment("Python Entwickler (m/w/d)", role="PRIMARY", skills="STRONG")
+    a.criteria = [c for c in a.criteria if c.name != "work_time"]
+    a.criteria.append(Criterion("work_time", status, "w"))
+    return a
+
+
+def test_a_suitable_developer_role_with_unconfirmed_hours_is_in_the_queue():
+    # PART_TIME / CONFLICT already lower the fit tier (STRETCH); UNKNOWN is the case the gate holds
+    status = "UNKNOWN"
+    a = _primary_with_work_time(status)
+    assert automatic_block_reason(a) == "WORK_TIME_NOT_CONFIRMED"  # the gate holds it ...
+    item = rq.review_item(_job(title=a.title), a, "https://example.invalid/x")
+    assert item is not None  # ... so a human must be able to see it
+    assert item.reason_code == rq.WORK_TIME_NOT_CONFIRMED
+    assert "unknown" in item.reason.lower()
+
+
+def test_a_confirmed_full_time_developer_role_does_not_enter_the_queue():
+    a = _primary_with_work_time("FULL_TIME")
+    assert rq.review_item(_job(title=a.title), a, None) is None
