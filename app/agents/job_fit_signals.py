@@ -1130,6 +1130,8 @@ def _part_time_is_an_offer(text: str, match: re.Match[str]) -> bool:
     Absprache möglich", "part-time options") rather than the hours of this vacancy."""
     if _PART_TIME_LABELLED.search(text[max(0, match.start() - 30) : match.end()]):
         return False
+    if _PRESENT_BEFORE.search(text[max(0, match.start() - 25) : match.start()]):
+        return False  # "aktuell Teilzeit möglich": today's terms, whatever follows
     if _PART_TIME_JOB_WORD.fullmatch(match.group(0)):
         return False  # "Teilzeitstelle", "Teilzeitarbeitsplatz": the job itself is part time
     if _own_hours_nearby(text, match):
@@ -1241,23 +1243,26 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
 # "Teilzeit, später Vollzeit möglich", "Vollzeit nach Einarbeitung", "part-time, full-time later".
 # Only forward-looking markers: "aktuell/zunächst/currently" describe the present and do not defer.
 _FUTURE_MARKER = (
-    r"sp(?:ä|ae)t\w*|danach|perspektivisch\w*|eventuell|eventually|later|in\s+(?:the\s+)?future"
-    r"|nach\s+(?:der\s+)?einarbeitung|after\s+(?:the\s+)?(?:onboarding|probation)"
+    r"sp(?:ä|ae)ter\w*|danach|perspektivisch\w*|eventuell|eventually|later|in\s+(?:the\s+)?future"
+    r"|nach\s+(?:der\s+|dem\s+)?(?:einarbeitung\w*|probezeit|probe\w*)"
+    r"|after\s+(?:the\s+)?(?:onboarding|probation\w*)"
+)
+# "Teilzeit mit Option auf Vollzeit", "Übergang in Vollzeit", "Aufstockung auf Vollzeit"
+_FUTURE_LEAD = (
+    r"(?:option|m(?:ö|oe)glichkeit|chance|perspektive|opportunit(?:y|ies)|"
+    r"(?:ü|ue)bergang|wechsel|aufstockung|transition|move|conversion)\w*\s+"
+    r"(?:in|auf|zur?|f(?:ü|ue)r|to|into|of|for)\s+(?:eine?\s+|a\s+)?"
 )
 _CLAUSE_END = re.compile(r"[,.;:\n]")
-_FUTURE_BEFORE = re.compile(r"\b(?:" + _FUTURE_MARKER + r")\W{0,3}$", re.IGNORECASE)
+_FUTURE_BEFORE = re.compile(
+    r"\b(?:(?:" + _FUTURE_MARKER + r")\W{0,3}(?:\w+\s+){0,2}?|" + _FUTURE_LEAD + r")$",
+    re.IGNORECASE,
+)
 _FUTURE_AFTER = re.compile(r"^\W{0,3}(?:\w+\s+){0,2}?(?:" + _FUTURE_MARKER + r")\b", re.IGNORECASE)
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
 )
-
-
-def _staff_part_time(text: str, match: re.Match[str]) -> bool:
-    """The "Teilzeit" of a "Voll- und Teilzeit" phrase in a sentence with a staff subject."""
-    return bool(
-        _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()])
-    ) and _sentence_has_staff_subject(text, match)
 
 
 def _full_time_deferred(text: str, match: re.Match[str]) -> bool:
@@ -1287,6 +1292,23 @@ def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str
     return None, False
 
 
+def _deferred_full_time_with_current_part_time(text: str) -> bool:
+    """A future full-time remark next to a current part-time statement of the vacancy: the
+    part-time statement wins, whichever other full-time words (staff, general) the text has."""
+    deferred = any(
+        _full_time_deferred(text, m)
+        for _, m in zip(range(_MAX_NEGATION_CHECKS), _FULL_TIME.finditer(text), strict=False)
+    )
+    if not deferred:
+        return False
+    for _, match in zip(range(_MAX_NEGATION_CHECKS), _PART_TIME.finditer(text), strict=False):
+        if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
+            continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
+        if not _part_time_is_an_offer(text, match) and not _negated(text, match):
+            return True
+    return False
+
+
 def _current_full_time(text: str) -> tuple[re.Match[str] | None, bool]:
     """First non-negated, non-deferred full-time match (and whether the budget ran out)."""
     for checked, match in enumerate(_FULL_TIME.finditer(text)):
@@ -1304,6 +1326,8 @@ def classify_work_time(text: str) -> WorkTimeSignal:
     work is too large to decide (hostile repetition) the answer is the one that keeps a human in
     the loop (PART_TIME), never FULL_TIME or UNKNOWN."""
     full, over_full = _current_full_time(text)
+    if full and _deferred_full_time_with_current_part_time(text):
+        return WorkTimeSignal("PART_TIME", _snippet(text, full))
     if full and _is_staff_statement(text, full):
         full = None  # "Our employees work full- and part-time": about the staff, not the job
     span = _combined_span(text, full) if full else None
@@ -1333,8 +1357,6 @@ def classify_work_time(text: str) -> WorkTimeSignal:
     for match in _PART_TIME.finditer(text):
         if _part_time_is_an_offer(text, match):
             continue
-        if _staff_part_time(text, match):
-            continue  # "Unsere Mitarbeiter arbeiten Voll- und Teilzeit": the staff, not this job
         checked += 1
         if checked > _MAX_NEGATION_CHECKS:
             return WorkTimeSignal("PART_TIME", _snippet(text, match))

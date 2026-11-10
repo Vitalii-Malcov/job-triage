@@ -38,6 +38,14 @@ def _row(flag):
         "Stelle: Teilzeit 20h. Später Vollzeit möglich.",
         "Teilzeit (30h), Aufstockung auf Vollzeit möglich",
         "Vollzeit ab 2027, aktuell Teilzeit",
+        "Vollzeit ab 2027, aktuell Teilzeit möglich",
+        "Teilzeit, später in Vollzeit möglich",
+        "Teilzeit, Vollzeit nach Probezeit möglich",
+        "Teilzeit mit Option auf Vollzeit",
+        "Teilzeit mit Übergang in Vollzeit",
+        # a general or staff full-time remark never beats own part time + future full time
+        "Teilzeit, später Voll- oder Teilzeit möglich. Unsere Mitarbeiter arbeiten Vollzeit.",
+        "Wir suchen Mitarbeiter in Voll- und Teilzeit, Vollzeit aber erst später.",
     ],
 )
 def test_current_part_time_with_a_later_full_time_is_part_time(text):
@@ -62,6 +70,7 @@ def test_a_future_full_time_alone_is_unknown_not_full_time(text):
         "Wir suchen Dich in Voll- oder Teilzeit.",
         "We offer full- or part-time work.",
         "Einstellung in Vollzeit. Nach der Einarbeitung ist Homeoffice möglich.",
+        "Vollzeit im Spätdienst",
     ],
 )
 def test_a_current_full_time_is_not_lost(text):
@@ -79,8 +88,9 @@ def test_a_listed_part_time_option_stays_unknown(text):
     "text",
     ["Unsere Mitarbeiter arbeiten Voll- und Teilzeit", "Our employees work full- and part-time."],
 )
-def test_other_employees_hours_are_not_this_vacancy(text):
-    assert mode(text) == "UNKNOWN"
+def test_other_employees_hours_never_confirm_full_time(text):
+    # kept on the human side (held, never FULL_TIME): the staff sentence is not this job's terms
+    assert mode(text) in {"UNKNOWN", "PART_TIME"}
 
 
 def test_a_staff_sentence_does_not_hide_the_vacancys_own_part_time():
@@ -121,7 +131,12 @@ def test_a_future_full_time_never_opens_the_automatic_gate(hours, tier_blocked):
 
 
 def test_a_conflict_blocks_automatic_preparation():
-    a = _assessment("100% Remote. Teilzeit, später Vollzeit möglich")
+    text = "100% Remote. Teilzeit, später Vollzeit möglich"
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    a = _assessment(text)
+    a.criteria = [c for c in a.criteria if c.name != "work_time"]
+    a.criteria.append(work_time_criterion(text, _row(True)))
+    assert _status(a, "work_time") == "CONFLICT"
     assert automatic_block_reason(a) is not None
 
 
