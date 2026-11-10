@@ -70,7 +70,20 @@ _SHARE = re.compile(
 )
 
 
+# An explicit scope label ("Beschaeftigungsgrad", "Stellenumfang" ...) must be followed by exactly
+# 100 %; anything else -- a range, a decimal, an hours figure, prose -- is "not confirmed".
+_SCOPE_LABEL = re.compile(
+    r"besch(?:ä|ae)ftigungsgrad|stellenumfang|arbeitsumfang|besch(?:ä|ae)ftigungsumfang"
+    r"|arbeitszeitumfang",
+    re.IGNORECASE,
+)
+_FULL_SCOPE = re.compile(r"\W{0,6}100(?:[.,]0+)?\s*%(?![\d\-–]|\s*[-–]\s*\d)")
+
+
 def _reduced_share(text: str) -> bool:
+    for m in _SCOPE_LABEL.finditer(text):
+        if not _FULL_SCOPE.match(text, m.end()):
+            return True
     for m in _SHARE.finditer(text):
         raw = m.group(1) or m.group("grad")
         if not raw or not (m.group("after") or m.group("grad")):

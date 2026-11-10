@@ -164,3 +164,24 @@ def test_any_share_other_than_100_percent_blocks(tail):
 def test_100_percent_remote_does_not_block():
     text = "100% Remote. 100 %-Stelle. Beschäftigungsgrad: 100 %"
     assert work_time_evidence(text, BA, True, text).current_full_time_confirmed
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Beschäftigungsgrad: 60-80 %",
+        "Stellenumfang: 50 bis 100 %",
+        "Beschäftigungsgrad: nach Absprache",
+        "Arbeitsumfang: 30 Stunden",
+        "Stellenumfang 100-120 %",
+    ],
+)
+def test_a_scope_label_must_state_exactly_100_percent(tail):
+    text = f"Arbeitszeit: Vollzeit\n\n{tail}"
+    assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
+    assert not work_time_evidence(text, None, None, text).current_full_time_confirmed
+
+
+def test_scope_label_with_100_percent_is_fine():
+    text = "Beschäftigungsgrad: 100 %\nPython."
+    assert work_time_evidence(text, BA, True, text).current_full_time_confirmed
