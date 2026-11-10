@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     # Off by default: every /ui route answers 404 while False. Login uses
     # api_key above; the session cookie expires after ui_session_hours.
     ui_enabled: bool = False
+    # Stage 62 (SEC-05): the interactive API schema pages are unauthenticated by construction;
+    # they stay off unless an operator explicitly opts in (development).
+    api_docs_enabled: bool = False
     # Task 23: where rate limits, the failed-auth budget, UI logout revocations and the
     # cookie nonce live. `memory` (default): this process only -- correct for exactly ONE
     # web process (enforced by the single-process lock below). `database`: the two

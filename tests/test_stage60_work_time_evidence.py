@@ -194,3 +194,27 @@ def test_the_whole_labelled_value_must_be_100_percent(tail):
     text = f"Arbeitszeit: Vollzeit\n\n{tail}"
     assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
     assert not work_time_evidence(text, None, None, text).current_full_time_confirmed
+
+
+def test_stage62_internship_posting_never_opens_the_gate():
+    from app.services.job_fit_assessment import Criterion
+    from app.services.shortlist_gate import BLOCK_NOT_EMPLOYMENT_POSTING
+
+    def with_type(title, status):
+        a = _gate_assessment("100% Remote.", _job(True))
+        a.title = title
+        a.criteria = [c for c in a.criteria if c.name != "posting_type"]
+        a.criteria.append(Criterion("posting_type", status, "x", None))
+        return a
+
+    assert automatic_block_reason(_gate_assessment("100% Remote.", _job(True))) is None
+    internship = with_type("Praktikum Data Science (m/w/d)", "TRAINEE_OR_INTERNSHIP")
+    assert automatic_block_reason(internship) == BLOCK_NOT_EMPLOYMENT_POSTING
+    assert automatic_block_reason(with_type("Working Student Python", "TRAINEE_OR_INTERNSHIP"))
+    # a trainee programme is a valid target and stays admissible
+    assert (
+        automatic_block_reason(with_type("Trainee Softwareentwicklung", "TRAINEE_OR_INTERNSHIP"))
+        is None
+    )
+    assert automatic_block_reason(with_type("Masterarbeit Python", "UNKNOWN"))
+    assert automatic_block_reason(with_type("Ausbildung Fachinformatiker", "APPRENTICESHIP"))
