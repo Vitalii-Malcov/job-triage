@@ -1250,6 +1250,7 @@ _FUTURE_MARKER = re.compile(
     r"|\bnach\s+(?:[\w\-–—]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w\-–—]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
     r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+dem\s+(?:\w+\s+){0,3}?(?:monat|woche|jahr)\w*"
+    r"|\bab\s+\d{1,2}\s+(?:monat|woche|jahr)\w*|\bab\s+(?:monat|woche|jahr)\w*\s+\d"
     r"|\bab\s+(?:erst|zweit|dritt|viert|f(?:ü|ue)nft|sechst)\w*\s+(?:\w+\s+)?(?:monat|woche|jahr)\w*"
     r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
     r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
