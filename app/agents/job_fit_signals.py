@@ -1247,8 +1247,8 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
 _FUTURE_MARKER = re.compile(
     r"\bsp(?:ä|ae)ter\w*|\bdanach\b|\bperspektivisch\w*|\beventuell\b|\beventually\b|\blater\b"
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
-    r"|\bnach\s+(?:[\w\-–—]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
-    r"|\bafter\s+(?:[\w\-–—]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
+    r"|\bnach\s+(?:\S+\s+){0,4}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*|tag(?:en)?\b)"
+    r"|\bafter\s+(?:\S+\s+){0,4}?(?:onboarding|probation\w*|training|months?|weeks?|years?|days?)"
     r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+dem\s+(?:\w+\s+){0,3}?(?:monat|woche|jahr)\w*"
     r"|\bab\s+\d{1,2}\s+(?:monat|woche|jahr)\w*|\bab\s+(?:monat|woche|jahr)\w*\s+\d"
     r"|\bab\s+(?:erst|zweit|dritt|viert|f(?:ü|ue)nft|sechst)\w*\s+(?:\w+\s+)?(?:monat|woche|jahr)\w*"
