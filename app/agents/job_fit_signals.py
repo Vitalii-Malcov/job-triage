@@ -1374,14 +1374,20 @@ _RECRUITING = re.compile(
 )
 
 
+_STAFF_ACTS = re.compile(
+    r"\b(?:employees?|staff|workforce|colleagues|engineers?|developers?|people|team"
+    r"|mitarbeiter\w*|belegschaft|kolleg\w+|besch(?:ä|ae)ftigte\w*)\W+(?:\w+\W+){0,3}?"
+    r"(?:arbeit\w*|work\w*|sind|are|haben|have)\b",
+    re.IGNORECASE,
+)
+
+
 def _staff_noun_sentence(text: str, match: re.Match[str]) -> bool:
-    """The sentence speaks about existing staff by a noun ("Unsere Kollegen arbeiten ..."), not
-    about the applicant ("Sie arbeiten ...") and not in recruiting wording ("Join our team")."""
+    """The sentence states what existing staff DO ("Unsere Kollegen arbeiten in Teilzeit"): a staff
+    noun as the subject of a working verb. A mere "in unserem Team" is not such a statement, nor is
+    applicant address ("Sie arbeiten") or recruiting wording."""
     sentence = _sentence_of(text, match)
-    subject = _STAFF_SUBJECT.search(sentence)
-    if subject is None or _RECRUITING.search(sentence):
-        return False
-    return not re.match(r"(?:wir|sie|we|they)\b", subject.group(0), re.IGNORECASE)
+    return bool(_STAFF_ACTS.search(sentence)) and not _RECRUITING.search(sentence)
 
 
 def _deferred_full_time_with_current_part_time(text: str) -> bool:
