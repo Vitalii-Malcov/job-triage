@@ -1265,6 +1265,17 @@ _ORDINAL_DAY = re.compile(
     r"\b(\d{1,2})\.(?=\s+(?:[^\W\d]+\s+20\d\d|monat|woche|jahr|quartal|month|week|year))",
     re.IGNORECASE,
 )
+_ABBREVIATION = re.compile(
+    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc)\.", re.IGNORECASE
+)
+
+
+def _unabbreviate(text: str) -> str:
+    """Drop the dots of ordinal days ("1. Januar 2027", "2. Monat") and common abbreviations
+    ("Std.", "ca.") so that they do not end a sentence."""
+    return _ABBREVIATION.sub(r"\1", _ORDINAL_DAY.sub(r"\1", text))
+
+
 # The SENTENCE (bounded by ; newline and a period that is not a date dot) is the unit: a deferral
 # word anywhere in it may qualify the full-time mention, so the answer is the safe one.
 _CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
@@ -1287,9 +1298,9 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     today -- so it counts only with `soft=True`, i.e. next to a current part-time statement.
     Only a CURRENT full-time statement may open the automatic gate: a future possibility is not
     evidence of today's terms. Bounded: only the clause, `_CLAUSE_WINDOW` characters a side."""
-    head = _ORDINAL_DAY.sub(r"\1", text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
+    head = _unabbreviate(text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
     before = re.split(_CLAUSE_END, head)[-1]
-    tail = _ORDINAL_DAY.sub(r"\1", text[match.end() : match.end() + _CLAUSE_WINDOW])
+    tail = _unabbreviate(text[match.end() : match.end() + _CLAUSE_WINDOW])
     after = re.split(_CLAUSE_END, tail, maxsplit=1)[0]
     clause = before + match.group(0) + after
     for marker in _FUTURE_MARKER.finditer(clause):
@@ -1318,8 +1329,8 @@ _MAX_PART_TIME_SCAN = 60
 
 
 def _sentence_of(text: str, match: re.Match[str]) -> str:
-    head = _ORDINAL_DAY.sub(r"\1", text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
-    tail = _ORDINAL_DAY.sub(r"\1", text[match.end() : match.end() + _CLAUSE_WINDOW])
+    head = _unabbreviate(text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
+    tail = _unabbreviate(text[match.end() : match.end() + _CLAUSE_WINDOW])
     return (
         re.split(_CLAUSE_END, head)[-1]
         + match.group(0)
@@ -1350,29 +1361,36 @@ def _reduced_hours_in(sentence: str) -> bool:
     )
 
 
+_RECRUITING = re.compile(
+    r"\b(?:suchen|sucht|gesucht|looking|seeking|hiring|verst(?:ä|ae)rk\w*|einstell\w*|besetz\w*|we\s+offer|wir\s+bieten)",
+    re.IGNORECASE,
+)
+
+
 def _deferred_full_time_with_current_part_time(text: str) -> bool:
     """A future full-time remark next to a current part-time statement of the vacancy: the
     part-time statement wins, whichever other full-time words (staff, general) the text has.
     An exhausted scan budget answers True (held for a human), never False."""
-    deferred: re.Match[str] | None = None
+    deferred: list[re.Match[str]] = []
     for checked, match in enumerate(_FULL_TIME.finditer(text)):
         if checked >= _MAX_NEGATION_CHECKS:
             return True
         if _full_time_deferred(text, match, soft=True):
-            deferred = match
-            break
-    if deferred is None:
+            deferred.append(match)
+    if not deferred:
         return False
     for checked, match in enumerate(_PART_TIME.finditer(text)):
         if checked >= _MAX_PART_TIME_SCAN:
             return True
         if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
-        if _sentence_has_staff_subject(text, match):
+        if _sentence_has_staff_subject(text, match) and not _RECRUITING.search(
+            _sentence_of(text, match)
+        ):
             continue  # "Unsere Kollegen arbeiten in Teilzeit": not this vacancy
         if not _part_time_is_an_offer(text, match) and not _negated(text, match):
             return True
-    return _reduced_hours_in(_sentence_of(text, deferred))
+    return any(_reduced_hours_in(_sentence_of(text, match)) for match in deferred)
 
 
 # "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit": stated hours below full time are
