@@ -1138,8 +1138,9 @@ def _part_time_is_an_offer(text: str, match: re.Match[str]) -> bool:
         return False  # stated hours of THIS vacancy beat any option wording around them
     if _PART_TIME_OFFER_WORD.fullmatch(match.group(0)):
         return True
-    if _PART_TIME_OFFER_LEAD.search(text[max(0, match.start() - 40) : match.start()]):
-        return True
+    lead = _PART_TIME_OFFER_LEAD.search(text[max(0, match.start() - 40) : match.start()])
+    if lead and not _FULL_TIME.search(lead.group(0)):
+        return True  # (an option that leads to a full-time word is about THAT word, not this one)
     after = re.split(r"[,;.\n]", text[match.end() : match.end() + 60], maxsplit=1)[0]
     if _PART_TIME_JOB_NOUN.match(after):
         return False  # "part-time position with pension options": the position IS part time
@@ -1364,7 +1365,7 @@ def _reduced_hours_in(sentence: str) -> bool:
 
 
 _RECRUITING = re.compile(
-    r"\b(?:suchen|sucht|gesucht|looking|seeking|hiring|verst(?:ä|ae)rk\w*|einstell\w*|besetz\w*|we\s+offer|wir\s+bieten|join|become|apply|werde|werden\s+sie|bewirb\w*|komm\w*|role|position|stelle|job\b|vakanz|your|dein\w*|ihre\w*)",
+    r"\b(?:suchen|sucht|gesucht|looking|seeking|hiring|verst(?:ä|ae)rk\w*|einstell\w*|besetz\w*|we\s+offer|wir\s+bieten|join|become|apply|werde|werden\s+sie|bewirb\w*|komm\w*|role|position|stelle|job|vakanz|your|dein\w*|ihre\w*|sie|du|dich|dir|you|starten|start)\b",
     re.IGNORECASE,
 )
 
