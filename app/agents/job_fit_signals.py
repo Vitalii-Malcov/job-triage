@@ -1248,7 +1248,10 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
-    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*",
+    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
+    r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
+    r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
+    r"|january|february|march|may|june|july|october|december)\b",
     re.IGNORECASE,
 )
 # "Option auf Vollzeit", "Übergang in eine unbefristete Vollzeitstelle", "Aufstockung auf Vollzeit"
@@ -1263,7 +1266,9 @@ _ORDINAL_DAY = re.compile(r"\b(\d{1,2})\.(?=\s+[^\W\d]+\s+20\d\d)")
 # word anywhere in it may qualify the full-time mention, so the answer is the safe one.
 _CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
 # A marker that qualifies PART time ("Vollzeit, später Teilzeit möglich") does not defer full time.
-_QUALIFIES_PART_TIME = re.compile(r"^\W*(?:\w+\W+){0,2}?(?:teilzeit|part[\s-]?time)", re.IGNORECASE)
+_QUALIFIES_PART_TIME = re.compile(
+    r"^[ \t-]*(?:\w+[ \t-]+){0,2}?(?:teilzeit|part[\s-]?time)", re.IGNORECASE
+)
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
@@ -1315,6 +1320,9 @@ def _sentence_of(text: str, match: re.Match[str]) -> str:
     )
 
 
+_DAILY = re.compile(
+    r"\s*(?:t(?:ä|ae)glich|pro\s+tag|am\s+tag|/\s*tag|daily|per\s+day|a\s+day)", re.IGNORECASE
+)
 _HOURS_RANGE_LEAD = re.compile(
     r"(?:\bab|\bbis|mindestens|\bmin\.?|\bfrom|up\s+to|at\s+least|zwischen|between)\s*$",
     re.IGNORECASE,
@@ -1326,6 +1334,7 @@ def _reduced_hours_in(sentence: str) -> bool:
     "bis 30 Stunden" describe a range the employer allows, not this job."""
     return any(
         not _HOURS_RANGE_LEAD.search(sentence[max(0, m.start() - 14) : m.start()])
+        and not _DAILY.match(sentence[m.end() : m.end() + 16])
         for m in _REDUCED_HOURS.finditer(sentence)
     )
 
