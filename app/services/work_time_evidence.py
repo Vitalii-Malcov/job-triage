@@ -49,6 +49,9 @@ _ANY_FIELD = re.compile(
     r"[ \t]*[:：][^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+_KEY_VALUE = re.compile(
+    r"^[ 	>*\-]*[^\W\d_][\w .\-/äöüÄÖÜß]{0,40}[ 	]*[:：][ 	]*\S.{0,80}$"
+)
 _VOLLZEIT_WORD = re.compile(r"\bvoll[\s-]?zeit|\bfull[\s-]?time|\bvoll-\s*(?:/|oder|und|&)", re.I)
 
 
@@ -63,7 +66,28 @@ def _not(reason: str) -> WorkTimeEvidence:
     return WorkTimeEvidence(False, SOURCE_NONE, reason)
 
 
-def work_time_evidence(text: str, job_source: str | None, full_time_offered: bool | None):
+def _leading_field_block(description: str) -> str:
+    """The description's leading metadata block: consecutive non-empty `Key: value` lines from the
+    very start. A field line after prose (an example, a quote, "folgende Beispieldaten:") is
+    employer free text, not structured data, and is never evidence."""
+    lines: list[str] = []
+    for line in description.splitlines():
+        if not line.strip():
+            if lines:
+                break
+            continue
+        if not _KEY_VALUE.match(line):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def work_time_evidence(
+    text: str,
+    job_source: str | None,
+    full_time_offered: bool | None,
+    description: str | None = None,
+):
     """The strict, positive answer to "does this vacancy offer full time right now?"."""
     text = text or ""
     if full_time_offered is False:
@@ -74,9 +98,13 @@ def work_time_evidence(text: str, job_source: str | None, full_time_offered: boo
     if full_time_denied(text):
         return _not("the text denies or reduces full time")
 
+    # any working-time field line anywhere must be a plain Vollzeit/Teilzeit value, but only the
+    # description's leading metadata block can CONFIRM
     fields = [m.group(0) for m in _ANY_FIELD.finditer(text)]
-    good = [m for m in _FIELD.finditer(text)]
-    if len(good) != len(fields):
+    all_good = [m for m in _FIELD.finditer(text)]
+    block = _leading_field_block(description if description is not None else text)
+    good = [m for m in _FIELD.finditer(block)]
+    if len(all_good) != len(fields):
         return _not("a working-time field is not a plain Vollzeit/Teilzeit value")
     states_full = any("vollzeit" in m.group("value").lower() for m in good)
     if good and signal.mode == "FULL_TIME" and states_full:

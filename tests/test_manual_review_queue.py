@@ -773,3 +773,17 @@ def test_heuristic_full_time_without_evidence_stays_in_the_queue():
     item = rq.review_item(_job(title=a.title), a, None)
     assert item is not None
     assert item.reason_code == "WORK_TIME_NOT_CONFIRMED"
+
+
+def test_adjacent_heuristic_full_time_without_evidence_stays_in_the_queue():
+    """Stage 60 (Codex P2): a newly held ADJACENT vacancy must not vanish from the queue."""
+    a = _primary_with_work_time("FULL_TIME")
+    a.criteria = [
+        Criterion("skills", "STRONG", "s") if c.name == "skills" else c
+        for c in a.criteria
+        if c.name != "work_time_evidence"
+    ]
+    a.title = "Junior Data Analyst (m/w/d)"
+    item = rq.review_item(_job(title=a.title), a, None)
+    assert item is not None
+    assert item.reason_code == "WORK_TIME_NOT_CONFIRMED"

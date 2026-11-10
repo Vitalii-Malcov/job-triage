@@ -679,6 +679,7 @@ def work_time_evidence_criterion(text: str, job: JobRecord | None = None) -> Cri
         text,
         getattr(job, "source", None),
         getattr(job, "full_time_offered", None),
+        getattr(job, "description", None) or "",
     )
     return Criterion(
         wte.CRITERION_NAME,

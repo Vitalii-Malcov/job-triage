@@ -20,7 +20,8 @@ BA = "bundesagentur"
 
 
 def _confirmed(text, source=BA, flag=None):
-    return work_time_evidence(text, source, flag).current_full_time_confirmed
+    # description == text: the posting's own text, a field line leads it
+    return work_time_evidence(text, source, flag, text).current_full_time_confirmed
 
 
 @pytest.mark.parametrize(
@@ -56,8 +57,8 @@ def test_evidence_table(text, source, flag, expected):
     assert _confirmed(text, source, flag) is expected
 
 
-def _job(flag=None, source=BA):
-    return SimpleNamespace(source=source, full_time_offered=flag)
+def _job(flag=None, source=BA, description=""):
+    return SimpleNamespace(source=source, full_time_offered=flag, description=description)
 
 
 def _gate_assessment(text, job):
@@ -79,7 +80,8 @@ def test_ba_flag_opens_the_gate_when_everything_else_passes():
 
 
 def test_structured_field_opens_the_gate():
-    a = _gate_assessment("Arbeitszeit: Vollzeit\n100% Remote.", _job(None, "xing_email"))
+    text = "Arbeitszeit: Vollzeit\n100% Remote."
+    a = _gate_assessment(text, _job(None, "xing_email", text))
     assert automatic_block_reason(a) is None
 
 
@@ -103,3 +105,16 @@ def test_a_forged_unconfirmed_criterion_stays_blocked():
         for c in a.criteria
     ]
     assert automatic_block_reason(a) == BLOCK_FULL_TIME_NOT_CONFIRMED
+
+
+def test_a_field_line_inside_employer_prose_is_not_evidence():
+    # Codex P2: sample data in the description says nothing about this vacancy's hours
+    text = "Du entwickelst Formulare, Beispieldaten:\nArbeitszeit: Vollzeit\n100% Remote."
+    assert not work_time_evidence(text, "xing_email", None, text).current_full_time_confirmed
+    a = _gate_assessment(text, _job(None, "xing_email", text))
+    assert automatic_block_reason(a) == BLOCK_FULL_TIME_NOT_CONFIRMED
+
+
+def test_a_leading_metadata_block_is_evidence():
+    text = "Firma: Example GmbH\nOrt: Berlin\nArbeitszeit: Vollzeit\n\nDu entwickelst Python."
+    assert work_time_evidence(text, None, None, text).current_full_time_confirmed

@@ -153,12 +153,20 @@ def review_item(job, assessment: FitAssessment, url: str | None) -> ReviewItem |
     code, reason = triage.code, triage.reason
     if triage.category == "MANUAL_REVIEW":
         pass
-    elif (
-        triage.category == "PRIMARY"
-        and assessment.fit_tier in AUTO_PREPARE_TIERS
-        and (
-            _status(assessment, "work_time") != "FULL_TIME"
-            or not work_time_evidence_confirmed(assessment)
+    elif assessment.fit_tier in AUTO_PREPARE_TIERS and (
+        (
+            triage.category == "PRIMARY"
+            and (
+                _status(assessment, "work_time") != "FULL_TIME"
+                or not work_time_evidence_confirmed(assessment)
+            )
+        )
+        # Stage 60: an ADJACENT role that read as full time was gate-open before and is now
+        # held only for missing evidence; it must not vanish from every list either
+        or (
+            triage.category == "ADJACENT"
+            and _status(assessment, "work_time") == "FULL_TIME"
+            and not work_time_evidence_confirmed(assessment)
         )
     ):
         # the gate holds it (`WORK_TIME_NOT_CONFIRMED`): a suitable developer role must not
