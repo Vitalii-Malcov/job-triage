@@ -100,3 +100,10 @@ work ran on a backup-API copy in the session scratchpad.
 2. Refresh BA jobs to populate `full_time_offered`; review the gate-open list by hand.
 3. Enable auto-prepare for a small cap only after operator sign-off; approval stays manual.
 
+
+## Final status
+PR #57 merged into main as 11dae54 (merge commit, no admin, no force). CI on main 11dae54: success.
+CI on the final PR HEAD aeb562c: test, scheduler-postgres, docker all pass.
+
+**MERGED — READY FOR CONTROLLED ROLLOUT**
+(open item before enabling anything: populate `full_time_offered` via a BA refresh; see §14)
