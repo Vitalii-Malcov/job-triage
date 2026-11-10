@@ -1299,7 +1299,7 @@ _OPTION_NOUN = (
 # "Vollzeitoption", "Vollzeit-Perspektive",
 # postposed "Vollzeit ist eine Option", "Vollzeit als Option"
 _FULL_TIME_OPTION_WORD = re.compile(
-    r"\b(?:vollzeit|full[\s-]?time)(?:\W{0,3}"
+    r"\b(?:vollzeit\w*?|full[\s-]?time)(?:\W{0,3}"
     + _OPTION_NOUN
     + r"|\W+(?:(?:ist|sind|is|are|als|as|eine?|an?|auch|also|ggf|possibly)\W+){1,3}"
     + _OPTION_NOUN
