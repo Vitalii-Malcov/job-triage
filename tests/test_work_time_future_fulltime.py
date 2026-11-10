@@ -111,6 +111,11 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Part-time first. Full-time after 1.5 months of probation.",
         "Start at 20 hours per week, full-time from the second month.",
         "Part-time now, full-time starting month 3.",
+        "Wir bieten eine 20-Stunden-Woche mit Option auf Vollzeit.",
+        "Arbeitszeit: 50 % einer Vollzeitstelle mit Option auf Vollzeit.",
+        "Vollzeit lt. Vereinbarung erst nach der Probezeit möglich.",
+        "Einstieg in Teilzeit. Unsere Mitarbeiter arbeiten ansonsten in Vollzeit.",
+        "Arbeitszeit: Teilzeit ohne Schichtdienst. Wir bieten auch Vollzeit an.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )

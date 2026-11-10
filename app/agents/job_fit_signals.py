@@ -1235,7 +1235,12 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
         if not combined and not _vacancy_defining(text, match):
             continue  # a plain "Vollzeit" yields only to the vacancy's own statement
         checked += 1
-        if checked > _MAX_NEGATION_CHECKS or not _negated(text, match):
+        negated = (
+            _directly_negated(text, match)
+            if _vacancy_defining(text, match)
+            else _negated(text, match)
+        )
+        if checked > _MAX_NEGATION_CHECKS or not negated:
             return True
     return False
 
@@ -1271,7 +1276,7 @@ _ORDINAL_DAY = re.compile(
     re.IGNORECASE,
 )
 _ABBREVIATION = re.compile(
-    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc|jan|feb|mrz|apr|jun|jul|aug|sept?|okt|oct|nov|dez|dec|[^\W\d_])\.",
+    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc|lt|usw|uvm|vs|ggfs|resp|sog|bzgl|ev|jan|feb|mrz|apr|jun|jul|aug|sept?|okt|oct|nov|dez|dec|[^\W\d_])\.",
     re.IGNORECASE,
 )
 
@@ -1374,9 +1379,17 @@ _HOURS_RANGE_LEAD = re.compile(
 )
 
 
+_REDUCED_FTE = re.compile(
+    r"\b(\d{1,2})\s*%\s+(?:einer|der|of(?:\s+a)?|von)\s+(?:vollzeit|full[\s-]?time)",
+    re.IGNORECASE,
+)
+
+
 def _reduced_hours_in(sentence: str) -> bool:
     """Stated weekly hours below full time as the vacancy's OWN hours; "ab 20 Stunden" or
     "bis 30 Stunden" describe a range the employer allows, not this job."""
+    if any(0 < int(m.group(1)) < 100 for m in _REDUCED_FTE.finditer(sentence)):
+        return True  # "50 % einer Vollzeitstelle"
     return any(
         not _HOURS_RANGE_LEAD.search(sentence[max(0, m.start() - 14) : m.start()])
         and not _FULL_TIME_HOURS_LEAD.search(sentence[max(0, m.start() - 24) : m.start()])
@@ -1448,7 +1461,7 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
 # the vacancy's current part time even without the word "Teilzeit".
 _FULL_TIME_WEEKLY_HOURS = 35.0  # below this a stated weekly figure is reduced hours
 _REDUCED_HOURS = re.compile(
-    r"\b(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:wochenstunden|stunden|std\.?|hours?|hrs|h\b)",
+    r"\b(\d{1,2}(?:[.,]\d{1,2})?)[\s-]*(?:wochenstunden|stunden|std\.?|hours?|hrs|h\b)",
     re.IGNORECASE,
 )
 
@@ -1470,7 +1483,11 @@ def _current_full_time(text: str) -> tuple[re.Match[str] | None, bool]:
     for checked, match in enumerate(_FULL_TIME.finditer(text)):
         if checked >= _MAX_NEGATION_CHECKS:
             return None, True
-        if not _negated(text, match) and not _full_time_deferred(text, match):
+        if (
+            not _negated(text, match)
+            and not _full_time_deferred(text, match)
+            and not _staff_noun_sentence(text, match)
+        ):
             return match, False
     return None, False
 
