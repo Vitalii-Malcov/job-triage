@@ -1261,11 +1261,15 @@ _FUTURE_LEAD = re.compile(
     re.IGNORECASE,
 )
 # "1. Januar 2027": the dot of an ordinal day does not end a clause either.
-_ORDINAL_DAY = re.compile(r"\b(\d{1,2})\.(?=\s+[^\W\d]+\s+20\d\d)")
+_ORDINAL_DAY = re.compile(
+    r"\b(\d{1,2})\.(?=\s+(?:[^\W\d]+\s+20\d\d|monat|woche|jahr|quartal|month|week|year))",
+    re.IGNORECASE,
+)
 # The SENTENCE (bounded by ; newline and a period that is not a date dot) is the unit: a deferral
 # word anywhere in it may qualify the full-time mention, so the answer is the safe one.
 _CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
 # A marker that qualifies PART time ("Vollzeit, später Teilzeit möglich") does not defer full time.
+_ADVERB_MARKER = re.compile(r"sp(?:ä|ae)ter\w*|danach|later|eventuell|eventually", re.IGNORECASE)
 _QUALIFIES_PART_TIME = re.compile(
     r"^[ \t-]*(?:\w+[ \t-]+){0,2}?(?:teilzeit|part[\s-]?time)", re.IGNORECASE
 )
@@ -1289,7 +1293,10 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     after = re.split(_CLAUSE_END, tail, maxsplit=1)[0]
     clause = before + match.group(0) + after
     for marker in _FUTURE_MARKER.finditer(clause):
-        if not _QUALIFIES_PART_TIME.match(clause[marker.end() :]):
+        qualifies_part_time = _ADVERB_MARKER.fullmatch(
+            marker.group(0)
+        ) and _QUALIFIES_PART_TIME.match(clause[marker.end() :])
+        if not qualifies_part_time:
             return True
     return soft and bool(
         _FUTURE_LEAD.search(before)
@@ -1323,6 +1330,9 @@ def _sentence_of(text: str, match: re.Match[str]) -> str:
 _DAILY = re.compile(
     r"\s*(?:t(?:ä|ae)glich|pro\s+tag|am\s+tag|/\s*tag|daily|per\s+day|a\s+day)", re.IGNORECASE
 )
+_FULL_TIME_HOURS_LEAD = re.compile(
+    r"(?:vollzeit\w*|full[\s-]?time)\s*[(:]\s*(?:ca\.?\s*)?$", re.IGNORECASE
+)
 _HOURS_RANGE_LEAD = re.compile(
     r"(?:\bab|\bbis|mindestens|\bmin\.?|\bfrom|up\s+to|at\s+least|zwischen|between)\s*$",
     re.IGNORECASE,
@@ -1334,6 +1344,7 @@ def _reduced_hours_in(sentence: str) -> bool:
     "bis 30 Stunden" describe a range the employer allows, not this job."""
     return any(
         not _HOURS_RANGE_LEAD.search(sentence[max(0, m.start() - 14) : m.start()])
+        and not _FULL_TIME_HOURS_LEAD.search(sentence[max(0, m.start() - 24) : m.start()])
         and not _DAILY.match(sentence[m.end() : m.end() + 16])
         for m in _REDUCED_HOURS.finditer(sentence)
     )
@@ -1357,6 +1368,8 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
             return True
         if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
+        if _sentence_has_staff_subject(text, match):
+            continue  # "Unsere Kollegen arbeiten in Teilzeit": not this vacancy
         if not _part_time_is_an_offer(text, match) and not _negated(text, match):
             return True
     return _reduced_hours_in(_sentence_of(text, deferred))
