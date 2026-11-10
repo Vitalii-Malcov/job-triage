@@ -1248,7 +1248,7 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
-    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
+    r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
     r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
     r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
     r"|january|february|march|may|june|july|october|december)\b",
@@ -1362,7 +1362,7 @@ def _reduced_hours_in(sentence: str) -> bool:
 
 
 _RECRUITING = re.compile(
-    r"\b(?:suchen|sucht|gesucht|looking|seeking|hiring|verst(?:ä|ae)rk\w*|einstell\w*|besetz\w*|we\s+offer|wir\s+bieten)",
+    r"\b(?:suchen|sucht|gesucht|looking|seeking|hiring|verst(?:ä|ae)rk\w*|einstell\w*|besetz\w*|we\s+offer|wir\s+bieten|join|become|apply|werde|werden\s+sie|bewirb\w*|komm\w*|role|position|stelle|job\b|vakanz|your|dein\w*|ihre\w*)",
     re.IGNORECASE,
 )
 
