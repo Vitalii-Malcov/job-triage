@@ -1097,7 +1097,6 @@ _PART_TIME_OFFER_LEAD = re.compile(
 )
 _ONLY_PART_TIME = re.compile(
     r"\b(?:nur|ausschlie(?:ß|ss)lich|lediglich)\s+(?:in\s+)?teilzeit"
-    r"(?!m(?:ö|oe)glichkeit|modell|option|variante|angebot|regelung|geeignet)"
     r"|\bpart[\s-]?time\s+only\b|\bonly\s+part[\s-]?time\b",
     re.IGNORECASE,
 )

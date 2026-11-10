@@ -493,7 +493,12 @@ def test_part_time_only_also_beats_a_combined_full_or_part_time_remark():
         assert work_time_criterion(text, _row(flag)).status in {"PART_TIME", "CONFLICT"}
 
 
-def test_nur_teilzeitoptionen_is_a_benefit_not_a_part_time_only_restriction():
-    text = "Vollzeit. Nur Teilzeitoptionen beduerfen einer Absprache."
-    assert classify_work_time(text).mode == "FULL_TIME"
-    assert work_time_criterion(text, _row(True)).status == "FULL_TIME"
+def test_nur_teilzeitmodelle_stays_part_time_and_a_flag_cannot_override_it():
+    # a blanket "option/model compound" exclusion would turn this restriction into UNKNOWN
+    # (and then FULL_TIME through the source flag): the unsafe direction. A benefit sentence that
+    # is held as PART_TIME instead ("Nur Teilzeitoptionen ...") is the safe, accepted direction.
+    text = "Fuer diese Stelle sind nur Teilzeitmodelle moeglich."
+    assert classify_work_time(text).mode == "PART_TIME"
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    text2 = text + " Vollzeit eventuell spaeter moeglich."
+    assert classify_work_time(text2).mode == "PART_TIME"
