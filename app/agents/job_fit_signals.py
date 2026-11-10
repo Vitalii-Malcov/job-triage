@@ -1307,9 +1307,13 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     after = re.split(_CLAUSE_END, tail, maxsplit=1)[0]
     clause = before + match.group(0) + after
     for marker in _FUTURE_MARKER.finditer(clause):
-        qualifies_part_time = _ADVERB_MARKER.fullmatch(
-            marker.group(0)
-        ) and _QUALIFIES_PART_TIME.match(clause[marker.end() :])
+        # only a marker AFTER the full-time word can qualify a part-time word ("Vollzeit, später
+        # Teilzeit"); before it, "später ... Teilzeit auf Vollzeit" is a part-to-full transition
+        qualifies_part_time = (
+            marker.start() >= len(before) + len(match.group(0))
+            and _ADVERB_MARKER.fullmatch(marker.group(0))
+            and _QUALIFIES_PART_TIME.match(clause[marker.end() :])
+        )
         if not qualifies_part_time:
             return True
     return soft and bool(

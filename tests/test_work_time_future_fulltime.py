@@ -91,6 +91,7 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Zum Einstieg 20 Wochenstunden; Vollzeit ab dem 2. vollen Monat.",
         "Als Mitarbeiter arbeiten Sie in Teilzeit mit Option auf Vollzeit.",
         "Mit der Option auf Vollzeit starten Sie in Teilzeit.",
+        "Zum Einstieg arbeiten Sie in Teilzeit. Später kann die Teilzeit auf Vollzeit aufstocken.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
