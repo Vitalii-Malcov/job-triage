@@ -1267,7 +1267,7 @@ _ORDINAL_DAY = re.compile(
     re.IGNORECASE,
 )
 _ABBREVIATION = re.compile(
-    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc)\.", re.IGNORECASE
+    r"\b(std|ca|bzw|ggf|inkl|max|min|evtl|zzgl|vgl|approx|incl|etc|[^\W\d_])\.", re.IGNORECASE
 )
 
 
