@@ -1289,7 +1289,7 @@ _QUALIFIES_PART_TIME = re.compile(
     re.IGNORECASE,
 )
 _FULL_TIME_OPTION_WORD = re.compile(
-    r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
+    r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|perspektive|chance|aufstock|(?:ü|ue)bergang|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
 )
 _CLAUSE_WINDOW = 250
@@ -1384,6 +1384,17 @@ _STAFF_ACTS = re.compile(
 )
 
 
+_DIRECT_NEGATOR = re.compile(
+    r"\b(?:kein\w*|nicht|ohne|no|not|never|without)\s+(?:\w+\s+){0,2}$", re.IGNORECASE
+)
+
+
+def _directly_negated(text: str, match: re.Match[str]) -> bool:
+    """A negator within three words before the part-time word ("keine Teilzeit", "not part-time").
+    Unrelated negations in the clause ("ohne Schichtdienst") do not negate it."""
+    return bool(_DIRECT_NEGATOR.search(text[max(0, match.start() - 40) : match.start()]))
+
+
 def _staff_noun_sentence(text: str, match: re.Match[str]) -> bool:
     """The sentence states what existing staff DO ("Unsere Kollegen arbeiten in Teilzeit"): a staff
     noun as the subject of a working verb. A mere "in unserem Team" is not such a statement, nor is
@@ -1411,7 +1422,7 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
         if _staff_noun_sentence(text, match):
             continue  # "Unsere Kollegen arbeiten in Teilzeit": not this vacancy
-        if not _part_time_is_an_offer(text, match) and not _negated(text, match):
+        if not _part_time_is_an_offer(text, match) and not _directly_negated(text, match):
             return True
     return any(_reduced_hours_in(_sentence_of(text, match)) for match in deferred)
 
