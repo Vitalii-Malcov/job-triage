@@ -86,6 +86,9 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Vollzeit ab dem 1. Januar 2027.",
         "Full-time from January 1, 2027.",
         "Wir suchen eine Assistenz. Sie arbeiten in Teilzeit mit Option auf Vollzeit.",
+        "Sie starten in Teilzeit und können später von Teilzeit auf Vollzeit aufstocken.",
+        "Start at 20 hours per week; full-time from 01/01/2027.",
+        "Zum Einstieg 20 Wochenstunden; Vollzeit ab dem 2. vollen Monat.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )

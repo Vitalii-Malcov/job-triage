@@ -1248,7 +1248,7 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
-    r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
+    r"|\b(?:ab|from)\s+(?:[\w,]+\s+){0,4}?(?:\d{1,2}[./]){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*"
     r"|\b(?:ab|from|starting|beginning)\s+(?:dem\s+)?(?:next|n(?:ä|ae)chste[nm]?|kommende[nm]?|folgende[nm]?"
     r"|januar|februar|m(?:ä|ae)rz|april|mai|juni|juli|august|september|oktober|november|dezember"
     r"|january|february|march|may|june|july|october|december)\b",
@@ -1262,7 +1262,7 @@ _FUTURE_LEAD = re.compile(
 )
 # "1. Januar 2027": the dot of an ordinal day does not end a clause either.
 _ORDINAL_DAY = re.compile(
-    r"\b(\d{1,2})\.(?=\s+(?:[^\W\d]+\s+20\d\d|monat|woche|jahr|quartal|month|week|year))",
+    r"\b(\d{1,2})\.(?=\s+(?:[^\W\d]+\s+){0,2}(?:20\d\d|monat|woche|jahr|quartal|month|week|year))",
     re.IGNORECASE,
 )
 _ABBREVIATION = re.compile(
@@ -1282,7 +1282,9 @@ _CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
 # A marker that qualifies PART time ("Vollzeit, später Teilzeit möglich") does not defer full time.
 _ADVERB_MARKER = re.compile(r"sp(?:ä|ae)ter\w*|danach|later|eventuell|eventually", re.IGNORECASE)
 _QUALIFIES_PART_TIME = re.compile(
-    r"^[ \t-]*(?:\w+[ \t-]+){0,2}?(?:teilzeit|part[\s-]?time)", re.IGNORECASE
+    r"^[ \t-]*(?:(?!(?:von|from|to|auf|zu|zum|zur|into)\b)\w+[ \t-]+){0,2}?"
+    r"(?:teilzeit|part[\s-]?time)",
+    re.IGNORECASE,
 )
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
