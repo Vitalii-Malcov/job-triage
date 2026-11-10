@@ -1248,7 +1248,7 @@ _FUTURE_MARKER = re.compile(
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
     r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
     r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
-    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b",
+    r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b|\bab\s+(?:dem\s+)?(?:\w+\s+){0,2}?(?:monat|woche|jahr)\w*",
     re.IGNORECASE,
 )
 # "Option auf Vollzeit", "Übergang in eine unbefristete Vollzeitstelle", "Aufstockung auf Vollzeit"
@@ -1259,13 +1259,11 @@ _FUTURE_LEAD = re.compile(
 )
 # "1. Januar 2027": the dot of an ordinal day does not end a clause either.
 _ORDINAL_DAY = re.compile(r"\b(\d{1,2})\.(?=\s+[^\W\d]+\s+20\d\d)")
-# A period between digits ("01.01.2027") does not end a clause.
-_CLAUSE_END = re.compile(r"[,;\n]|(?<!\d)\.|\.(?!\d)")
-# "Full-time, but only after onboarding": a contrastive continuation belongs to the same clause.
-_CONTRAST_START = re.compile(
-    r"^[,;]?\s*(?:aber|jedoch|allerdings|doch|wobei|but|however|though|yet|while|nach|after|erst|only|danach|then|sp(?:ä|ae)ter)\b",
-    re.IGNORECASE,
-)
+# The SENTENCE (bounded by ; newline and a period that is not a date dot) is the unit: a deferral
+# word anywhere in it may qualify the full-time mention, so the answer is the safe one.
+_CLAUSE_END = re.compile(r"[;\n]|(?<!\d)\.|\.(?!\d)")
+# A marker that qualifies PART time ("Vollzeit, später Teilzeit möglich") does not defer full time.
+_QUALIFIES_PART_TIME = re.compile(r"^\W*(?:\w+\W+){0,2}?(?:teilzeit|part[\s-]?time)", re.IGNORECASE)
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
     re.IGNORECASE,
@@ -1283,19 +1281,11 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     head = _ORDINAL_DAY.sub(r"\1", text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
     before = re.split(_CLAUSE_END, head)[-1]
     tail = _ORDINAL_DAY.sub(r"\1", text[match.end() : match.end() + _CLAUSE_WINDOW])
-    after = ""
-    for _ in range(3):  # the clause plus at most two contrastive continuations
-        parts = re.split(_CLAUSE_END, tail, maxsplit=1)
-        after += parts[0]
-        contrast = _CONTRAST_START.match(parts[1].lstrip()) if len(parts) > 1 else None
-        if contrast is None:
-            break
-        rest = parts[1].lstrip()
-        after += " " + contrast.group(0)
-        tail = rest[contrast.end() :].lstrip(" ,;")  # "however, only after ..." keeps its tail
+    after = re.split(_CLAUSE_END, tail, maxsplit=1)[0]
     clause = before + match.group(0) + after
-    if _FUTURE_MARKER.search(clause):
-        return True
+    for marker in _FUTURE_MARKER.finditer(clause):
+        if not _QUALIFIES_PART_TIME.match(clause[marker.end() :]):
+            return True
     return soft and bool(
         _FUTURE_LEAD.search(before)
         or _FULL_TIME_OPTION_WORD.match(text[match.start() : match.start() + 40])
@@ -1315,18 +1305,43 @@ def _staged_part_time_first(text: str, match: re.Match[str]) -> bool:
 _MAX_PART_TIME_SCAN = 60
 
 
+def _sentence_of(text: str, match: re.Match[str]) -> str:
+    head = _ORDINAL_DAY.sub(r"\1", text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])
+    tail = _ORDINAL_DAY.sub(r"\1", text[match.end() : match.end() + _CLAUSE_WINDOW])
+    return (
+        re.split(_CLAUSE_END, head)[-1]
+        + match.group(0)
+        + re.split(_CLAUSE_END, tail, maxsplit=1)[0]
+    )
+
+
+_HOURS_RANGE_LEAD = re.compile(
+    r"(?:\bab|\bbis|mindestens|\bmin\.?|\bfrom|up\s+to|at\s+least|zwischen|between)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _reduced_hours_in(sentence: str) -> bool:
+    """Stated weekly hours below full time as the vacancy's OWN hours; "ab 20 Stunden" or
+    "bis 30 Stunden" describe a range the employer allows, not this job."""
+    return any(
+        not _HOURS_RANGE_LEAD.search(sentence[max(0, m.start() - 14) : m.start()])
+        for m in _REDUCED_HOURS.finditer(sentence)
+    )
+
+
 def _deferred_full_time_with_current_part_time(text: str) -> bool:
     """A future full-time remark next to a current part-time statement of the vacancy: the
     part-time statement wins, whichever other full-time words (staff, general) the text has.
     An exhausted scan budget answers True (held for a human), never False."""
-    deferred = False
+    deferred: re.Match[str] | None = None
     for checked, match in enumerate(_FULL_TIME.finditer(text)):
         if checked >= _MAX_NEGATION_CHECKS:
             return True
         if _full_time_deferred(text, match, soft=True):
-            deferred = True
+            deferred = match
             break
-    if not deferred:
+    if deferred is None:
         return False
     for checked, match in enumerate(_PART_TIME.finditer(text)):
         if checked >= _MAX_PART_TIME_SCAN:
@@ -1335,7 +1350,7 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
         if not _part_time_is_an_offer(text, match) and not _negated(text, match):
             return True
-    return bool(_REDUCED_HOURS.search(text))
+    return _reduced_hours_in(_sentence_of(text, deferred))
 
 
 # "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit": stated hours below full time are

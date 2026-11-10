@@ -72,6 +72,9 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "20 h/Woche zum Einstieg. Vollzeit, nach der Probezeit möglich.",
         "20 h/Woche zum Einstieg, Vollzeit nach 6-monatiger Probezeit möglich.",
         "20 h/Woche mit Perspektive auf Vollzeit.",
+        "20 h/Woche zum Einstieg. Nach der Probezeit, bei guter Leistung, ist Vollzeit möglich.",
+        "20 h/Woche zum Einstieg; Vollzeit ab dem zweiten Monat.",
+        "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
 def test_a_deferred_full_time_is_never_confirmed(text):
@@ -107,6 +110,7 @@ def test_a_future_full_time_alone_is_unknown_not_full_time(text):
         "We offer full- or part-time work.",
         "Einstellung in Vollzeit. Nach der Einarbeitung ist Homeoffice möglich.",
         "Vollzeit im Spätdienst",
+        "Vollzeit ab sofort mit Option auf spätere Teilzeit.",
         # real vacancies #49 and #2463: an option between full-time models / a permanent offer
         "Flexible Arbeitszeiten mit der Option auf 4 oder 5 Tage Vollzeit (32 – 40 Stunden)",
         "Langfristige berufliche Perspektive in Vollzeitbeschäftigung",
