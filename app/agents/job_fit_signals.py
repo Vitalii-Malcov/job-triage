@@ -1364,6 +1364,7 @@ def _reduced_hours_in(sentence: str) -> bool:
         not _HOURS_RANGE_LEAD.search(sentence[max(0, m.start() - 14) : m.start()])
         and not _FULL_TIME_HOURS_LEAD.search(sentence[max(0, m.start() - 24) : m.start()])
         and not _DAILY.match(sentence[m.end() : m.end() + 16])
+        and 0 < float(m.group(1).replace(",", ".")) < _FULL_TIME_WEEKLY_HOURS
         for m in _REDUCED_HOURS.finditer(sentence)
     )
 
@@ -1416,8 +1417,9 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
 
 # "Arbeitszeit: 20 Stunden pro Woche mit Option auf Vollzeit": stated hours below full time are
 # the vacancy's current part time even without the word "Teilzeit".
+_FULL_TIME_WEEKLY_HOURS = 35.0  # below this a stated weekly figure is reduced hours
 _REDUCED_HOURS = re.compile(
-    r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d)?\s*(?:wochenstunden|stunden|std\.?|hours?|hrs|h\b)",
+    r"\b(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:wochenstunden|stunden|std\.?|hours?|hrs|h\b)",
     re.IGNORECASE,
 )
 
