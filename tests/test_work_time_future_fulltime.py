@@ -69,6 +69,9 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Full-time, however, only after onboarding.",
         "Teilzeit zum Einstieg. Vollzeit nach sechs Monaten möglich.",
         "Teilzeit. Full-time after 6 months possible.",
+        "20 h/Woche zum Einstieg. Vollzeit, nach der Probezeit möglich.",
+        "20 h/Woche zum Einstieg, Vollzeit nach 6-monatiger Probezeit möglich.",
+        "20 h/Woche mit Perspektive auf Vollzeit.",
     ],
 )
 def test_a_deferred_full_time_is_never_confirmed(text):

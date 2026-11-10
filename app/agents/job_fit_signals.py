@@ -1246,14 +1246,14 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
 _FUTURE_MARKER = re.compile(
     r"\bsp(?:ä|ae)ter\w*|\bdanach\b|\bperspektivisch\w*|\beventuell\b|\beventually\b|\blater\b"
     r"|\bin\s+(?:the\s+)?future\b|\berst\b|\bonly\s+after\b|\bonce\b"
-    r"|\bnach\s+(?:\w+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
-    r"|\bafter\s+(?:\w+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
+    r"|\bnach\s+(?:[\w-]+\s+){0,3}?(?:einarbeitung\w*|probe\w*|monat\w*|woche\w*|jahr\w*)"
+    r"|\bafter\s+(?:[\w-]+\s+){0,3}?(?:onboarding|probation\w*|training|months?|weeks?|years?)"
     r"|\b(?:ab|from)\s+(?:\w+\s+){0,2}?(?:\d{1,2}\.){0,2}20(?:2[7-9]|[3-9]\d)\b",
     re.IGNORECASE,
 )
 # "Option auf Vollzeit", "Übergang in eine unbefristete Vollzeitstelle", "Aufstockung auf Vollzeit"
 _FUTURE_LEAD = re.compile(
-    r"\b(?:option|m(?:ö|oe)glichkeit|chance|opportunit(?:y|ies)|(?:ü|ue)bergang"
+    r"\b(?:option|m(?:ö|oe)glichkeit|chance|perspektive|opportunit(?:y|ies)|(?:ü|ue)bergang"
     r"|wechsel|aufstockung|transition|move|conversion)\w*\b",
     re.IGNORECASE,
 )
@@ -1263,7 +1263,8 @@ _ORDINAL_DAY = re.compile(r"\b(\d{1,2})\.(?=\s+[^\W\d]+\s+20\d\d)")
 _CLAUSE_END = re.compile(r"[,;\n]|(?<!\d)\.|\.(?!\d)")
 # "Full-time, but only after onboarding": a contrastive continuation belongs to the same clause.
 _CONTRAST_START = re.compile(
-    r"^[,;]?\s*(?:aber|jedoch|allerdings|doch|wobei|but|however|though|yet|while)\b", re.IGNORECASE
+    r"^[,;]?\s*(?:aber|jedoch|allerdings|doch|wobei|but|however|though|yet|while|nach|after|erst|only|danach|then|sp(?:ä|ae)ter)\b",
+    re.IGNORECASE,
 )
 _FULL_TIME_OPTION_WORD = re.compile(
     r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
