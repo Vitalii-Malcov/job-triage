@@ -1367,6 +1367,16 @@ _RECRUITING = re.compile(
 )
 
 
+def _staff_noun_sentence(text: str, match: re.Match[str]) -> bool:
+    """The sentence speaks about existing staff by a noun ("Unsere Kollegen arbeiten ..."), not
+    about the applicant ("Sie arbeiten ...") and not in recruiting wording ("Join our team")."""
+    sentence = _sentence_of(text, match)
+    subject = _STAFF_SUBJECT.search(sentence)
+    if subject is None or _RECRUITING.search(sentence):
+        return False
+    return not re.match(r"(?:wir|sie|we|they)\b", subject.group(0), re.IGNORECASE)
+
+
 def _deferred_full_time_with_current_part_time(text: str) -> bool:
     """A future full-time remark next to a current part-time statement of the vacancy: the
     part-time statement wins, whichever other full-time words (staff, general) the text has.
@@ -1384,9 +1394,7 @@ def _deferred_full_time_with_current_part_time(text: str) -> bool:
             return True
         if _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()]):
             continue  # the "Teilzeit" of a "Vollzeit oder Teilzeit" phrase
-        if _sentence_has_staff_subject(text, match) and not _RECRUITING.search(
-            _sentence_of(text, match)
-        ):
+        if _staff_noun_sentence(text, match):
             continue  # "Unsere Kollegen arbeiten in Teilzeit": not this vacancy
         if not _part_time_is_an_offer(text, match) and not _negated(text, match):
             return True
