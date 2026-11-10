@@ -1,0 +1,134 @@
+"""Stage 59: a FUTURE full-time possibility is not evidence of today's full time.
+
+"Teilzeit, später Vollzeit möglich" is a part-time vacancy. Only a CURRENT full-time statement may
+open the automatic gate (AUTO_PREPARE needs confirmed FULL_TIME + duplicate CLEAR).
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+from app.agents.job_fit_signals import classify_work_time
+from app.services.job_fit_assessment import work_time_criterion
+from app.services.shortlist_gate import automatic_block_reason
+from tests.test_remote_work_eligibility import _assessment, _status
+
+
+def mode(text: str) -> str:
+    return classify_work_time(text).mode
+
+
+def _row(flag):
+    return SimpleNamespace(full_time_offered=flag)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Teilzeit, später Vollzeit möglich",
+        "Teilzeit mit späterer Vollzeitoption",
+        "Teilzeit, Vollzeit nach Einarbeitung möglich",
+        "Zunächst Teilzeit, später Vollzeit",
+        "Part-time initially, full-time possible later",
+        "Part-time role with full-time opportunity",
+        "Aktuell Teilzeit, später Vollzeit",
+        "Nur Teilzeit, Vollzeit später möglich",
+        "Anfangs Teilzeit, danach Vollzeit",
+        "Part-time now, full-time in the future",
+        "Stelle: Teilzeit 20h. Später Vollzeit möglich.",
+        "Teilzeit (30h), Aufstockung auf Vollzeit möglich",
+        "Vollzeit ab 2027, aktuell Teilzeit",
+    ],
+)
+def test_current_part_time_with_a_later_full_time_is_part_time(text):
+    assert mode(text) == "PART_TIME"
+
+
+@pytest.mark.parametrize("text", ["Vollzeit perspektivisch möglich", "Full-time later"])
+def test_a_future_full_time_alone_is_unknown_not_full_time(text):
+    assert mode(text) == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Vollzeit",
+        "Vollzeit oder Teilzeit",
+        "Vollzeit (40h) oder Teilzeit (30h)",
+        "Vollzeit, Teilzeit auf Wunsch möglich",
+        "Vollzeit, später Teilzeit möglich",
+        "Aktuell Vollzeit, Teilzeit nach Absprache möglich",
+        "Zunächst Vollzeit",
+        "Wir suchen Dich in Voll- oder Teilzeit.",
+        "We offer full- or part-time work.",
+        "Einstellung in Vollzeit. Nach der Einarbeitung ist Homeoffice möglich.",
+    ],
+)
+def test_a_current_full_time_is_not_lost(text):
+    assert mode(text) == "FULL_TIME"
+
+
+@pytest.mark.parametrize(
+    "text", ["Teilzeitmöglichkeiten", "Part-time options available", "Gleitzeit, Teilzeitmodell"]
+)
+def test_a_listed_part_time_option_stays_unknown(text):
+    assert mode(text) == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Unsere Mitarbeiter arbeiten Voll- und Teilzeit", "Our employees work full- and part-time."],
+)
+def test_other_employees_hours_are_not_this_vacancy(text):
+    assert mode(text) == "UNKNOWN"
+
+
+def test_a_staff_sentence_does_not_hide_the_vacancys_own_part_time():
+    text = "Wir arbeiten in Voll- und Teilzeit. Die ausgeschriebene Stelle ist in Teilzeit."
+    assert mode(text) == "PART_TIME"
+
+
+def test_ba_flag_true_against_part_time_with_future_full_time_is_a_conflict():
+    text = "Teilzeit, später Vollzeit möglich"
+    assert work_time_criterion(text, _row(True)).status == "CONFLICT"
+    assert work_time_criterion(text, _row(None)).status == "PART_TIME"
+    assert work_time_criterion(text, _row(False)).status == "PART_TIME"
+
+
+def test_ba_flag_decides_only_where_the_text_names_no_current_hours():
+    text = "Vollzeit perspektivisch möglich"
+    assert work_time_criterion(text, _row(True)).status == "FULL_TIME"  # structured flag
+    assert work_time_criterion(text, _row(False)).status == "PART_TIME"
+    assert work_time_criterion(text, _row(None)).status == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "hours,tier_blocked",
+    [
+        ("Teilzeit, später Vollzeit möglich", True),
+        ("Vollzeit perspektivisch möglich", True),
+        ("Vollzeit", False),
+    ],
+)
+def test_a_future_full_time_never_opens_the_automatic_gate(hours, tier_blocked):
+    a = _assessment("100% Remote. " + hours)
+    reason = automatic_block_reason(a)
+    if tier_blocked:
+        assert _status(a, "work_time") in {"PART_TIME", "UNKNOWN"}
+        assert reason is not None
+    else:
+        assert _status(a, "work_time") == "FULL_TIME"
+
+
+def test_a_conflict_blocks_automatic_preparation():
+    a = _assessment("100% Remote. Teilzeit, später Vollzeit möglich")
+    assert automatic_block_reason(a) is not None
+
+
+def test_hostile_repetition_stays_bounded():
+    import time
+
+    start = time.perf_counter()
+    result = classify_work_time("Teilzeit, später Vollzeit. " * 5000)
+    assert time.perf_counter() - start < 2.0
+    assert result.mode != "FULL_TIME"

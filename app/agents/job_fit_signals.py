@@ -1152,10 +1152,7 @@ class WorkTimeSignal:
     evidence: str | None = None
 
 
-def _is_staff_statement(text: str, match: re.Match[str]) -> bool:
-    """A combined "Voll-/Teilzeit" match whose own sentence has a staff subject."""
-    if not _COMBINED_FULL_PART.match(match.group(0)):
-        return False
+def _sentence_has_staff_subject(text: str, match: re.Match[str]) -> bool:
     lo, hi = max(0, match.start() - 100), match.end() + 60
     window = text[lo:hi]
     rel, rel_end = match.start() - lo, match.end() - lo
@@ -1163,6 +1160,13 @@ def _is_staff_statement(text: str, match: re.Match[str]) -> bool:
     stop = _SENTENCE_BREAK.search(window, rel_end)
     sentence = window[(starts[-1] if starts else 0) : stop.start() if stop else len(window)]
     return bool(_STAFF_SUBJECT.search(sentence))
+
+
+def _is_staff_statement(text: str, match: re.Match[str]) -> bool:
+    """A combined "Voll-/Teilzeit" match whose own sentence has a staff subject."""
+    return bool(_COMBINED_FULL_PART.match(match.group(0))) and _sentence_has_staff_subject(
+        text, match
+    )
 
 
 _COMBINED_TAIL = re.compile(
@@ -1191,6 +1195,14 @@ _THIS_POSITION = re.compile(
 )
 
 
+# "Vollzeit ab 2027, aktuell Teilzeit": today's terms are part time.
+_PRESENT_BEFORE = re.compile(
+    r"\b(?:aktuell|derzeit|momentan|zun(?:ä|ae)chst|anfangs|vorerst|currently|initially"
+    r"|at\s+first|for\s+now)\W{0,3}$",
+    re.IGNORECASE,
+)
+
+
 def _vacancy_defining(text: str, match: re.Match[str]) -> bool:
     """A part-time mention that says what THIS vacancy is: a labelled field, "Teilzeitstelle",
     stated hours, or "This position is part-time". A list item ("Vollzeit, Teilzeit und mobiles
@@ -1201,6 +1213,7 @@ def _vacancy_defining(text: str, match: re.Match[str]) -> bool:
         or _PART_TIME_JOB_WORD.fullmatch(match.group(0))
         or _own_hours_nearby(text, match)
         or _THIS_POSITION.search(before)
+        or _PRESENT_BEFORE.search(before)
     )
 
 
@@ -1224,6 +1237,44 @@ def _own_part_time_elsewhere(text: str, span: tuple[int, int], *, combined: bool
     return False
 
 
+# A full-time mention that is a FUTURE possibility, not the current terms of the vacancy:
+# "Teilzeit, später Vollzeit möglich", "Vollzeit nach Einarbeitung", "part-time, full-time later".
+# Only forward-looking markers: "aktuell/zunächst/currently" describe the present and do not defer.
+_FUTURE_MARKER = (
+    r"sp(?:ä|ae)t\w*|danach|perspektivisch\w*|eventuell|eventually|later|in\s+(?:the\s+)?future"
+    r"|nach\s+(?:der\s+)?einarbeitung|after\s+(?:the\s+)?(?:onboarding|probation)"
+)
+_CLAUSE_END = re.compile(r"[,.;:\n]")
+_FUTURE_BEFORE = re.compile(r"\b(?:" + _FUTURE_MARKER + r")\W{0,3}$", re.IGNORECASE)
+_FUTURE_AFTER = re.compile(r"^\W{0,3}(?:\w+\s+){0,2}?(?:" + _FUTURE_MARKER + r")\b", re.IGNORECASE)
+_FULL_TIME_OPTION_WORD = re.compile(
+    r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
+    re.IGNORECASE,
+)
+
+
+def _staff_part_time(text: str, match: re.Match[str]) -> bool:
+    """The "Teilzeit" of a "Voll- und Teilzeit" phrase in a sentence with a staff subject."""
+    return bool(
+        _COMBINED_LEAD.search(text[max(0, match.start() - 50) : match.start()])
+    ) and _sentence_has_staff_subject(text, match)
+
+
+def _full_time_deferred(text: str, match: re.Match[str]) -> bool:
+    """True when the full-time mention is tied, inside its own clause, to a time marker or to
+    "option/opportunity" wording. Only a CURRENT full-time statement may open the automatic gate:
+    a future possibility is not evidence of today's terms (the candidate cannot be hired full time
+    on a promise). Bounded: only the clause (no comma/period) around the match is looked at."""
+    lo = max(0, match.start() - 40)
+    before = re.split(_CLAUSE_END, text[lo : match.start()])[-1]
+    after = re.split(_CLAUSE_END, text[match.end() : match.end() + 60], maxsplit=1)[0]
+    return bool(
+        _FUTURE_BEFORE.search(before)
+        or _FUTURE_AFTER.match(after)
+        or _FULL_TIME_OPTION_WORD.match(text[match.start() : match.start() + 40])
+    )
+
+
 def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
     """(first non-negated match, budget exhausted). Hostile pages that repeat a negated phrase
     thousands of times must not cost quadratic time: after `_MAX_NEGATION_CHECKS` the caller is
@@ -1236,13 +1287,23 @@ def _affirmed_bounded(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str
     return None, False
 
 
+def _current_full_time(text: str) -> tuple[re.Match[str] | None, bool]:
+    """First non-negated, non-deferred full-time match (and whether the budget ran out)."""
+    for checked, match in enumerate(_FULL_TIME.finditer(text)):
+        if checked >= _MAX_NEGATION_CHECKS:
+            return None, True
+        if not _negated(text, match) and not _full_time_deferred(text, match):
+            return match, False
+    return None, False
+
+
 def classify_work_time(text: str) -> WorkTimeSignal:
     """What the posting states about working hours. "Vollzeit oder Teilzeit" counts as
     full time (it is offered); only a part-time posting is PART_TIME. A listed option
     ("Teilzeitmöglichkeiten") and a missing statement are UNKNOWN. Unsafe direction first: when the
     work is too large to decide (hostile repetition) the answer is the one that keeps a human in
     the loop (PART_TIME), never FULL_TIME or UNKNOWN."""
-    full, over_full = _affirmed_bounded(_FULL_TIME, text)
+    full, over_full = _current_full_time(text)
     if full and _is_staff_statement(text, full):
         full = None  # "Our employees work full- and part-time": about the staff, not the job
     span = _combined_span(text, full) if full else None
@@ -1272,6 +1333,8 @@ def classify_work_time(text: str) -> WorkTimeSignal:
     for match in _PART_TIME.finditer(text):
         if _part_time_is_an_offer(text, match):
             continue
+        if _staff_part_time(text, match):
+            continue  # "Unsere Mitarbeiter arbeiten Voll- und Teilzeit": the staff, not this job
         checked += 1
         if checked > _MAX_NEGATION_CHECKS:
             return WorkTimeSignal("PART_TIME", _snippet(text, match))
