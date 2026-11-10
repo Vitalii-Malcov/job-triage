@@ -1292,8 +1292,18 @@ _QUALIFIES_PART_TIME = re.compile(
     r"(?:teilzeit|part[\s-]?time)",
     re.IGNORECASE,
 )
+_OPTION_NOUN = (
+    r"(?:option\w*|optional|perspektive|chance|aufstock|(?:ü|ue)bergang|opportunit\w*"
+    r"|m(?:ö|oe)glichkeit\w*)"
+)
+# "Vollzeitoption", "Vollzeit-Perspektive",
+# postposed "Vollzeit ist eine Option", "Vollzeit als Option"
 _FULL_TIME_OPTION_WORD = re.compile(
-    r"\b(?:vollzeit|full[\s-]?time)\W{0,3}(?:option|perspektive|chance|aufstock|(?:ü|ue)bergang|opportunit\w*|m(?:ö|oe)glichkeit\w*)",
+    r"\b(?:vollzeit|full[\s-]?time)(?:\W{0,3}"
+    + _OPTION_NOUN
+    + r"|\W+(?:(?:ist|sind|is|are|als|as|eine?|an?|auch|also|ggf|possibly)\W+){1,3}"
+    + _OPTION_NOUN
+    + r")",
     re.IGNORECASE,
 )
 _CLAUSE_WINDOW = 250

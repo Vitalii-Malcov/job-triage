@@ -104,6 +104,8 @@ def test_current_part_time_with_a_later_full_time_is_part_time(text):
         "Einstieg mit 20 Wochenstunden; Vollzeit ab dem 2. oder 3. Monat möglich.",
         "Einstieg mit 20 Wochenstunden, Vollzeit ab 3. Monat möglich.",
         "Einstieg mit 20 Wochenstunden, Vollzeit ab Monat 3 möglich.",
+        "Arbeitszeit: 20 Stunden pro Woche, Vollzeit ist eine Option.",
+        "Teilzeit, Vollzeit als Option.",
         "Vollzeit mit Gehaltserhöhung nach der Probezeit.",  # unclear scope: held, never FULL_TIME
     ],
 )
