@@ -58,11 +58,28 @@ _KEY_VALUE = re.compile(
 _REDUCED_HOURS = re.compile(
     r"\b(?:[1-9]|[12]\d|3[0-4])(?:[.,]\d+)?\s*(?:-\s*(?:\d{1,2}\s*)?)?"
     r"(?:wochen\s*stunden|stunden|std\b\.?|h\b|hours?)"
-    r"|(?<![\d.,])(?:[1-9]\d?)(?:[.,]\d+)?\s*%[\s-]*(?:stelle|besch|teilzeit|arbeit)"
-    r"|besch(?:ä|ae)ftigungsgrad\W{0,6}[1-9]\d?(?:[.,]\d+)?\s*%"
     r"|\b(?:halbtag|minijob|midijob|werkstudent|geringf(?:ü|ue)gig)",
     re.IGNORECASE,
 )
+# A share of working time ("50 %-Stelle", "0,5 %-Stelle", "Beschaeftigungsgrad: 60,5 %"): any value
+# other than exactly 100 is reduced. Parsed numerically, so no decimal/zero shape can slip past.
+_SHARE = re.compile(
+    r"(?<![\d.,])(\d{1,3}(?:[.,]\d+)?)\s*%(?P<after>[\s-]*(?:stelle|besch|teilzeit|arbeit))?"
+    r"|besch(?:ä|ae)ftigungsgrad\W{0,6}(?P<grad>\d{1,3}(?:[.,]\d+)?)\s*%",
+    re.IGNORECASE,
+)
+
+
+def _reduced_share(text: str) -> bool:
+    for m in _SHARE.finditer(text):
+        raw = m.group(1) or m.group("grad")
+        if not raw or not (m.group("after") or m.group("grad")):
+            continue
+        if float(raw.replace(",", ".")) != 100.0:
+            return True
+    return False
+
+
 _VOLLZEIT_WORD = re.compile(r"\bvoll[\s-]?zeit|\bfull[\s-]?time|\bvoll-\s*(?:/|oder|und|&)", re.I)
 
 
@@ -111,7 +128,7 @@ def work_time_evidence(
 
     # any working-time field line anywhere must be a plain Vollzeit/Teilzeit value, but only the
     # description's leading metadata block can CONFIRM
-    if _REDUCED_HOURS.search(text):
+    if _REDUCED_HOURS.search(text) or _reduced_share(text):
         return _not("the text states reduced weekly hours or a reduced job form")
     fields = [m.group(0) for m in _ANY_FIELD.finditer(text)]
     all_good = [m for m in _FIELD.finditer(text)]

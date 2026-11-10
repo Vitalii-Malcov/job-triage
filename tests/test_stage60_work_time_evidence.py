@@ -150,3 +150,17 @@ def test_decimal_employment_percentages_block_both_confirmation_paths(pct):
     text = f"Arbeitszeit: Vollzeit\n\nBeschäftigungsgrad: {pct}"
     assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
     assert not work_time_evidence(text, None, None, text).current_full_time_confirmed
+
+
+@pytest.mark.parametrize(
+    "tail", ["Beschäftigungsgrad: 0,5 %", "Umfang: 0.5%-Stelle", "0 %-Stelle", "100,5 %-Stelle"]
+)
+def test_any_share_other_than_100_percent_blocks(tail):
+    text = f"Arbeitszeit: Vollzeit\n\n{tail}"
+    assert not work_time_evidence(text, BA, True, text).current_full_time_confirmed
+    assert not work_time_evidence(text, None, None, text).current_full_time_confirmed
+
+
+def test_100_percent_remote_does_not_block():
+    text = "100% Remote. 100 %-Stelle. Beschäftigungsgrad: 100 %"
+    assert work_time_evidence(text, BA, True, text).current_full_time_confirmed
