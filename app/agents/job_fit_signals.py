@@ -1271,7 +1271,7 @@ def _full_time_deferred(text: str, match: re.Match[str], *, soft: bool = False) 
     "Teilzeit, Vollzeit ...") is ambiguous -- "Option auf 4 oder 5 Tage Vollzeit" offers full time
     today -- so it counts only with `soft=True`, i.e. next to a current part-time statement.
     Only a CURRENT full-time statement may open the automatic gate: a future possibility is not
-    evidence of today's terms. Bounded: only the clause (at most `_CLAUSE_WINDOW` characters a side)."""
+    evidence of today's terms. Bounded: only the clause, `_CLAUSE_WINDOW` characters a side."""
     before = re.split(_CLAUSE_END, text[max(0, match.start() - _CLAUSE_WINDOW) : match.start()])[-1]
     after = re.split(_CLAUSE_END, text[match.end() : match.end() + _CLAUSE_WINDOW], maxsplit=1)[0]
     clause = before + match.group(0) + after
