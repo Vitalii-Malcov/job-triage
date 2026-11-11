@@ -218,3 +218,35 @@ def test_stage62_internship_posting_never_opens_the_gate():
     )
     assert automatic_block_reason(with_type("Masterarbeit Python", "UNKNOWN"))
     assert automatic_block_reason(with_type("Ausbildung Fachinformatiker", "APPRENTICESHIP"))
+
+
+@pytest.mark.parametrize(
+    "title,blocked",
+    [
+        ("Praktikum Python Developer", True),
+        ("Python Internship", True),
+        ("Intern Software Engineer", True),
+        ("Software Engineer (Intern)", True),
+        ("Werkstudent Python", True),
+        ("Working Student Backend", True),
+        ("Ausbildung Fachinformatiker", True),
+        ("Masterthesis Machine Learning", True),
+        ("Abschlussarbeit Python", True),
+        ("International Python Developer", False),
+        ("Interne Automatisierung Python", False),
+        ("Internet-Filiale Entwickler", False),
+        ("Softwareentwickler interne Systeme", False),
+        ("Interne Revision (m/w/d)", False),
+        ("(Interner) Softwareentwickler", False),
+        ("Trainee Python Developer", False),
+        ("Ausbilder Fachinformatik", False),
+        ("Synthesis Engineer", False),
+        ("Praktiker Elektrotechnik", False),
+        ("Junior Python Entwickler", False),
+        (None, False),
+    ],
+)
+def test_stage64_internship_title_is_word_aware(title, blocked):
+    from app.services.shortlist_gate import is_non_employment_title
+
+    assert is_non_employment_title(title) is blocked

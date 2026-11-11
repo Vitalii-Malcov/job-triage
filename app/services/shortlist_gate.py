@@ -157,11 +157,23 @@ BLOCK_FULL_TIME_NOT_CONFIRMED = "FULL_TIME_NOT_CONFIRMED"
 BLOCK_NOT_EMPLOYMENT_POSTING = "NOT_EMPLOYMENT_POSTING"
 # BA types both internships and trainee programmes as PRAKTIKUM_TRAINEE; a trainee programme is a
 # valid target (see the fit tier), an internship / student job / thesis is not.
+# Stage 64: word-aware. The Stage 62 pattern `intern(ship)?` also matched "Interne Revision",
+# "interne Systeme", "Internet-Filiale" and "International" (19 of 227 matches on a production
+# copy were false positives). `intern` / `internship` now only match as whole words.
 _INTERNSHIP_TITLE = re.compile(
-    r"praktik|intern(ship)?|werkstudent|working student|abschlussarbeit|bachelorarbeit|masterarbeit"
-    r"|thesis",
+    r"praktik(?:um|ant)"
+    r"|\b(?:intern|internship|internships)\b"
+    r"|werkstudent|working student"
+    r"|abschlussarbeit|bachelorarbeit|masterarbeit|diplomarbeit"
+    r"|\b(?:master|bachelor)?thesis\b"
+    r"|\b(?:ausbildung|azubi|auszubildende[rn]?)\b|duales studium",
     re.IGNORECASE,
 )
+
+
+def is_non_employment_title(title: str | None) -> bool:
+    """True for titles that name an internship, student job, thesis or apprenticeship."""
+    return bool(_INTERNSHIP_TITLE.search(title or ""))
 
 
 def work_time_evidence_confirmed(assessment: FitAssessment) -> bool:
