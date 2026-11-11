@@ -44,8 +44,11 @@ with `API_KEY`. The session cookie is `Secure`; Chrome/Edge accept it on `http:/
 .\.venv\Scripts\python.exe scripts\stage21_assess_vacancies.py --database runtime\job_triage_runtime.db --apply --snapshot E:\JobTriage-Backups
 ```
 
-Exit codes of (b): 0 done, 1 incomplete (re-run, idempotent), 2 refused, 3 a protected table
-changed (restore the printed snapshot). `applications` / `application_events` are digest-checked
+Exit codes of (b): 0 done, 1 incomplete (re-run, idempotent), 2 refused, 3 ALERT: read the
+printed line. "lease was lost ... partial write" = the written rows are valid, re-run (b) to add the
+rest (Stage 63 rehearsal: 83 created, re-run created 196, `APPLIED`); "protected tables changed" or
+a failed post-write check = stop and restore the printed snapshot. See
+`STAGE63_DAILY_DISCOVERY_MANUAL_MODE.md`. `applications` / `application_events` are digest-checked
 unchanged. No Telegram, mail or auto-prepare is touched.
 
 ## 4. Check the result
