@@ -42,6 +42,8 @@ def test_fields_are_exactly_the_allowlist():
         "trusted_proxy_count",
         "shared_state_backend",
         "api_key_strength",  # SEC-02: class only (unset/placeholder/weak/strong)
+        "telegram_token_configured",  # Stage 64: presence only, never the value
+        "telegram_chat_configured",
     }
     assert fields["database_dialect"] == "postgresql"
     assert fields["trusted_proxy_count"] == "1"
@@ -112,3 +114,16 @@ def test_scheduler_startup_emits_the_safety_line(monkeypatch, capsys):
     (line,) = _safety_lines(capsys.readouterr().err)
     assert line.startswith("startup_safety_state process=scheduler ")
     assert "telegram_gmail_draft_enabled=false" in line
+
+
+def test_stage64_telegram_presence_is_a_boolean_not_the_value(caplog):
+    configured = startup_safety_fields(_settings())
+    assert configured["telegram_token_configured"] == "true"
+    assert configured["telegram_chat_configured"] == "true"
+    blank = startup_safety_fields(Settings(_env_file=None))
+    assert blank["telegram_token_configured"] == "false"
+    assert blank["telegram_chat_configured"] == "false"
+    caplog.set_level(logging.INFO, logger="app.core.startup_diagnostics")
+    log_startup_safety_state(_settings(), process="web")
+    assert SENTINELS["telegram_bot_token"] not in caplog.text
+    assert SENTINELS["telegram_chat_id"] not in caplog.text
