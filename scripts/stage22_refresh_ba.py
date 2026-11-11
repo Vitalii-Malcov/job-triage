@@ -47,6 +47,7 @@ import os
 import smtplib
 import sqlite3
 import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -441,6 +442,12 @@ def print_report(summary: dict, as_json: bool) -> None:
 # --- apply ------------------------------------------------------------------------------
 
 
+# Stage 64: writers commit one transaction after another; SQLite's busy handler polls with sleeps
+# and can be starved for its whole 5 s timeout by back-to-back commits, so the lease heartbeat's
+# renewal never gets the write lock (reproduced). A short idle gap after every commit lets it in.
+WRITER_YIELD_SECONDS = 0.05
+
+
 def write_updates(engine, updates, *, is_lease_lost=None) -> tuple[int, int]:
     """Batches of BATCH_SIZE, one BEGIN IMMEDIATE transaction each. Returns
     (rows changed, rows left by conflicts). Stops between batches when the
@@ -459,6 +466,7 @@ def write_updates(engine, updates, *, is_lease_lost=None) -> tuple[int, int]:
                 try:
                     with factory() as session, session.begin():
                         written += apply_updates(session, batch)
+                    time.sleep(WRITER_YIELD_SECONDS)
                     break
                 except OperationalError as exc:
                     if not _retryable(exc):
@@ -521,6 +529,7 @@ async def create_jobs(engine, creates, detail_collector, *, is_lease_lost=None) 
                 except Exception:  # noqa: BLE001 -- one vacancy must not stop the others
                     session.rollback()
                     counts["failed"] += 1
+            await asyncio.sleep(WRITER_YIELD_SECONDS)
     finally:
         writer.dispose()
     return counts

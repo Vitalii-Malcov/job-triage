@@ -218,3 +218,69 @@ def test_stage62_internship_posting_never_opens_the_gate():
     )
     assert automatic_block_reason(with_type("Masterarbeit Python", "UNKNOWN"))
     assert automatic_block_reason(with_type("Ausbildung Fachinformatiker", "APPRENTICESHIP"))
+
+
+@pytest.mark.parametrize(
+    "title,blocked",
+    [
+        ("Praktikum Python Developer", True),
+        ("Praktika Softwareentwicklung", True),
+        ("Pflichtpraktikum Informatik", True),
+        ("Python Internship", True),
+        ("Intern Software Engineer", True),
+        ("Software Engineer (Intern)", True),
+        ("Werkstudent Python", True),
+        ("Working Student Backend", True),
+        ("Ausbildung Fachinformatiker", True),
+        ("Masterthesis Machine Learning", True),
+        ("Abschlussarbeit Python", True),
+        ("International Python Developer", False),
+        ("Interne Automatisierung Python", False),
+        ("Internet-Filiale Entwickler", False),
+        ("Softwareentwickler interne Systeme", False),
+        ("Interne Revision (m/w/d)", False),
+        ("(Interner) Softwareentwickler", False),
+        ("Trainee Python Developer", False),
+        ("Ausbilder Fachinformatik", False),
+        ("Softwareentwickler mit abgeschlossener Ausbildung", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
+        ("Python Entwickler (m/w/d) nach Ausbildung oder Studium", False),
+        ("Trainee Softwareentwicklung nach erfolgreicher Ausbildung", False),
+        ("Quereinsteiger ohne Ausbildung Python", False),
+        ("Ausbildung 2027 Fachinformatiker", True),
+        ("Starte mit Ausbildung 2027 zum Fachinformatiker", True),
+        ("Mit Ausbildung zur Fachinformatikerin starten", True),
+        ("AUSBILDUNG zum Fachinformatiker (m/w/d)", True),
+        ("Synthesis Engineer", False),
+        ("Praktiker Elektrotechnik", False),
+        ("Junior Python Entwickler", False),
+        (None, False),
+    ],
+)
+def test_stage64_internship_title_is_word_aware(title, blocked):
+    from app.services.shortlist_gate import is_non_employment_title
+
+    assert is_non_employment_title(title) is blocked
+
+
+@pytest.mark.parametrize(
+    "title,blocked",
+    [
+        ("Starte mit Ausbildung 2027 zum Fachinformatiker", True),
+        ("Praktika Softwareentwicklung", True),
+        ("Softwareentwickler mit abgeschlossener Ausbildung", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
+        ("International Python Developer", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
+    ],
+)
+def test_stage64_gate_applies_the_word_aware_title_rule(title, blocked):
+    from app.services.job_fit_assessment import Criterion
+    from app.services.shortlist_gate import BLOCK_NOT_EMPLOYMENT_POSTING
+
+    a = _gate_assessment("100% Remote.", _job(True))
+    a.title = title
+    a.criteria = [c for c in a.criteria if c.name != "posting_type"]
+    a.criteria.append(Criterion("posting_type", "UNKNOWN", "x", None))  # source says nothing
+    expected = BLOCK_NOT_EMPLOYMENT_POSTING if blocked else None
+    assert automatic_block_reason(a) == expected

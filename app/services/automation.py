@@ -86,6 +86,7 @@ results; see that module's own docstring for the full policy.
 
 import logging
 import threading
+import time
 from functools import partial
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -412,6 +413,21 @@ def _build_error_summary(step_results: dict[str, dict]) -> str | None:
     return "; ".join(parts) if parts else None
 
 
+_SQLITE_BUSY = 5
+_SQLITE_LOCKED = 6
+
+
+def sqlite_error_code(exc: BaseException) -> int | None:
+    """The primary SQLite result code of a DBAPI error (None for other databases)."""
+    code = getattr(getattr(exc, "orig", None), "sqlite_errorcode", None)
+    return None if code is None else code & 0xFF
+
+
+def is_transient_lock_error(exc: BaseException) -> bool:
+    """True for SQLITE_BUSY / SQLITE_LOCKED ("database is locked"): contention, retryable."""
+    return sqlite_error_code(exc) in (_SQLITE_BUSY, _SQLITE_LOCKED)
+
+
 class _RunLeaseHeartbeat:
     """periodically renews an
     `AutomationRunRecord`'s lease on `holder`'s behalf for as long as
@@ -464,18 +480,39 @@ class _RunLeaseHeartbeat:
 
     def _run(self) -> None:
         session = self._session_factory()
+        # Stage 64: a single SQLITE_BUSY / SQLITE_LOCKED is a contention symptom, not proof that
+        # ownership was lost: a writer committing back-to-back transactions (the BA create loop)
+        # can starve this renewal past SQLite's 5 s busy timeout (reproduced in Stage 64). It is
+        # retried only while the lease, by our own last successful renewal, has not lapsed; once
+        # `ttl` has passed without a renewal the lease IS lost. Every other error, and a renewal
+        # the database refuses (expired or taken over), still ends the run at once.
+        last_ok = time.monotonic()
+        wait = self._interval_seconds
         try:
-            while not self._stop_event.wait(self._interval_seconds):
+            while not self._stop_event.wait(wait):
+                attempt_started = time.monotonic()
                 try:
                     renewed = renew_run_lease(
                         session, self._run_id, holder=self._holder, ttl_seconds=self._ttl_seconds
                     )
                 except Exception as exc:
                     session.rollback()
+                    if is_transient_lock_error(exc) and (
+                        time.monotonic() - last_ok < self._ttl_seconds
+                    ):
+                        logger.warning(
+                            "automation_run_lease_heartbeat_renewal_busy run_id=%s sqlite_code=%s",
+                            self._run_id,
+                            sqlite_error_code(exc),
+                        )
+                        wait = min(self._interval_seconds, 1.0)
+                        continue
                     logger.warning(
-                        "automation_run_lease_heartbeat_renewal_error run_id=%s error_type=%s",
+                        "automation_run_lease_heartbeat_renewal_error run_id=%s error_type=%s"
+                        " sqlite_code=%s",
                         self._run_id,
                         type(exc).__name__,
+                        sqlite_error_code(exc),
                     )
                     self.lease_lost.set()
                     return
@@ -486,6 +523,18 @@ class _RunLeaseHeartbeat:
                     )
                     self.lease_lost.set()
                     return
+                if time.monotonic() - last_ok >= self._ttl_seconds:
+                    # The renewal blocked on a lock past the lease's expiry: `renew_run_lease`
+                    # compares with the clock from BEFORE it waited, so it can succeed on a lease
+                    # that lapsed meanwhile. Expiry is a lost lease, not a revived one.
+                    logger.warning(
+                        "automation_run_lease_heartbeat_renewed_after_expiry run_id=%s",
+                        self._run_id,
+                    )
+                    self.lease_lost.set()
+                    return
+                last_ok = attempt_started
+                wait = self._interval_seconds
         finally:
             session.close()
 

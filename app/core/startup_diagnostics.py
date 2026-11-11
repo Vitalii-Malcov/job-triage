@@ -48,6 +48,11 @@ def startup_safety_fields(settings) -> dict[str, str]:
     fields["shared_state_backend"] = str(settings.shared_state_backend)
     # Strength class only ('unset' | 'placeholder' | 'weak' | 'strong'), never the value.
     fields["api_key_strength"] = secret_strength(reveal(settings.api_key))
+    # Stage 64: presence only (never the values). The legacy Telegram control-center bot starts
+    # and the job alert can send whenever BOTH exist, independent of every flag above; the
+    # operator launcher (`scripts/run_operator_ui.py`) blanks the token for its process.
+    fields["telegram_token_configured"] = str(bool(reveal(settings.telegram_bot_token))).lower()
+    fields["telegram_chat_configured"] = str(bool(settings.telegram_chat_id)).lower()
     return fields
 
 
