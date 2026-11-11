@@ -162,8 +162,14 @@ class TestGates:
             def add_error_handler(self, handler):
                 pass
 
+        seen_defaults = []
+
         class FakeBuilder:
             def token(self, value):
+                return self
+
+            def defaults(self, value):
+                seen_defaults.append(value)
                 return self
 
             def build(self):
@@ -177,6 +183,9 @@ class TestGates:
             if getattr(handler, "callback", None) is bot.on_gmail_draft_callback
         ]
         assert patterns == ["^bm:"]
+        # SEC-04: link previews are disabled application-wide.
+        assert len(seen_defaults) == 1
+        assert seen_defaults[0].link_preview_options.is_disabled is True
 
 
 class TestApprovalOffer:
