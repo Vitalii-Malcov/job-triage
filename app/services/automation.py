@@ -523,6 +523,16 @@ class _RunLeaseHeartbeat:
                     )
                     self.lease_lost.set()
                     return
+                if time.monotonic() - last_ok >= self._ttl_seconds:
+                    # The renewal blocked on a lock past the lease's expiry: `renew_run_lease`
+                    # compares with the clock from BEFORE it waited, so it can succeed on a lease
+                    # that lapsed meanwhile. Expiry is a lost lease, not a revived one.
+                    logger.warning(
+                        "automation_run_lease_heartbeat_renewed_after_expiry run_id=%s",
+                        self._run_id,
+                    )
+                    self.lease_lost.set()
+                    return
                 last_ok = attempt_started
                 wait = self._interval_seconds
         finally:

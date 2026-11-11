@@ -132,3 +132,23 @@ def test_real_sqlite_lock_held_by_another_connection_is_survived(tmp_path):
         assert not hb.lease_lost.is_set()
         hb.stop()
         assert hb.is_alive() is False
+
+
+def test_a_renewal_that_succeeds_only_after_the_ttl_is_a_lost_lease(monkeypatch):
+    """Codex R1 P2: a renewal blocked past the lease's expiry compares with the clock from
+    before it waited and can succeed; the heartbeat must not treat that as a live lease."""
+    slow = []
+
+    def fake_renew(session, run_id, *, holder, ttl_seconds):
+        slow.append(True)
+        time.sleep(0.5)  # longer than the 0.3 s ttl
+        return True
+
+    monkeypatch.setattr(automation, "renew_run_lease", fake_renew)
+    monkeypatch.setattr(_RunLeaseHeartbeat, "__init__", _init_without_engine(0.3, 0.05))
+    hb = _RunLeaseHeartbeat.__new__(_RunLeaseHeartbeat)
+    hb.__init__()
+    hb.start()
+    assert hb.lease_lost.wait(3.0)
+    assert slow == [True]
+    hb.stop()

@@ -160,13 +160,22 @@ BLOCK_NOT_EMPLOYMENT_POSTING = "NOT_EMPLOYMENT_POSTING"
 # Stage 64: word-aware. The Stage 62 pattern `intern(ship)?` also matched "Interne Revision",
 # "interne Systeme", "Internet-Filiale" and "International" (19 of 227 matches on a production
 # copy were false positives). `intern` / `internship` now only match as whole words.
+# "Ausbildung" as a qualification clause ("mit abgeschlossener Ausbildung", "nach Ausbildung",
+# "ohne Ausbildung", "oder Ausbildung") describes the candidate, not the offer: not a match.
+_AFTER_QUALIFICATION = (
+    r"(?<!mit )(?<!nach )(?<!ohne )(?<!oder )"
+    r"(?<!abgeschlossen )(?<!abgeschlossene )(?<!abgeschlossener )"
+    r"(?<!abgeschlossenen )(?<!abgeschlossenes )"
+    r"(?<!erfolgreiche )(?<!erfolgreicher )(?<!erfolgreichen )"
+)
 _INTERNSHIP_TITLE = re.compile(
-    r"praktik(?:um|ant)"
+    r"praktik(?:um|ant|a\b)"
     r"|\b(?:intern|internship|internships)\b"
     r"|werkstudent|working student"
     r"|abschlussarbeit|bachelorarbeit|masterarbeit|diplomarbeit"
     r"|\b(?:master|bachelor)?thesis\b"
-    r"|\b(?:ausbildung|azubi|auszubildende[rn]?)\b|duales studium",
+    r"|" + _AFTER_QUALIFICATION + r"\bausbildung\b"
+    r"|\b(?:azubi|auszubildende[rn]?)\b|duales studium",
     re.IGNORECASE,
 )
 
