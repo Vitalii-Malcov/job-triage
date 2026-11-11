@@ -108,12 +108,12 @@ Evidence tags: **verified in code 11.11** = I read the cited file/line on this c
 | S62-08 | Stage62 | 28 BA reference conflicts | P2 | NEEDS_OPERATOR | never auto-resolved |
 | S62-09 | Stage62 | no second off-disk backup | P2 | NEEDS_OPERATOR | needs another drive |
 
-## Totals (101 rows)
-- FIXED: 26
+## Totals (102 rows)
+- FIXED: 27
 - NEEDS_OPERATOR: 7
 - NOT_REPRODUCED: 1
 - OPEN: 37
 - PARTIAL: 30
-- Rows with code-level evidence gathered in this run: 55; rows carried per matrix or not re-verified: 46.
+- Rows with code-level evidence gathered in this run: 56; rows carried per matrix or not re-verified: 46.
 
 No P0/P1 defect found that is fixable without the operator. Open P1 (OPS-02 alerting, ARC-07 liveness, FLOW-15, OPS-03 automation) need design/operator decisions and are not fixed here.

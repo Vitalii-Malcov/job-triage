@@ -43,3 +43,13 @@ def test_long_decoration_runs_stay_linear():
     started = time.perf_counter()
     extract_skills("Softwareentwickler", hostile + "\n- Python")
     assert time.perf_counter() - started < 2.0
+
+
+def test_closing_atx_markers_are_stripped_and_offer_header_resets_context():
+    result = extract_skills(
+        "Softwareentwickler",
+        "### Ihr Profil ###\n\n- Git\n\n### Wir bieten ###\n\n- Python Weiterbildung",
+    )
+    assert "git" in result.must_have_skills
+    assert "python" not in result.must_have_skills
+    assert "python" in extract_skills("x", "### Ihr Profil ###" + BODY).must_have_skills
