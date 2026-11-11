@@ -309,8 +309,21 @@ def _classify_mention(
     return "must" if nearest_must <= nearest_nice else "nice"
 
 
+_MARKDOWN_HEADER_DECORATION = re.compile(r"^[#>\s]+|[\s*_]+$|^[*_]+")
+
+
 def _normalized_header(line: str) -> str:
-    return re.sub(r"\s+", " ", line.strip().rstrip(":?!").casefold())
+    """Section header text without Markdown decoration (`### **Ihr Profil**`, `**Ihr Profil:**`):
+    many Bundesagentur descriptions are Markdown, and an unrecognised header silently dropped
+    every requirement listed under it."""
+    text = line.strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = _MARKDOWN_HEADER_DECORATION.sub("", text).strip()
+        text = text.rstrip(":?!").strip()
+        text = re.sub(r"[*_]+$", "", text).strip()
+    return re.sub(r"\s+", " ", text.casefold())
 
 
 def _section_header(line: str) -> tuple[str | None, str] | None:

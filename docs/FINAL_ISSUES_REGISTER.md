@@ -102,6 +102,7 @@ Evidence tags: **verified in code 11.11** = I read the cited file/line on this c
 | UI-03 | issues-index | see issues-index.md | P3 | PARTIAL | verified in code 11.11: html lang=de and label for=api_key present; table scope not checked |
 | UI-04 | issues-index | see issues-index.md | P3 | PARTIAL | verified in code 11.11: Cache-Control no-store set in ui/routes.py:52 |
 | AI-01 | issues-index | see issues-index.md | P3 | OPEN | LLM-provider stub text in providers/bewerbung/base.py; README states no LLM |
+| FINAL-01 | Daily Discovery copy run | Markdown section headers (`**Ihr Profil**`, `### ...`) not recognised by `skill_extractor`; requirements below them (Python/FastAPI/PostgreSQL in the Dockweiler ad) were dropped | P1/P2 | FIXED | reproduced on copy: id 3245 extracted [git, oauth, rest]; after fix Python/SQL/PostgreSQL found; 329 of 3 535 stored jobs change skill sets (66 gain Python); `tests/test_skill_extractor_markdown_headers.py`; stored scores/fit cache refresh needs the operator |
 | S62-03 | Stage62 | weak production API_KEY | P2 | NEEDS_OPERATOR | operator-owned |
 | S62-05 | Stage62 | gate PARTIAL tier for DevOps / earlier start | P3 | NEEDS_OPERATOR | product decision |
 | S62-08 | Stage62 | 28 BA reference conflicts | P2 | NEEDS_OPERATOR | never auto-resolved |
