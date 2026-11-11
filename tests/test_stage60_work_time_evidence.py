@@ -247,6 +247,8 @@ def test_stage62_internship_posting_never_opens_the_gate():
         ("Trainee Softwareentwicklung nach erfolgreicher Ausbildung", False),
         ("Quereinsteiger ohne Ausbildung Python", False),
         ("Ausbildung 2027 Fachinformatiker", True),
+        ("Starte mit Ausbildung 2027 zum Fachinformatiker", True),
+        ("Mit Ausbildung zur Fachinformatikerin starten", True),
         ("AUSBILDUNG zum Fachinformatiker (m/w/d)", True),
         ("Synthesis Engineer", False),
         ("Praktiker Elektrotechnik", False),
@@ -258,3 +260,24 @@ def test_stage64_internship_title_is_word_aware(title, blocked):
     from app.services.shortlist_gate import is_non_employment_title
 
     assert is_non_employment_title(title) is blocked
+
+
+@pytest.mark.parametrize(
+    "title,blocked",
+    [
+        ("Starte mit Ausbildung 2027 zum Fachinformatiker", True),
+        ("Praktika Softwareentwicklung", True),
+        ("Softwareentwickler mit abgeschlossener Ausbildung", False),
+        ("International Python Developer", False),
+    ],
+)
+def test_stage64_gate_applies_the_word_aware_title_rule(title, blocked):
+    from app.services.job_fit_assessment import Criterion
+    from app.services.shortlist_gate import BLOCK_NOT_EMPLOYMENT_POSTING
+
+    a = _gate_assessment("100% Remote.", _job(True))
+    a.title = title
+    a.criteria = [c for c in a.criteria if c.name != "posting_type"]
+    a.criteria.append(Criterion("posting_type", "UNKNOWN", "x", None))  # source says nothing
+    expected = BLOCK_NOT_EMPLOYMENT_POSTING if blocked else None
+    assert automatic_block_reason(a) == expected

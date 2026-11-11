@@ -175,6 +175,7 @@ _INTERNSHIP_TITLE = re.compile(
     r"|abschlussarbeit|bachelorarbeit|masterarbeit|diplomarbeit"
     r"|\b(?:master|bachelor)?thesis\b"
     r"|" + _AFTER_QUALIFICATION + r"\bausbildung\b"
+    r"|\bausbildung\s+(?:zum|zur|20\d\d|ab\b|beginn|start)"  # explicit offer
     r"|\b(?:azubi|auszubildende[rn]?)\b|duales studium",
     re.IGNORECASE,
 )
