@@ -35,7 +35,7 @@ import contextlib
 import functools
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -43,6 +43,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
 )
 
 from app.collectors.base import CollectorError, CollectorNotConfiguredError
@@ -960,7 +961,12 @@ async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application(settings: Settings) -> Application:
-    application = ApplicationBuilder().token(reveal(settings.telegram_bot_token)).build()
+    # SEC-04: Telegram would fetch every URL in a reply to build a preview; job links can be
+    # per-recipient tracking redirects (XING). Disabled for every SDK send/reply/edit.
+    defaults = Defaults(link_preview_options=LinkPreviewOptions(is_disabled=True))
+    application = (
+        ApplicationBuilder().token(reveal(settings.telegram_bot_token)).defaults(defaults).build()
+    )
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("jobs", cmd_jobs))

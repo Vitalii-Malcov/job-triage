@@ -132,7 +132,14 @@ async def send_telegram_message(
     markup.
     """
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload: dict = {"chat_id": chat_id, "text": text}
+    # SEC-04: Telegram's servers would otherwise fetch every URL in the text to build a preview.
+    # Job links can be per-recipient tracking redirects (XING), so that fetch could notify a
+    # recruiter that the candidate "viewed" a posting -- see app/collectors/xing_email.py.
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     try:
