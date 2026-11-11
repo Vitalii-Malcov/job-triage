@@ -46,7 +46,9 @@ def session_factory(tmp_path):
 @pytest.fixture(autouse=True)
 def patch_bot_dependencies(monkeypatch, session_factory):
     fake_settings = Settings(
-        telegram_bot_token="test-token", telegram_chat_id=str(AUTHORIZED_CHAT_ID)
+        telegram_bot_enabled=True,
+        telegram_bot_token="test-token",
+        telegram_chat_id=str(AUTHORIZED_CHAT_ID),
     )
     monkeypatch.setattr(bot, "SessionLocal", session_factory)
     monkeypatch.setattr(bot, "get_settings", lambda: fake_settings)
@@ -631,7 +633,9 @@ class TestStartBot:
     @pytest.mark.asyncio
     async def test_returns_none_and_does_not_raise_when_initialize_fails(self, monkeypatch):
         settings = Settings(
-            telegram_bot_token="test-token", telegram_chat_id=str(AUTHORIZED_CHAT_ID)
+            telegram_bot_enabled=True,
+            telegram_bot_token="test-token",
+            telegram_chat_id=str(AUTHORIZED_CHAT_ID),
         )
 
         async def failing_initialize(self):

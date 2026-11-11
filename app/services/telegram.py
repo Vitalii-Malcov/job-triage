@@ -178,6 +178,16 @@ async def send_telegram_message(
     return TelegramSendResult(TelegramSendOutcome.SENT, _extract_message_id(response))
 
 
+def job_alert_credentials(settings) -> tuple[str, str]:
+    """Fail-closed credentials for the legacy job alert: blank (-> notifier disabled) unless
+    TELEGRAM_JOB_ALERTS_ENABLED is true. Holding a token/chat id is not permission to send."""
+    from app.core.config import reveal
+
+    if not getattr(settings, "telegram_job_alerts_enabled", False):
+        return "", ""
+    return reveal(settings.telegram_bot_token), settings.telegram_chat_id
+
+
 class TelegramNotifier:
     def __init__(
         self,

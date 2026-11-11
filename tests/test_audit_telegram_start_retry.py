@@ -43,7 +43,7 @@ async def test_no_token_means_no_task():
 
 @pytest.mark.asyncio
 async def test_a_failed_start_is_retried_with_backoff_until_it_succeeds(patched):
-    settings = Settings(_env_file=None, telegram_bot_token="test-token")
+    settings = Settings(_env_file=None, telegram_bot_enabled=True, telegram_bot_token="test-token")
     task = asyncio.create_task(bot._run_bot_supervised(settings, patched["sleep"]))
     for _ in range(20):
         await asyncio.sleep(0)
@@ -57,7 +57,7 @@ async def test_a_failed_start_is_retried_with_backoff_until_it_succeeds(patched)
 @pytest.mark.asyncio
 async def test_backoff_is_capped(patched):
     patched["fail_first"] = 12
-    settings = Settings(_env_file=None, telegram_bot_token="test-token")
+    settings = Settings(_env_file=None, telegram_bot_enabled=True, telegram_bot_token="test-token")
     task = asyncio.create_task(bot._run_bot_supervised(settings, patched["sleep"]))
     for _ in range(80):
         await asyncio.sleep(0)
@@ -69,7 +69,7 @@ async def test_backoff_is_capped(patched):
 @pytest.mark.asyncio
 async def test_shutdown_while_still_retrying_cancels_cleanly(patched):
     patched["fail_first"] = 10**6
-    settings = Settings(_env_file=None, telegram_bot_token="test-token")
+    settings = Settings(_env_file=None, telegram_bot_enabled=True, telegram_bot_token="test-token")
     task = asyncio.create_task(bot._run_bot_supervised(settings, patched["sleep"]))
     for _ in range(5):
         await asyncio.sleep(0)
@@ -139,7 +139,12 @@ class _FakeFullApplication:
 
 
 def _settings():
-    return Settings(_env_file=None, telegram_bot_token="test-token", telegram_chat_id="1")
+    return Settings(
+        _env_file=None,
+        telegram_bot_enabled=True,
+        telegram_bot_token="test-token",
+        telegram_chat_id="1",
+    )
 
 
 @pytest.mark.asyncio

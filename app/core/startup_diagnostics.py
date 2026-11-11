@@ -18,6 +18,8 @@ from app.core.key_strength import secret_strength
 logger = logging.getLogger(__name__)
 
 SAFETY_FLAGS = (
+    "telegram_bot_enabled",
+    "telegram_job_alerts_enabled",
     "outbound_sending_enabled",
     "telegram_gmail_draft_enabled",
     "telegram_bewerbung_draft_enabled",
@@ -48,8 +50,9 @@ def startup_safety_fields(settings) -> dict[str, str]:
     fields["shared_state_backend"] = str(settings.shared_state_backend)
     # Strength class only ('unset' | 'placeholder' | 'weak' | 'strong'), never the value.
     fields["api_key_strength"] = secret_strength(reveal(settings.api_key))
-    # Stage 64: presence only (never the values). The legacy Telegram control-center bot starts
-    # and the job alert can send whenever BOTH exist, independent of every flag above; the
+    # Stage 64: presence only (never the values). The Telegram control-center bot starts only when
+    # TELEGRAM_BOT_ENABLED=true AND both exist (Stage 65); the legacy job alert can still send
+    # to the operator chat whenever BOTH exist; the
     # operator launcher (`scripts/run_operator_ui.py`) blanks the token for its process.
     fields["telegram_token_configured"] = str(bool(reveal(settings.telegram_bot_token))).lower()
     fields["telegram_chat_configured"] = str(bool(settings.telegram_chat_id)).lower()

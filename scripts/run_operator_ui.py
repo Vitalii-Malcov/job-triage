@@ -49,6 +49,8 @@ FORCED_ENV = {
     # POSTGRES_HOST would rebuild DATABASE_URL as PostgreSQL (Codex final review)
     "POSTGRES_HOST": "",
     "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_BOT_ENABLED": "false",
+    "TELEGRAM_JOB_ALERTS_ENABLED": "false",
     "ALEMBIC_AUTO_UPGRADE": "false",
     "OUTBOUND_SENDING_ENABLED": "false",
     "TELEGRAM_GMAIL_DRAFT_ENABLED": "false",

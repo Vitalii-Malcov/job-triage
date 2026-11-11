@@ -1022,11 +1022,24 @@ async def _teardown(application: Application) -> None:
             )
 
 
+def bot_start_block_reason(settings: Settings) -> str | None:
+    """Stage 65 fail-closed gate: None only when the operator explicitly enabled the bot
+    (TELEGRAM_BOT_ENABLED=true) AND both credentials exist. Reasons never contain secrets."""
+    if not settings.telegram_bot_enabled:
+        return "bot_not_enabled"
+    if not reveal(settings.telegram_bot_token):
+        return "no_bot_token_configured"
+    if not settings.telegram_chat_id.strip():
+        return "no_chat_id_configured"
+    return None
+
+
 async def _start_bot_attempt(settings: Settings) -> tuple[Application | None, str | None]:
     """One start attempt: (running application, None) or (None, failure exception TYPE name).
     The failure classification travels with the attempt's own result (no shared state)."""
-    if not reveal(settings.telegram_bot_token):
-        logger.info("telegram_bot_disabled reason=no_bot_token_configured")
+    reason = bot_start_block_reason(settings)
+    if reason is not None:
+        logger.info("telegram_bot_disabled reason=%s", reason)
         return None, None
 
     application = build_application(settings)
@@ -1162,9 +1175,10 @@ async def _run_bot_supervised(settings: Settings, sleep=asyncio.sleep) -> None:
 async def start_bot_supervised(settings: Settings) -> asyncio.Task | None:
     """Like `start_bot`, but the returned task retries a failed start until it succeeds (or
     `stop_bot_supervised` cancels it). None when no token is configured."""
-    if not reveal(settings.telegram_bot_token):
+    reason = bot_start_block_reason(settings)
+    if reason is not None:
         set_telegram_state(BotState.DISABLED)
-        logger.info("telegram_bot_disabled reason=no_bot_token_configured")
+        logger.info("telegram_bot_disabled reason=%s", reason)
         return None
     set_telegram_state(BotState.STARTING)
     task = asyncio.create_task(_run_bot_supervised(settings), name="telegram-bot")
