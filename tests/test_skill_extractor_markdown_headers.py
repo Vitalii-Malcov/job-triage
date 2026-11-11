@@ -33,3 +33,13 @@ def test_decorated_offer_header_still_ends_the_requirements_section():
         "**Ihr Profil**\n\n- Git\n\n**Wir bieten**\n\n- Python Weiterbildung",
     )
     assert "python" not in result.must_have_skills
+
+
+def test_long_decoration_runs_stay_linear():
+    """A hostile description with a huge run of Markdown characters must not freeze extraction."""
+    import time
+
+    hostile = "*" * 200_000 + "a" + " " * 200_000 + "b"
+    started = time.perf_counter()
+    extract_skills("Softwareentwickler", hostile + "\n- Python")
+    assert time.perf_counter() - started < 2.0
