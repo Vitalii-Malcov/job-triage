@@ -37,10 +37,15 @@ async def lifespan(_: FastAPI):
             process_lock.release()
 
 
+_docs_on = get_settings().api_docs_enabled
 app = FastAPI(
     title="JobTriage",
     version="0.2.0",
     lifespan=lifespan,
+    # Stage 62 (SEC-05): schema/docs pages need no key, so they are opt-in only.
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
 )
 app.include_router(router, prefix="/api/v1")
 # Stage 20: read-only operator UI; every /ui route is a 404 unless UI_ENABLED.

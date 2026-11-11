@@ -20,6 +20,7 @@ status.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -151,6 +152,16 @@ BLOCK_APPLICATION_IN_PROGRESS = "APPLICATION_IN_PROGRESS"
 # Stage 60: FULL_TIME came from the text heuristic only; there is no positive, uncontradicted
 # structured evidence (BA flag / Arbeitszeit field) that full time is offered NOW.
 BLOCK_FULL_TIME_NOT_CONFIRMED = "FULL_TIME_NOT_CONFIRMED"
+# Stage 62: a trainee programme / internship (or any posting the source types as something other
+# than regular employment) is not an employment application for the profile; the operator decides.
+BLOCK_NOT_EMPLOYMENT_POSTING = "NOT_EMPLOYMENT_POSTING"
+# BA types both internships and trainee programmes as PRAKTIKUM_TRAINEE; a trainee programme is a
+# valid target (see the fit tier), an internship / student job / thesis is not.
+_INTERNSHIP_TITLE = re.compile(
+    r"praktik|intern(ship)?|werkstudent|working student|abschlussarbeit|bachelorarbeit|masterarbeit"
+    r"|thesis",
+    re.IGNORECASE,
+)
 
 
 def work_time_evidence_confirmed(assessment: FitAssessment) -> bool:
@@ -167,6 +178,13 @@ def automatic_block_reason(assessment: FitAssessment) -> str | None:
         # A title that mixes administration/support with development is the operator's call.
         if hybrid_support_admin_family(assessment.title) is not None:
             return BLOCK_HYBRID_ADMIN_ROLE
+        posting_type = next(
+            (c.status for c in assessment.criteria if c.name == "posting_type"), "UNKNOWN"
+        )
+        if posting_type in {"SELF_EMPLOYMENT", "APPRENTICESHIP"} or _INTERNSHIP_TITLE.search(
+            assessment.title or ""
+        ):
+            return BLOCK_NOT_EMPLOYMENT_POSTING
         work_time = next(
             (c.status for c in assessment.criteria if c.name == "work_time"), "UNKNOWN"
         )
