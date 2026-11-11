@@ -53,3 +53,17 @@ def test_closing_atx_markers_are_stripped_and_offer_header_resets_context():
     assert "git" in result.must_have_skills
     assert "python" not in result.must_have_skills
     assert "python" in extract_skills("x", "### Ihr Profil ###" + BODY).must_have_skills
+
+
+def test_alternating_decoration_suffix_scales_linearly():
+    """Header normalisation must not be quadratic (4x input: ~4x cost, quadratic ~16x)."""
+    import time
+
+    def cost(n: int) -> float:
+        started = time.perf_counter()
+        extract_skills("Softwareentwickler", "x" + "#:" * n + chr(10) + "- Python")
+        return time.perf_counter() - started
+
+    cost(2_000)  # warm-up
+    small, large = cost(40_000), cost(160_000)
+    assert large < small * 8
