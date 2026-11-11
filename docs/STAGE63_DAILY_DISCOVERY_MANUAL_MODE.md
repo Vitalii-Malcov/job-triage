@@ -44,7 +44,8 @@ Order matters: refresh → match → assess (assessing before matching scores ne
 * `3` **ALERT** — read the printed line:
   * *"the collector-exclusion lease was lost; N updated and M created (partial write)"*:
     the rows already written are valid; run step 3 again (it adds the rest). Seen once in the
-    Stage 63 rehearsal (83 created, then the lease heartbeat hit an `OperationalError`); the second
+    Stage 63 rehearsal (root cause found and fixed in Stage 64: back-to-back write
+    transactions starved the heartbeat; see `STAGE64_FINAL_REPORT.md`) (83 created, then the lease heartbeat hit an `OperationalError`); the second
     run created the remaining 196 and ended `APPLIED`.
   * *"protected tables changed"* or a post-write check failure: **stop**, do not continue,
     restore the printed snapshot (see the runbook §6) and report.
