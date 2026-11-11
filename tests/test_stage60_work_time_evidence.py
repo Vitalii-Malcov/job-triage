@@ -243,6 +243,7 @@ def test_stage62_internship_posting_never_opens_the_gate():
         ("Trainee Python Developer", False),
         ("Ausbilder Fachinformatik", False),
         ("Softwareentwickler mit abgeschlossener Ausbildung", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
         ("Python Entwickler (m/w/d) nach Ausbildung oder Studium", False),
         ("Trainee Softwareentwicklung nach erfolgreicher Ausbildung", False),
         ("Quereinsteiger ohne Ausbildung Python", False),
@@ -268,7 +269,9 @@ def test_stage64_internship_title_is_word_aware(title, blocked):
         ("Starte mit Ausbildung 2027 zum Fachinformatiker", True),
         ("Praktika Softwareentwicklung", True),
         ("Softwareentwickler mit abgeschlossener Ausbildung", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
         ("International Python Developer", False),
+        ("Softwareentwickler (m/w/d) mit abgeschlossener Ausbildung zum Fachinformatiker", False),
     ],
 )
 def test_stage64_gate_applies_the_word_aware_title_rule(title, blocked):

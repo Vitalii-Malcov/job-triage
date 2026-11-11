@@ -162,20 +162,23 @@ BLOCK_NOT_EMPLOYMENT_POSTING = "NOT_EMPLOYMENT_POSTING"
 # copy were false positives). `intern` / `internship` now only match as whole words.
 # "Ausbildung" as a qualification clause ("mit abgeschlossener Ausbildung", "nach Ausbildung",
 # "ohne Ausbildung", "oder Ausbildung") describes the candidate, not the offer: not a match.
-_AFTER_QUALIFICATION = (
-    r"(?<!mit )(?<!nach )(?<!ohne )(?<!oder )"
+_COMPLETED = (
+    r"(?<!nach )(?<!ohne )(?<!oder )"
     r"(?<!abgeschlossen )(?<!abgeschlossene )(?<!abgeschlossener )"
     r"(?<!abgeschlossenen )(?<!abgeschlossenes )"
     r"(?<!erfolgreiche )(?<!erfolgreicher )(?<!erfolgreichen )"
 )
+# "mit Ausbildung" alone is ambiguous ("Starte mit Ausbildung 2027" is an offer, "mit Ausbildung
+# als Elektriker" a requirement), so it only exempts the bare word, never the explicit offer forms
+# below ("Ausbildung zum/zur ...", "Ausbildung 2027", "Ausbildung ab ...").
 _INTERNSHIP_TITLE = re.compile(
     r"praktik(?:um|ant|a\b)"
     r"|\b(?:intern|internship|internships)\b"
     r"|werkstudent|working student"
     r"|abschlussarbeit|bachelorarbeit|masterarbeit|diplomarbeit"
     r"|\b(?:master|bachelor)?thesis\b"
-    r"|" + _AFTER_QUALIFICATION + r"\bausbildung\b"
-    r"|\bausbildung\s+(?:zum|zur|20\d\d|ab\b|beginn|start)"  # explicit offer
+    r"|(?<!mit )" + _COMPLETED + r"\bausbildung\b"
+    r"|" + _COMPLETED + r"\bausbildung\s+(?:zum|zur|20\d\d|ab\b|beginn|start)"
     r"|\b(?:azubi|auszubildende[rn]?)\b|duales studium",
     re.IGNORECASE,
 )
