@@ -83,7 +83,7 @@ from app.models.company_research import CompanyResearchRunResponse
 from app.models.job import Job, JobScore
 from app.services.company_research import CompanyResearchService
 from app.services.search_strategy import BundesagenturQuery, bundesagentur_queries
-from app.services.telegram import TelegramNotifier
+from app.services.telegram import TelegramNotifier, job_alert_credentials
 from app.services.telegram_vacancy_feed import (  # confirmed_barrier: the shared fit gate
     confirmed_barrier,
     deliver_queued_vacancy_cards,
@@ -1132,8 +1132,8 @@ async def _process_ba_work(
     # overhead, but it also keeps the flood-limit pacing in `_publish_persisted_job` scoped to a
     # single run via one shared tally.
     notifier = TelegramNotifier(
-        bot_token=reveal(settings.telegram_bot_token),
-        chat_id=settings.telegram_chat_id,
+        bot_token=job_alert_credentials(settings)[0],
+        chat_id=job_alert_credentials(settings)[1],
         timeout_seconds=settings.telegram_timeout_seconds,
         max_retries=settings.telegram_max_retries,
     )
@@ -1304,8 +1304,8 @@ async def run_xing(
     # One notifier for the whole run (all batches), so the flood-limit pacing
     # via the tally's `notified` is scoped per collector run, not per message.
     notifier = TelegramNotifier(
-        bot_token=reveal(settings.telegram_bot_token),
-        chat_id=settings.telegram_chat_id,
+        bot_token=job_alert_credentials(settings)[0],
+        chat_id=job_alert_credentials(settings)[1],
         timeout_seconds=settings.telegram_timeout_seconds,
         max_retries=settings.telegram_max_retries,
     )

@@ -6,6 +6,7 @@ from enum import StrEnum
 
 import httpx
 
+from app.core.config import reveal
 from app.models.job import Job, JobScore
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,14 @@ async def send_telegram_message(
 
     logger.info("telegram_send_sent")
     return TelegramSendResult(TelegramSendOutcome.SENT, _extract_message_id(response))
+
+
+def job_alert_credentials(settings) -> tuple[str, str]:
+    """Fail-closed credentials for the legacy job alert: blank (-> notifier disabled) unless
+    TELEGRAM_JOB_ALERTS_ENABLED is true. Holding a token/chat id is not permission to send."""
+    if not getattr(settings, "telegram_job_alerts_enabled", False):
+        return "", ""
+    return reveal(settings.telegram_bot_token), settings.telegram_chat_id
 
 
 class TelegramNotifier:

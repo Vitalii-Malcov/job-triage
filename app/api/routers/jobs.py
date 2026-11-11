@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 from app.api.http_errors import http_errors
 from app.api.routers import common
 from app.api.routers.common import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, MAX_OFFSET
-from app.core.config import reveal
 from app.db.candidate_profile_repository import (
     get_candidate_skills_for_scoring,
 )
@@ -33,7 +32,7 @@ from app.services.collector_runner import (
 )
 from app.services.offload import run_off_loop
 from app.services.shortlist_gate import confirmed_barrier
-from app.services.telegram import TelegramNotifier
+from app.services.telegram import TelegramNotifier, job_alert_credentials
 
 logger = logging.getLogger("app.api.routes")
 router = APIRouter()
@@ -98,8 +97,8 @@ async def _score_job_service(job: Job, db: Session) -> JobScore:
         # classification), but this must fail closed regardless of that
         # internal contract, not rely on it.
         notifier = TelegramNotifier(
-            bot_token=reveal(settings.telegram_bot_token),
-            chat_id=settings.telegram_chat_id,
+            bot_token=job_alert_credentials(settings)[0],
+            chat_id=job_alert_credentials(settings)[1],
             timeout_seconds=settings.telegram_timeout_seconds,
             max_retries=settings.telegram_max_retries,
         )

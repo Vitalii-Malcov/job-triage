@@ -144,6 +144,12 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
+    # Stage 65: explicit opt-in for the Telegram control-center bot (polling lifecycle).
+    # Holding a token/chat id is NOT permission to start the bot; absent == False (fail closed).
+    telegram_bot_enabled: bool = False
+    # Stage 65: explicit opt-in for the legacy per-vacancy job alert (TelegramNotifier.send_job,
+    # used by collector runs and POST /jobs). Token + chat id alone never send it; absent == False.
+    telegram_job_alerts_enabled: bool = False
     telegram_timeout_seconds: float = 5.0
     telegram_max_retries: int = 3
     min_job_score_to_notify: int = 80

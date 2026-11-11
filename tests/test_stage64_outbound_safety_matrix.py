@@ -6,7 +6,8 @@ fake that only records that it was started. No real account, token or network is
 Matrix proved below (production-like config: Telegram token + chat and Gmail credentials
 present, every feature flag false):
 
-* Telegram bot: configured, no flag; a plain web start attempts the bot (operator chat only).
+* Telegram bot: configured, no TELEGRAM_BOT_ENABLED flag (Stage 65); a plain web start does NOT
+  start the bot.
 * Gmail / SMTP: configured, not enabled; no mail connection is opened.
 * Scheduler, auto-prepare, outbound: off.
 """
@@ -95,11 +96,10 @@ def _start_web(monkeypatch):
     return started
 
 
-def test_a_plain_web_start_only_reaches_for_the_telegram_bot_and_never_for_mail(web_env):
-    started = _start_web(web_env)
-    # documented behaviour: with a token the bot start is attempted without any flag; mail and
-    # every sender flag stay untouched (the SMTP/IMAP doubles above would have raised)
-    assert started == [True]
+def test_a_plain_web_start_never_starts_the_bot_and_never_opens_mail(web_env):
+    # Stage 65: token + chat present but no TELEGRAM_BOT_ENABLED -> no bot; mail untouched
+    # (the SMTP/IMAP doubles above would have raised)
+    assert _start_web(web_env) == []
 
 
 def test_the_operator_launcher_blanks_the_token_so_the_bot_is_not_started(web_env):

@@ -105,7 +105,9 @@ def test_start_without_token_is_disabled():
     from app.services import telegram_bot
 
     ch.set_telegram_state(BotState.FAILED)
-    settings = SimpleNamespace(telegram_bot_token=None)
+    settings = SimpleNamespace(
+        telegram_bot_enabled=True, telegram_bot_token=None, telegram_chat_id=""
+    )
     assert asyncio.run(telegram_bot.start_bot_supervised(settings)) is None
     assert ch.telegram_state() is BotState.DISABLED
 
