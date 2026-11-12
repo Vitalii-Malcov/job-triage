@@ -1,4 +1,6 @@
-# PR #30 — Deployment and rollback plan (PREPARED, NOT EXECUTED)
+# PR #30 — Deployment and rollback plan (HISTORICAL: EXECUTED 2026-11-06)
+
+> **Status: executed.** PR #30 was merged as `d0f576e` and the production database was migrated to `d6e9a2b4c8f1` on 2026-11-06 with the operator's explicit approval. What was actually done, with exact commits, outputs, deviations and the gates that are STILL PENDING (fit-cache refill, the §7 lockout and Telegram checks, a real-Gmail validation), is recorded in `docs/PR30_PRODUCTION_ROLLOUT_REPORT.md`. The text below is the plan as written before the rollout and is kept for the rollback steps; commit names in it (`1a9cc22`, `44d8e5d`) refer to the pre-merge branch.
 
 Scope: roll the Hard Code Review remediation (PR #30, head `1a9cc22`) onto the working system
 (`E:\Projects\job-triage`, SQLite `runtime\job_triage_runtime.db`, now at Alembic `e3b7c9d1f4a6`).
