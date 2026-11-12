@@ -41,6 +41,30 @@ SOURCE_NAME = "bundesagentur"
 # API-documented limit for the `veroeffentlichtseit` (published-since) filter.
 MAX_VEROEFFENTLICHTSEIT_DAYS = 100
 
+# Hard ceiling on search pages per fetch, whatever a caller configures: a misconfigured
+# `max_pages` can never turn into an open-ended request loop. 50 pages x 100 = 5 000 hits; the
+# live API was measured on 2026-11-12 to serve page 20 of a 2 791-hit search without a depth
+# cut-off, and every measured search (nationwide, no `wo`) was below 3 200 hits.
+ABSOLUTE_MAX_PAGES = 50
+# Upper bound for a server-requested `Retry-After` pause (429/503), seconds.
+RETRY_AFTER_CAP_SECONDS = 30.0
+# A search that delivered all but this many announced hits counts as complete: the live result
+# list shifts while it is paged (new postings, expired ones), so `maxErgebnisse` read on page 1
+# is not exact. max(1, 1 percent of the announced total).
+SHORTFALL_TOLERANCE_FLOOR = 1
+SHORTFALL_TOLERANCE_SHARE = 0.01
+
+COMPLETE = "COMPLETE"
+PARTIAL_PAGE_LIMIT = "PARTIAL_PAGE_LIMIT"  # our `max_pages` was reached
+PARTIAL_REQUEST_BUDGET = "PARTIAL_REQUEST_BUDGET"  # the run's RequestGate ran out
+PARTIAL_API_LIMITATION = "PARTIAL_API_LIMITATION"  # the API stopped serving before its own total
+COMPLETENESS_LABELS = {
+    COMPLETE: "COMPLETE",
+    PARTIAL_PAGE_LIMIT: "PARTIAL_RESULTS \u2014 PAGE LIMIT",
+    PARTIAL_REQUEST_BUDGET: "PARTIAL_RESULTS \u2014 REQUEST BUDGET",
+    PARTIAL_API_LIMITATION: "PARTIAL_RESULTS \u2014 API LIMITATION",
+}
+
 
 class RequestBudgetExhausted(Exception):
     """The run's ceiling on search requests is reached; nothing was sent."""
@@ -115,12 +139,24 @@ def is_api_key_configured(api_key: str) -> bool:
     return is_configured(api_key)
 
 
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    """Backoff 1, 2, 4 ... s; a numeric `Retry-After` on a 429/503 raises it (capped)."""
+    delay = float(2 ** (attempt - 1))
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503):
+        try:
+            asked = float(exc.response.headers.get("Retry-After", ""))
+        except ValueError:
+            asked = 0.0
+        delay = max(delay, min(asked, RETRY_AFTER_CAP_SECONDS))
+    return delay
+
+
 def _parse_int(value: object) -> int | None:
     if value is None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: JSON 1e400 -> inf
         return None
 
 
@@ -371,6 +407,24 @@ class BundesagenturCollector(JobCollector):
         # `maxErgebnisse` of the last fetch (None when the API did not say);
         # with `truncated` it tells how many results `max_pages` left out.
         self.total_results: int | None = None
+        # Pagination evidence of the last fetch (never inferred from `max_pages`):
+        # unique postings the API delivered (before the home-office/title filters), pages
+        # requested, repeated postings dropped, and one of the COMPLETENESS codes above.
+        self.unique_results_seen = 0
+        self.pages_fetched = 0
+        self.duplicates_skipped = 0
+        self.completeness = COMPLETE
+
+    @property
+    def left_out(self) -> int | None:
+        """Announced hits this fetch did not receive; None when the API gave no total."""
+        if self.total_results is None:
+            return None
+        return max(0, self.total_results - self.unique_results_seen)
+
+    @property
+    def completeness_label(self) -> str:
+        return COMPLETENESS_LABELS[self.completeness]
 
     async def fetch(self, since: datetime | None = None) -> list[Job]:
         if not is_api_key_configured(self.api_key):
@@ -382,6 +436,10 @@ class BundesagenturCollector(JobCollector):
         self.requests_made = 0
         self.truncated = False
         self.total_results = None
+        self.unique_results_seen = 0
+        self.pages_fetched = 0
+        self.duplicates_skipped = 0
+        self.completeness = COMPLETE
         headers = {"X-API-Key": self.api_key}
         params = self._build_params(since)
 
@@ -462,26 +520,61 @@ class BundesagenturCollector(JobCollector):
         base_params: dict[str, str | int],
     ) -> list[Job]:
         jobs: list[Job] = []
+        seen_postings: set[tuple] = set()
         total_results: int | None = None
+        page_size = self.page_size
+        max_pages = min(self.max_pages, ABSOLUTE_MAX_PAGES)
+        stop = PARTIAL_PAGE_LIMIT  # replaced below whenever the loop ends for another reason
         page = 1
 
-        while page <= self.max_pages:
+        while page <= max_pages:
             page_params = {**base_params, "page": page}
             try:
                 payload = await self._get_page(client, headers, page_params)
             except RequestBudgetExhausted:
-                self.truncated = True
+                stop = PARTIAL_REQUEST_BUDGET
                 break
+            self.pages_fetched += 1
 
             if total_results is None:
                 total_results = _parse_int(payload.get("maxErgebnisse"))
                 self.total_results = total_results
+            # the API may serve fewer per page than requested: its own `size` decides
+            served_size = _parse_int(payload.get("size"))
+            if served_size is not None and 0 < served_size <= page_size:
+                page_size = served_size
 
             postings = _extract_postings(payload)
             if not postings:
+                # a natural end; _final_completeness compares it with the announced total
+                stop = COMPLETE
                 break
 
+            new_on_page = 0
             for posting in postings:
+                reference = (
+                    (posting.get("referenznummer") or posting.get("refnr"))
+                    if isinstance(posting, dict)
+                    else None
+                )
+                if reference:
+                    # Identical postings only: two DIFFERENT postings sharing one reference are a
+                    # conflict the refresh reports (SAME_REFERENCE_TWICE_IN_RESULTS), not a
+                    # duplicate to hide. The list shifts while it is paged, so the same posting
+                    # can arrive twice.
+                    title = posting.get("stellenangebotsTitel") or posting.get("titel")
+                    employer = posting.get("firma") or posting.get("arbeitgeber")
+                    identity = (  # untrusted types: only strings are hashed
+                        str(reference),
+                        title if isinstance(title, str) else None,
+                        employer if isinstance(employer, str) else None,
+                    )
+                    if identity in seen_postings:
+                        self.duplicates_skipped += 1
+                        continue
+                    seen_postings.add(identity)
+                new_on_page += 1
+                self.unique_results_seen += 1
                 job = _map_posting(posting)
                 if job is None:
                     self.skipped_invalid_count += 1
@@ -492,15 +585,38 @@ class BundesagenturCollector(JobCollector):
                 else:
                     jobs.append(job)
 
-            if total_results is not None and page * self.page_size >= total_results:
+            if new_on_page == 0:
+                # a whole page of postings already delivered: the paging is not advancing
+                logger.warning("bundesagentur_repeated_page page=%s", page)
+                stop = PARTIAL_API_LIMITATION
+                break
+            if total_results is not None and page * page_size >= total_results:
+                stop = COMPLETE
                 break
             page += 1
-        else:
-            self.truncated = (
-                total_results is None or total_results > self.max_pages * self.page_size
-            )
 
+        self.completeness = self._final_completeness(stop, total_results)
+        self.truncated = self.completeness != COMPLETE
+        if self.truncated:
+            logger.warning(
+                "bundesagentur_partial_results status=%s total=%s seen=%s pages=%s",
+                self.completeness,
+                total_results,
+                self.unique_results_seen,
+                self.pages_fetched,
+            )
         return jobs
+
+    def _final_completeness(self, stop: str, total_results: int | None) -> str:
+        if stop == COMPLETE and total_results is not None:
+            # the list ended (page arithmetic or an empty page): the announced total is only an
+            # estimate that drifts while paging, so a small shortfall is not a truncation
+            tolerance = max(
+                SHORTFALL_TOLERANCE_FLOOR, int(total_results * SHORTFALL_TOLERANCE_SHARE)
+            )
+            if total_results - self.unique_results_seen > tolerance:
+                return PARTIAL_API_LIMITATION
+        return stop
 
     async def _get_page(
         self,
@@ -623,7 +739,7 @@ class BundesagenturCollector(JobCollector):
                     exc,
                 )
                 if attempt < self.max_retries:
-                    await asyncio.sleep(2 ** (attempt - 1))
+                    await asyncio.sleep(_retry_delay(exc, attempt))
 
         logger.error(
             "bundesagentur_fetch_exhausted_retries request=%s params=%s",

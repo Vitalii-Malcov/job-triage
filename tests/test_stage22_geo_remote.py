@@ -376,15 +376,17 @@ def _page(postings, total):
 
 
 def test_the_collector_keeps_only_home_office_postings_and_reports_truncation():
-    home = _posting()
-    office = _posting(referenznummer="10001-2-S", homeofficemoeglich=False)
-    silent = _posting(referenznummer="10001-3-S")
-    silent.pop("homeofficemoeglich")
     pages = []
 
     def handler(request):
-        pages.append(int(request.url.params["page"]))
+        page = int(request.url.params["page"])
+        pages.append(page)
         assert "arbeitszeit" not in request.url.params
+        # distinct postings per page: an identical page twice is a non-advancing list
+        home = _posting(referenznummer=f"10001-{page}0-S")
+        office = _posting(referenznummer=f"10001-{page}1-S", homeofficemoeglich=False)
+        silent = _posting(referenznummer=f"10001-{page}2-S")
+        silent.pop("homeofficemoeglich")
         return httpx.Response(200, json=_page([home, office, silent], 9999))
 
     async def go():
@@ -396,7 +398,7 @@ def test_the_collector_keeps_only_home_office_postings_and_reports_truncation():
 
     collector, jobs = asyncio.run(go())
     assert pages == [1, 2]
-    assert [j.source_reference for j in jobs] == ["10001-1000911926-S"] * 2
+    assert [j.source_reference for j in jobs] == ["10001-10-S", "10001-20-S"]
     assert collector.skipped_not_home_office == 4 and collector.truncated
     assert collector.skipped_invalid_count == 0
 
