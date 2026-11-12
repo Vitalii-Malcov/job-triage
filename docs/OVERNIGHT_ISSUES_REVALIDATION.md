@@ -53,5 +53,5 @@ Stage 62 inventory (S62-03 weak production API key, S62-08 28 BA reference confl
 
 ## D. Counts
 - Hard-review findings: 8 → 5 fixed, 2 partial (2.3, 2.4), 1 needs-operator (2.2).
-- Audit index rows: 89 (+4 style items out of scope). Re-verified in code today: 17. Carried per matrix: 72.
+- Audit index rows: 89 (+4 style items out of scope). Re-verified in code today: 18 distinct IDs in section B (section C lists some of them again; superseded by `FINAL_ISSUES_REGISTER.md`). Carried per matrix: the rest (see the final register for exact counts).
 - Fixed in this run: SEC-04, DOC-01, DEP-03 (partial), DOC-05 (partial). No P0/P1 defects found open that are fixable without the operator.

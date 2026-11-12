@@ -17,6 +17,7 @@ import argparse
 import sqlite3
 import sys
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +43,8 @@ COMMON_JOB_AD_STEMS = frozenset(
 
 def build(database: Path, min_share: float) -> tuple[list[str], int]:
     uri = f"file:{database.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+    # `with sqlite3.connect()` only commits; it does not close the connection (RUN-03).
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
         rows = connection.execute(
             "select description from jobs where length(trim(description)) > 300"
         ).fetchall()

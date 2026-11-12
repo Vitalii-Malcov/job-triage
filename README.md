@@ -133,7 +133,7 @@ Full deployment architecture (topology, scheduler-placement decision, scaling li
 | 23 (PRs #25-#26): opt-in BA `angebotsart` / `veroeffentlichtseit` filters, specialization-domain criterion | yes | yes | not verified |
 | 24 (PRs #27-#28): opt-in BA discovery queries, target-role alignment | yes | yes | not verified |
 | Docs PRs #14 (Stage 19 release report), #29 (Astra audit policy) | yes | yes | n/a |
-| Hard-review remediation (PR #30, merged 2026-11-06) and audit remediation (PRs #35-#47, merged 2026-11-09) | yes | yes | not verifiable from this repository (see operator reports) |
+| Hard-review remediation (PR #30, merged 2026-11-06) and audit remediation (PRs #35-#47, merged 2026-11-09; #37 and #38 were closed unmerged and their changes arrived through the integration PR #47) | yes | yes | not verifiable from this repository (see operator reports) |
 | Discovery, matching and manual-review queue (PRs #48-#55), post-release quality (#57) | yes | yes (merged 2026-11-09/10) | not verifiable from this repository |
 | Stage 58-65 stabilisation: release gate, route-auth matrix, discovery reliability, Telegram opt-in (PRs #58-#61) | yes | yes (merged 2026-11-11; `main` = `5834fe7`) | operator-owned; `docs/STAGE65_FINAL_SECURITY_REPORT.md` §9-11 |
 

@@ -309,8 +309,15 @@ def _classify_mention(
     return "must" if nearest_must <= nearest_nice else "nice"
 
 
+_HEADER_TRIM_CHARS = " 	#>*_:?!"
+
+
 def _normalized_header(line: str) -> str:
-    return re.sub(r"\s+", " ", line.strip().rstrip(":?!").casefold())
+    """Section header text without Markdown decoration or a trailing colon (`### **Ihr Profil**`,
+    `**Ihr Profil:**`, `### Ihr Profil ###`): many Bundesagentur descriptions are Markdown, and an
+    unrecognised header silently dropped every requirement listed under it. One `str.strip` pass
+    (linear) -- no regex and no retry loop on untrusted text."""
+    return re.sub(r"\s+", " ", line.strip(_HEADER_TRIM_CHARS).casefold())
 
 
 def _section_header(line: str) -> tuple[str | None, str] | None:
