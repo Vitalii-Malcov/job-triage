@@ -56,7 +56,11 @@ class QueryReport:
     skipped_not_home_office: int = 0
     truncated: bool = False
     total_results: int | None = None
-    left_out: int | None = None  # results beyond max_pages (None = unknown)
+    left_out: int | None = None  # announced results not delivered (None = unknown)
+    completeness: str = "COMPLETE"  # or PARTIAL_PAGE_LIMIT / _REQUEST_BUDGET / _API_LIMITATION
+    unique_seen: int = 0  # unique postings delivered, before the home-office filter
+    pages_fetched: int = 0
+    duplicates_skipped: int = 0
     error: str | None = None
 
 
@@ -132,10 +136,11 @@ async def fetch_postings(
         report.skipped_not_home_office = collector.skipped_not_home_office
         report.truncated = collector.truncated
         report.total_results = collector.total_results
-        if collector.truncated and collector.total_results is not None:
-            report.left_out = max(
-                0, collector.total_results - collector.max_pages * collector.page_size
-            )
+        report.left_out = collector.left_out if collector.truncated else 0
+        report.completeness = collector.completeness
+        report.unique_seen = collector.unique_results_seen
+        report.pages_fetched = collector.pages_fetched
+        report.duplicates_skipped = collector.duplicates_skipped
         for job in jobs:
             # one entry per posting AS STORED: the same posting found by several
             # searches collapses, two different postings sharing a BA reference

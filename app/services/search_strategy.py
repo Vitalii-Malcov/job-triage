@@ -44,7 +44,12 @@ BA_RADIUS_STEPS = (10, 15, 20, 25, 50, 100, 150, 200)
 # Straight-line margin between the BA place centre and the commute origin.
 RADIUS_MARGIN_KM = 50
 DEFAULT_MAX_PAGES = 20
-REMOTE_MAX_PAGES = 10
+# Remote searches have no `wo`, so a broad term matches the whole country: measured
+# 2026-11-12 `Python` 2 791 hits, `Softwareentwickler` about 3 100. The former 10 pages
+# (1 000 hits) left two thirds of them unread, and the client-side home-office filter
+# then kept only about a tenth of the 1 000 read. 40 pages cover every measured search;
+# the collector stops at the announced total and reports PARTIAL_* if it cannot.
+REMOTE_MAX_PAGES = 40
 
 
 @dataclass(frozen=True)

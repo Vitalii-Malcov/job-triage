@@ -383,6 +383,10 @@ def summarize(plan, fetched) -> dict:
                 "truncated": q.truncated,
                 "total_results": q.total_results,
                 "left_out_by_pagination": q.left_out,
+                "completeness": q.completeness,
+                "unique_seen": q.unique_seen,
+                "pages_fetched": q.pages_fetched,
+                "duplicates_skipped": q.duplicates_skipped,
                 "error": q.error,
             }
             for q in fetched.queries
@@ -423,7 +427,8 @@ def print_report(summary: dict, as_json: bool) -> None:
         print(
             f"  query {q['label']}/{q['keywords']}: fetched={q['fetched']} "
             f"invalid={q['skipped_invalid']} not_home_office={q['skipped_not_home_office']} "
-            f"truncated={q['truncated']}{cut}{extra}"
+            f"seen={q['unique_seen']}/{q['total_results']} pages={q['pages_fetched']} "
+            f"dupes={q['duplicates_skipped']} {q['completeness']}{cut}{extra}"
         )
     print(
         f"pagination: {s['truncated_queries']} search(es) truncated, "
